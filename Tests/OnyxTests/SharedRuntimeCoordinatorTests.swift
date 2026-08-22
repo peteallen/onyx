@@ -1,0 +1,915 @@
+import Foundation
+import XCTest
+@testable import Onyx
+
+final class SharedRuntimeCoordinatorTests: XCTestCase {
+    func testEverySubscriberReceivesEveryRuntimeEventInOrder() async throws {
+        let runtime = CoordinatorFakeRuntime()
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+        let first = CoordinatorEventRecorder()
+        let second = CoordinatorEventRecorder()
+        await first.start(stream: coordinator.events)
+        await second.start(stream: coordinator.events)
+
+        let expected: [AgentRuntimeEvent] = [
+            .connectionChanged(.connecting),
+            .runtimeNotice(title: "First", detail: "one"),
+            .runtimeNotice(title: "Second", detail: "two"),
+        ]
+        for event in expected {
+            runtime.emit(event)
+        }
+
+        try await first.waitForCount(expected.count)
+        try await second.waitForCount(expected.count)
+        let firstEvents = await first.snapshot()
+        let secondEvents = await second.snapshot()
+        XCTAssertEqual(firstEvents, expected)
+        XCTAssertEqual(secondEvents, expected)
+        XCTAssertEqual(runtime.eventStreamAccessCount, 1)
+    }
+
+    func testStalledSubscriberCoalescesAdjacentDeltasWhileActiveConsumerKeepsExactOrder() async throws {
+        let runtime = CoordinatorFakeRuntime()
+        let coordinator = SharedRuntimeCoordinator(
+            runtime: runtime,
+            subscriberEventLimit: 2
+        )
+        let stalledStream = coordinator.events
+        let active = CoordinatorEventRecorder()
+        await active.start(stream: coordinator.events)
+
+        let firstDelta = AgentRuntimeEvent.itemDelta(
+            threadID: "thread-1",
+            itemID: "item-1",
+            delta: "hel"
+        )
+        let secondDelta = AgentRuntimeEvent.itemDelta(
+            threadID: "thread-1",
+            itemID: "item-1",
+            delta: "lo"
+        )
+        let boundary = AgentRuntimeEvent.runtimeNotice(title: "Boundary", detail: "after delta")
+
+        runtime.emit(firstDelta)
+        try await active.waitForCount(1)
+        runtime.emit(secondDelta)
+        try await active.waitForCount(2)
+        runtime.emit(boundary)
+        try await active.waitForCount(3)
+
+        let stalled = CoordinatorEventRecorder()
+        await stalled.start(stream: stalledStream)
+        try await stalled.waitForCount(2)
+
+        let activeEvents = await active.snapshot()
+        let stalledEvents = await stalled.snapshot()
+        XCTAssertEqual(activeEvents, [firstDelta, secondDelta, boundary])
+        XCTAssertEqual(
+            stalledEvents,
+            [
+                .itemDelta(threadID: "thread-1", itemID: "item-1", delta: "hello"),
+                boundary,
+            ]
+        )
+    }
+
+    func testStalledSubscriberBackpressuresSourceInsteadOfDroppingEvents() async throws {
+        let runtime = CoordinatorFakeRuntime()
+        let coordinator = SharedRuntimeCoordinator(
+            runtime: runtime,
+            subscriberEventLimit: 2
+        )
+        let stalledStream = coordinator.events
+        let active = CoordinatorEventRecorder()
+        await active.start(stream: coordinator.events)
+
+        let events: [AgentRuntimeEvent] = [
+            .runtimeNotice(title: "First", detail: "one"),
+            .runtimeNotice(title: "Second", detail: "two"),
+            .runtimeNotice(title: "Third", detail: "three"),
+        ]
+        for (index, event) in events.enumerated() {
+            runtime.emit(event)
+            if index < 2 {
+                try await active.waitForCount(index + 1)
+            }
+        }
+        await Task.yield()
+        let activeBeforeDrain = await active.snapshot()
+        XCTAssertEqual(activeBeforeDrain, Array(events.prefix(2)))
+
+        let stalled = CoordinatorEventRecorder()
+        await stalled.start(stream: stalledStream)
+        try await stalled.waitForCount(events.count)
+        try await active.waitForCount(events.count)
+
+        let activeEvents = await active.snapshot()
+        let stalledEvents = await stalled.snapshot()
+        XCTAssertEqual(activeEvents, events)
+        XCTAssertEqual(stalledEvents, events)
+    }
+
+    func testConcurrentConnectsShareOneHandshakeAndLaterWindowsUseItsSnapshot() async throws {
+        let gate = InvocationGate(isOpen: false)
+        let session = Self.session(label: "Connected once")
+        let runtime = CoordinatorFakeRuntime(connectSession: session, connectGate: gate)
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+
+        let first = Task { try await coordinator.connect() }
+        await gate.waitForInvocationCount(1)
+        let second = Task { try await coordinator.connect() }
+        for _ in 0 ..< 20 { await Task.yield() }
+
+        let countBeforeOpening = await gate.invocationCount
+        XCTAssertEqual(countBeforeOpening, 1)
+        await gate.open()
+        let firstSession = try await first.value
+        let secondSession = try await second.value
+        let attachedLater = try await coordinator.connect()
+
+        XCTAssertEqual(firstSession, session)
+        XCTAssertEqual(secondSession, session)
+        XCTAssertEqual(attachedLater, session)
+        let finalCount = await gate.invocationCount
+        XCTAssertEqual(finalCount, 1)
+    }
+
+    func testDisconnectEventInvalidatesTheCachedSessionBeforeSubscribersSeeIt() async throws {
+        let gate = InvocationGate(isOpen: true)
+        let runtime = CoordinatorFakeRuntime(connectGate: gate)
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+        let events = CoordinatorEventRecorder()
+        await events.start(stream: coordinator.events)
+
+        _ = try await coordinator.connect()
+        _ = try await coordinator.connect()
+        let countBeforeDisconnect = await gate.invocationCount
+        XCTAssertEqual(countBeforeDisconnect, 1)
+
+        runtime.emit(.connectionChanged(.disconnected))
+        try await events.waitForCount(1)
+        _ = try await coordinator.connect()
+
+        let countAfterDisconnect = await gate.invocationCount
+        XCTAssertEqual(countAfterDisconnect, 2)
+    }
+
+    func testConcurrentAccountRefreshesAreCoalescedAndReplaceTheCachedSnapshot() async throws {
+        let refreshGate = InvocationGate(isOpen: false)
+        let initial = Self.session(label: "Initial")
+        let refreshed = Self.session(label: "Refreshed")
+        let runtime = CoordinatorFakeRuntime(
+            connectSession: initial,
+            refreshSession: refreshed,
+            refreshGate: refreshGate
+        )
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+        _ = try await coordinator.connect()
+
+        let first = Task { try await coordinator.refreshAccount() }
+        await refreshGate.waitForInvocationCount(1)
+        let second = Task { try await coordinator.refreshAccount() }
+        for _ in 0 ..< 20 { await Task.yield() }
+
+        let countBeforeOpening = await refreshGate.invocationCount
+        XCTAssertEqual(countBeforeOpening, 1)
+        await refreshGate.open()
+        let firstSession = try await first.value
+        let secondSession = try await second.value
+        let attachedLater = try await coordinator.connect()
+        let finalRefreshCount = await refreshGate.invocationCount
+        let finalConnectCount = await runtime.connectCallCount
+        XCTAssertEqual(firstSession, refreshed)
+        XCTAssertEqual(secondSession, refreshed)
+        XCTAssertEqual(attachedLater, refreshed)
+        XCTAssertEqual(finalRefreshCount, 1)
+        XCTAssertEqual(finalConnectCount, 1)
+    }
+
+    func testLogoutInvalidatesCachedSessionBeforeProviderFinishes() async throws {
+        let logoutGate = InvocationGate(isOpen: false)
+        let runtime = CoordinatorFakeRuntime(logoutGate: logoutGate)
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+        _ = try await coordinator.connect()
+
+        let logout = Task { try await coordinator.logout() }
+        await logoutGate.waitForInvocationCount(1)
+        let reconnect = Task { try await coordinator.connect() }
+        for _ in 0 ..< 20 { await Task.yield() }
+
+        let connectsDuringLogout = await runtime.connectCallCount
+        XCTAssertEqual(connectsDuringLogout, 1)
+
+        await logoutGate.open()
+        try await logout.value
+        _ = try await reconnect.value
+        let connectsAfterLogout = await runtime.connectCallCount
+        XCTAssertEqual(connectsAfterLogout, 2)
+    }
+
+    func testSuccessfulLogoutBroadcastsSignedOutBoundaryWhenProviderEmitsNoAccountEvent() async throws {
+        let runtime = CoordinatorFakeRuntime()
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+        let first = CoordinatorEventRecorder()
+        let second = CoordinatorEventRecorder()
+        await first.start(stream: coordinator.events)
+        await second.start(stream: coordinator.events)
+
+        try await coordinator.logout()
+        try await first.waitForCount(1)
+        try await second.waitForCount(1)
+
+        let expected = [AgentRuntimeEvent.accountUpdated(.signedOut)]
+        let firstEvents = await first.snapshot()
+        let secondEvents = await second.snapshot()
+        XCTAssertEqual(firstEvents, expected)
+        XCTAssertEqual(secondEvents, expected)
+    }
+
+    func testConcurrentLogoutsInvokeProviderOnceAndBroadcastOneSyntheticBoundary() async throws {
+        let logoutGate = InvocationGate(isOpen: false)
+        let runtime = CoordinatorFakeRuntime(logoutGate: logoutGate)
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+        let firstRecorder = CoordinatorEventRecorder()
+        let secondRecorder = CoordinatorEventRecorder()
+        await firstRecorder.start(stream: coordinator.events)
+        await secondRecorder.start(stream: coordinator.events)
+
+        let firstLogout = Task { try await coordinator.logout() }
+        let secondLogout = Task { try await coordinator.logout() }
+        await logoutGate.waitForInvocationCount(1)
+        for _ in 0 ..< 100 { await Task.yield() }
+
+        let callsWhileBothCallersAreWaiting = await runtime.logoutCallCount
+        XCTAssertEqual(callsWhileBothCallersAreWaiting, 1)
+
+        await logoutGate.open()
+        try await firstLogout.value
+        try await secondLogout.value
+        try await firstRecorder.waitForCount(1)
+        try await secondRecorder.waitForCount(1)
+
+        let expected = [AgentRuntimeEvent.accountUpdated(.signedOut)]
+        let firstEvents = await firstRecorder.snapshot()
+        let secondEvents = await secondRecorder.snapshot()
+        let finalProviderCallCount = await runtime.logoutCallCount
+        XCTAssertEqual(finalProviderCallCount, 1)
+        XCTAssertEqual(firstEvents, expected)
+        XCTAssertEqual(secondEvents, expected)
+    }
+
+    func testLogoutDoesNotReleaseConnectWaitersUntilBoundaryBroadcastFinishes() async throws {
+        let logoutGate = InvocationGate(isOpen: false)
+        let runtime = CoordinatorFakeRuntime(logoutGate: logoutGate)
+        let coordinator = SharedRuntimeCoordinator(
+            runtime: runtime,
+            subscriberEventLimit: 1
+        )
+        let stalledStream = coordinator.events
+        let active = CoordinatorEventRecorder()
+        await active.start(stream: coordinator.events)
+
+        _ = try await coordinator.connect()
+        runtime.emit(.runtimeNotice(title: "Fill", detail: "stalled subscriber queue"))
+        try await active.waitForCount(1)
+
+        let logout = Task { try await coordinator.logout() }
+        await logoutGate.waitForInvocationCount(1)
+        let reconnect = Task { try await coordinator.connect() }
+        await logoutGate.open()
+        try await active.waitForCount(2)
+
+        // The stalled subscriber still owns the first queue slot. The shared
+        // logout attempt must remain in-flight until its synthetic boundary
+        // can be delivered, so a waiting connect cannot start early.
+        for _ in 0 ..< 100 {
+            await Task.yield()
+        }
+        let connectsBeforeBoundaryDrain = await runtime.connectCallCount
+        XCTAssertEqual(
+            connectsBeforeBoundaryDrain,
+            1,
+            "A reconnect started before every window observed sign-out."
+        )
+
+        let stalled = CoordinatorEventRecorder()
+        await stalled.start(stream: stalledStream)
+        try await stalled.waitForCount(2)
+        try await logout.value
+        _ = try await reconnect.value
+
+        let finalConnects = await runtime.connectCallCount
+        XCTAssertEqual(finalConnects, 2)
+    }
+
+    func testAccountOperationIsRejectedWhileProviderLogoutIsPending() async throws {
+        let logoutGate = InvocationGate(isOpen: false)
+        let runtime = CoordinatorFakeRuntime(logoutGate: logoutGate)
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+
+        let logout = Task { try await coordinator.logout() }
+        await logoutGate.waitForInvocationCount(1)
+
+        do {
+            try await coordinator.startTurn(
+                StartTurnRequest(threadID: "thread-1", text: "Must not cross sign-out")
+            )
+            XCTFail("A sibling window sent a turn while logout was pending.")
+        } catch {
+            assertAccountBoundary(error)
+        }
+
+        let providerStartTurnCount = await runtime.startTurnCallCount
+        XCTAssertEqual(providerStartTurnCount, 0)
+
+        await logoutGate.open()
+        try await logout.value
+    }
+
+    func testLogoutWaitsForInFlightAccountOperationBeforeProviderLogoutBegins() async throws {
+        let startTurnGate = InvocationGate(isOpen: false)
+        let logoutGate = InvocationGate(isOpen: false)
+        let runtime = CoordinatorFakeRuntime(
+            logoutGate: logoutGate,
+            startTurnGate: startTurnGate
+        )
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+
+        let turn = Task {
+            try await coordinator.startTurn(
+                StartTurnRequest(threadID: "thread-1", text: "Finish before sign-out")
+            )
+        }
+        await startTurnGate.waitForInvocationCount(1)
+
+        let logout = Task { try await coordinator.logout() }
+        let boundaryBecameActive = await waitForAccountBoundary(coordinator)
+        XCTAssertTrue(boundaryBecameActive, "Logout never established its account boundary.")
+        let providerLogoutsWhileTurnWasActive = await runtime.logoutCallCount
+        XCTAssertEqual(
+            providerLogoutsWhileTurnWasActive,
+            0,
+            "Provider logout crossed an in-flight account operation."
+        )
+
+        await startTurnGate.open()
+        try await turn.value
+        await logoutGate.waitForInvocationCount(1)
+        await logoutGate.open()
+        try await logout.value
+
+        let startTurnCalls = await runtime.startTurnCallCount
+        let logoutCalls = await runtime.logoutCallCount
+        XCTAssertEqual(startTurnCalls, 1)
+        XCTAssertEqual(logoutCalls, 1)
+    }
+
+    func testLateLoginIsCancelledBeforeProviderLogoutBegins() async throws {
+        let loginStartGate = InvocationGate(isOpen: false)
+        let cancelLoginGate = InvocationGate(isOpen: false)
+        let logoutGate = InvocationGate(isOpen: false)
+        let loginStart = Self.loginStart(loginID: "late-login")
+        let runtime = CoordinatorFakeRuntime(
+            logoutGate: logoutGate,
+            loginStartResult: loginStart,
+            loginStartGate: loginStartGate,
+            cancelLoginGate: cancelLoginGate
+        )
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+
+        let login = Task { try await coordinator.startLogin(methodID: loginStart.method.id) }
+        await loginStartGate.waitForInvocationCount(1)
+
+        let logout = Task { try await coordinator.logout() }
+        let boundaryBecameActive = await waitForAccountBoundary(coordinator)
+        XCTAssertTrue(boundaryBecameActive, "Logout never established its account boundary.")
+        let providerLogoutsBeforeLoginReturns = await runtime.logoutCallCount
+        XCTAssertEqual(providerLogoutsBeforeLoginReturns, 0)
+
+        await loginStartGate.open()
+        await cancelLoginGate.waitForInvocationCount(1)
+
+        let cancelledIDs = await runtime.cancelledLoginIDs
+        let providerLogoutsDuringCancellation = await runtime.logoutCallCount
+        XCTAssertEqual(cancelledIDs, [loginStart.loginID])
+        XCTAssertEqual(
+            providerLogoutsDuringCancellation,
+            0,
+            "Provider logout began before the invalidated login was cancelled."
+        )
+
+        await cancelLoginGate.open()
+        await logoutGate.waitForInvocationCount(1)
+
+        do {
+            _ = try await login.value
+            XCTFail("A login created before logout crossed the account boundary.")
+        } catch {
+            assertAccountBoundary(error)
+        }
+
+        await logoutGate.open()
+        try await logout.value
+
+        let loginStartCalls = await runtime.loginStartCallCount
+        let cancelLoginCalls = await runtime.cancelLoginCallCount
+        let logoutCalls = await runtime.logoutCallCount
+        XCTAssertEqual(loginStartCalls, 1)
+        XCTAssertEqual(cancelLoginCalls, 1)
+        XCTAssertEqual(logoutCalls, 1)
+    }
+
+    func testPendingCompletedLoginIsCancelledBeforeLogoutBegins() async throws {
+        let cancelLoginGate = InvocationGate(isOpen: false)
+        let logoutGate = InvocationGate(isOpen: false)
+        let loginStart = Self.loginStart(loginID: "pending-login")
+        let runtime = CoordinatorFakeRuntime(
+            logoutGate: logoutGate,
+            loginStartResult: loginStart,
+            cancelLoginGate: cancelLoginGate
+        )
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+
+        _ = try await coordinator.startLogin(methodID: loginStart.method.id)
+        let loginStartCallCount = await runtime.loginStartCallCount
+        XCTAssertEqual(loginStartCallCount, 1)
+
+        let logout = Task { try await coordinator.logout() }
+        await cancelLoginGate.waitForInvocationCount(1)
+        let logoutCallCountBeforeCancellation = await runtime.logoutCallCount
+        XCTAssertEqual(
+            logoutCallCountBeforeCancellation,
+            0,
+            "Provider logout began before the pending login was cancelled."
+        )
+
+        await cancelLoginGate.open()
+        await logoutGate.waitForInvocationCount(1)
+        await logoutGate.open()
+        try await logout.value
+
+        let cancelledLoginIDs = await runtime.cancelledLoginIDs
+        let logoutCallCount = await runtime.logoutCallCount
+        XCTAssertEqual(cancelledLoginIDs, [loginStart.loginID])
+        XCTAssertEqual(logoutCallCount, 1)
+    }
+
+    func testLoginRequestedDuringLogoutIsRejectedWithoutProviderCall() async throws {
+        let logoutGate = InvocationGate(isOpen: false)
+        let loginStart = Self.loginStart(loginID: "blocked-login")
+        let runtime = CoordinatorFakeRuntime(
+            logoutGate: logoutGate,
+            loginStartResult: loginStart
+        )
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+
+        let logout = Task { try await coordinator.logout() }
+        await logoutGate.waitForInvocationCount(1)
+
+        do {
+            _ = try await coordinator.startLogin(methodID: loginStart.method.id)
+            XCTFail("A login requested during logout crossed the account boundary.")
+        } catch {
+            assertAccountBoundary(error)
+        }
+
+        let loginStartCallCount = await runtime.loginStartCallCount
+        XCTAssertEqual(loginStartCallCount, 0)
+        await logoutGate.open()
+        try await logout.value
+    }
+
+    func testFailedLoginStartDoesNotLeaveLogoutWaitingForever() async throws {
+        let logoutGate = InvocationGate(isOpen: false)
+        let runtime = CoordinatorFakeRuntime(logoutGate: logoutGate)
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+
+        do {
+            _ = try await coordinator.startLogin(methodID: "unsupported")
+            XCTFail("The fake runtime unexpectedly started a login.")
+        } catch {
+            // Expected provider failure; the operation token must still drain.
+        }
+
+        let logout = Task { try await coordinator.logout() }
+        await logoutGate.waitForInvocationCount(1)
+        await logoutGate.open()
+        try await logout.value
+
+        let logoutCallCount = await runtime.logoutCallCount
+        XCTAssertEqual(logoutCallCount, 1)
+    }
+
+    func testProviderLogoutEventIsReplacedByOneCanonicalBoundaryForEverySubscriber() async throws {
+        for iteration in 0 ..< 25 {
+            let providerAuth = RuntimeAuthState(
+                mode: nil,
+                email: nil,
+                planLabel: "provider-boundary-\(iteration)",
+                requiresAuthentication: true
+            )
+            let providerEvent = AgentRuntimeEvent.accountUpdated(providerAuth)
+            let syntheticEvent = AgentRuntimeEvent.accountUpdated(.signedOut)
+            let processed = AgentRuntimeEvent.runtimeNotice(
+                title: "Processed \(iteration)",
+                detail: "after provider boundary"
+            )
+            let runtime = CoordinatorFakeRuntime(logoutEvent: providerEvent)
+            let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+            let first = CoordinatorEventRecorder()
+            let second = CoordinatorEventRecorder()
+            await first.start(stream: coordinator.events)
+            await second.start(stream: coordinator.events)
+
+            try await coordinator.logout()
+            runtime.emit(processed)
+            try await first.waitForCount(2)
+            try await second.waitForCount(2)
+
+            let firstEvents = await first.snapshot()
+            let secondEvents = await second.snapshot()
+            XCTAssertEqual(firstEvents, secondEvents, "Subscribers diverged in iteration \(iteration).")
+            XCTAssertEqual(firstEvents, [syntheticEvent, processed])
+            XCTAssertEqual(secondEvents, [syntheticEvent, processed])
+        }
+    }
+
+    func testSignedInProviderEventsCannotReopenLogoutBoundary() async throws {
+        let staleSignedIn = AgentRuntimeEvent.accountUpdated(
+            RuntimeAuthState(
+                mode: .chatgpt,
+                email: "stale@example.com",
+                planLabel: "plus",
+                requiresAuthentication: true
+            )
+        )
+        let syntheticEvent = AgentRuntimeEvent.accountUpdated(.signedOut)
+        let processed = AgentRuntimeEvent.runtimeNotice(
+            title: "Processed",
+            detail: "after stale signed-in events"
+        )
+        let runtime = CoordinatorFakeRuntime(logoutEvent: staleSignedIn)
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+        let first = CoordinatorEventRecorder()
+        let second = CoordinatorEventRecorder()
+        await first.start(stream: coordinator.events)
+        await second.start(stream: coordinator.events)
+
+        try await coordinator.logout()
+        runtime.emit(staleSignedIn)
+        runtime.emit(processed)
+        try await first.waitForCount(2)
+        try await second.waitForCount(2)
+
+        let firstEvents = await first.snapshot()
+        let secondEvents = await second.snapshot()
+        XCTAssertEqual(firstEvents, [syntheticEvent, processed])
+        XCTAssertEqual(secondEvents, [syntheticEvent, processed])
+    }
+
+    private func assertAccountBoundary(
+        _ error: any Error,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        guard case let AgentRuntimeError.requestFailed(code, message) = error else {
+            XCTFail("Expected an account-boundary error, got \(error).", file: file, line: line)
+            return
+        }
+        XCTAssertEqual(code, -32_100, file: file, line: line)
+        XCTAssertEqual(message, "Account sign-out is in progress.", file: file, line: line)
+    }
+
+    private func waitForAccountBoundary(_ coordinator: SharedRuntimeCoordinator) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(2))
+        while clock.now < deadline {
+            do {
+                _ = try await coordinator.listThreads(limit: 1, archived: false)
+            } catch let AgentRuntimeError.requestFailed(code, _) where code == -32_100 {
+                return true
+            } catch {
+                XCTFail("Unexpected account operation error: \(error)")
+                return false
+            }
+            await Task.yield()
+        }
+        return false
+    }
+
+    private static func loginStart(loginID: String) -> RuntimeLoginStart {
+        RuntimeLoginStart(
+            method: RuntimeLoginMethod(
+                id: "chatgpt",
+                displayName: "ChatGPT",
+                detail: "Browser sign-in",
+                ceremony: .browser
+            ),
+            loginID: loginID,
+            authURL: URL(string: "https://example.test/login"),
+            verificationURL: nil,
+            userCode: nil
+        )
+    }
+
+    private static func session(label: String) -> RuntimeSession {
+        RuntimeSession(
+            runtime: .local,
+            displayName: label,
+            accountLabel: label,
+            planLabel: nil,
+            auth: RuntimeAuthState(
+                mode: nil,
+                email: nil,
+                planLabel: nil,
+                requiresAuthentication: false
+            ),
+            availableLoginMethods: [],
+            availableModels: [],
+            capabilities: []
+        )
+    }
+}
+
+private actor CoordinatorFakeRuntime: AgentRuntime {
+    nonisolated let kind = AgentRuntimeKind.local
+    nonisolated var events: AsyncStream<AgentRuntimeEvent> {
+        eventAccessProbe.recordAccess()
+        return sourceEvents
+    }
+
+    nonisolated var eventStreamAccessCount: Int { eventAccessProbe.count }
+
+    private nonisolated let sourceEvents: AsyncStream<AgentRuntimeEvent>
+    private nonisolated let eventContinuation: AsyncStream<AgentRuntimeEvent>.Continuation
+    private nonisolated let eventAccessProbe = EventAccessProbe()
+    private let connectSession: RuntimeSession
+    private let refreshSession: RuntimeSession
+    private let connectGate: InvocationGate?
+    private let refreshGate: InvocationGate?
+    private let logoutGate: InvocationGate?
+    private let loginStartResult: RuntimeLoginStart?
+    private let loginStartGate: InvocationGate?
+    private let cancelLoginGate: InvocationGate?
+    private let startTurnGate: InvocationGate?
+    private let logoutEvent: AgentRuntimeEvent?
+    private(set) var connectCallCount = 0
+    private(set) var refreshCallCount = 0
+    private(set) var logoutCallCount = 0
+    private(set) var loginStartCallCount = 0
+    private(set) var cancelLoginCallCount = 0
+    private(set) var startTurnCallCount = 0
+    private(set) var cancelledLoginIDs: [String] = []
+
+    init(
+        connectSession: RuntimeSession? = nil,
+        refreshSession: RuntimeSession? = nil,
+        connectGate: InvocationGate? = nil,
+        refreshGate: InvocationGate? = nil,
+        logoutGate: InvocationGate? = nil,
+        loginStartResult: RuntimeLoginStart? = nil,
+        loginStartGate: InvocationGate? = nil,
+        cancelLoginGate: InvocationGate? = nil,
+        startTurnGate: InvocationGate? = nil,
+        logoutEvent: AgentRuntimeEvent? = nil
+    ) {
+        let fallback = RuntimeSession(
+            runtime: .local,
+            displayName: "Fake",
+            accountLabel: nil,
+            planLabel: nil,
+            auth: RuntimeAuthState(
+                mode: nil,
+                email: nil,
+                planLabel: nil,
+                requiresAuthentication: false
+            ),
+            availableLoginMethods: [],
+            availableModels: [],
+            capabilities: []
+        )
+        self.connectSession = connectSession ?? fallback
+        self.refreshSession = refreshSession ?? connectSession ?? fallback
+        self.connectGate = connectGate
+        self.refreshGate = refreshGate
+        self.logoutGate = logoutGate
+        self.loginStartResult = loginStartResult
+        self.loginStartGate = loginStartGate
+        self.cancelLoginGate = cancelLoginGate
+        self.startTurnGate = startTurnGate
+        self.logoutEvent = logoutEvent
+        let pair = AsyncStream.makeStream(of: AgentRuntimeEvent.self)
+        sourceEvents = pair.stream
+        eventContinuation = pair.continuation
+    }
+
+    nonisolated func emit(_ event: AgentRuntimeEvent) {
+        eventContinuation.yield(event)
+    }
+
+    func connect() async throws -> RuntimeSession {
+        connectCallCount += 1
+        if let connectGate { await connectGate.enter() }
+        return connectSession
+    }
+
+    func disconnect() async {}
+
+    func startLogin(methodID _: String) async throws -> RuntimeLoginStart {
+        loginStartCallCount += 1
+        if let loginStartGate { await loginStartGate.enter() }
+        guard let loginStartResult else {
+            throw AgentRuntimeError.unsupported("fake account login")
+        }
+        return loginStartResult
+    }
+
+    func cancelLogin(id: String) async throws {
+        cancelLoginCallCount += 1
+        cancelledLoginIDs.append(id)
+        if let cancelLoginGate { await cancelLoginGate.enter() }
+    }
+
+    func refreshAccount() async throws -> RuntimeSession {
+        refreshCallCount += 1
+        if let refreshGate { await refreshGate.enter() }
+        return refreshSession
+    }
+
+    func logout() async throws {
+        logoutCallCount += 1
+        if let logoutGate { await logoutGate.enter() }
+        if let logoutEvent { emit(logoutEvent) }
+    }
+
+    func listThreads(limit _: Int, archived _: Bool) async throws -> [RuntimeThread] { [] }
+
+    func readThread(id _: String) async throws -> RuntimeConversation {
+        throw AgentRuntimeError.unsupported("fake thread reading")
+    }
+
+    func startThread(_: StartThreadRequest) async throws -> RuntimeThread {
+        throw AgentRuntimeError.unsupported("fake thread creation")
+    }
+
+    func startTurn(_: StartTurnRequest) async throws {
+        startTurnCallCount += 1
+        if let startTurnGate { await startTurnGate.enter() }
+    }
+
+    func steer(threadID _: String, text _: String) async throws {}
+
+    func interrupt(threadID _: String) async throws {}
+
+    func respond(
+        to _: RuntimeRequestID,
+        with _: RuntimeUserInteractionResponse
+    ) async throws {}
+
+    func renameThread(id _: String, name _: String) async throws {}
+
+    func archiveThread(id _: String) async throws {}
+
+    func unarchiveThread(id _: String) async throws {}
+}
+
+private final class EventAccessProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var accessCount = 0
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return accessCount
+    }
+
+    func recordAccess() {
+        lock.lock()
+        accessCount += 1
+        lock.unlock()
+    }
+}
+
+private actor InvocationGate {
+    private(set) var invocationCount = 0
+    private var isOpen: Bool
+    private var blocked: [CheckedContinuation<Void, Never>] = []
+    private var countWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+
+    init(isOpen: Bool) {
+        self.isOpen = isOpen
+    }
+
+    func enter() async {
+        invocationCount += 1
+        let ready = countWaiters.filter { invocationCount >= $0.count }
+        countWaiters.removeAll { invocationCount >= $0.count }
+        for waiter in ready { waiter.continuation.resume() }
+
+        guard !isOpen else { return }
+        await withCheckedContinuation { blocked.append($0) }
+    }
+
+    func waitForInvocationCount(_ count: Int) async {
+        guard invocationCount < count else { return }
+        await withCheckedContinuation { continuation in
+            countWaiters.append((count, continuation))
+        }
+    }
+
+    func open() {
+        isOpen = true
+        let waiting = blocked
+        blocked.removeAll()
+        for continuation in waiting { continuation.resume() }
+    }
+}
+
+private actor CoordinatorEventRecorder {
+    enum WaitError: Error {
+        case timedOut
+    }
+
+    private var events: [AgentRuntimeEvent] = []
+    private var waiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+    private var finishWaiters: [CheckedContinuation<Void, Never>] = []
+    private var isFinished = false
+    private var task: Task<Void, Never>?
+
+    func start(stream: AsyncStream<AgentRuntimeEvent>) {
+        guard task == nil else { return }
+        task = Task { [weak self] in
+            for await event in stream {
+                await self?.record(event)
+            }
+            await self?.recordFinish()
+        }
+    }
+
+    deinit {
+        task?.cancel()
+    }
+
+    func snapshot() -> [AgentRuntimeEvent] { events }
+
+    func waitForCount(_ count: Int) async throws {
+        let clock = ContinuousClock()
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask { [weak self] in
+                guard let self else { return }
+                await self.suspendUntilCount(count)
+            }
+            group.addTask {
+                try await clock.sleep(for: .seconds(2))
+                throw WaitError.timedOut
+            }
+            _ = try await group.next()
+            group.cancelAll()
+        }
+    }
+
+    func waitForFinish() async throws {
+        let clock = ContinuousClock()
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask { [weak self] in
+                guard let self else { return }
+                await self.suspendUntilFinished()
+            }
+            group.addTask {
+                try await clock.sleep(for: .seconds(2))
+                throw WaitError.timedOut
+            }
+            _ = try await group.next()
+            group.cancelAll()
+        }
+    }
+
+    private func record(_ event: AgentRuntimeEvent) {
+        events.append(event)
+        let ready = waiters.filter { events.count >= $0.count }
+        waiters.removeAll { events.count >= $0.count }
+        for waiter in ready { waiter.continuation.resume() }
+    }
+
+    private func recordFinish() {
+        isFinished = true
+        let ready = finishWaiters
+        finishWaiters.removeAll()
+        for waiter in ready { waiter.resume() }
+    }
+
+    private func suspendUntilCount(_ count: Int) async {
+        guard events.count < count else { return }
+        await withCheckedContinuation { continuation in
+            waiters.append((count, continuation))
+        }
+    }
+
+    private func suspendUntilFinished() async {
+        guard !isFinished else { return }
+        await withCheckedContinuation { continuation in
+            finishWaiters.append(continuation)
+        }
+    }
+}

@@ -1,0 +1,256 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, with or without a leading v (for example, 0.2.0)"
+        required: true
+        type: string
+      publish_release:
+        description: "Create or update the GitHub Release after validation"
+        required: true
+        default: false
+        type: boolean
+      prerelease:
+        description: "Mark a manually published GitHub Release as a prerelease"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build release DMG
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      CLANG_MODULE_CACHE_PATH: ${{ github.workspace }}/.build/module-cache
+      SWIFTPM_MODULECACHE_OVERRIDE: ${{ github.workspace }}/.build/swiftpm-module-cache
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Select compatible Xcode
+        shell: zsh -euo pipefail {0}
+        run: |
+          developer_candidates=("$(/usr/bin/xcode-select -p)")
+          xcode_apps=(/Applications/Xcode_*.app(NOn))
+          for (( index=${#xcode_apps[@]}; index >= 1; index-- )); do
+            developer_candidates+=("${xcode_apps[index]}/Contents/Developer")
+          done
+
+          selected_xcode=""
+          for candidate in "${developer_candidates[@]}"; do
+            export DEVELOPER_DIR="$candidate"
+            if /usr/bin/swift package --disable-sandbox dump-package >/dev/null 2>&1; then
+              selected_xcode="$candidate"
+              break
+            fi
+          done
+          if [[ -z "$selected_xcode" ]]; then
+            print -u2 -- "The runner image does not contain Xcode 26 / Swift 6.2 or newer."
+            exit 1
+          fi
+          echo "DEVELOPER_DIR=$selected_xcode" >> "$GITHUB_ENV"
+          export DEVELOPER_DIR="$selected_xcode"
+          /usr/bin/xcodebuild -version
+          /usr/bin/swift --version
+
+      - name: Resolve release metadata
+        id: metadata
+        shell: zsh -euo pipefail {0}
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+          REQUESTED_PUBLISH: ${{ inputs.publish_release }}
+          REQUESTED_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            publish="true"
+            prerelease="false"
+          else
+            requested_version="$REQUESTED_VERSION"
+            version="${requested_version#v}"
+            publish="$REQUESTED_PUBLISH"
+            prerelease="$REQUESTED_PRERELEASE"
+          fi
+
+          if [[ ! "$version" =~ '^[0-9]+[.][0-9]+[.][0-9]+$' ]]; then
+            print -u2 -- "Release version must be numeric x.y.z; got: $version"
+            exit 1
+          fi
+
+          tag="v$version"
+          artifact_name="Onyx-$version-macOS"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+      - name: Configure optional Developer ID certificate
+        id: signing
+        shell: zsh -euo pipefail {0}
+        env:
+          CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          SIGNING_IDENTITY: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION }}
+        run: |
+          if [[ -z "$CERTIFICATE_P12_BASE64" && -z "$CERTIFICATE_PASSWORD" && \
+                -z "$SIGNING_IDENTITY" ]]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            print -- "Developer ID secrets are absent; building an ad-hoc-signed app and unsigned DMG."
+            exit 0
+          fi
+
+          if [[ -z "$CERTIFICATE_P12_BASE64" || -z "$CERTIFICATE_PASSWORD" || \
+                -z "$SIGNING_IDENTITY" ]]; then
+            print -u2 -- "Developer ID configuration is partial. Set the P12, password, and identity secrets together."
+            exit 1
+          fi
+          if [[ "$SIGNING_IDENTITY" == *$'\n'* || "$SIGNING_IDENTITY" == *$'\r'* ]]; then
+            print -u2 -- "Developer ID signing identity cannot contain a newline."
+            exit 1
+          fi
+
+          keychain_path="$RUNNER_TEMP/onyx-signing.keychain-db"
+          certificate_path="$RUNNER_TEMP/onyx-developer-id.p12"
+          keychain_password="$(/usr/bin/uuidgen)$(/usr/bin/uuidgen)"
+          echo "keychain_path=$keychain_path" >> "$GITHUB_OUTPUT"
+          trap '/bin/rm -f -- "$certificate_path"' EXIT
+
+          print -rn -- "$CERTIFICATE_P12_BASE64" | /usr/bin/base64 --decode > "$certificate_path"
+          /usr/bin/security create-keychain -p "$keychain_password" "$keychain_path"
+          /usr/bin/security set-keychain-settings -lut 21600 "$keychain_path"
+          /usr/bin/security unlock-keychain -p "$keychain_password" "$keychain_path"
+          /usr/bin/security import "$certificate_path" -k "$keychain_path" \
+            -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          /usr/bin/security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain_path"
+          /usr/bin/security list-keychains -d user -s "$keychain_path"
+          /bin/rm -f -- "$certificate_path"
+
+          available_identities="$(/usr/bin/security find-identity -v -p codesigning "$keychain_path")"
+          print -- "$available_identities"
+          if [[ "$available_identities" != *"$SIGNING_IDENTITY"* ]]; then
+            print -u2 -- "The configured signing identity was not found in the imported certificate."
+            exit 1
+          fi
+
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          echo "identity=$SIGNING_IDENTITY" >> "$GITHUB_OUTPUT"
+
+      - name: Validate optional notarization configuration
+        id: notarization
+        shell: zsh -euo pipefail {0}
+        env:
+          NOTARY_APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
+          NOTARY_TEAM_ID: ${{ secrets.APPLE_NOTARY_TEAM_ID }}
+          NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+          SIGNING_ENABLED: ${{ steps.signing.outputs.enabled }}
+        run: |
+          if [[ -z "$NOTARY_APPLE_ID" && -z "$NOTARY_TEAM_ID" && -z "$NOTARY_PASSWORD" ]]; then
+            echo "enabled=0" >> "$GITHUB_OUTPUT"
+            print -- "Notarization secrets are absent; skipping notarization."
+            exit 0
+          fi
+          if [[ -z "$NOTARY_APPLE_ID" || -z "$NOTARY_TEAM_ID" || -z "$NOTARY_PASSWORD" ]]; then
+            print -u2 -- "Notarization configuration is partial. Set all three notarization secrets."
+            exit 1
+          fi
+          if [[ "$SIGNING_ENABLED" != "true" ]]; then
+            print -u2 -- "Notarization secrets require a configured Developer ID certificate."
+            exit 1
+          fi
+          echo "enabled=1" >> "$GITHUB_OUTPUT"
+
+      - name: Run unit tests
+        shell: zsh -euo pipefail {0}
+        run: /usr/bin/swift test --disable-sandbox
+
+      - name: Build, sign, notarize, and verify release artifacts
+        shell: zsh -euo pipefail {0}
+        env:
+          ONYX_CODESIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
+          ONYX_NOTARIZE: ${{ steps.notarization.outputs.enabled }}
+          ONYX_NOTARY_APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
+          ONYX_NOTARY_TEAM_ID: ${{ secrets.APPLE_NOTARY_TEAM_ID }}
+          ONYX_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+        run: |
+          release_dir="$RUNNER_TEMP/onyx-release"
+          scripts/release.sh "${{ steps.metadata.outputs.version }}" "$release_dir" \
+            --build-number "$GITHUB_RUN_NUMBER"
+          (
+            cd "$release_dir"
+            /usr/bin/shasum -a 256 -c \
+              "${{ steps.metadata.outputs.artifact_name }}.dmg.sha256"
+          )
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.metadata.outputs.artifact_name }}
+          path: |
+            ${{ runner.temp }}/onyx-release/${{ steps.metadata.outputs.artifact_name }}.dmg
+            ${{ runner.temp }}/onyx-release/${{ steps.metadata.outputs.artifact_name }}.dmg.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: steps.metadata.outputs.publish == 'true'
+        shell: zsh -euo pipefail {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="${{ steps.metadata.outputs.tag }}"
+          version="${{ steps.metadata.outputs.version }}"
+          release_dir="$RUNNER_TEMP/onyx-release"
+          dmg="$release_dir/${{ steps.metadata.outputs.artifact_name }}.dmg"
+          checksum="$dmg.sha256"
+
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]] && \
+             /usr/bin/git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
+            existing_tag_commit="$(/usr/bin/git rev-list -n 1 "$tag")"
+            selected_commit="$(/usr/bin/git rev-parse "$GITHUB_SHA^{commit}")"
+            if [[ "$existing_tag_commit" != "$selected_commit" ]]; then
+              print -u2 -- "Tag $tag already points to a different commit; refusing to retarget it."
+              exit 1
+            fi
+          fi
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$dmg" "$checksum" --clobber
+          else
+            release_arguments=(
+              "$tag"
+              "$dmg"
+              "$checksum"
+              --target "$GITHUB_SHA"
+              --title "Onyx $version"
+              --generate-notes
+            )
+            if [[ "${{ steps.metadata.outputs.prerelease }}" == "true" ]]; then
+              release_arguments+=(--prerelease)
+            fi
+            gh release create "${release_arguments[@]}"
+          fi
+
+      - name: Remove temporary signing keychain
+        if: always() && steps.signing.outputs.keychain_path != ''
+        shell: zsh -euo pipefail {0}
+        run: /usr/bin/security delete-keychain "${{ steps.signing.outputs.keychain_path }}" || true

@@ -1,0 +1,17 @@
+.build/
+.build-*/
+.swiftpm/
+DerivedData/
+dist/
+dist-*/
+*.app/
+*.xcresult
+.DS_Store
+
+# Local signing credentials and environment files.
+.env
+.env.*
+*.p12
+*.pem
+*.key
+*.mobileprovision

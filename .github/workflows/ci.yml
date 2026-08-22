@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test-package:
+    name: Build, test, and package
+    runs-on: macos-15
+    timeout-minutes: 35
+    env:
+      CLANG_MODULE_CACHE_PATH: ${{ github.workspace }}/.build/module-cache
+      SWIFTPM_MODULECACHE_OVERRIDE: ${{ github.workspace }}/.build/swiftpm-module-cache
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Select compatible Xcode
+        shell: zsh -euo pipefail {0}
+        run: |
+          developer_candidates=("$(/usr/bin/xcode-select -p)")
+          xcode_apps=(/Applications/Xcode_*.app(NOn))
+          for (( index=${#xcode_apps[@]}; index >= 1; index-- )); do
+            developer_candidates+=("${xcode_apps[index]}/Contents/Developer")
+          done
+
+          selected_xcode=""
+          for candidate in "${developer_candidates[@]}"; do
+            export DEVELOPER_DIR="$candidate"
+            if /usr/bin/swift package --disable-sandbox dump-package >/dev/null 2>&1; then
+              selected_xcode="$candidate"
+              break
+            fi
+          done
+          if [[ -z "$selected_xcode" ]]; then
+            print -u2 -- "The runner image does not contain Xcode 26 / Swift 6.2 or newer."
+            exit 1
+          fi
+          echo "DEVELOPER_DIR=$selected_xcode" >> "$GITHUB_ENV"
+          export DEVELOPER_DIR="$selected_xcode"
+          /usr/bin/xcodebuild -version
+          /usr/bin/swift --version
+
+      - name: Run unit tests
+        shell: zsh -euo pipefail {0}
+        run: /usr/bin/swift test --disable-sandbox
+
+      - name: Verify app packaging safeguards
+        shell: zsh -euo pipefail {0}
+        run: scripts/check-package-app.sh
+
+      - name: Build and verify an unsigned release DMG
+        shell: zsh -euo pipefail {0}
+        run: |
+          version="$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - support/Info.plist)"
+          release_dir="$RUNNER_TEMP/onyx-ci-release"
+          scripts/release.sh "$version" "$release_dir" \
+            --build-number "$GITHUB_RUN_NUMBER"
+          (
+            cd "$release_dir"
+            /usr/bin/shasum -a 256 -c "Onyx-$version-macOS.dmg.sha256"
+          )
