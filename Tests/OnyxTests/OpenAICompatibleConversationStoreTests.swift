@@ -97,6 +97,141 @@ final class OpenAICompatibleConversationStoreTests: XCTestCase {
         XCTAssertEqual(Set(records.map(\.title)).count, 20)
     }
 
+    func testLegacyTextOnlyMessageDecodesWithoutContentParts() async throws {
+        let location = temporaryLocation()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        try FileManager.default.createDirectory(
+            at: location.file.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let conversation = OpenAICompatibleStoredConversation(
+            id: "legacy-conversation",
+            connectionID: ProviderConnectionID("provider.legacy"),
+            title: "Legacy",
+            modelID: "fixture-model",
+            messages: [
+                OpenAICompatibleStoredMessage(
+                    id: "legacy-message",
+                    role: .user,
+                    text: "Legacy text"
+                ),
+            ]
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        let encoded = try encoder.encode(
+            OpenAICompatibleConversationSnapshot(conversations: [conversation])
+        )
+        var document = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        var conversations = try XCTUnwrap(document["conversations"] as? [[String: Any]])
+        var messages = try XCTUnwrap(conversations[0]["messages"] as? [[String: Any]])
+        messages[0].removeValue(forKey: "contentParts")
+        conversations[0]["messages"] = messages
+        document["conversations"] = conversations
+        try JSONSerialization.data(withJSONObject: document).write(
+            to: location.file,
+            options: .atomic
+        )
+
+        let decoded = try await OpenAICompatibleConversationStore(fileURL: location.file)
+            .snapshot()
+        let message = try XCTUnwrap(decoded.conversations.first?.messages.first)
+        XCTAssertEqual(message.contentParts, [.text("Legacy text")])
+        XCTAssertEqual(message.chatMessage?.parts, [.text("Legacy text")])
+        XCTAssertTrue(message.timelineItem.attachments.isEmpty)
+    }
+
+    func testOrderedImagePartsRoundTripAndProjectStableAttachments() async throws {
+        let location = temporaryLocation()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        let store = OpenAICompatibleConversationStore(fileURL: location.file)
+        let connectionID = ProviderConnectionID("provider.images")
+        var conversation = try await store.create(
+            connectionID: connectionID,
+            title: "Images",
+            cwd: nil,
+            modelID: "vision-model"
+        )
+        let dataURL = "data:image/png;base64,AA=="
+        let remoteURL = "https://images.example/reference.png"
+        conversation.messages = [
+            OpenAICompatibleStoredMessage(
+                id: "ordered-user-message",
+                role: .user,
+                text: "Before\nAfter",
+                contentParts: [
+                    .text("Before"),
+                    .imageURL(dataURL),
+                    .text("After"),
+                    .imageURL(remoteURL),
+                ]
+            ),
+        ]
+        try await store.upsert(conversation)
+
+        let reopened = OpenAICompatibleConversationStore(fileURL: location.file)
+        let persisted = try await reopened.conversation(
+            connectionID: connectionID,
+            id: conversation.id
+        )
+        let reloaded = try XCTUnwrap(persisted)
+        XCTAssertEqual(reloaded.messages[0].contentParts, conversation.messages[0].contentParts)
+        XCTAssertEqual(
+            reloaded.messages[0].chatMessage?.parts,
+            [
+                .text("Before"),
+                .imageURL(dataURL),
+                .text("After"),
+                .imageURL(remoteURL),
+            ]
+        )
+
+        let item = reloaded.runtimeConversation(kind: .local).items[0]
+        XCTAssertEqual(item.body, "Before\nAfter")
+        XCTAssertEqual(item.attachments.map(\.id), [
+            "ordered-user-message:image:1",
+            "ordered-user-message:image:3",
+        ])
+        XCTAssertEqual(item.attachments.map(\.source), [
+            .dataURL(dataURL),
+            .remoteURL(try XCTUnwrap(URL(string: remoteURL))),
+        ])
+        XCTAssertEqual(item.attachments.map(\.cacheIdentity), item.attachments.map(\.id))
+    }
+
+    func testAtomicUpdateAppliesMessageMutationWithoutDroppingConversationMetadata() async throws {
+        let location = temporaryLocation()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        let store = OpenAICompatibleConversationStore(fileURL: location.file)
+        let connection = ProviderConnectionID("provider.atomic-update")
+        let created = try await store.create(
+            connectionID: connection,
+            title: "Keep this title",
+            cwd: "/tmp/project",
+            modelID: "fixture-model"
+        )
+        let seeded = try await store.update(connectionID: connection, id: created.id) { record in
+            record.isArchived = true
+            record.messages.append(OpenAICompatibleStoredMessage(
+                id: "assistant-1",
+                role: .assistant,
+                text: "before"
+            ))
+        }
+        XCTAssertTrue(seeded.isArchived)
+
+        let updated = try await store.update(connectionID: connection, id: created.id) { record in
+            record.messages[0].text = "after"
+            record.messages[0].status = .completed
+        }
+        XCTAssertEqual(updated.title, "Keep this title")
+        XCTAssertEqual(updated.cwd, "/tmp/project")
+        XCTAssertTrue(updated.isArchived)
+        XCTAssertEqual(updated.messages[0].text, "after")
+    }
+
     func testRecoveryMarksPersistedRunningTurnFailedWithoutDroppingText() async throws {
         let location = temporaryLocation()
         defer { try? FileManager.default.removeItem(at: location.directory) }

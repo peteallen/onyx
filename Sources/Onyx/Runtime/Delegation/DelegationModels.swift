@@ -435,6 +435,9 @@ struct DelegationCancellationRequest: Codable, Equatable, Hashable, Sendable {
     let target: DelegationTarget
     let lineage: DelegationLineage
     let reason: DelegationCancellationReason
+    /// State at the instant cancellation was requested. Queued cancellation
+    /// must not be projected as work that reached a provider.
+    let state: DelegationJobState
     let occurredAt: Date
 }
 
@@ -462,7 +465,8 @@ enum DelegationEvent: Sendable, Equatable {
     var state: DelegationJobState {
         switch self {
         case .queued: .queued
-        case .started, .progress, .cancellationRequested: .running
+        case .started, .progress: .running
+        case let .cancellationRequested(request): request.state
         case .completed: .succeeded
         case .failed: .failed
         case .cancelled: .cancelled
@@ -522,27 +526,42 @@ struct DelegationEventStream: AsyncSequence, Sendable {
     typealias Element = DelegationEvent
 
     struct AsyncIterator: AsyncIteratorProtocol {
-        private let buffer: DelegationEventBuffer
+        private let subscription: DelegationEventSubscription
 
-        fileprivate init(buffer: DelegationEventBuffer) {
-            self.buffer = buffer
+        fileprivate init(subscription: DelegationEventSubscription) {
+            self.subscription = subscription
         }
 
         mutating func next() async -> DelegationEvent? {
-            await buffer.next()
+            await subscription.buffer.next()
         }
     }
 
     fileprivate let id: UUID
-    fileprivate let buffer: DelegationEventBuffer
+    private let subscription: DelegationEventSubscription
 
     init(id: UUID, buffer: DelegationEventBuffer) {
         self.id = id
-        self.buffer = buffer
+        subscription = DelegationEventSubscription(buffer: buffer)
     }
 
     func makeAsyncIterator() -> AsyncIterator {
-        AsyncIterator(buffer: buffer)
+        AsyncIterator(subscription: subscription)
+    }
+}
+
+/// The coordinator owns only the event buffer. Stream and iterator copies
+/// share this lease, whose deinitialization unregisters a subscription even
+/// when a caller drops it without an outstanding `next()` to cancel.
+fileprivate final class DelegationEventSubscription: @unchecked Sendable {
+    let buffer: DelegationEventBuffer
+
+    init(buffer: DelegationEventBuffer) {
+        self.buffer = buffer
+    }
+
+    deinit {
+        buffer.finish()
     }
 }
 
@@ -552,12 +571,17 @@ struct DelegationEventStream: AsyncSequence, Sendable {
 final class DelegationEventBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private let capacity: Int
+    private let onFinish: (@Sendable () -> Void)?
     private var queue: [DelegationEvent] = []
     private var waiter: CheckedContinuation<DelegationEvent?, Never>?
     private var isFinished = false
 
-    init(capacity: Int = 256) {
+    init(
+        capacity: Int = 256,
+        onFinish: (@Sendable () -> Void)? = nil
+    ) {
         self.capacity = max(4, capacity)
+        self.onFinish = onFinish
     }
 
     func publish(_ event: DelegationEvent) {
@@ -595,15 +619,23 @@ final class DelegationEventBuffer: @unchecked Sendable {
 
     func finish() {
         lock.lock()
+        guard !isFinished else {
+            lock.unlock()
+            return
+        }
         isFinished = true
         let waiter = waiter
         self.waiter = nil
         lock.unlock()
         waiter?.resume(returning: nil)
+        onFinish?()
     }
 
     func next() async -> DelegationEvent? {
-        if Task.isCancelled { return nil }
+        if Task.isCancelled {
+            finish()
+            return nil
+        }
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 lock.lock()

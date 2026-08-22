@@ -45,13 +45,15 @@ struct OnyxWindowCommandContext {
     static func workspace(
         model: OnyxAppModel,
         windowProvider: @escaping @MainActor () -> NSWindow?,
-        focusTaskSearch: @escaping () -> Void
+        openProject: (() -> Void)? = nil,
+        focusTaskSearch: @escaping () -> Void,
+        toggleSidebar: (() -> Void)? = nil
     ) -> Self {
         Self(
             newTask: model.newTask,
-            openProject: { model.chooseWorkspace(window: windowProvider()) },
+            openProject: openProject ?? { model.chooseWorkspace(window: windowProvider()) },
             focusTaskSearch: focusTaskSearch,
-            toggleSidebar: { model.isSidebarVisible.toggle() },
+            toggleSidebar: toggleSidebar ?? { model.isSidebarVisible.toggle() },
             toggleInspector: { model.isInspectorVisible.toggle() },
             toggleTerminal: { model.isBottomPanelVisible.toggle() }
         )

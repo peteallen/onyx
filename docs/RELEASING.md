@@ -83,7 +83,8 @@ and mounts an unsigned release DMG as an end-to-end packaging check.
 The `Release` workflow supports two ways to cut a release:
 
 1. Push a numeric version tag such as `v0.2.0`. A successful workflow creates
-   or updates the matching GitHub Release and attaches the DMG and checksum.
+   or updates the matching GitHub Release and attaches the DMG and checksum,
+   but only when Developer ID signing and notarization are fully configured.
 2. Run **Actions → Release → Run workflow**. Enter `0.2.0`; leave **Publish
    release** off for an artifact-only dry run, or turn it on to create the tag
    and GitHub Release at the selected commit.
@@ -98,8 +99,10 @@ git push origin v0.2.0
 Each run also uploads the DMG and checksum as a downloadable workflow artifact.
 Release versions must use three numeric components because macOS stores them in
 `CFBundleShortVersionString`. GitHub's run number becomes `CFBundleVersion`.
-Without Apple secrets, both workflow artifacts and published tag releases are
-intentionally unsigned development distributions.
+Without Apple secrets, artifact-only workflow runs remain useful development
+distributions. Publishing a GitHub Release fails closed until both signing and
+notarization are configured; a pushed release tag is therefore not a shortcut
+around the distribution trust requirements.
 
 ### Optional repository secrets
 

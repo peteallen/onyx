@@ -174,7 +174,7 @@ struct TerminalDrawerView: View {
                 Image(systemName: isSearchVisible ? "magnifyingglass.circle.fill" : "magnifyingglass")
             }
             .buttonStyle(.borderless)
-            .help("Search terminal output")
+            .onyxHelp("Search terminal output")
             .accessibilityLabel(isSearchVisible ? "Hide terminal search" : "Search terminal output")
             .accessibilityHint(isSearchVisible ? "Clears the output filter" : "Shows and focuses the output filter")
 
@@ -184,7 +184,7 @@ struct TerminalDrawerView: View {
                 Image(systemName: followsOutput ? "arrow.down.to.line.compact" : "pause")
             }
             .buttonStyle(.borderless)
-            .help(followsOutput ? "Following new output" : "Resume following new output")
+            .onyxHelp(followsOutput ? "Following new output" : "Resume following new output")
             .accessibilityLabel(followsOutput ? "Pause following terminal output" : "Resume following terminal output")
             .accessibilityValue(followsOutput ? "Following new output" : "Paused")
 
@@ -205,7 +205,7 @@ struct TerminalDrawerView: View {
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
-            .help("Terminal actions")
+            .onyxHelp("Terminal actions")
             .accessibilityLabel("Terminal actions")
 
             Button {
@@ -214,7 +214,7 @@ struct TerminalDrawerView: View {
                 Image(systemName: "xmark")
             }
             .buttonStyle(.borderless)
-            .help("Hide terminal")
+            .onyxHelp("Hide terminal")
             .accessibilityLabel("Hide terminal")
             .accessibilityHint("Closes the terminal panel")
         }
@@ -277,7 +277,7 @@ struct TerminalDrawerView: View {
                 Button("⌃C", action: session.interrupt)
                     .buttonStyle(.borderless)
                     .font(.system(size: 10, design: .monospaced))
-                    .help("Interrupt the current command")
+                    .onyxHelp("Interrupt the current command")
                     .accessibilityLabel("Interrupt command")
                     .accessibilityHint("Sends Control-C to the shell")
             } else {

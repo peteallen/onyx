@@ -2,6 +2,7 @@ import Foundation
 
 enum DelegationCoordinatorError: Error, LocalizedError, Equatable, Sendable {
     case invalidMaxConcurrentJobs(Int)
+    case invalidMaxRetainedTerminalJobs(Int)
     case duplicateExecutorConnection(ProviderConnectionID)
     case noExecutor(ProviderConnectionID)
     case unsupportedModel(connectionID: ProviderConnectionID, modelID: String)
@@ -18,6 +19,8 @@ enum DelegationCoordinatorError: Error, LocalizedError, Equatable, Sendable {
         switch self {
         case let .invalidMaxConcurrentJobs(value):
             "Delegation concurrency must be at least one (received \(value))."
+        case let .invalidMaxRetainedTerminalJobs(value):
+            "Delegation terminal-job retention must be at least one (received \(value))."
         case let .duplicateExecutorConnection(id):
             "More than one delegation executor is registered for \(id)."
         case let .noExecutor(id):
@@ -57,7 +60,14 @@ enum DelegationCancellationDisposition: String, Sendable, Equatable {
 /// they receive only `DelegationRequest` plus a progress sink.
 actor DelegationCoordinator {
     private let maxConcurrentJobs: Int
+    private let maxRetainedTerminalJobs: Int
     private let executors: [ProviderConnectionID: any DelegationExecutor]
+
+    private enum ExecutorCompletion: Sendable {
+        case success(DelegationOutput)
+        case cancelled
+        case failure(code: DelegationFailureCode, message: String)
+    }
 
     private struct JobRecord {
         let request: DelegationRequest
@@ -77,16 +87,31 @@ actor DelegationCoordinator {
     }
 
     private var jobs: [DelegationJobID: JobRecord] = [:]
+    /// Accepted IDs are reserved for the coordinator lifetime. Terminal
+    /// record eviction must not make an ID reusable while an ignored
+    /// cancellation can still deliver a late executor completion keyed to it.
+    private var acceptedJobIDs: Set<DelegationJobID> = []
     private var queue: [DelegationJobID] = []
     private var running: Set<DelegationJobID> = []
+    /// Tracks provider calls that have actually entered an executor. A job can
+    /// be logically cancelled before a non-cooperative transport returns, so
+    /// physical work needs its own concurrency budget.
+    private var executorTasksInFlight: Set<DelegationJobID> = []
+    private var terminalJobOrder: [DelegationJobID] = []
     private var isShutDown = false
 
     init(
         executors: [any DelegationExecutor],
-        maxConcurrentJobs: Int = 2
+        maxConcurrentJobs: Int = 2,
+        maxRetainedTerminalJobs: Int = 256
     ) throws {
         guard maxConcurrentJobs > 0 else {
             throw DelegationCoordinatorError.invalidMaxConcurrentJobs(maxConcurrentJobs)
+        }
+        guard maxRetainedTerminalJobs > 0 else {
+            throw DelegationCoordinatorError.invalidMaxRetainedTerminalJobs(
+                maxRetainedTerminalJobs
+            )
         }
 
         var byConnection: [ProviderConnectionID: any DelegationExecutor] = [:]
@@ -100,16 +125,19 @@ actor DelegationCoordinator {
         }
 
         self.maxConcurrentJobs = maxConcurrentJobs
+        self.maxRetainedTerminalJobs = maxRetainedTerminalJobs
         self.executors = byConnection
     }
 
     init(
         executors: [ProviderConnectionID: any DelegationExecutor],
-        maxConcurrentJobs: Int = 2
+        maxConcurrentJobs: Int = 2,
+        maxRetainedTerminalJobs: Int = 256
     ) throws {
         try self.init(
             executors: Array(executors.values),
-            maxConcurrentJobs: maxConcurrentJobs
+            maxConcurrentJobs: maxConcurrentJobs,
+            maxRetainedTerminalJobs: maxRetainedTerminalJobs
         )
     }
 
@@ -122,9 +150,10 @@ actor DelegationCoordinator {
 
         let request = rawRequest.assigningRootIfNeeded()
         try validate(request)
-        guard jobs[request.id] == nil else {
+        guard !acceptedJobIDs.contains(request.id) else {
             // Reusing IDs would make lineage and cancellation ambiguous.  A
-            // stable public error is preferable to silently replacing work.
+            // stable public error is preferable to silently replacing work,
+            // including after terminal record retention evicts the old job.
             throw DelegationCoordinatorError.duplicateJobID(request.id)
         }
         guard let executor = executors[request.targetConnectionID] else {
@@ -154,6 +183,7 @@ actor DelegationCoordinator {
             subscribers: [:],
             waiters: [:]
         )
+        acceptedJobIDs.insert(request.id)
         jobs[request.id] = record
         queue.append(request.id)
         emit(.queued(makeSnapshot(for: request.id)))
@@ -255,6 +285,15 @@ actor DelegationCoordinator {
         return makeSnapshot(for: jobID)
     }
 
+    /// Exposes subscription pressure for diagnostics and leak regression
+    /// tests without exposing subscriber objects or buffered event contents.
+    func activeSubscriberCount(for jobID: DelegationJobID) throws -> Int {
+        guard let record = jobs[jobID] else {
+            throw DelegationCoordinatorError.unknownJob(jobID)
+        }
+        return record.subscribers.count
+    }
+
     /// Requests cancellation.  Queued work transitions to `.cancelled`
     /// immediately; running work receives cooperative `Task.cancel()` and is
     /// makes cancellation authoritative when the adapter eventually exits, so
@@ -275,6 +314,7 @@ actor DelegationCoordinator {
         let now = Date()
         record.cancellationReason = reason
         if record.state == .queued {
+            let stateBeforeCancellation = record.state
             queue.removeAll { $0 == jobID }
             record.state = .cancelled
             record.finishedAt = now
@@ -292,12 +332,14 @@ actor DelegationCoordinator {
                         jobID: jobID,
                         request: record.request,
                         reason: reason,
+                        state: stateBeforeCancellation,
                         occurredAt: now
                     )
                 )
             )
             emit(.cancelled(cancellation))
             resumeWaiters(record: record)
+            retainTerminalJob(jobID)
             drain()
             return .queuedCancelled
         }
@@ -311,6 +353,7 @@ actor DelegationCoordinator {
                     jobID: jobID,
                     request: record.request,
                     reason: reason,
+                    state: record.state,
                     occurredAt: now
                 )
             )
@@ -381,7 +424,7 @@ actor DelegationCoordinator {
 
     private func drain() {
         guard !isShutDown else { return }
-        while running.count < maxConcurrentJobs, !queue.isEmpty {
+        while executorTasksInFlight.count < maxConcurrentJobs, !queue.isEmpty {
             let jobID = queue.removeFirst()
             guard var record = jobs[jobID], record.state == .queued else { continue }
 
@@ -405,6 +448,7 @@ actor DelegationCoordinator {
             }
 
             let request = record.request
+            executorTasksInFlight.insert(jobID)
             let task = Task { [weak self, executor] in
                 guard let self else { return }
                 let reportProgress: DelegationProgressReporter = { [weak self] update in
@@ -412,28 +456,62 @@ actor DelegationCoordinator {
                     await self.receiveProgress(jobID: request.id, update: update)
                 }
 
+                let completion: ExecutorCompletion
                 do {
                     let output = try await executor.execute(
                         request,
                         reportProgress: reportProgress
                     )
-                    await self.finishSuccess(jobID: request.id, output: output)
+                    completion = .success(output)
                 } catch is CancellationError {
-                    await self.finishCancellation(
-                        jobID: request.id,
-                        reason: .user
-                    )
+                    completion = .cancelled
                 } catch {
-                    await self.finishFailure(
-                        jobID: request.id,
+                    completion = .failure(
                         code: Self.failureCode(for: error),
                         message: DelegationSafeText.sanitizeDiagnostic(
                             error.localizedDescription
                         )
                     )
                 }
+                await self.completeExecutorTask(
+                    jobID: request.id,
+                    completion: completion
+                )
             }
             jobs[jobID]?.task = task
+        }
+    }
+
+    /// Releases the physical provider-work slot only when the executor really
+    /// exits. Logical cancellation can therefore unblock UI immediately
+    /// without letting ignored cancellation exceed the configured limit.
+    private func completeExecutorTask(
+        jobID: DelegationJobID,
+        completion: ExecutorCompletion
+    ) {
+        executorTasksInFlight.remove(jobID)
+        guard var record = jobs[jobID] else {
+            drain()
+            return
+        }
+        if record.state.isTerminal {
+            record.task = nil
+            jobs[jobID] = record
+            running.remove(jobID)
+            drain()
+            return
+        }
+
+        switch completion {
+        case let .success(output):
+            finishSuccess(jobID: jobID, output: output)
+        case .cancelled:
+            finishCancellation(
+                jobID: jobID,
+                reason: record.cancellationReason ?? .unknown
+            )
+        case let .failure(code, message):
+            finishFailure(jobID: jobID, code: code, message: message)
         }
     }
 
@@ -501,6 +579,7 @@ actor DelegationCoordinator {
         running.remove(jobID)
         emit(.completed(result))
         resumeWaiters(record: record)
+        retainTerminalJob(jobID)
         drain()
     }
 
@@ -535,6 +614,7 @@ actor DelegationCoordinator {
         running.remove(jobID)
         emit(.failed(failure))
         resumeWaiters(record: record)
+        retainTerminalJob(jobID)
         drain()
     }
 
@@ -558,6 +638,7 @@ actor DelegationCoordinator {
         running.remove(jobID)
         emit(.cancelled(cancellation))
         resumeWaiters(record: record)
+        retainTerminalJob(jobID)
         drain()
     }
 
@@ -616,9 +697,17 @@ actor DelegationCoordinator {
         jobs[event.jobID] = record
     }
 
+    private func removeSubscriber(jobID: DelegationJobID, subscriberID: UUID) {
+        jobs[jobID]?.subscribers.removeValue(forKey: subscriberID)
+    }
+
     private func makeReplayStream(for jobID: DelegationJobID) -> DelegationEventStream {
         let id = UUID()
-        let buffer = DelegationEventBuffer()
+        let buffer = DelegationEventBuffer { [weak self] in
+            Task { [weak self] in
+                await self?.removeSubscriber(jobID: jobID, subscriberID: id)
+            }
+        }
         guard var record = jobs[jobID] else {
             buffer.finish()
             return DelegationEventStream(id: id, buffer: buffer)
@@ -633,6 +722,22 @@ actor DelegationCoordinator {
             jobs[jobID] = record
         }
         return DelegationEventStream(id: id, buffer: buffer)
+    }
+
+    /// Keeps retained prompts, event history, and results bounded. A handle
+    /// that already received its terminal event continues to own that buffered
+    /// event after the coordinator record is evicted.
+    private func retainTerminalJob(_ jobID: DelegationJobID) {
+        guard jobs[jobID]?.state.isTerminal == true,
+              !terminalJobOrder.contains(jobID)
+        else { return }
+        terminalJobOrder.append(jobID)
+        while terminalJobOrder.count > maxRetainedTerminalJobs {
+            let expired = terminalJobOrder.removeFirst()
+            jobs.removeValue(forKey: expired)
+            queue.removeAll { $0 == expired }
+            running.remove(expired)
+        }
     }
 
     private func appendBounded(
@@ -659,6 +764,7 @@ actor DelegationCoordinator {
         jobID: DelegationJobID,
         request: DelegationRequest,
         reason: DelegationCancellationReason,
+        state: DelegationJobState,
         occurredAt: Date
     ) -> DelegationCancellationRequest {
         DelegationCancellationRequest(
@@ -666,6 +772,7 @@ actor DelegationCoordinator {
             target: request.target,
             lineage: request.lineage,
             reason: reason,
+            state: state,
             occurredAt: occurredAt
         )
     }

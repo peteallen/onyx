@@ -109,7 +109,7 @@ final class OnyxAppModelReviewTests: XCTestCase {
             failedFixture.model.notice?.title == "Could not start code review"
         }
         XCTAssertTrue(
-            failedFixture.model.notice?.detail.contains("another Codex window") == true
+            failedFixture.model.notice?.detail.contains("another Review test runtime window") == true
         )
         XCTAssertNil(failedFixture.model.reviewingThreadID)
         XCTAssertFalse(failedFixture.model.isStartingReview)

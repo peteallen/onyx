@@ -6,30 +6,33 @@ struct ContextInspectorView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 3) {
+            HStack(spacing: 1) {
                 ForEach(InspectorTab.allCases) { tab in
                     Button {
                         model.inspectorTab = tab
                     } label: {
                         Label(tab.label, systemImage: tab.icon)
-                            .font(.system(size: 11.5, weight: .medium))
+                            .font(.system(size: 11.5, weight: model.inspectorTab == tab ? .semibold : .medium))
+                            .foregroundStyle(model.inspectorTab == tab ? Color.primary : Color.secondary)
                             .frame(maxWidth: .infinity)
-                            .frame(height: 28)
-                            .background(model.inspectorTab == tab ? OnyxTheme.raisedSurface : Color.clear)
-                            .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                            .frame(height: 34)
+                            .background {
+                                if model.inspectorTab == tab {
+                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        .fill(OnyxTheme.raisedSurface)
+                                }
+                            }
                     }
                     .buttonStyle(.plain)
                     .accessibilityAddTraits(model.inspectorTab == tab ? .isSelected : [])
                     .accessibilityHint("Shows the \(tab.label.lowercased()) section")
                 }
             }
-            .padding(.horizontal, 9)
-            .padding(.top, 13)
-            .padding(.bottom, 9)
+            .padding(.horizontal, 12)
+            .padding(.top, 12)
+            .padding(.bottom, 10)
             .accessibilityElement(children: .contain)
             .accessibilityLabel("Context panel sections")
-
-            Divider().overlay(OnyxTheme.border)
 
             ScrollView {
                 Group {
@@ -42,105 +45,320 @@ struct ContextInspectorView: View {
                         GitDiffViewerView(model: model)
                     }
                 }
-                .padding(12)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
             }
         }
-        .background(OnyxTheme.sidebar)
+        .background(OnyxTheme.inspector)
     }
 }
 
 private struct SummaryInspector: View {
     @ObservedObject var model: OnyxAppModel
+    @State private var isPlanExpanded = true
+    @State private var isAgentsExpanded = false
+    @State private var isChangesExpanded = false
+    @State private var isEnvironmentExpanded = true
+    @State private var showsAllAgents = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 0) {
             InspectorSection(title: "Task", icon: "checklist") {
-                LabeledContent("Status", value: model.selectedTaskAttention.label)
-                LabeledContent("Runtime", value: "Codex")
-                LabeledContent("Model", value: model.selectedModelName)
-                LabeledContent("Reasoning", value: model.selectedReasoningEffortName)
+                InspectorValueRow(label: "Status", value: model.selectedTaskAttention.label)
+                InspectorValueRow(label: "Runtime", value: model.runtimeDisplayName)
+                InspectorValueRow(label: "Model", value: model.selectedModelName)
+                InspectorValueRow(label: "Reasoning", value: model.selectedReasoningEffortName)
             }
 
             if let plan = model.selectedPlan {
-                InspectorSection(title: "Plan", icon: "list.bullet.rectangle") {
-                    if let explanation = plan.explanation {
-                        Text(explanation)
-                            .font(.system(size: 10.5))
-                            .foregroundStyle(.secondary)
-                    }
-                    ForEach(Array(plan.steps.enumerated()), id: \.offset) { _, step in
-                        HStack(alignment: .firstTextBaseline, spacing: 7) {
-                            Image(systemName: planSymbol(for: step.status))
-                                .foregroundStyle(planColor(for: step.status))
-                                .accessibilityHidden(true)
-                            Text(step.text)
-                                .font(.system(size: 11))
-                                .foregroundStyle(step.status == .completed ? .secondary : .primary)
-                        }
-                        .accessibilityElement(children: .ignore)
-                        .accessibilityLabel("\(planStatusLabel(for: step.status)): \(step.text)")
-                    }
-                }
+                inspectorSectionDivider
+                planSection(plan)
             } else {
                 let plans = model.timeline.filter { $0.kind == .plan }
                 if let lastPlan = plans.last {
-                    InspectorSection(title: "Plan", icon: "list.bullet.rectangle") {
+                    inspectorSectionDivider
+                    InspectorDisclosureSection(
+                        title: "Plan",
+                        icon: "list.bullet.rectangle",
+                        summary: "Latest update",
+                        isExpanded: $isPlanExpanded,
+                        accessibilityHint: "Shows the latest plan update"
+                    ) {
                         Text(lastPlan.body)
                             .font(.system(size: 11.5))
                             .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityLabel("Latest plan update: \(lastPlan.body)")
                     }
                 }
             }
 
             if !model.collaborationAgents.isEmpty {
-                InspectorSection(title: "Agents", icon: "person.2") {
-                    let liveCount = model.collaborationAgents.filter { $0.status.isLive }.count
-                    LabeledContent("Live", value: "\(liveCount)")
-                    LabeledContent("Known", value: "\(model.collaborationAgents.count)")
-                    ForEach(model.collaborationAgents.prefix(6)) { agent in
-                        HStack(spacing: 7) {
-                            Circle()
-                                .fill(agentColor(for: agent.status))
-                                .frame(width: 6, height: 6)
-                                .accessibilityHidden(true)
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(agent.displayName)
-                                    .foregroundStyle(.primary)
-                                    .lineLimit(1)
-                                if let message = agent.message, !message.isEmpty {
-                                    Text(message)
-                                        .lineLimit(2)
-                                }
-                            }
-                            Spacer(minLength: 4)
-                            Text(agent.status.label)
-                                .font(.system(size: 9.5, weight: .medium))
-                                .foregroundStyle(agentColor(for: agent.status))
-                        }
-                        .accessibilityElement(children: .ignore)
-                        .accessibilityLabel("\(agent.displayName), \(agent.status.label)")
+                inspectorSectionDivider
+                agentsSection
+            }
+
+            inspectorSectionDivider
+            changesSection
+
+            inspectorSectionDivider
+            environmentSection
+        }
+        .onAppear {
+            resetDisclosureState()
+        }
+        .onChange(of: model.selectedThreadID) { _, _ in
+            resetDisclosureState()
+        }
+    }
+
+    private var changes: [TimelineItem] {
+        model.timeline.filter { $0.kind == .fileChange }
+    }
+
+    private var workspacePath: String {
+        model.selectedThread?.cwd ?? model.draftWorkspacePath ?? "No project selected"
+    }
+
+    @ViewBuilder
+    private func planSection(_ plan: RuntimePlan) -> some View {
+        InspectorDisclosureSection(
+            title: "Plan",
+            icon: "list.bullet.rectangle",
+            summary: planSummary(for: plan),
+            isExpanded: $isPlanExpanded,
+            accessibilityHint: "Shows the task plan"
+        ) {
+            if let explanation = plan.explanation?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !explanation.isEmpty {
+                Text(explanation)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if plan.steps.isEmpty {
+                Text("No plan steps yet")
+                    .foregroundStyle(.tertiary)
+            } else {
+                ForEach(Array(plan.steps.enumerated()), id: \.offset) { _, step in
+                    HStack(alignment: .firstTextBaseline, spacing: 7) {
+                        Image(systemName: planSymbol(for: step.status))
+                            .foregroundStyle(planColor(for: step.status))
+                            .accessibilityHidden(true)
+                        Text(step.text)
+                            .font(.system(size: 11))
+                            .foregroundStyle(step.status == .completed ? .secondary : .primary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                    if model.collaborationAgents.count > 6 {
-                        Text("\(model.collaborationAgents.count - 6) more agents")
-                            .foregroundStyle(.tertiary)
-                    }
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("\(planStatusLabel(for: step.status)): \(step.text)")
                 }
             }
+        }
+    }
 
-            InspectorSection(title: "Changes", icon: "arrow.triangle.branch") {
-                let changes = model.timeline.filter { $0.kind == .fileChange }
-                LabeledContent("Files touched", value: "\(changes.count)")
-                LabeledContent("Branch", value: model.selectedThread?.branch ?? "Current checkout")
+    private var agentsSection: some View {
+        InspectorDisclosureSection(
+            title: "Agents",
+            icon: "person.2",
+            summary: agentsSummary,
+            isExpanded: $isAgentsExpanded,
+            accessibilityHint: "Shows delegated agent tasks"
+        ) {
+            let visibleAgents = showsAllAgents
+                ? model.collaborationAgents
+                : Array(model.collaborationAgents.prefix(6))
+            ForEach(visibleAgents) { agent in
+                Button {
+                    model.openCollaborationAgent(agent)
+                } label: {
+                    HStack(spacing: 7) {
+                        Circle()
+                            .fill(agentColor(for: agent.status))
+                            .frame(width: 6, height: 6)
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(agent.displayName)
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+                            if let message = agent.message?.trimmingCharacters(in: .whitespacesAndNewlines),
+                               !message.isEmpty {
+                                Text(message)
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                            }
+                        }
+                        Spacer(minLength: 4)
+                        Text(agent.status.label)
+                            .font(.system(size: 9.5, weight: .medium))
+                            .foregroundStyle(agentColor(for: agent.status))
+                        Image(systemName: "chevron.forward")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.tertiary)
+                            .accessibilityHidden(true)
+                    }
+                    .contentShape(Rectangle())
+                    .frame(minHeight: 30)
+                }
+                .buttonStyle(.plain)
+                .disabled(agent.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .onyxHelp("Open agent task")
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("\(agent.displayName), \(agent.status.label)")
+                .accessibilityValue(agentAccessibilityValue(agent))
+                .accessibilityHint(
+                    agent.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        ? "No child conversation is available"
+                        : "Opens this agent's conversation"
+                )
             }
-
-            InspectorSection(title: "Environment", icon: "shippingbox") {
-                Text(model.selectedThread?.cwd ?? model.draftWorkspacePath ?? "No project selected")
-                    .font(.system(size: 10.5, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                LabeledContent("Permissions", value: model.permissionLabel)
+            if model.collaborationAgents.count > 6 {
+                Button {
+                    showsAllAgents.toggle()
+                } label: {
+                    HStack(spacing: 5) {
+                        Text(showsAllAgents ? "Show fewer agents" : "Show all agents")
+                        Spacer(minLength: 4)
+                        Image(systemName: showsAllAgents ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 9, weight: .semibold))
+                            .accessibilityHidden(true)
+                    }
+                    .foregroundStyle(.tertiary)
+                    .contentShape(Rectangle())
+                    .frame(minHeight: 26)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(showsAllAgents ? "Show fewer agents" : "Show all agents")
+                .accessibilityValue(
+                    showsAllAgents
+                        ? "All \(model.collaborationAgents.count) agents visible"
+                        : "\(model.collaborationAgents.count - visibleAgents.count) additional agents hidden"
+                )
             }
         }
+    }
+
+    private var changesSection: some View {
+        InspectorDisclosureSection(
+            title: "Changes",
+            icon: "arrow.triangle.branch",
+            summary: changesSummary,
+            isExpanded: $isChangesExpanded,
+            accessibilityHint: "Shows file changes recorded for this task"
+        ) {
+            InspectorValueRow(
+                label: "Branch",
+                value: model.selectedThread?.branch ?? "Current checkout"
+            )
+            if changes.isEmpty {
+                Text("No file changes recorded in this task")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.tertiary)
+            } else {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(changes.prefix(4)) { change in
+                        HStack(spacing: 7) {
+                            Image(systemName: "doc.badge.ellipsis")
+                                .font(.system(size: 10.5))
+                                .foregroundStyle(.secondary)
+                                .accessibilityHidden(true)
+                            Text(change.title ?? "Changed file")
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel(change.title ?? "Changed file")
+                    }
+                }
+                if changes.count > 4 {
+                    Text("More changes are available in Files and Review")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                }
+                Button {
+                    model.inspectorTab = .files
+                } label: {
+                    Label("Open Files", systemImage: "doc.on.doc")
+                }
+                .buttonStyle(.link)
+                .font(.system(size: 10.5, weight: .medium))
+                .accessibilityHint("Shows the project's files and task changes")
+            }
+        }
+    }
+
+    private var environmentSection: some View {
+        InspectorDisclosureSection(
+            title: "Environment",
+            icon: "shippingbox",
+            summary: model.permissionLabel,
+            isExpanded: $isEnvironmentExpanded,
+            accessibilityHint: "Shows the selected workspace and access level"
+        ) {
+            InspectorPathRow(label: "Workspace", path: workspacePath)
+            InspectorValueRow(label: "Permissions", value: model.permissionLabel)
+        }
+    }
+
+    private var agentsSummary: String {
+        let failed = model.collaborationAgents.filter { $0.status == .failed }.count
+        let live = model.collaborationAgents.filter { $0.status.isLive }.count
+        let completed = model.collaborationAgents.filter { $0.status == .completed }.count
+
+        var parts: [String] = []
+        if failed > 0 {
+            parts.append("\(failed) failed")
+        }
+        if live > 0 {
+            parts.append("\(live) working")
+        }
+        if completed > 0 {
+            parts.append("\(completed) done")
+        }
+        if parts.isEmpty {
+            return "\(model.collaborationAgents.count) available"
+        }
+        return parts.prefix(2).joined(separator: " · ")
+    }
+
+    private var changesSummary: String {
+        guard !changes.isEmpty else { return "No task changes" }
+        return changes.count == 1 ? "1 file changed" : "\(changes.count) files changed"
+    }
+
+    private func planSummary(for plan: RuntimePlan) -> String {
+        switch plan.timelineStatus {
+        case .running: "In progress"
+        case .completed: "Complete"
+        case .pending: "Not started"
+        case .failed: "Needs attention"
+        case .declined: "Declined"
+        }
+    }
+
+    private func agentAccessibilityValue(_ agent: RuntimeCollaborationAgent) -> String {
+        [agent.path, agent.message]
+            .compactMap { value in
+                guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !value.isEmpty else { return nil }
+                return value
+            }
+            .joined(separator: ". ")
+    }
+
+    private func resetDisclosureState() {
+        isPlanExpanded = model.selectedPlan?.timelineStatus == .running
+        isAgentsExpanded = false
+        isChangesExpanded = false
+        isEnvironmentExpanded = true
+        showsAllAgents = false
+    }
+
+    private var inspectorSectionDivider: some View {
+        Divider()
+            .overlay(OnyxTheme.divider)
+            .padding(.horizontal, 2)
     }
 
     private func planSymbol(for status: RuntimePlanStepStatus) -> String {
@@ -215,7 +433,7 @@ private struct FilesInspector: View {
                     }
                     .menuStyle(.borderlessButton)
                     .fixedSize()
-                    .help("Project actions")
+                    .onyxHelp("Project actions")
                     .accessibilityLabel("Project actions")
                 }
             }
@@ -288,7 +506,7 @@ private struct FilesInspector: View {
                         .foregroundStyle(.tertiary)
                 }
                 .buttonStyle(.plain)
-                .help("Clear file search")
+                .onyxHelp("Clear file search")
                 .accessibilityLabel("Clear file search")
             }
         }
@@ -443,7 +661,7 @@ private struct FilesInspector: View {
                     .frame(width: 20, height: 20)
             }
             .buttonStyle(.plain)
-            .help("Back to project files")
+            .onyxHelp("Back to project files")
             .accessibilityLabel("Back to project files")
 
             Text(title)
@@ -460,7 +678,7 @@ private struct FilesInspector: View {
                         .frame(width: 20, height: 20)
                 }
                 .buttonStyle(.plain)
-                .help("Open in default app")
+                .onyxHelp("Open in default app")
                 .accessibilityLabel("Open \(preview.file.name) in default app")
 
                 Button {
@@ -470,7 +688,7 @@ private struct FilesInspector: View {
                         .frame(width: 20, height: 20)
                 }
                 .buttonStyle(.plain)
-                .help("Reveal in Finder")
+                .onyxHelp("Reveal in Finder")
                 .accessibilityLabel("Reveal \(preview.file.name) in Finder")
             }
         }
@@ -651,7 +869,7 @@ private struct ProjectFileRow: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .help(isExpanded ? "Collapse folder" : "Expand folder")
+                .onyxHelp(isExpanded ? "Collapse folder" : "Expand folder")
                 .accessibilityLabel("\(isExpanded ? "Collapse" : "Expand") \(entry.name)")
                 .accessibilityHint("Changes which files are shown")
             } else {
@@ -672,7 +890,7 @@ private struct ProjectFileRow: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .help("Preview \(entry.name)")
+                .onyxHelp("Preview \(entry.name)")
             } else {
                 Image(systemName: icon)
                     .frame(width: 13)
@@ -696,7 +914,7 @@ private struct ProjectFileRow: View {
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
-            .help("File actions")
+            .onyxHelp("File actions")
             .accessibilityLabel("Actions for \(entry.name)")
         }
         .font(.system(size: 11.5))
@@ -758,18 +976,131 @@ private struct InspectorSection<Content: View>: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 9) {
             Label(title, systemImage: icon)
-                .font(.system(size: 11.5, weight: .semibold))
-            VStack(alignment: .leading, spacing: 7) {
+                .font(.system(size: 12.5, weight: .semibold))
+            VStack(alignment: .leading, spacing: 8) {
                 content
             }
-            .font(.system(size: 10.5))
+            .font(.system(size: 11))
             .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(11)
-        .onyxPanel(radius: 11)
+        .padding(.horizontal, 4)
+        .padding(.vertical, 14)
+    }
+}
+
+/// A compact key/value row used by the summary pane. Keeping the value on the
+/// same visual line makes the inspector read like a quiet status surface
+/// instead of a stack of cards.
+private struct InspectorValueRow: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Text(label)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 8)
+            Text(value)
+                .foregroundStyle(.primary)
+                .multilineTextAlignment(.trailing)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .font(.system(size: 11))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct InspectorPathRow: View {
+    let label: String
+    let path: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label)
+                .font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
+            Text(path)
+                .font(.system(size: 10.5, design: .monospaced))
+                .foregroundStyle(.primary)
+                .textSelection(.enabled)
+                .lineLimit(2)
+                .truncationMode(.middle)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct InspectorDisclosureSection<Content: View>: View {
+    let title: String
+    let icon: String
+    let summary: String
+    @Binding var isExpanded: Bool
+    let accessibilityHint: String
+    @ViewBuilder let content: Content
+
+    init(
+        title: String,
+        icon: String,
+        summary: String,
+        isExpanded: Binding<Bool>,
+        accessibilityHint: String,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.title = title
+        self.icon = icon
+        self.summary = summary
+        self._isExpanded = isExpanded
+        self.accessibilityHint = accessibilityHint
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                withAnimation(.easeOut(duration: 0.14)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 7) {
+                    Label(title, systemImage: icon)
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(.primary)
+                    Spacer(minLength: 8)
+                    if !summary.isEmpty {
+                        Text(summary)
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
+            .accessibilityHint(accessibilityHint)
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 8) {
+                    content
+                }
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .transition(.opacity)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 4)
+        .padding(.vertical, 12)
     }
 }
 

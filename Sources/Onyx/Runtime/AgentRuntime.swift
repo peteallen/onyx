@@ -11,10 +11,18 @@ protocol AgentRuntime: Sendable {
     func logout() async throws
     func refreshAccount() async throws -> RuntimeSession
     func listThreads(limit: Int, archived: Bool) async throws -> [RuntimeThread]
+    /// Returns the complete provider-owned thread catalog for migrations and
+    /// cross-provider project grouping. Runtimes with cursor APIs should
+    /// override this instead of guessing a very large page size.
+    func listAllThreads(archived: Bool) async throws -> [RuntimeThread]
     func readThread(id: String) async throws -> RuntimeConversation
     func resumeThread(id: String) async throws -> RuntimeConversation
     func startThread(_ request: StartThreadRequest) async throws -> RuntimeThread
     func forkThread(id: String) async throws -> RuntimeThread
+    /// Creates an isolated, non-durable branch of an existing conversation.
+    /// The returned transcript belongs to the fork; callers must never add it
+    /// to the durable task catalog or treat it as a replacement for the parent.
+    func forkEphemeralThread(id: String) async throws -> RuntimeConversation
     func compactThread(id: String) async throws
     func deleteThread(id: String) async throws
     func startTurn(_ request: StartTurnRequest) async throws
@@ -64,12 +72,20 @@ extension AgentRuntime {
         try await listThreads(limit: limit, archived: false)
     }
 
+    func listAllThreads(archived: Bool) async throws -> [RuntimeThread] {
+        try await listThreads(limit: Int.max, archived: archived)
+    }
+
     func resumeThread(id: String) async throws -> RuntimeConversation {
         try await readThread(id: id)
     }
 
     func forkThread(id _: String) async throws -> RuntimeThread {
         throw AgentRuntimeError.unsupported("thread forking")
+    }
+
+    func forkEphemeralThread(id _: String) async throws -> RuntimeConversation {
+        throw AgentRuntimeError.unsupported("ephemeral thread forking")
     }
 
     func compactThread(id _: String) async throws {

@@ -10,12 +10,15 @@ enabling work only, not a completed user surface.
 
 - [x] Native macOS window, command rail, project/task sidebar, transcript, and context inspector
 - [x] Responsive three-pane sizing with inspector visibility control
+- [x] Persisted drag-resizing for sidebar and inspector with compact-window safeguards
+- [x] App-owned project catalog with grouped tasks, add, rename, reorder, and metadata-only removal
 - [x] Multiple independently restored workspace windows with per-window task, draft, panel, terminal, command, and frame ownership
 - [x] Production shared-runtime event broadcast, single-flight connection/account handshakes, and cross-window sign-out boundary
 - [x] Native tabbing, core keyboard commands and task menus, plus window-frame restoration
 - [x] Focused VoiceOver, keyboard-focus, non-color status, and reduced-motion pass
 - [ ] Full VoiceOver traversal and large-text audit
 - [x] Ad-hoc signed, staged, and verified development `.app` packaging with the custom Onyx icon and configurable destination, display name, and bundle ID for isolated preview builds
+- [x] Stable preview path/name/bundle identity, optional persistent local signing identity, atomic replacement, and executable-owned graceful stop
 - [ ] Sandboxed, notarized, and updateable production distribution
 
 ## Codex runtime
@@ -37,6 +40,7 @@ enabling work only, not a completed user surface.
 - [ ] Approval UX and protocol coverage for every command, file, MCP, user-input, and permission-amendment variant
 - [ ] Hands-on verification for every destructive task-management action
 - [x] Read-only plan, task-attention, and collaboration-agent progress in the transcript, sidebar, and inspector
+- [x] Click-through collaboration-agent detail and isolated ephemeral Codex side chat
 - [ ] Skills, plugins, apps, MCP authentication, goals, collaboration controls, and usage surfaces
 - [ ] Worktree creation, handoff, Git review, and cloud/local task parity
 
@@ -58,14 +62,15 @@ enabling work only, not a completed user surface.
 
 ## Multi-provider platform
 
-- [x] Production composition through a Codex-only runtime registry with one default Codex connection
+- [x] One registry-owned default Codex connection plus host-resolved configured OpenAI-compatible connections
 - [x] Tested opaque adapter, connection, and connection-scoped model identity foundation
 - [x] Tested versioned conversation-catalog foundation with app-owned IDs, provider bindings, and lineage validation
 - [x] Tested provider connection descriptors, credential references, model capability negotiation, OpenRouter catalog projection, and OpenAI-compatible request codec
 - [x] Provider Settings for OpenAI-compatible connections, safe URL validation, `/models` discovery, and Keychain-only bearer credentials
 - [x] OpenAI-compatible runtime adapter with streamed chat and provider-owned local conversation persistence
+- [x] Production provider/model selection with cached catalogs and frequent/recent ranking
+- [x] Capability-aware OpenAI-compatible image and reasoning controls with conservative unknowns
 - [ ] Production integration of the conversation catalog with task discovery, drafts, and restoration
-- [ ] Production provider/configured-connection selection in the workspace
 - [ ] End-to-end capability negotiation through a second live runtime adapter
 - [ ] Claude runtime adapter (not implemented)
 - [ ] Usable cross-provider continuation with explicit lineage

@@ -58,6 +58,7 @@ enum OpenAICompatibleChatStreamEvent: Sendable, Equatable {
 enum OpenAICompatibleChatTransportError: LocalizedError, Sendable, Equatable {
     case invalidEndpoint
     case insecureEndpoint
+    case insecureBearerToken
     case invalidBearerToken
     case requestModeMismatch(expectedStreaming: Bool)
     case invalidHTTPResponse
@@ -73,7 +74,9 @@ enum OpenAICompatibleChatTransportError: LocalizedError, Sendable, Equatable {
         case .invalidEndpoint:
             "The provider endpoint is not a valid HTTP(S) base URL."
         case .insecureEndpoint:
-            "The provider endpoint must use HTTPS unless insecure HTTP was explicitly allowed."
+            "Clear-text HTTP is allowed only after acknowledgement and only for a literal loopback, private-network, or link-local IP address. Use HTTPS for hostnames and public IPs."
+        case .insecureBearerToken:
+            "Bearer credentials cannot be sent over clear-text HTTP. Use HTTPS or choose a provider without authentication."
         case .invalidBearerToken:
             "The provider bearer token contains characters that are not valid in an HTTP header."
         case let .requestModeMismatch(expectedStreaming):
@@ -112,16 +115,16 @@ enum OpenAICompatibleChatTransportError: LocalizedError, Sendable, Equatable {
 struct OpenAICompatibleChatTransport: Sendable {
     private let chatCompletionsURL: URL
     private let bearerToken: String?
-    private let session: URLSession
+    private let protectedSession: ProviderRedirectProtectedSession
 
     /// - Parameters:
     ///   - endpoint: Provider base URL (for example `https://host/v1`) or the
     ///     full `/chat/completions` URL.
     ///   - bearerToken: Optional so trusted local vLLM servers can be used
     ///     without inventing a credential.
-    ///   - allowsInsecureHTTP: An explicit opt-in for non-loopback HTTP such
-    ///     as a trusted LAN inference server. Never enable it for API keys over
-    ///     an untrusted network.
+    ///   - allowsInsecureHTTP: An explicit user acknowledgement for clear-text
+    ///     HTTP. It is required even for local IPs, and is accepted only for a
+    ///     literal loopback/private/link-local IP with no bearer token.
     ///   - session: Injectable to support deterministic URLProtocol fixtures.
     init(
         endpoint: URL,
@@ -136,18 +139,29 @@ struct OpenAICompatibleChatTransport: Sendable {
               endpoint.query == nil, endpoint.fragment == nil else {
             throw OpenAICompatibleChatTransportError.invalidEndpoint
         }
-        if scheme == "http", !allowsInsecureHTTP, !Self.isLoopback(host) {
-            throw OpenAICompatibleChatTransportError.insecureEndpoint
-        }
-
         let token = bearerToken.flatMap { $0.isEmpty ? nil : $0 }
         if let token, token.contains(where: { $0.isNewline || $0 == "\0" }) {
             throw OpenAICompatibleChatTransportError.invalidBearerToken
         }
 
+        if scheme == "http" {
+            guard ProviderBaseURLNormalizer.isAllowedInsecureHTTPHost(host),
+                  allowsInsecureHTTP
+            else {
+                throw OpenAICompatibleChatTransportError.insecureEndpoint
+            }
+            guard token == nil else {
+                throw OpenAICompatibleChatTransportError.insecureBearerToken
+            }
+        }
+
         self.chatCompletionsURL = Self.resolveChatCompletionsURL(from: endpoint)
         self.bearerToken = token
-        self.session = session ?? Self.makeDefaultSession()
+        self.protectedSession = ProviderRedirectProtectedSession(
+            wrapping: session ?? Self.makeDefaultSession(),
+            transportSecurity: allowsInsecureHTTP ? .allowInsecureHTTP : .requireTLS,
+            hasBearerCredential: token != nil
+        )
     }
 
     func complete(
@@ -161,7 +175,7 @@ struct OpenAICompatibleChatTransport: Sendable {
 
         let request = try makeURLRequest(for: chatRequest)
         do {
-            let (data, response) = try await session.data(for: request)
+            let (data, response) = try await protectedSession.session.data(for: request)
             try Task.checkCancellation()
             let http = try validatedHTTPResponse(response)
             guard (200 ..< 300).contains(http.statusCode) else {
@@ -198,7 +212,7 @@ struct OpenAICompatibleChatTransport: Sendable {
             return Self.failedStream(error)
         }
 
-        let session = session
+        let session = protectedSession.session
         let secret = bearerToken
         let pair = AsyncThrowingStream.makeStream(
             of: OpenAICompatibleChatStreamEvent.self,
@@ -469,12 +483,6 @@ struct OpenAICompatibleChatTransport: Sendable {
         return endpoint
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("completions", isDirectory: false)
-    }
-
-    private static func isLoopback(_ host: String) -> Bool {
-        let value = host.lowercased()
-        return value == "localhost" || value == "127.0.0.1"
-            || value == "::1" || value == "[::1]"
     }
 
     private static func makeDefaultSession() -> URLSession {

@@ -43,9 +43,14 @@ actor OpenAICompatibleConversationStore {
     let fileURL: URL
 
     private static let fileAccess = OpenAICompatibleConversationFileAccess.shared
+    private let beforePersist: (@Sendable (OpenAICompatibleConversationSnapshot) throws -> Void)?
 
-    init(fileURL: URL = OpenAICompatibleConversationStore.defaultFileURL()) {
+    init(
+        fileURL: URL = OpenAICompatibleConversationStore.defaultFileURL(),
+        beforePersist: (@Sendable (OpenAICompatibleConversationSnapshot) throws -> Void)? = nil
+    ) {
         self.fileURL = fileURL
+        self.beforePersist = beforePersist
     }
 
     func snapshot() throws -> OpenAICompatibleConversationSnapshot {
@@ -56,6 +61,7 @@ actor OpenAICompatibleConversationStore {
 
     func conversations(
         connectionID: ProviderConnectionID,
+        scopeID: String? = nil,
         archived: Bool,
         limit: Int = 100
     ) throws -> [OpenAICompatibleStoredConversation] {
@@ -63,7 +69,11 @@ actor OpenAICompatibleConversationStore {
             let maximum = max(0, limit)
             return Array(
                 try loadFromDisk().conversations
-                    .filter { $0.connectionID == connectionID && $0.isArchived == archived }
+                    .filter {
+                        $0.connectionID == connectionID
+                            && $0.isArchived == archived
+                            && (scopeID == nil || $0.belongs(to: scopeID!))
+                    }
                     .sorted { lhs, rhs in
                         if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
                         return lhs.id < rhs.id
@@ -73,13 +83,47 @@ actor OpenAICompatibleConversationStore {
         }
     }
 
+    /// Assigns legacy conversations written before provider scope isolation to
+    /// the connection's current scope. This is intentionally an explicit
+    /// migration step rather than a broad `nil` match in `conversations`:
+    /// after an endpoint or credential rotation, an old record must stay in
+    /// its previous scope and never be replayed to the replacement backend.
+    @discardableResult
+    func migrateLegacyConversations(
+        connectionID: ProviderConnectionID,
+        to scopeID: String
+    ) throws -> Int {
+        let normalizedScopeID = scopeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedScopeID.isEmpty else { return 0 }
+        return try Self.fileAccess.withLock(for: fileURL) {
+            let current = try loadFromDisk()
+            var candidate = current.conversations
+            var migrated = 0
+            for index in candidate.indices
+            where candidate[index].connectionID == connectionID
+                && candidate[index].conversationScopeID == nil
+            {
+                candidate[index].conversationScopeID = normalizedScopeID
+                migrated += 1
+            }
+            guard migrated > 0 else { return 0 }
+            let next = OpenAICompatibleConversationSnapshot(conversations: candidate)
+            try Self.validate(next)
+            try persist(next)
+            return migrated
+        }
+    }
+
     func conversation(
         connectionID: ProviderConnectionID,
-        id: String
+        id: String,
+        scopeID: String? = nil
     ) throws -> OpenAICompatibleStoredConversation? {
         try Self.fileAccess.withLock(for: fileURL) {
             try loadFromDisk().conversations.first {
-                $0.connectionID == connectionID && $0.id == id
+                $0.connectionID == connectionID
+                    && $0.id == id
+                    && (scopeID == nil || $0.belongs(to: scopeID!))
             }
         }
     }
@@ -90,6 +134,7 @@ actor OpenAICompatibleConversationStore {
         title: String,
         cwd: String?,
         modelID: String,
+        scopeID: String? = nil,
         now: Date = .now
     ) throws -> OpenAICompatibleStoredConversation {
         try Self.fileAccess.withLock(for: fileURL) {
@@ -97,6 +142,7 @@ actor OpenAICompatibleConversationStore {
             let record = OpenAICompatibleStoredConversation(
                 id: Self.makeConversationID(connectionID: connectionID),
                 connectionID: connectionID,
+                conversationScopeID: scopeID,
                 title: title,
                 cwd: cwd,
                 modelID: modelID,
@@ -133,15 +179,54 @@ actor OpenAICompatibleConversationStore {
         }
     }
 
+    /// Mutates an existing conversation as one read-modify-write transaction.
+    /// Runtime code uses this instead of pairing `conversation` with `upsert`:
+    /// a streamed message update must not replace a rename/archive change that
+    /// landed after the stream read its history, and a deleted conversation
+    /// must never be recreated by a late stream callback.
+    @discardableResult
+    func update(
+        connectionID: ProviderConnectionID,
+        id: String,
+        scopeID: String? = nil,
+        _ mutation: @Sendable (inout OpenAICompatibleStoredConversation) throws -> Void
+    ) throws -> OpenAICompatibleStoredConversation {
+        try Self.fileAccess.withLock(for: fileURL) {
+            let current = try loadFromDisk()
+            var candidate = current.conversations
+            guard let index = candidate.firstIndex(where: {
+                $0.connectionID == connectionID
+                    && $0.id == id
+                    && (scopeID == nil || $0.belongs(to: scopeID!))
+            }) else {
+                throw OpenAICompatibleConversationStoreError.conversationNotFound(
+                    connectionID: connectionID,
+                    id: id
+                )
+            }
+            if let scopeID, candidate[index].conversationScopeID == nil {
+                candidate[index].conversationScopeID = scopeID
+            }
+            try mutation(&candidate[index])
+            let next = OpenAICompatibleConversationSnapshot(conversations: candidate)
+            try Self.validate(next)
+            try persist(next)
+            return candidate[index]
+        }
+    }
+
     @discardableResult
     func remove(
         connectionID: ProviderConnectionID,
-        id: String
+        id: String,
+        scopeID: String? = nil
     ) throws -> OpenAICompatibleStoredConversation? {
         try Self.fileAccess.withLock(for: fileURL) {
             let current = try loadFromDisk()
             guard let index = current.conversations.firstIndex(where: {
-                $0.connectionID == connectionID && $0.id == id
+                $0.connectionID == connectionID
+                    && $0.id == id
+                    && (scopeID == nil || $0.belongs(to: scopeID!))
             }) else { return nil }
             var candidate = current.conversations
             let removed = candidate.remove(at: index)
@@ -158,6 +243,7 @@ actor OpenAICompatibleConversationStore {
     @discardableResult
     func recoverInterruptedTurns(
         connectionID: ProviderConnectionID,
+        scopeID: String? = nil,
         now: Date = .now
     ) throws -> [OpenAICompatibleStoredConversation] {
         try Self.fileAccess.withLock(for: fileURL) {
@@ -166,8 +252,12 @@ actor OpenAICompatibleConversationStore {
             var recovered: [OpenAICompatibleStoredConversation] = []
             for index in candidate.indices
             where candidate[index].connectionID == connectionID
+                && (scopeID == nil || candidate[index].belongs(to: scopeID!))
                 && candidate[index].status == .running
             {
+                if let scopeID, candidate[index].conversationScopeID == nil {
+                    candidate[index].conversationScopeID = scopeID
+                }
                 candidate[index].status = .failed
                 candidate[index].updatedAt = now
                 for messageIndex in candidate[index].messages.indices
@@ -219,6 +309,7 @@ actor OpenAICompatibleConversationStore {
     }
 
     private func persist(_ snapshot: OpenAICompatibleConversationSnapshot) throws {
+        try beforePersist?(snapshot)
         try FileManager.default.createDirectory(
             at: fileURL.deletingLastPathComponent(),
             withIntermediateDirectories: true

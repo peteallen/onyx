@@ -38,5 +38,18 @@ info_plist="$app_path/Contents/Info.plist"
 [[ -f "$app_path/Contents/Resources/Onyx.icns" ]]
 /usr/bin/plutil -lint "$info_plist" >/dev/null
 /usr/bin/codesign --verify --deep --strict --verbose=2 "$app_path"
+[[ "$(/usr/bin/plutil -extract NSLocalNetworkUsageDescription raw -o - \
+  "$info_plist")" == *"local model servers"* ]]
+
+atomic_swap_root="$check_root/atomic-swap"
+/bin/mkdir -p "$atomic_swap_root/existing" "$atomic_swap_root/replacement"
+/usr/bin/printf 'old\n' > "$atomic_swap_root/existing/value"
+/usr/bin/printf 'new\n' > "$atomic_swap_root/replacement/value"
+CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-$repo_root/.build/module-cache}" \
+  SWIFTPM_MODULECACHE_OVERRIDE="${SWIFTPM_MODULECACHE_OVERRIDE:-$repo_root/.build/swiftpm-module-cache}" \
+  /usr/bin/swift "$repo_root/scripts/atomic-swap.swift" \
+  "$atomic_swap_root/existing" "$atomic_swap_root/replacement"
+[[ "$(<"$atomic_swap_root/existing/value")" == "new" ]]
+[[ "$(<"$atomic_swap_root/replacement/value")" == "old" ]]
 
 print -- "Packaging checks passed: $app_path"

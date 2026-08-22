@@ -84,6 +84,45 @@ final class OnyxAppModelReconnectTests: XCTestCase {
         XCTAssertTrue(fixture.model.notice?.detail.contains("existing tasks are still available") == true)
     }
 
+    func testConnectionFailureUsesRuntimeNameAndRetryClearsItsNotice() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+
+        fixture.model.start()
+        await waitUntil("Initial task did not load") {
+            fixture.model.connectionState == .connected(ReconnectFixture.runtimeLabel)
+                && fixture.model.selectedThreadID == ReconnectFixture.threadID
+        }
+
+        await fixture.runtime.failNextConnect(message: "simulated provider outage")
+        await fixture.runtime.emit(.connectionChanged(.disconnected))
+        await waitUntil("The disconnect did not reach the app model") {
+            fixture.model.connectionState == .disconnected
+        }
+
+        fixture.model.reconnect()
+        await waitUntil("The provider-specific connection failure was not surfaced") {
+            fixture.model.notice?.title == "\(ReconnectFixture.runtimeLabel) did not connect"
+        }
+        XCTAssertTrue(fixture.model.notice?.detail.contains("simulated provider outage") == true)
+
+        await fixture.runtime.preparePausedReconnect(
+            thread: ReconnectFixture.initialThread,
+            items: [ReconnectFixture.initialItem]
+        )
+        fixture.model.reconnect()
+        await waitUntilAsync("Retry did not reach the runtime") {
+            await fixture.runtime.recordedConnectCount() == 3
+        }
+        XCTAssertEqual(fixture.model.connectionState, .connecting)
+        XCTAssertNil(fixture.model.notice)
+
+        await fixture.runtime.completePausedReconnect()
+        await waitUntil("Retry did not reconnect") {
+            fixture.model.connectionState == .connected(ReconnectFixture.runtimeLabel)
+        }
+    }
+
     func testLateSuccessfulConnectCannotConcealAStopEvent() async {
         let fixture = makeFixture()
         defer { fixture.cleanUp() }
@@ -216,6 +255,7 @@ private actor ReconnectModelRuntime: AgentRuntime {
     private var pausedReconnectContinuation: CheckedContinuation<Void, Never>?
     private var shouldFailThreadList = false
     private var shouldStopBeforeReturningSession = false
+    private var nextConnectFailureMessage: String?
 
     init() {
         let stream = AsyncStream.makeStream(of: AgentRuntimeEvent.self)
@@ -225,6 +265,10 @@ private actor ReconnectModelRuntime: AgentRuntime {
 
     func connect() async throws -> RuntimeSession {
         connectCount += 1
+        if let nextConnectFailureMessage {
+            self.nextConnectFailureMessage = nil
+            throw AgentRuntimeError.protocolFailure(nextConnectFailureMessage)
+        }
         if connectCount > 1, shouldPauseReconnect {
             await withCheckedContinuation { continuation in
                 pausedReconnectContinuation = continuation
@@ -294,6 +338,10 @@ private actor ReconnectModelRuntime: AgentRuntime {
 
     func failNextThreadList() {
         shouldFailThreadList = true
+    }
+
+    func failNextConnect(message: String) {
+        nextConnectFailureMessage = message
     }
 
     func makeStopWinNextReconnect() {

@@ -53,6 +53,72 @@ enum ThreadListScope: String, CaseIterable, Identifiable {
     }
 }
 
+/// One immutable publication consumed by the native transcript. Keeping the
+/// items, revision, and hint in the same value prevents SwiftUI from observing
+/// a new array with metadata from an older mutation.
+struct TranscriptPresentationSnapshot: Equatable {
+    var items: [TimelineItem]
+    var revision: UInt64
+    var changeHint: TranscriptCollectionUpdate.Hint?
+
+    init(
+        items: [TimelineItem],
+        revision: UInt64 = 0,
+        changeHint: TranscriptCollectionUpdate.Hint? = nil
+    ) {
+        self.items = items
+        self.revision = revision
+        self.changeHint = changeHint
+    }
+
+    mutating func replaceAll(with newItems: [TimelineItem]) {
+        revision &+= 1
+        items = newItems
+        changeHint = nil
+    }
+
+    mutating func append(_ item: TimelineItem) {
+        revision &+= 1
+        items.append(item)
+        // Structural mutations are cheap to recognise as tail appends and do
+        // not satisfy the row-hint contract.
+        changeHint = nil
+    }
+
+    mutating func replaceRow(at index: Int, with item: TimelineItem) {
+        guard items.indices.contains(index) else { return }
+        let previousRevision = revision
+        revision &+= 1
+        items[index] = item
+        changeHint = .rowsChanged(
+            indices: IndexSet(integer: index),
+            fromRevision: previousRevision,
+            toRevision: revision
+        )
+    }
+
+    mutating func mutateRows(
+        _ indices: IndexSet,
+        mutation: (inout [TimelineItem]) -> Void
+    ) {
+        guard !indices.isEmpty,
+              indices.allSatisfy({ items.indices.contains($0) }) else {
+            mutation(&items)
+            revision &+= 1
+            changeHint = nil
+            return
+        }
+        let previousRevision = revision
+        mutation(&items)
+        revision &+= 1
+        changeHint = .rowsChanged(
+            indices: indices,
+            fromRevision: previousRevision,
+            toRevision: revision
+        )
+    }
+}
+
 @MainActor
 final class OnyxAppModel: ObservableObject {
     @Published var connectionState: RuntimeConnectionState = .disconnected
@@ -63,7 +129,8 @@ final class OnyxAppModel: ObservableObject {
     @Published var isSigningOut = false
     @Published var threads: [RuntimeThread]
     @Published var selectedThreadID: String?
-    @Published var timeline: [TimelineItem]
+    @Published private(set) var transcriptSnapshot: TranscriptPresentationSnapshot
+    var timeline: [TimelineItem] { transcriptSnapshot.items }
     @Published var composerText: String {
         didSet { scheduleComposerDraftSave() }
     }
@@ -89,6 +156,20 @@ final class OnyxAppModel: ObservableObject {
     @Published private(set) var respondingInteractionIDs: Set<RuntimeRequestID> = []
     @Published private(set) var collaborationAgents: [RuntimeCollaborationAgent] = []
     @Published private(set) var plansByThreadID: [String: RuntimePlan] = [:]
+    /// Ephemeral side chat state is intentionally owned by the window model,
+    /// but kept completely separate from the durable task transcript/catalog.
+    /// The fork's remote thread ID is only retained while this panel is open.
+    @Published private(set) var isSideChatPresented = false
+    @Published private(set) var isSideChatLoading = false
+    @Published private(set) var sideChatParentThreadID: String?
+    @Published private(set) var sideChatThreadID: String?
+    @Published private(set) var sideChatTranscriptSnapshot = TranscriptPresentationSnapshot(items: [])
+    var sideChatTimeline: [TimelineItem] { sideChatTranscriptSnapshot.items }
+    @Published var sideChatComposerText = ""
+    @Published private(set) var isSideChatTurnRunning = false
+    @Published private(set) var sideChatInteraction: RuntimeUserInteraction?
+    @Published private(set) var isRespondingToSideChatInteraction = false
+    @Published private(set) var sideChatError: String?
     @Published var notice: (title: String, detail: String)?
     @Published var selectedModelID: String? {
         didSet {
@@ -119,11 +200,19 @@ final class OnyxAppModel: ObservableObject {
     @Published var isLoadingThreadList = false
 
     private let runtime: (any AgentRuntime)?
+    /// The runtime kind is available before a provider session has connected.
+    /// Use it only as a fallback; a connected session supplies the configured
+    /// provider name (for example, "vLLM").
+    private let runtimeKind: AgentRuntimeKind?
     private let startupError: (any Error)?
     private let preferences: UserDefaults
     private let preferenceNamespace: OnyxPreferenceNamespace
     private let pinnedThreadStore: OnyxPinnedThreadStore
     private let workspacePersistenceStore: OnyxWorkspacePersistenceStore?
+    /// The window composition root scopes this callback to the active
+    /// provider.  It is invoked only after the runtime has accepted a user
+    /// message, never when the user merely browses the model picker.
+    private let modelUsageRecorder: @MainActor (String) -> Void
     private var pinnedThreadCancellable: AnyCancellable?
     private var eventTask: Task<Void, Never>?
     private var connectionTask: Task<Void, Never>?
@@ -133,6 +222,8 @@ final class OnyxAppModel: ObservableObject {
     private var deltaFlushTask: Task<Void, Never>?
     private var draftSaveTask: Task<Void, Never>?
     private var accountRefreshTask: Task<Void, Never>?
+    private var sideChatForkTask: Task<Void, Never>?
+    private var sideChatTurnTask: Task<Void, Never>?
     private struct DeltaKey: Hashable {
         let threadID: String
         let itemID: String
@@ -164,6 +255,16 @@ final class OnyxAppModel: ObservableObject {
     /// Invalidates async work that began while a different provider account
     /// owned the visible task state.
     private var accountEpoch: UInt64 = 0
+    private var sideChatGeneration: UInt64 = 0
+    private var sideChatPendingDeltas: [String: String] = [:]
+    private var sideChatModelID: String?
+    private var sideChatReasoningEffort: String?
+    private var sideChatCWD: String?
+    /// Retain every side-chat ID for this window/runtime session. The runtime
+    /// also quarantines Codex ephemeral IDs, but keeping this UI-level set makes
+    /// the provider-neutral reducer safe against late events from any future
+    /// ephemeral-capable adapter without an arbitrary eviction boundary.
+    private var discardedSideChatThreadIDs: Set<String> = []
 
     private struct SendContext: Sendable {
         /// The exact composer contents before submission. The runtime receives
@@ -185,6 +286,18 @@ final class OnyxAppModel: ObservableObject {
         let approvalPolicy: RuntimeApprovalPolicy
         let navigationRevision: Int
         let accountEpoch: UInt64
+    }
+
+    /// The in-progress new-task state that should follow the user when they
+    /// switch providers before sending.  This is deliberately separate from
+    /// durable task state: an existing task keeps the model it was created
+    /// with, while a welcome-task draft can move to another provider.
+    struct NewTaskContext: Equatable, Sendable {
+        let composerText: String
+        let composerImages: [ComposerImageDraft]
+        let workspacePath: String?
+        let reasoningEffort: String?
+        let permissionLabel: String
     }
 
     private enum PreferenceKey {
@@ -219,16 +332,20 @@ final class OnyxAppModel: ObservableObject {
         defaults: UserDefaults = .standard,
         preferenceKeyPrefix: String? = nil,
         pinnedThreadStore: OnyxPinnedThreadStore? = nil,
-        workspacePersistenceStore: OnyxWorkspacePersistenceStore? = nil
+        workspacePersistenceStore: OnyxWorkspacePersistenceStore? = nil,
+        startsWithNewTask: Bool = false,
+        modelUsageRecorder: @escaping @MainActor (String) -> Void = { _ in }
     ) {
         let preferenceNamespace = OnyxPreferenceNamespace(prefix: preferenceKeyPrefix)
         let pinnedThreadStore = pinnedThreadStore ?? OnyxPinnedThreadStore(defaults: defaults)
         self.runtime = runtime
+        runtimeKind = runtime?.kind
         self.startupError = startupError
         preferences = defaults
         self.preferenceNamespace = preferenceNamespace
         self.pinnedThreadStore = pinnedThreadStore
         self.workspacePersistenceStore = workspacePersistenceStore
+        self.modelUsageRecorder = modelUsageRecorder
         let restoredScope = defaults.string(forKey: preferenceNamespace.key(PreferenceKey.threadListScope))
             .flatMap(ThreadListScope.init(rawValue:)) ?? .active
         let restoredDrafts = defaults.dictionary(
@@ -261,10 +378,14 @@ final class OnyxAppModel: ObservableObject {
         selectedReasoningEffort = defaults.string(forKey: preferenceNamespace.key(PreferenceKey.reasoningEffort))
         permissionLabel = defaults.string(forKey: preferenceNamespace.key(PreferenceKey.permissionLabel)) ?? "Workspace"
         threadListScope = restoredScope
-        pendingRestoredSelectionID = defaults.string(forKey: preferenceNamespace.key(PreferenceKey.selectedThread))
+        pendingRestoredSelectionID = startsWithNewTask
+            ? Self.welcomeThread.id
+            : defaults.string(forKey: preferenceNamespace.key(PreferenceKey.selectedThread))
         threads = restoredScope == .active ? [Self.welcomeThread] : []
         selectedThreadID = restoredScope == .active ? Self.welcomeThread.id : nil
-        timeline = restoredScope == .active ? [.welcome()] : []
+        transcriptSnapshot = TranscriptPresentationSnapshot(
+            items: restoredScope == .active ? [.welcome()] : []
+        )
 
         pinnedThreadCancellable = pinnedThreadStore.$ids
             .dropFirst()
@@ -282,10 +403,23 @@ final class OnyxAppModel: ObservableObject {
         deltaFlushTask?.cancel()
         draftSaveTask?.cancel()
         accountRefreshTask?.cancel()
+        sideChatForkTask?.cancel()
+        sideChatTurnTask?.cancel()
     }
 
     var selectedThread: RuntimeThread? {
         threads.first { $0.id == selectedThreadID }
+    }
+
+    /// A durable task's model is pinned on its thread.  The window-level
+    /// `selectedModelID` is only the picker state for a new task and must not
+    /// leak into an existing task's label or request.
+    var selectedTaskModelID: String? {
+        guard let selectedThread,
+              selectedThread.id != Self.welcomeThread.id,
+              let model = selectedThread.model?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !model.isEmpty else { return nil }
+        return model
     }
 
     var selectedPlan: RuntimePlan? {
@@ -361,6 +495,44 @@ final class OnyxAppModel: ObservableObject {
         isReviewRunning || isSelectedReviewStarting
     }
 
+    /// Side chat is available only for runtimes that can make a real
+    /// non-durable fork. OpenAI-compatible chat runtimes deliberately do not
+    /// claim this capability, so their workspace never offers a misleading
+    /// fallback that would create a durable conversation.
+    var canOpenSideChat: Bool {
+        guard canRunAgent,
+              supports(.ephemeralThreadForking),
+              !isShowingArchivedThreads,
+              let thread = selectedThread,
+              thread.id != Self.welcomeThread.id else { return false }
+        return true
+    }
+
+    var canSendSideChat: Bool {
+        guard isSideChatPresented,
+              !isSideChatLoading,
+              sideChatThreadID != nil,
+              canRunAgent,
+              sideChatInteraction?.isBlocking != true else { return false }
+        return !sideChatComposerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var sideChatModelName: String {
+        guard let sideChatModelID else { return selectedModelName }
+        return session?.availableModels.first(where: { $0.id == sideChatModelID })?.displayName
+            ?? sideChatModelID
+    }
+
+    var sideChatReasoningEffortName: String {
+        guard let sideChatReasoningEffort else { return "Default reasoning" }
+        switch sideChatReasoningEffort.lowercased() {
+        case "xhigh": return "X-High reasoning"
+        case "max": return "Max reasoning"
+        case "ultra": return "Ultra reasoning"
+        default: return "\(sideChatReasoningEffort.capitalized) reasoning"
+        }
+    }
+
     var canStartReview: Bool {
         guard canRunAgent,
               supports(.codeReview),
@@ -399,6 +571,7 @@ final class OnyxAppModel: ObservableObject {
 
     func isResponding(to interaction: RuntimeUserInteraction) -> Bool {
         respondingInteractionIDs.contains(interaction.id)
+            || (sideChatInteraction?.id == interaction.id && isRespondingToSideChatInteraction)
     }
 
     func questionDraft(for interaction: RuntimeUserInteraction) -> RuntimeQuestionDraft {
@@ -412,7 +585,8 @@ final class OnyxAppModel: ObservableObject {
         _ draft: RuntimeQuestionDraft,
         for interaction: RuntimeUserInteraction
     ) {
-        guard pendingUserInteractions.contains(interaction) else { return }
+        guard pendingUserInteractions.contains(interaction)
+                || sideChatInteraction == interaction else { return }
         questionDrafts[interaction.id] = InteractionDraftEntry(interaction: interaction, value: draft)
     }
 
@@ -424,7 +598,8 @@ final class OnyxAppModel: ObservableObject {
     }
 
     func updateFormDraft(_ draft: RuntimeFormDraft, for interaction: RuntimeUserInteraction) {
-        guard pendingUserInteractions.contains(interaction) else { return }
+        guard pendingUserInteractions.contains(interaction)
+                || sideChatInteraction == interaction else { return }
         formDrafts[interaction.id] = InteractionDraftEntry(interaction: interaction, value: draft)
     }
 
@@ -455,16 +630,43 @@ final class OnyxAppModel: ObservableObject {
     }
 
     var selectedModelName: String {
+        if let selectedTaskModelID {
+            return session?.availableModels.first(where: { $0.id == selectedTaskModelID })?.displayName
+                ?? selectedTaskModelID
+        }
         guard let selectedModelID else {
             return session?.availableModels.first(where: \.isDefault)?.displayName
                 ?? session?.availableModels.first?.displayName
-                ?? "Codex"
+                ?? (runtimeKind == .codex ? "Codex" : "Choose model")
         }
         return session?.availableModels.first(where: { $0.id == selectedModelID })?.displayName ?? selectedModelID
     }
 
+    /// A user-facing runtime label. Remote providers should be identified by
+    /// their configured connection name, never by the Codex implementation
+    /// they do not use.
+    var runtimeDisplayName: String {
+        if let displayName = session?.displayName.nilIfEmpty { return displayName }
+        if runtimeKind == .codex { return "Codex" }
+        return "Agent runtime"
+    }
+
+    private var connectionFailureNoticeTitle: String {
+        "\(runtimeDisplayName) did not connect"
+    }
+
+    private var signInRequiredDetail: String {
+        if runtimeKind == .codex {
+            return "Connect your ChatGPT account before starting or continuing a Codex task."
+        }
+        return "Add valid credentials for \(runtimeDisplayName) before starting or continuing a task."
+    }
+
     var availableReasoningEfforts: [String] {
-        guard let model = session?.availableModels.first(where: { $0.id == selectedModelID }) else { return [] }
+        guard let model = selectedRuntimeModel else { return [] }
+        guard model.supportedRequestParameters.isEmpty
+                || model.supportedRequestParameters.contains(.reasoningEffort)
+        else { return [] }
         return model.reasoningEfforts
     }
 
@@ -483,7 +685,21 @@ final class OnyxAppModel: ObservableObject {
     }
 
     var canAttachImages: Bool {
-        supports(.images) && canRunAgent && !isSelectedThreadArchived
+        guard supports(.images), canRunAgent, !isSelectedThreadArchived else { return false }
+        guard let selectedRuntimeModel else { return true }
+        return selectedRuntimeModel.inputModalities.contains(.image)
+    }
+
+    var selectedRuntimeModel: RuntimeModel? {
+        let models = session?.availableModels ?? []
+        if let selectedTaskModelID {
+            return models.first(where: { $0.id == selectedTaskModelID })
+        }
+        if let selectedModelID,
+           let selected = models.first(where: { $0.id == selectedModelID }) {
+            return selected
+        }
+        return models.first(where: \.isDefault) ?? models.first
     }
 
     func chooseComposerImages(window: NSWindow?) {
@@ -561,6 +777,46 @@ final class OnyxAppModel: ObservableObject {
 
     func selectModel(_ id: String) {
         selectedModelID = id
+    }
+
+    /// Captures only the welcome-task state that is safe to carry between
+    /// provider windows. Existing tasks return nil because their transcript,
+    /// cwd, and model belong to their original provider.
+    func captureNewTaskContext() -> NewTaskContext? {
+        guard threadListScope == .active,
+              selectedThreadID == nil || selectedThreadID == Self.welcomeThread.id else {
+            return nil
+        }
+        return NewTaskContext(
+            composerText: composerText,
+            composerImages: composerImages,
+            workspacePath: draftWorkspacePath,
+            reasoningEffort: selectedReasoningEffort,
+            permissionLabel: permissionLabel
+        )
+    }
+
+    /// Restores a welcome-task draft after a provider/model switch. The target
+    /// model itself is selected by the caller; reasoning is validated again
+    /// when that provider's model catalog arrives.
+    func restoreNewTaskContext(_ context: NewTaskContext) {
+        guard threadListScope == .active,
+              selectedThreadID == nil || selectedThreadID == Self.welcomeThread.id else {
+            return
+        }
+        composerDraftKey = Self.welcomeThread.id
+        draftWorkspacePath = context.workspacePath
+        if let workspacePath = context.workspacePath, !workspacePath.isEmpty {
+            preferences.set(workspacePath, forKey: preferenceKey("Onyx.lastWorkspacePath"))
+        } else {
+            preferences.removeObject(forKey: preferenceKey("Onyx.lastWorkspacePath"))
+        }
+        permissionLabel = context.permissionLabel
+        selectedReasoningEffort = context.reasoningEffort
+        composerImages = context.composerImages
+        composerText = context.composerText
+        saveCurrentDraftNow()
+        saveCurrentImageDraftNow()
     }
 
     func selectReasoningEffort(_ effort: String) {
@@ -658,7 +914,7 @@ final class OnyxAppModel: ObservableObject {
         didStart = true
 
         guard let runtime else {
-            connectionState = .failed(startupError?.localizedDescription ?? "Codex is unavailable")
+            connectionState = .failed(startupError?.localizedDescription ?? "\(runtimeDisplayName) is unavailable")
             return
         }
 
@@ -693,7 +949,7 @@ final class OnyxAppModel: ObservableObject {
         let epoch = accountEpoch
         connectionTask?.cancel()
         connectionState = .connecting
-        if notice?.title == "Codex did not connect" {
+        if notice?.title == connectionFailureNoticeTitle {
             notice = nil
         }
 
@@ -727,7 +983,7 @@ final class OnyxAppModel: ObservableObject {
                       !Task.isCancelled else { return }
                 isLoadingThreadList = false
                 connectionState = .failed(error.localizedDescription)
-                notice = ("Codex did not connect", error.localizedDescription)
+                notice = (connectionFailureNoticeTitle, error.localizedDescription)
                 return
             }
 
@@ -772,11 +1028,13 @@ final class OnyxAppModel: ObservableObject {
 
     func selectThread(_ id: String) {
         guard selectedThreadID != id else { return }
+        closeSideChat()
         saveCurrentDraftNow()
         saveCurrentImageDraftNow()
 
         navigationRevision += 1
         selectedThreadID = id
+        validateSelectedReasoningEffort()
         preferences.set(id, forKey: preferenceKey(PreferenceKey.selectedThread))
         loadComposerDraft(for: id)
         loadTask?.cancel()
@@ -828,7 +1086,277 @@ final class OnyxAppModel: ObservableObject {
         }
     }
 
+    /// Opens a provider-native, non-durable branch of the selected task. The
+    /// fork is kept entirely in this window model: it is never inserted into
+    /// `threads`, written to the conversation catalog, or used as the current
+    /// durable task. A generation token makes a late fork response harmless
+    /// if the user navigates away while app-server is preparing it.
+    func openSideChat() {
+        guard canOpenSideChat,
+              let runtime,
+              let parentThread = selectedThread else { return }
+
+        if isSideChatPresented, sideChatParentThreadID == parentThread.id {
+            return
+        }
+
+        closeSideChat()
+        sideChatGeneration &+= 1
+        let generation = sideChatGeneration
+        let epoch = accountEpoch
+        let parentID = parentThread.id
+
+        sideChatParentThreadID = parentID
+        sideChatThreadID = nil
+        replaceSideChatTimeline([])
+        sideChatComposerText = ""
+        sideChatError = nil
+        isSideChatPresented = true
+        isSideChatLoading = true
+        isSideChatTurnRunning = false
+        sideChatPendingDeltas.removeAll()
+        sideChatModelID = parentThread.model ?? selectedRuntimeModel?.id ?? selectedModelID
+        sideChatReasoningEffort = selectedReasoningEffort
+        sideChatCWD = parentThread.cwd
+
+        sideChatForkTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let conversation = try await runtime.forkEphemeralThread(id: parentID)
+                guard accountEpoch == epoch,
+                      sideChatGeneration == generation,
+                      isSideChatPresented,
+                      sideChatParentThreadID == parentID,
+                      selectedThreadID == parentID,
+                      !Task.isCancelled else {
+                    // The fork may have crossed the provider boundary just as
+                    // the panel closed or navigation changed. Remember its ID
+                    // before dropping the late response so no subsequent event
+                    // can fall through to the durable task reducer.
+                    rememberDiscardedSideChatThread(conversation.thread.id)
+                    return
+                }
+
+                sideChatThreadID = conversation.thread.id
+                replaceSideChatTimeline(conversation.items)
+                sideChatModelID = conversation.thread.model ?? sideChatModelID
+                sideChatCWD = conversation.thread.cwd ?? sideChatCWD
+                isSideChatLoading = false
+                sideChatError = nil
+            } catch {
+                guard accountEpoch == epoch,
+                      sideChatGeneration == generation,
+                      isSideChatPresented,
+                      sideChatParentThreadID == parentID,
+                      !Task.isCancelled else { return }
+                isSideChatLoading = false
+                sideChatError = error.localizedDescription
+            }
+        }
+    }
+
+    /// Closes the ephemeral panel and drops every local fork reference. If a
+    /// turn is live, interrupt it best-effort so closing the panel does not
+    /// leave an invisible provider turn consuming resources.
+    func closeSideChat() {
+        let threadID = sideChatThreadID
+        let shouldInterrupt = isSideChatTurnRunning
+        if let interactionID = sideChatInteraction?.id {
+            removeInteractionDraft(for: interactionID)
+        }
+        if let threadID {
+            rememberDiscardedSideChatThread(threadID)
+        }
+        sideChatGeneration &+= 1
+        sideChatForkTask?.cancel()
+        sideChatForkTask = nil
+        sideChatTurnTask?.cancel()
+        sideChatTurnTask = nil
+        sideChatPendingDeltas.removeAll()
+
+        isSideChatPresented = false
+        isSideChatLoading = false
+        sideChatParentThreadID = nil
+        sideChatThreadID = nil
+        replaceSideChatTimeline([])
+        sideChatComposerText = ""
+        isSideChatTurnRunning = false
+        sideChatInteraction = nil
+        isRespondingToSideChatInteraction = false
+        sideChatError = nil
+        sideChatModelID = nil
+        sideChatReasoningEffort = nil
+        sideChatCWD = nil
+
+        guard shouldInterrupt, let runtime, let threadID else { return }
+        Task { try? await runtime.interrupt(threadID: threadID) }
+    }
+
+    func sendSideChat() {
+        let draft = sideChatComposerText
+        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty,
+              isSideChatPresented,
+              !isSideChatLoading,
+              let threadID = sideChatThreadID,
+              let runtime,
+              canRunAgent,
+              sideChatInteraction?.isBlocking != true else { return }
+
+        let generation = sideChatGeneration
+        let epoch = accountEpoch
+        let modelID = sideChatModelID
+        let reasoningEffort = sideChatReasoningEffort
+        let cwd = sideChatCWD
+        let parentID = sideChatParentThreadID
+        let wasRunning = isSideChatTurnRunning
+        let steeringModelID = parentID.flatMap { parentID in
+            threads.first(where: { $0.id == parentID })?.model
+        } ?? modelID
+
+        sideChatComposerText = ""
+        sideChatError = nil
+        appendSideChatTimeline(
+            TimelineItem(
+                id: "side-optimistic:\(UUID().uuidString)",
+                kind: .userMessage,
+                title: nil,
+                body: text,
+                status: .completed,
+                timestamp: .now,
+                detail: nil
+            )
+        )
+        isSideChatTurnRunning = true
+
+        sideChatTurnTask?.cancel()
+        sideChatTurnTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                if wasRunning {
+                    try await runtime.steer(threadID: threadID, inputs: [.text(text)])
+                    recordModelUsageIfAvailable(steeringModelID)
+                } else {
+                    try await runtime.startTurn(
+                        StartTurnRequest(
+                            threadID: threadID,
+                            inputs: [.text(text)],
+                            model: modelID,
+                            cwd: cwd,
+                            reasoningEffort: reasoningEffort,
+                            sandboxMode: selectedSandboxMode,
+                            approvalPolicy: selectedApprovalPolicy
+                        )
+                    )
+                    recordModelUsageIfAvailable(modelID)
+                }
+                guard accountEpoch == epoch,
+                      sideChatGeneration == generation,
+                      isSideChatPresented,
+                      sideChatThreadID == threadID,
+                      sideChatParentThreadID == parentID,
+                      !Task.isCancelled else { return }
+            } catch {
+                guard accountEpoch == epoch,
+                      sideChatGeneration == generation,
+                      isSideChatPresented,
+                      sideChatThreadID == threadID,
+                      !Task.isCancelled else { return }
+                isSideChatTurnRunning = false
+                sideChatComposerText = draft
+                sideChatError = error.localizedDescription
+                appendSideChatTimeline(
+                    TimelineItem(
+                        id: "side-error:\(UUID().uuidString)",
+                        kind: .error,
+                        title: "Side chat failed",
+                        body: error.localizedDescription,
+                        status: .failed,
+                        timestamp: .now,
+                        detail: nil
+                    )
+                )
+            }
+        }
+    }
+
+    func interruptSideChat() {
+        guard let runtime, let threadID = sideChatThreadID else { return }
+        let generation = sideChatGeneration
+        let epoch = accountEpoch
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await runtime.interrupt(threadID: threadID)
+            } catch {
+                guard accountEpoch == epoch,
+                      sideChatGeneration == generation,
+                      isSideChatPresented else { return }
+                sideChatError = error.localizedDescription
+            }
+        }
+    }
+
+    func respondToSideChatInteraction(
+        _ response: RuntimeUserInteractionResponse
+    ) {
+        guard canRunAgent,
+              let interaction = sideChatInteraction,
+              interaction.threadID == sideChatThreadID,
+              let runtime,
+              !isRespondingToSideChatInteraction else { return }
+
+        let epoch = accountEpoch
+        let generation = sideChatGeneration
+        isRespondingToSideChatInteraction = true
+        sideChatError = nil
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await runtime.respond(to: interaction.id, with: response)
+                guard accountEpoch == epoch,
+                      sideChatGeneration == generation,
+                      isSideChatPresented,
+                      sideChatThreadID == interaction.threadID else { return }
+                if sideChatInteraction?.id == interaction.id {
+                    sideChatInteraction = nil
+                    removeInteractionDraft(for: interaction.id)
+                }
+            } catch {
+                guard accountEpoch == epoch,
+                      sideChatGeneration == generation,
+                      isSideChatPresented else { return }
+                sideChatError = error.localizedDescription
+            }
+            guard sideChatGeneration == generation else { return }
+            isRespondingToSideChatInteraction = false
+        }
+    }
+
+    /// Opens a child conversation reported by a collaboration-capable runtime.
+    ///
+    /// Child threads are not guaranteed to be present in the current task list
+    /// (for example, the provider may omit them from its normal listing). The
+    /// normal selection path intentionally accepts an unknown id and reads it
+    /// directly, after which the returned thread is inserted into the list.
+    /// This keeps the parent task in the list and makes the action provider
+    /// neutral; runtimes that do not support child conversations can surface
+    /// their normal read error through the existing task-load UI.
+    func openCollaborationAgent(_ agent: RuntimeCollaborationAgent) {
+        let childThreadID = agent.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !childThreadID.isEmpty else {
+            notice = ("Agent conversation unavailable", "This agent did not provide a conversation id.")
+            return
+        }
+        guard runtime != nil else {
+            notice = ("Agent conversation unavailable", "No agent runtime is configured for this workspace.")
+            return
+        }
+        selectThread(childThreadID)
+    }
+
     func newTask() {
+        closeSideChat()
         saveCurrentDraftNow()
         saveCurrentImageDraftNow()
         navigationRevision += 1
@@ -853,12 +1381,14 @@ final class OnyxAppModel: ObservableObject {
     /// Without this hook, pressing Command-W immediately after typing can
     /// cancel the pending draft write in deinit.
     func flushWindowState() {
+        closeSideChat()
         saveCurrentDraftNow()
         saveCurrentImageDraftNow()
     }
 
     func setThreadListScope(_ scope: ThreadListScope) {
         guard scope != threadListScope, runtime != nil else { return }
+        closeSideChat()
         saveCurrentDraftNow()
         saveCurrentImageDraftNow()
         navigationRevision += 1
@@ -958,26 +1488,26 @@ final class OnyxAppModel: ObservableObject {
         }
         guard let runtime else {
             notice = (
-                "Codex is unavailable",
-                startupError?.localizedDescription ?? "Onyx could not start its Codex runtime. Your draft is still here."
+                "\(runtimeDisplayName) is unavailable",
+                startupError?.localizedDescription ?? "Onyx could not start the configured runtime. Your draft is still here."
             )
             return
         }
         guard activeUserInteraction?.isBlocking != true else {
             notice = (
                 "Answer the pending request first",
-                "Codex is waiting for your response before this task can continue."
+                "\(runtimeDisplayName) is waiting for your response before this task can continue."
             )
             return
         }
         guard canRunAgent else {
             notice = (
                 "Sign in to continue",
-                "Connect your ChatGPT account before starting or continuing a Codex task."
+                signInRequiredDetail
             )
             return
         }
-        guard images.isEmpty || supports(.images) else {
+        guard images.isEmpty || canAttachImages else {
             notice = (
                 "Images are not available",
                 "The selected runtime cannot receive these attachments. Remove them or switch runtimes; your draft is still here."
@@ -990,6 +1520,11 @@ final class OnyxAppModel: ObservableObject {
                 return
             }
         }
+
+        // Existing tasks can each be pinned to a different model. Revalidate
+        // at dispatch as a final guard against carrying an effort from the
+        // previously selected task into this task's request.
+        validateSelectedReasoningEffort()
 
         let originThread = selectedThread
         let originThreadID = selectedThreadID
@@ -1008,7 +1543,12 @@ final class OnyxAppModel: ObservableObject {
             isNewThread: isNewThread,
             cwd: isNewThread ? draftWorkspacePath : originThread?.cwd,
             wasTurnRunning: originThread.map(\.status.isBusy) ?? isTurnRunning,
-            modelID: selectedModelID,
+            // Capture the resolved default as well as an explicit picker
+            // choice. This keeps the request and its usage attribution
+            // aligned even when the user never opens the picker.
+            // Existing tasks are pinned to the model recorded on their
+            // thread. The window picker only chooses a model for a new task.
+            modelID: selectedTaskModelID ?? selectedRuntimeModel?.id ?? selectedModelID,
             reasoningEffort: selectedReasoningEffort,
             sandboxMode: selectedSandboxMode,
             approvalPolicy: selectedApprovalPolicy,
@@ -1026,11 +1566,22 @@ final class OnyxAppModel: ObservableObject {
             composerImages = composerImageDrafts[provisionalDraftKey] ?? []
         }
 
+        // Submission itself is visible work. Set this synchronously so the
+        // transcript's inline waiting row appears in the same UI update that
+        // clears the composer, including while a new thread or an existing
+        // conversation is still being resumed by the provider.
+        isTurnRunning = true
+
         Task { [weak self] in
             guard let self else { return }
             var failureDraftKey = context.sourceDraftKey
             var targetThreadID = context.originThreadID
             var createdThread = false
+            // A steering request has no model field: it continues the task's
+            // established model. A fresh turn uses the model captured at send
+            // time, so changing the picker while the request is in flight
+            // cannot misattribute the usage.
+            var modelUsed = originThread?.model ?? context.modelID
             do {
                 if context.isNewThread {
                     guard let cwd = context.cwd else { return }
@@ -1046,6 +1597,7 @@ final class OnyxAppModel: ObservableObject {
                     targetThreadID = thread.id
                     failureDraftKey = thread.id
                     createdThread = true
+                    modelUsed = context.modelID ?? thread.model
                     if threadListScope == .active {
                         threads.removeAll { $0.id == Self.welcomeThread.id }
                         updateThread(thread)
@@ -1063,7 +1615,7 @@ final class OnyxAppModel: ObservableObject {
                     if !context.images.isEmpty,
                        selectedThreadID == threadID,
                        navigationRevision == context.navigationRevision {
-                        timeline.append(
+                        appendTimeline(
                             TimelineItem(
                                 id: "optimistic:\(UUID().uuidString)",
                                 kind: .userMessage,
@@ -1077,11 +1629,13 @@ final class OnyxAppModel: ObservableObject {
                         )
                     }
                     try await runtime.steer(threadID: threadID, inputs: context.inputs)
+                    recordModelUsageIfAvailable(modelUsed)
                     guard accountEpoch == context.accountEpoch, !Task.isCancelled else { return }
                 } else {
                     if !createdThread {
                         let conversation = try await runtime.resumeThread(id: threadID)
                         guard accountEpoch == context.accountEpoch, !Task.isCancelled else { return }
+                        modelUsed = conversation.thread.model ?? modelUsed
                         if selectedThreadID == threadID,
                            navigationRevision == context.navigationRevision {
                             replaceTimeline(conversation.items, authoritativeFor: conversation.thread.id)
@@ -1091,7 +1645,7 @@ final class OnyxAppModel: ObservableObject {
 
                     if selectedThreadID == threadID,
                        (createdThread || navigationRevision == context.navigationRevision) {
-                        timeline.append(
+                        appendTimeline(
                             TimelineItem(
                                 id: "optimistic:\(UUID().uuidString)",
                                 kind: .userMessage,
@@ -1113,13 +1667,14 @@ final class OnyxAppModel: ObservableObject {
                         StartTurnRequest(
                             threadID: threadID,
                             inputs: context.inputs,
-                            model: context.modelID,
+                            model: modelUsed,
                             cwd: context.cwd,
                             reasoningEffort: context.reasoningEffort,
                             sandboxMode: context.sandboxMode,
                             approvalPolicy: context.approvalPolicy
                         )
                     )
+                    recordModelUsageIfAvailable(modelUsed)
                     guard accountEpoch == context.accountEpoch, !Task.isCancelled else { return }
                 }
             } catch {
@@ -1139,7 +1694,7 @@ final class OnyxAppModel: ObservableObject {
                 if selectedThreadID == targetThreadID
                     || (targetThreadID == nil && navigationRevision == context.navigationRevision) {
                     isTurnRunning = false
-                    timeline.append(
+                    appendTimeline(
                         TimelineItem(
                             id: UUID().uuidString,
                             kind: .error,
@@ -1230,7 +1785,7 @@ final class OnyxAppModel: ObservableObject {
                 let detail: String
                 if case let AgentRuntimeError.requestFailed(_, message) = error,
                    message.localizedCaseInsensitiveContains("active writer") {
-                    detail = "This task is actively open in another Codex window. Let that work finish, then try the review again."
+                    detail = "This task is actively open in another \(runtimeDisplayName) window. Let that work finish, then try the review again."
                 } else {
                     detail = error.localizedDescription
                 }
@@ -1245,6 +1800,10 @@ final class OnyxAppModel: ObservableObject {
         to interaction: RuntimeUserInteraction,
         with response: RuntimeUserInteractionResponse
     ) {
+        if sideChatInteraction == interaction {
+            respondToSideChatInteraction(response)
+            return
+        }
         guard canRunAgent,
               pendingUserInteractions.contains(interaction),
               interaction.threadID == nil || interaction.threadID == selectedThreadID,
@@ -1283,6 +1842,10 @@ final class OnyxAppModel: ObservableObject {
     }
 
     func interruptInteraction(_ interaction: RuntimeUserInteraction) {
+        if sideChatInteraction == interaction {
+            interruptSideChat()
+            return
+        }
         guard let threadID = interaction.threadID,
               interaction.threadID == selectedThreadID,
               let runtime else { return }
@@ -1454,7 +2017,7 @@ final class OnyxAppModel: ObservableObject {
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Delete this task permanently?"
-        alert.informativeText = "This removes the task history and any descendant tasks from Codex. It cannot be undone. Project files are not deleted."
+        alert.informativeText = "This removes the task history and any descendant tasks. It cannot be undone. Project files are not deleted."
         alert.addButton(withTitle: "Delete")
         alert.addButton(withTitle: "Cancel")
         alert.buttons.first?.hasDestructiveAction = true
@@ -1474,8 +2037,18 @@ final class OnyxAppModel: ObservableObject {
     }
 
     private func handle(_ event: AgentRuntimeEvent) {
+        if shouldDiscardClosedSideChatEvent(event) {
+            return
+        }
+        if handleSideChatEvent(event) {
+            return
+        }
+
         switch event {
         case let .connectionChanged(state):
+            if isSideChatPresented {
+                closeSideChat()
+            }
             connectionState = state
             if case .failed = state {
                 pendingUserInteractions.removeAll()
@@ -1497,6 +2070,9 @@ final class OnyxAppModel: ObservableObject {
                 downgradeLiveCollaborationAgents()
             }
         case let .accountUpdated(updatedAuth):
+            if isSideChatPresented, updatedAuth != authState {
+                closeSideChat()
+            }
             applyAuthProjection(updatedAuth)
             if !updatedAuth.canRun {
                 closeAccountBoundary()
@@ -1555,6 +2131,9 @@ final class OnyxAppModel: ObservableObject {
             }
         case let .threadArchived(threadID):
             guard authState.canRun, !isSigningOut else { return }
+            if sideChatParentThreadID == threadID {
+                closeSideChat()
+            }
             clearReviewState(for: threadID)
             activeTurnIDsByThreadID.removeValue(forKey: threadID)
             removeUserInteractions(for: threadID)
@@ -1572,6 +2151,9 @@ final class OnyxAppModel: ObservableObject {
             }
         case let .threadDeleted(threadID):
             guard authState.canRun, !isSigningOut else { return }
+            if sideChatParentThreadID == threadID {
+                closeSideChat()
+            }
             clearReviewState(for: threadID)
             activeTurnIDsByThreadID.removeValue(forKey: threadID)
             removeUserInteractions(for: threadID)
@@ -1589,9 +2171,9 @@ final class OnyxAppModel: ObservableObject {
             recordLiveItem(item.id, for: threadID)
             if item.kind == .userMessage,
                let optimisticIndex = timeline.lastIndex(where: { $0.id.hasPrefix("optimistic:") && $0.body == item.body }) {
-                timeline[optimisticIndex] = item
+                replaceTimelineRow(at: optimisticIndex, with: item)
             } else if !timeline.contains(where: { $0.id == item.id }) {
-                timeline.append(item)
+                appendTimeline(item)
             }
             mergeCollaborationActivity(from: item)
         case let .itemDelta(threadID, itemID, delta):
@@ -1604,9 +2186,9 @@ final class OnyxAppModel: ObservableObject {
             recordLiveItem(item.id, for: threadID)
             flushDeltas()
             if let index = timeline.firstIndex(where: { $0.id == item.id }) {
-                timeline[index] = item
+                replaceTimelineRow(at: index, with: item)
             } else {
-                timeline.append(item)
+                appendTimeline(item)
             }
             mergeCollaborationActivity(from: item)
         case let .turnStarted(threadID, turnID):
@@ -1628,9 +2210,9 @@ final class OnyxAppModel: ObservableObject {
             let item = TimelineItem.planUpdate(plan)
             liveItemRevisionByThreadID[threadID, default: [:]][item.id] = revision
             if let index = timeline.firstIndex(where: { $0.id == item.id }) {
-                timeline[index] = item
+                replaceTimelineRow(at: index, with: item)
             } else {
-                timeline.append(item)
+                appendTimeline(item)
             }
         case let .turnCompleted(threadID, status):
             guard authState.canRun, !isSigningOut else { return }
@@ -1685,6 +2267,149 @@ final class OnyxAppModel: ObservableObject {
         }
     }
 
+    /// Consumes events for the in-memory side-chat fork before the ordinary
+    /// task event reducer sees them. This is the key isolation boundary: side
+    /// items, plans, turns, and interactions never enter the durable task
+    /// timeline or change a task's catalog status.
+    @discardableResult
+    private func handleSideChatEvent(_ event: AgentRuntimeEvent) -> Bool {
+        guard isSideChatPresented,
+              let sideThreadID = sideChatThreadID else { return false }
+
+        switch event {
+        case let .itemStarted(threadID, item) where threadID == sideThreadID:
+            if item.kind == .userMessage,
+               let optimisticIndex = sideChatTimeline.lastIndex(where: {
+                   $0.id.hasPrefix("side-optimistic:") && $0.body == item.body
+               }) {
+                replaceSideChatTimelineRow(at: optimisticIndex, with: item)
+            } else if let index = sideChatTimeline.firstIndex(where: { $0.id == item.id }) {
+                replaceSideChatTimelineRow(at: index, with: item)
+            } else {
+                appendSideChatTimeline(item)
+            }
+            return true
+
+        case let .itemDelta(threadID, itemID, delta) where threadID == sideThreadID:
+            guard !delta.isEmpty else { return true }
+            sideChatPendingDeltas[itemID, default: ""] += delta
+            if let index = sideChatTimeline.firstIndex(where: { $0.id == itemID }) {
+                mutateSideChatTimelineRows(IndexSet(integer: index)) { items in
+                    items[index].body += delta
+                    items[index].status = .running
+                }
+            } else {
+                appendSideChatTimeline(
+                    TimelineItem(
+                        id: itemID,
+                        kind: .assistantMessage,
+                        title: nil,
+                        body: delta,
+                        status: .running,
+                        timestamp: .now,
+                        detail: nil
+                    )
+                )
+            }
+            return true
+
+        case let .itemCompleted(threadID, item) where threadID == sideThreadID:
+            sideChatPendingDeltas.removeValue(forKey: item.id)
+            if item.kind == .userMessage,
+               let optimisticIndex = sideChatTimeline.lastIndex(where: {
+                   $0.id.hasPrefix("side-optimistic:") && $0.body == item.body
+               }) {
+                replaceSideChatTimelineRow(at: optimisticIndex, with: item)
+            } else if let index = sideChatTimeline.firstIndex(where: { $0.id == item.id }) {
+                replaceSideChatTimelineRow(at: index, with: item)
+            } else {
+                appendSideChatTimeline(item)
+            }
+            return true
+
+        case let .turnStarted(threadID, _) where threadID == sideThreadID:
+            isSideChatTurnRunning = true
+            sideChatInteraction = nil
+            isRespondingToSideChatInteraction = false
+            return true
+
+        case let .planUpdated(threadID, plan) where threadID == sideThreadID:
+            let item = TimelineItem.planUpdate(plan)
+            if let index = sideChatTimeline.firstIndex(where: { $0.id == item.id }) {
+                replaceSideChatTimelineRow(at: index, with: item)
+            } else {
+                appendSideChatTimeline(item)
+            }
+            return true
+
+        case let .turnCompleted(threadID, _) where threadID == sideThreadID:
+            flushSideChatDeltas()
+            isSideChatTurnRunning = false
+            return true
+
+        case let .userInteractionRequested(interaction)
+            where interaction.threadID == sideThreadID:
+            if let existing = sideChatInteraction, existing != interaction {
+                removeInteractionDraft(for: existing.id)
+            }
+            sideChatInteraction = interaction
+            isSideChatTurnRunning = true
+            return true
+
+        case let .userInteractionResolved(requestID)
+            where sideChatInteraction?.id == requestID:
+            sideChatInteraction = nil
+            isRespondingToSideChatInteraction = false
+            removeInteractionDraft(for: requestID)
+            return true
+
+        case let .threadDeleted(threadID) where threadID == sideThreadID:
+            // Ephemeral threads should not normally emit a delete event, but
+            // if a provider does, close only the local panel and leave the
+            // parent task untouched.
+            closeSideChat()
+            return true
+
+        default:
+            return false
+        }
+    }
+
+    private func flushSideChatDeltas() {
+        sideChatPendingDeltas.removeAll()
+    }
+
+    private func rememberDiscardedSideChatThread(_ threadID: String) {
+        discardedSideChatThreadIDs.insert(threadID)
+    }
+
+    private func shouldDiscardClosedSideChatEvent(_ event: AgentRuntimeEvent) -> Bool {
+        let threadID: String? = switch event {
+        case let .threadUpdated(thread): thread.id
+        case let .threadNameChanged(threadID, _): threadID
+        case let .threadStatusChanged(threadID, _): threadID
+        case let .threadArchived(threadID): threadID
+        case let .threadUnarchived(threadID): threadID
+        case let .threadDeleted(threadID): threadID
+        case let .threadRefreshRequested(threadID): threadID
+        case let .itemStarted(threadID, _): threadID
+        case let .itemDelta(threadID, _, _): threadID
+        case let .itemCompleted(threadID, _): threadID
+        case let .turnStarted(threadID, _): threadID
+        case let .planUpdated(threadID, _): threadID
+        case let .turnCompleted(threadID, _): threadID
+        case let .userInteractionRequested(interaction): interaction.threadID
+        case .connectionChanged,
+             .accountUpdated,
+             .loginCompleted,
+             .userInteractionResolved,
+             .runtimeNotice:
+            nil
+        }
+        guard let threadID else { return false }
+        return discardedSideChatThreadIDs.contains(threadID)
+    }
+
     private func updateThread(_ thread: RuntimeThread) {
         var thread = thread
         thread.isPinned = pinnedThreadIDs.contains(thread.id)
@@ -1696,11 +2421,12 @@ final class OnyxAppModel: ObservableObject {
         threads.sort { $0.updatedAt > $1.updatedAt }
         if selectedThreadID == thread.id {
             isTurnRunning = thread.status.isBusy || isReviewActive(for: thread.id)
+            validateSelectedReasoningEffort()
         }
     }
 
     private func replaceTimeline(_ items: [TimelineItem], authoritativeFor threadID: String? = nil) {
-        timeline = items
+        transcriptSnapshot.replaceAll(with: items)
         if let threadID {
             plansByThreadID.removeValue(forKey: threadID)
         }
@@ -1709,6 +2435,40 @@ final class OnyxAppModel: ObservableObject {
             mergeCollaborationActivity(from: item, publish: false)
         }
         publishCollaborationAgents()
+    }
+
+    private func appendTimeline(_ item: TimelineItem) {
+        transcriptSnapshot.append(item)
+    }
+
+    private func replaceTimelineRow(at index: Int, with item: TimelineItem) {
+        transcriptSnapshot.replaceRow(at: index, with: item)
+    }
+
+    private func mutateTimelineRows(
+        _ indices: IndexSet,
+        mutation: (inout [TimelineItem]) -> Void
+    ) {
+        transcriptSnapshot.mutateRows(indices, mutation: mutation)
+    }
+
+    private func replaceSideChatTimeline(_ items: [TimelineItem]) {
+        sideChatTranscriptSnapshot.replaceAll(with: items)
+    }
+
+    private func appendSideChatTimeline(_ item: TimelineItem) {
+        sideChatTranscriptSnapshot.append(item)
+    }
+
+    private func replaceSideChatTimelineRow(at index: Int, with item: TimelineItem) {
+        sideChatTranscriptSnapshot.replaceRow(at: index, with: item)
+    }
+
+    private func mutateSideChatTimelineRows(
+        _ indices: IndexSet,
+        mutation: (inout [TimelineItem]) -> Void
+    ) {
+        sideChatTranscriptSnapshot.mutateRows(indices, mutation: mutation)
     }
 
     /// Applies a provider history snapshot without allowing it to erase item,
@@ -1794,7 +2554,7 @@ final class OnyxAppModel: ObservableObject {
             includedIDs: includedIDs
         )
 
-        timeline = merged
+        transcriptSnapshot.replaceAll(with: merged)
         if (livePlanRevisionByThreadID[threadID] ?? 0) <= readStartRevision {
             plansByThreadID.removeValue(forKey: threadID)
         }
@@ -2178,7 +2938,11 @@ final class OnyxAppModel: ObservableObject {
 
     private func fetchThreads(in scope: ThreadListScope) async throws -> [RuntimeThread] {
         guard let runtime else { return [] }
-        return try await runtime.listThreads(limit: 100, archived: scope == .archived).map { thread in
+        // The sidebar is project-scoped and must remain complete even when a
+        // provider has more than the old 100-row page. Codex implements this
+        // with cursor pagination; local providers return their uncapped
+        // on-disk catalog through the same runtime-neutral API.
+        return try await runtime.listAllThreads(archived: scope == .archived).map { thread in
             var projected = thread
             projected.isPinned = pinnedThreadIDs.contains(thread.id)
             return projected
@@ -2192,7 +2956,12 @@ final class OnyxAppModel: ObservableObject {
     ) {
         guard threadListScope == scope else { return }
         isLoadingThreadList = false
-        threads = liveThreads.isEmpty && scope == .active ? [Self.welcomeThread] : liveThreads
+        let shouldKeepNewTask = scope == .active && preferredSelection == Self.welcomeThread.id
+        if shouldKeepNewTask {
+            threads = [Self.welcomeThread] + liveThreads.filter { $0.id != Self.welcomeThread.id }
+        } else {
+            threads = liveThreads.isEmpty && scope == .active ? [Self.welcomeThread] : liveThreads
+        }
 
         let targetID = preferredSelection.flatMap { preferredID in
             threads.contains(where: { $0.id == preferredID }) ? preferredID : nil
@@ -2231,10 +3000,17 @@ final class OnyxAppModel: ObservableObject {
         permissionLabel == "Full access" ? .never : .onRequest
     }
 
+    private func recordModelUsageIfAvailable(_ modelID: String?) {
+        guard let modelID = modelID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !modelID.isEmpty else { return }
+        modelUsageRecorder(modelID)
+    }
+
     /// Closes the local account boundary after the provider has confirmed
     /// logout. No task, transcript, draft, workspace, or async completion from
     /// the previous account may remain visible in the signed-out window.
     private func closeAccountBoundary() {
+        closeSideChat()
         workspacePersistenceStore?.clearAccountOwnedState()
         accountEpoch &+= 1
         connectionRevision &+= 1
@@ -2254,6 +3030,7 @@ final class OnyxAppModel: ObservableObject {
         draftSaveTask = nil
 
         pendingDeltas.removeAll()
+        discardedSideChatThreadIDs.removeAll()
         activeTurnIDsByThreadID.removeAll()
         liveTimelineRevisionByThreadID.removeAll()
         liveItemRevisionByThreadID.removeAll()
@@ -2297,6 +3074,10 @@ final class OnyxAppModel: ObservableObject {
     }
 
     private func applyRuntimeSession(_ updatedSession: RuntimeSession) {
+        if isSideChatPresented,
+           !updatedSession.capabilities.contains(.ephemeralThreadForking) {
+            closeSideChat()
+        }
         session = updatedSession
         authState = updatedSession.auth
         if updatedSession.auth.isSignedIn { loginAttempt = nil }
@@ -2373,7 +3154,13 @@ final class OnyxAppModel: ObservableObject {
     }
 
     private func validateSelectedReasoningEffort() {
-        guard let model = session?.availableModels.first(where: { $0.id == selectedModelID }) else { return }
+        guard let model = selectedRuntimeModel else { return }
+        guard model.supportedRequestParameters.isEmpty
+                || model.supportedRequestParameters.contains(.reasoningEffort)
+        else {
+            selectedReasoningEffort = nil
+            return
+        }
         if let selectedReasoningEffort, model.reasoningEfforts.contains(selectedReasoningEffort) {
             return
         }
@@ -2500,7 +3287,7 @@ final class OnyxAppModel: ObservableObject {
            message.localizedCaseInsensitiveContains("active writer") {
             return (
                 "Task is open elsewhere",
-                "Another Codex window is actively working in this task. Let that turn finish or close the other window, then try again. Your draft is still here."
+                "Another \(runtimeDisplayName) window is actively working in this task. Let that turn finish or close the other window, then try again. Your draft is still here."
             )
         }
         return ("Could not send", error.localizedDescription)
@@ -2569,11 +3356,13 @@ final class OnyxAppModel: ObservableObject {
         let deltas = pendingDeltas
         pendingDeltas.removeAll(keepingCapacity: true)
 
+        var changedIndices = IndexSet()
+        var appendedItems: [TimelineItem] = []
         for (key, delta) in deltas where !delta.isEmpty && key.threadID == selectedThreadID {
             if let index = timeline.firstIndex(where: { $0.id == key.itemID }) {
-                timeline[index].body += delta
+                changedIndices.insert(index)
             } else {
-                timeline.append(
+                appendedItems.append(
                     TimelineItem(
                         id: key.itemID,
                         kind: .assistantMessage,
@@ -2585,6 +3374,20 @@ final class OnyxAppModel: ObservableObject {
                     )
                 )
             }
+        }
+
+        if !changedIndices.isEmpty {
+            mutateTimelineRows(changedIndices) { items in
+                for (key, delta) in deltas
+                where !delta.isEmpty && key.threadID == selectedThreadID {
+                    if let index = items.firstIndex(where: { $0.id == key.itemID }) {
+                        items[index].body += delta
+                    }
+                }
+            }
+        }
+        for item in appendedItems {
+            appendTimeline(item)
         }
     }
 }

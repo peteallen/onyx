@@ -25,6 +25,28 @@ actor CodexRuntime: AgentRuntime {
     private var activeTransportGeneration: UInt64?
     private var activeTurnIDs: [String: String] = [:]
     private var pendingUserInteractions: [RuntimeRequestID: AppServerRequest] = [:]
+    /// App-server can emit `thread/started` before the matching `thread/fork`
+    /// response reaches this actor. Keep every thread lifecycle notification
+    /// behind this small classification barrier while an ephemeral fork is in
+    /// flight, then either discard it for the returned fork ID or release it in
+    /// original order for an unrelated durable task.
+    private struct PendingEphemeralFork {
+        let sourceThreadID: String
+        var correlatedThreadIDs: Set<String> = []
+    }
+
+    private struct BufferedThreadLifecycleEvent {
+        let threadID: String
+        let event: AgentRuntimeEvent
+    }
+
+    private var nextEphemeralForkToken: UInt64 = 0
+    private var pendingEphemeralForks: [UInt64: PendingEphemeralFork] = [:]
+    /// Intentionally retained for the lifetime of this app-server connection.
+    /// Ephemeral IDs must never be allowed to re-enter the durable task catalog
+    /// through a late lifecycle notification after their side-chat UI closes.
+    private var quarantinedEphemeralThreadIDs: Set<String> = []
+    private var bufferedThreadLifecycleEvents: [BufferedThreadLifecycleEvent] = []
     private var cachedModels: [RuntimeModel] = []
     private var connected = false
 
@@ -95,6 +117,7 @@ actor CodexRuntime: AgentRuntime {
             connectionAttempt = nil
             activeTurnIDs.removeAll()
             pendingUserInteractions.removeAll()
+            resetEphemeralThreadBoundary()
             await client.stop()
             guard connectionGeneration == generation else { throw error }
             eventContinuation.yield(.connectionChanged(.failed(error.localizedDescription)))
@@ -111,6 +134,7 @@ actor CodexRuntime: AgentRuntime {
         connected = false
         activeTurnIDs.removeAll()
         pendingUserInteractions.removeAll()
+        resetEphemeralThreadBoundary()
         await client.stop()
         guard connectionGeneration == generation else { return }
         eventContinuation.yield(.connectionChanged(.disconnected))
@@ -186,16 +210,68 @@ actor CodexRuntime: AgentRuntime {
     }
 
     func listThreads(limit: Int = 100, archived: Bool = false) async throws -> [RuntimeThread] {
+        guard limit > 0 else { return [] }
+        return try await listThreadPage(
+            limit: limit,
+            archived: archived,
+            cursor: nil
+        ).threads
+    }
+
+    func listAllThreads(archived: Bool) async throws -> [RuntimeThread] {
+        let pageSize = 100
+        var cursor: String?
+        var seenCursors: Set<String> = []
+        var threadsByID: [String: RuntimeThread] = [:]
+
+        repeat {
+            let page = try await listThreadPage(
+                limit: pageSize,
+                archived: archived,
+                cursor: cursor
+            )
+            for thread in page.threads {
+                if let current = threadsByID[thread.id], current.updatedAt > thread.updatedAt {
+                    continue
+                }
+                threadsByID[thread.id] = thread
+            }
+            guard let nextCursor = page.nextCursor, !nextCursor.isEmpty else {
+                cursor = nil
+                break
+            }
+            guard seenCursors.insert(nextCursor).inserted else {
+                throw AgentRuntimeError.protocolFailure(
+                    "thread/list repeated a pagination cursor"
+                )
+            }
+            cursor = nextCursor
+        } while cursor != nil
+
+        return threadsByID.values.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    private func listThreadPage(
+        limit: Int,
+        archived: Bool,
+        cursor: String?
+    ) async throws -> (threads: [RuntimeThread], nextCursor: String?) {
+        var params: [String: JSONValue] = [
+            "limit": .integer(limit),
+            "archived": .bool(archived),
+            "sourceKinds": .array([.string("appServer"), .string("cli"), .string("vscode")]),
+        ]
+        if let cursor { params["cursor"] = .string(cursor) }
         let result = try await client.request(
             method: "thread/list",
-            params: .object([
-                "limit": .integer(limit),
-                "archived": .bool(archived),
-                "sourceKinds": .array([.string("appServer"), .string("cli"), .string("vscode")]),
-            ])
+            params: .object(params)
         )
         let values = result["data"]?.arrayValue ?? result["threads"]?.arrayValue ?? result.arrayValue ?? []
-        return values.compactMap(CodexProjection.thread(from:)).sorted { $0.updatedAt > $1.updatedAt }
+        let threads = values
+            .filter { $0["ephemeral"]?.boolValue != true }
+            .compactMap(CodexProjection.thread(from:))
+            .sorted { $0.updatedAt > $1.updatedAt }
+        return (threads, result["nextCursor"]?.stringValue)
     }
 
     func readThread(id: String) async throws -> RuntimeConversation {
@@ -254,6 +330,90 @@ actor CodexRuntime: AgentRuntime {
         return thread
     }
 
+    func forkEphemeralThread(id: String) async throws -> RuntimeConversation {
+        // `ThreadForkParams.ephemeral` is part of the installed app-server's
+        // generated v2 schema. An ephemeral fork keeps the parent's history in
+        // the response but is not materialized in Codex's durable thread store.
+        nextEphemeralForkToken &+= 1
+        let token = nextEphemeralForkToken
+        pendingEphemeralForks[token] = PendingEphemeralFork(sourceThreadID: id)
+
+        let result: JSONValue
+        do {
+            result = try await client.request(
+                method: "thread/fork",
+                params: .object([
+                    "threadId": .string(id),
+                    "ephemeral": .bool(true),
+                    "excludeTurns": .bool(false),
+                ])
+            )
+        } catch {
+            let correlatedIDs = pendingEphemeralForks[token]?.correlatedThreadIDs ?? []
+            quarantineEphemeralThreads(correlatedIDs)
+            await deleteThreadsBestEffort(correlatedIDs)
+            finishEphemeralFork(token)
+            throw error
+        }
+
+        let threadValue = result["thread"] ?? result
+        guard let threadID = threadValue["id"]?.stringValue else {
+            let correlatedIDs = pendingEphemeralForks[token]?.correlatedThreadIDs ?? []
+            quarantineEphemeralThreads(correlatedIDs)
+            await deleteThreadsBestEffort(correlatedIDs)
+            finishEphemeralFork(token)
+            throw AgentRuntimeError.missingField("thread.id")
+        }
+
+        let wasCorrelatedBeforeResponse = pendingEphemeralForks[token]?
+            .correlatedThreadIDs.contains(threadID) == true
+        if !wasCorrelatedBeforeResponse {
+            // A `thread/started` event can arrive without lineage or an
+            // ephemeral flag. The fork response is the authoritative join key;
+            // drop that provisional catalog update once its ID is known.
+            bufferedThreadLifecycleEvents.removeAll { entry in
+                guard entry.threadID == threadID else { return false }
+                guard case .threadUpdated = entry.event else { return false }
+                return true
+            }
+        }
+        pendingEphemeralForks[token]?.correlatedThreadIDs.insert(threadID)
+        let correlatedIDs = pendingEphemeralForks[token]?.correlatedThreadIDs ?? []
+        quarantineEphemeralThreads(correlatedIDs.union([threadID]))
+
+        guard threadValue["ephemeral"]?.boolValue == true else {
+            var cleanupFailure: (any Error)?
+            do {
+                _ = try await client.request(
+                    method: "thread/delete",
+                    params: .object(["threadId": .string(threadID)])
+                )
+            } catch {
+                cleanupFailure = error
+            }
+            finishEphemeralFork(token)
+
+            var detail = "Codex app-server returned thread \(threadID) without explicit ephemeral confirmation. Onyx rejected the side chat and requested deletion of the accidental durable fork."
+            if let cleanupFailure {
+                detail += " Cleanup also failed: \(cleanupFailure.localizedDescription)"
+            }
+            throw AgentRuntimeError.protocolFailure(detail)
+        }
+
+        do {
+            let conversation = try CodexProjection.conversation(from: result)
+            finishEphemeralFork(token)
+            return conversation
+        } catch {
+            // A malformed response can still identify a newly created thread.
+            // Keep it quarantined and remove it rather than allowing a partial
+            // projection to leave an invisible provider-side fork behind.
+            await deleteThreadsBestEffort(Set([threadID]))
+            finishEphemeralFork(token)
+            throw error
+        }
+    }
+
     func compactThread(id: String) async throws {
         _ = try await client.request(
             method: "thread/compact/start",
@@ -269,6 +429,7 @@ actor CodexRuntime: AgentRuntime {
     }
 
     func startTurn(_ request: StartTurnRequest) async throws {
+        try Task.checkCancellation()
         var params: [String: JSONValue] = [
             "threadId": .string(request.threadID),
             "input": .array(request.inputs.map(codexTurnInput)),
@@ -281,6 +442,29 @@ actor CodexRuntime: AgentRuntime {
         let result = try await client.request(method: "turn/start", params: .object(params))
         if let turnID = result["turn"]?["id"]?.stringValue {
             activeTurnIDs[request.threadID] = turnID
+        }
+        guard !Task.isCancelled else {
+            // Closing a side chat cancels the task that submitted its turn. The
+            // app-server request itself may already have crossed the process
+            // boundary, so cancellation alone cannot guarantee that no work is
+            // running. Once the response exposes the turn ID, interrupt that
+            // accepted work before reporting cancellation to the caller.
+            let turnID = result["turn"]?["id"]?.stringValue
+                ?? activeTurnIDs[request.threadID]
+            if let turnID {
+                do {
+                    try await interruptAcceptedTurn(threadID: request.threadID, turnID: turnID)
+                } catch {
+                    throw AgentRuntimeError.protocolFailure(
+                        "The turn was accepted after its caller cancelled, and cleanup failed: \(error.localizedDescription)"
+                    )
+                }
+            } else {
+                throw AgentRuntimeError.protocolFailure(
+                    "The turn was accepted after its caller cancelled, but app-server returned no turn ID for cleanup."
+                )
+            }
+            throw CancellationError()
         }
     }
 
@@ -441,6 +625,7 @@ actor CodexRuntime: AgentRuntime {
                 .streaming, .steering, .interruption, .approvals, .threadForking,
                 .threadArchiving, .threadCompaction, .threadDeletion, .reasoning,
                 .tools, .diffs, .codeReview, .terminal, .images, .usage,
+                .ephemeralThreadForking,
             ]
         )
     }
@@ -497,6 +682,7 @@ actor CodexRuntime: AgentRuntime {
             activeTransportGeneration = nil
             activeTurnIDs.removeAll()
             pendingUserInteractions.removeAll()
+            resetEphemeralThreadBoundary()
             eventContinuation.yield(.connectionChanged(.failed(reason)))
         }
     }
@@ -550,15 +736,25 @@ actor CodexRuntime: AgentRuntime {
             if case let .threadDeleted(threadID) = lifecycleEvent {
                 activeTurnIDs.removeValue(forKey: threadID)
             }
-            eventContinuation.yield(lifecycleEvent)
+            publishOrBufferThreadLifecycleEvent(lifecycleEvent, threadID: threadID)
             return
         }
 
         switch notification.method {
         case "thread/started":
-            if let thread = CodexProjection.thread(from: params["thread"] ?? params) {
-                eventContinuation.yield(.threadUpdated(thread))
+            let threadValue = params["thread"] ?? params
+            guard let startedThreadID = threadValue["id"]?.stringValue else { return }
+            let isExplicitlyEphemeral = threadValue["ephemeral"]?.boolValue == true
+            if isExplicitlyEphemeral {
+                quarantinedEphemeralThreadIDs.insert(startedThreadID)
             }
+            correlateStartedThread(
+                startedThreadID,
+                forkedFromID: threadValue["forkedFromId"]?.stringValue,
+                isExplicitlyEphemeral: isExplicitlyEphemeral
+            )
+            guard let thread = CodexProjection.thread(from: threadValue) else { return }
+            publishOrBufferThreadLifecycleEvent(.threadUpdated(thread), threadID: startedThreadID)
         case "turn/started":
             if let turnID = params["turn"]?["id"]?.stringValue, !threadID.isEmpty {
                 activeTurnIDs[threadID] = turnID
@@ -610,6 +806,89 @@ actor CodexRuntime: AgentRuntime {
         default:
             break
         }
+    }
+
+    private func correlateStartedThread(
+        _ threadID: String,
+        forkedFromID: String?,
+        isExplicitlyEphemeral: Bool
+    ) {
+        guard !pendingEphemeralForks.isEmpty else { return }
+
+        if let forkedFromID {
+            let matchingTokens = pendingEphemeralForks.compactMap { token, pending in
+                pending.sourceThreadID == forkedFromID ? token : nil
+            }
+            guard matchingTokens.count == 1, let token = matchingTokens.first else { return }
+            pendingEphemeralForks[token]?.correlatedThreadIDs.insert(threadID)
+            return
+        }
+
+        // Older app-server builds can omit lineage from `thread/started`. An
+        // explicitly ephemeral start is still safe to correlate when only one
+        // ephemeral fork request is outstanding. Unknown/non-ephemeral starts
+        // remain buffered until the response supplies a definitive thread ID.
+        guard isExplicitlyEphemeral,
+              pendingEphemeralForks.count == 1,
+              let token = pendingEphemeralForks.keys.first else { return }
+        pendingEphemeralForks[token]?.correlatedThreadIDs.insert(threadID)
+    }
+
+    private func publishOrBufferThreadLifecycleEvent(
+        _ event: AgentRuntimeEvent,
+        threadID: String
+    ) {
+        guard !quarantinedEphemeralThreadIDs.contains(threadID) else { return }
+        guard !pendingEphemeralForks.isEmpty else {
+            eventContinuation.yield(event)
+            return
+        }
+        bufferedThreadLifecycleEvents.append(
+            BufferedThreadLifecycleEvent(threadID: threadID, event: event)
+        )
+    }
+
+    private func quarantineEphemeralThreads(_ threadIDs: Set<String>) {
+        guard !threadIDs.isEmpty else { return }
+        quarantinedEphemeralThreadIDs.formUnion(threadIDs)
+        bufferedThreadLifecycleEvents.removeAll { threadIDs.contains($0.threadID) }
+    }
+
+    private func finishEphemeralFork(_ token: UInt64) {
+        let pending = pendingEphemeralForks.removeValue(forKey: token)
+        if let pending {
+            quarantineEphemeralThreads(pending.correlatedThreadIDs)
+        }
+        guard pendingEphemeralForks.isEmpty else { return }
+
+        let buffered = bufferedThreadLifecycleEvents
+        bufferedThreadLifecycleEvents.removeAll(keepingCapacity: true)
+        for entry in buffered where !quarantinedEphemeralThreadIDs.contains(entry.threadID) {
+            eventContinuation.yield(entry.event)
+        }
+    }
+
+    private func deleteThreadsBestEffort(_ threadIDs: Set<String>) async {
+        for threadID in threadIDs {
+            try? await deleteThread(id: threadID)
+        }
+    }
+
+    private func resetEphemeralThreadBoundary() {
+        pendingEphemeralForks.removeAll()
+        quarantinedEphemeralThreadIDs.removeAll()
+        bufferedThreadLifecycleEvents.removeAll()
+    }
+
+    private func interruptAcceptedTurn(threadID: String, turnID: String) async throws {
+        _ = try await client.request(
+            method: "turn/interrupt",
+            params: .object([
+                "threadId": .string(threadID),
+                "turnId": .string(turnID),
+            ])
+        )
+        activeTurnIDs.removeValue(forKey: threadID)
     }
 
     private func codexInteractionResponse(

@@ -12,10 +12,22 @@ final class ShellAccessibilityTests: XCTestCase {
     }
 
     func testConnectionStatesHaveUsefulVoiceOverValues() {
-        XCTAssertEqual(RuntimeConnectionState.connected("Codex").onyxAccessibilityValue, "Connected: Codex")
-        XCTAssertEqual(RuntimeConnectionState.connecting.onyxAccessibilityValue, "Connecting to Codex")
-        XCTAssertEqual(RuntimeConnectionState.failed("Runtime stopped").onyxAccessibilityValue, "Connection failed: Runtime stopped")
-        XCTAssertEqual(RuntimeConnectionState.disconnected.onyxAccessibilityValue, "Disconnected")
+        XCTAssertEqual(
+            RuntimeConnectionState.connected("account@example.com").onyxAccessibilityValue(runtimeName: "vLLM"),
+            "Connected: vLLM"
+        )
+        XCTAssertEqual(
+            RuntimeConnectionState.connecting.onyxAccessibilityValue(runtimeName: "Agent runtime"),
+            "Connecting to Agent runtime"
+        )
+        XCTAssertEqual(
+            RuntimeConnectionState.failed("Runtime stopped").onyxAccessibilityValue(runtimeName: "vLLM"),
+            "Connection failed: Runtime stopped"
+        )
+        XCTAssertEqual(
+            RuntimeConnectionState.disconnected.onyxAccessibilityValue(runtimeName: "vLLM"),
+            "Disconnected"
+        )
     }
 
     func testConnectionStatesDoNotRelyOnColorAlone() {

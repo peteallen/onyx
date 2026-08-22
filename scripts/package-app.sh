@@ -11,6 +11,8 @@ build_number="${ONYX_BUILD_NUMBER:-}"
 signing_identity="${ONYX_CODESIGN_IDENTITY:-}"
 architectures="${ONYX_ARCHITECTURES:-native}"
 allow_running_overwrite=0
+signing_timestamp="${ONYX_CODESIGN_TIMESTAMP:-1}"
+designated_requirement="${ONYX_CODESIGN_REQUIREMENT:-}"
 
 usage() {
   cat <<'EOF'
@@ -24,14 +26,17 @@ Options:
   --bundle-id IDENTIFIER         Bundle identifier (for example, dev.example.onyx.preview).
   --version VERSION              CFBundleShortVersionString.
   --build-number NUMBER          CFBundleVersion.
-  --signing-identity IDENTITY    Developer ID Application identity. Defaults to ad hoc.
+  --signing-identity IDENTITY    Code-signing identity. Defaults to ad hoc.
+  --no-signing-timestamp         Do not request a trusted timestamp (for a local identity).
+  --designated-requirement EXPR  Requirement body after `designated =>`.
   --architectures MODE           native or universal (arm64 + x86_64).
   --allow-running-overwrite      Replace APP_PATH even when that exact app is running.
   -h, --help                     Show this help.
 
 Environment equivalents:
   ONYX_APP_DISPLAY_NAME, ONYX_BUNDLE_IDENTIFIER, ONYX_APP_VERSION,
-  ONYX_BUILD_NUMBER, ONYX_CODESIGN_IDENTITY, ONYX_ARCHITECTURES
+  ONYX_BUILD_NUMBER, ONYX_CODESIGN_IDENTITY, ONYX_ARCHITECTURES,
+  ONYX_CODESIGN_TIMESTAMP, ONYX_CODESIGN_REQUIREMENT
 
 The positional form `scripts/package-app.sh debug [APP_PATH]` remains supported.
 The script never launches or stops an application.
@@ -74,6 +79,15 @@ while (( $# > 0 )); do
     --signing-identity)
       require_value "$1" "${2:-}"
       signing_identity="$2"
+      shift 2
+      ;;
+    --no-signing-timestamp)
+      signing_timestamp=0
+      shift
+      ;;
+    --designated-requirement)
+      require_value "$1" "${2:-}"
+      designated_requirement="$2"
       shift 2
       ;;
     --architectures)
@@ -150,8 +164,15 @@ plist_value() {
   die "build number must contain one to three numeric components: $build_number"
 [[ "$architectures" == "native" || "$architectures" == "universal" ]] || \
   die "architectures must be native or universal (got: $architectures)"
+[[ "$signing_timestamp" == "0" || "$signing_timestamp" == "1" ]] || \
+  die "signing timestamp must be 0 or 1"
 [[ "$signing_identity" != *$'\n'* && "$signing_identity" != *$'\r'* ]] || \
   die "signing identity cannot contain a newline"
+[[ "$designated_requirement" != *$'\n'* && "$designated_requirement" != *$'\r'* ]] || \
+  die "designated requirement cannot contain a newline"
+if [[ -n "$designated_requirement" && "$signing_identity" == "-" ]]; then
+  die "an explicit designated requirement requires a persistent signing identity"
+fi
 
 target_executable="$app_dir/Contents/MacOS/Onyx"
 if [[ -f "$app_dir/Contents/Info.plist" ]]; then
@@ -162,10 +183,12 @@ if [[ -f "$app_dir/Contents/Info.plist" ]]; then
   fi
 fi
 
-running_pids=""
-if [[ -f "$target_executable" && -x /usr/sbin/lsof ]]; then
-  running_pids="$(/usr/sbin/lsof -a -d txt -t -- "$target_executable" 2>/dev/null || true)"
-fi
+target_running_pids() {
+  [[ -f "$target_executable" && -x /usr/sbin/lsof ]] || return 0
+  /usr/sbin/lsof -a -d txt -t -- "$target_executable" 2>/dev/null || true
+}
+
+running_pids="$(target_running_pids)"
 if [[ -n "$running_pids" && "$allow_running_overwrite" -ne 1 ]]; then
   running_summary="${running_pids//$'\n'/, }"
   die "target is running (PID ${running_summary}): $app_dir
@@ -206,15 +229,11 @@ app_basename="${app_dir:t}"
 /bin/mkdir -p "$parent_dir"
 staging_root="$(/usr/bin/mktemp -d "$parent_dir/.${app_basename}.package.XXXXXX")"
 staged_app="$staging_root/$app_basename"
-backup_path="$parent_dir/.${app_basename}.backup.$$.$RANDOM"
 
 cleanup() {
   local exit_code=$?
   if [[ -n "${staging_root:-}" && -d "$staging_root" ]]; then
     /bin/rm -rf -- "$staging_root"
-  fi
-  if [[ -n "${backup_path:-}" && -e "$backup_path" && ! -e "$app_dir" ]]; then
-    /bin/mv -- "$backup_path" "$app_dir"
   fi
   return $exit_code
 }
@@ -245,11 +264,24 @@ signature_summary="ad hoc"
 if [[ "$signing_identity" == "-" ]]; then
   codesign_arguments+=(--timestamp=none)
 else
-  codesign_arguments+=(--options runtime --timestamp)
-  signature_summary="$signing_identity (hardened runtime)"
+  codesign_arguments+=(--options runtime)
+  if [[ -n "$designated_requirement" ]]; then
+    codesign_arguments+=(--requirements "=designated => $designated_requirement")
+  fi
+  if [[ "$signing_timestamp" == "1" ]]; then
+    codesign_arguments+=(--timestamp)
+    signature_summary="$signing_identity (hardened runtime, trusted timestamp)"
+  else
+    codesign_arguments+=(--timestamp=none)
+    signature_summary="$signing_identity (hardened runtime, no timestamp)"
+  fi
 fi
 /usr/bin/codesign "${codesign_arguments[@]}" "$staged_app"
 /usr/bin/codesign --verify --deep --strict --verbose=2 "$staged_app"
+if [[ -n "$designated_requirement" ]]; then
+  /usr/bin/codesign --verify --deep --strict --verbose=2 \
+    -R "=$designated_requirement" "$staged_app"
+fi
 
 [[ "$(/usr/bin/plutil -extract CFBundleDisplayName raw -o - "$contents_dir/Info.plist")" == "$display_name" ]] || \
   die "packaged display name did not verify"
@@ -264,21 +296,29 @@ if [[ "$architectures" == "universal" ]]; then
     die "universal executable did not contain arm64 and x86_64: $packaged_architectures"
 fi
 
-# Everything that can fail has operated on a sibling staging directory. Keep the
-# prior target available for rollback until the verified bundle is in place.
+# Everything that can fail has operated on a sibling staging directory. Recheck
+# the exact executable after the build and verification, immediately before the
+# swap, so a launch during a long build cannot silently be overwritten.
 if [[ -e "$app_dir" ]]; then
-  [[ ! -e "$backup_path" ]] || die "backup path unexpectedly exists: $backup_path"
-  /bin/mv -- "$app_dir" "$backup_path"
-fi
-if ! /bin/mv -- "$staged_app" "$app_dir"; then
-  if [[ -e "$backup_path" && ! -e "$app_dir" ]]; then
-    /bin/mv -- "$backup_path" "$app_dir"
+  final_running_pids="$(target_running_pids)"
+  if [[ -n "$final_running_pids" && "$allow_running_overwrite" -ne 1 ]]; then
+    final_running_summary="${final_running_pids//$'\n'/, }"
+    die "target started running during packaging (PID ${final_running_summary}): $app_dir
+Quit it first, choose a different APP_PATH, or explicitly pass --allow-running-overwrite."
+  elif [[ -n "$final_running_pids" ]]; then
+    print -u2 -- "package-app: warning: replacing a running target by explicit request: $app_dir"
   fi
-  die "could not move the verified app into place"
-fi
 
-if [[ -e "$backup_path" ]]; then
-  /bin/rm -rf -- "$backup_path"
+  # Swap an existing target with the verified bundle in one filesystem
+  # operation so a stable destination never briefly disappears or exposes a
+  # partial bundle.
+  CLANG_MODULE_CACHE_PATH="$CLANG_MODULE_CACHE_PATH" \
+    SWIFTPM_MODULECACHE_OVERRIDE="$SWIFTPM_MODULECACHE_OVERRIDE" \
+    /usr/bin/swift "$repo_root/scripts/atomic-swap.swift" "$app_dir" "$staged_app" || \
+    die "could not atomically replace the existing app"
+else
+  /bin/mv -- "$staged_app" "$app_dir" || \
+    die "could not move the verified app into place"
 fi
 
 print -- "Packaged: $app_dir"

@@ -3,6 +3,77 @@ import XCTest
 @testable import Onyx
 
 final class TranscriptLayoutPerformanceTests: XCTestCase {
+    @MainActor
+    func testExpansionIsPartOfHeightCacheAndInvalidatesOnlyTheToggledRow() {
+        let item = TimelineItem(
+            id: "tool-cache",
+            kind: .tool,
+            title: "Search",
+            body: String(repeating: "verbose tool output ", count: 80),
+            status: .completed,
+            timestamp: .now,
+            detail: nil
+        )
+        var state = TranscriptLayoutState()
+
+        _ = state.height(for: item, width: 640, isExpanded: false) { 42 }
+        _ = state.height(for: item, width: 640, isExpanded: false) { 99 }
+        XCTAssertEqual(state.instrumentation.measurementCount, 1)
+        XCTAssertEqual(state.instrumentation.cacheHitCount, 1)
+
+        _ = state.height(for: item, width: 640, isExpanded: true) { 84 }
+        XCTAssertEqual(state.instrumentation.measurementCount, 2)
+
+        state.invalidate(itemID: item.id)
+        _ = state.height(for: item, width: 640, isExpanded: true) { 126 }
+        XCTAssertEqual(state.instrumentation.measurementCount, 3)
+        XCTAssertEqual(state.instrumentation.invalidatedRowCount, 1)
+    }
+
+    @MainActor
+    func testExpansionStateDoesNotTruncateReadableActivityOutput() {
+        let item = TimelineItem(
+            id: "long-tool",
+            kind: .command,
+            title: "Run command",
+            body: String(repeating: "line with useful output\n", count: 80),
+            status: .completed,
+            timestamp: .now,
+            detail: nil
+        )
+
+        let collapsed = TranscriptCellView.metrics(for: item, width: 640, isExpanded: false)
+        let expanded = TranscriptCellView.metrics(for: item, width: 640, isExpanded: true)
+
+        XCTAssertTrue(collapsed.isCollapsed)
+        XCTAssertFalse(expanded.isCollapsed)
+        XCTAssertLessThan(collapsed.bodyHeight + collapsed.summaryHeight, expanded.bodyHeight)
+        XCTAssertGreaterThan(expanded.bodyHeight, 188, "Expanded activity output must remain readable")
+    }
+
+    @MainActor
+    func testActionableActivityKindsAreNeverCollapsedByDefault() {
+        let body = "Actionable status"
+        for kind in [TimelineItemKind.approval, .error, .plan] {
+            let item = TimelineItem(
+                id: "always-visible-\(kind.rawValue)",
+                kind: kind,
+                title: kind.rawValue,
+                body: body,
+                status: .completed,
+                timestamp: .now,
+                detail: nil
+            )
+            XCTAssertFalse(kind.isCollapsibleActivity)
+            XCTAssertTrue(kind.defaultExpanded)
+            XCTAssertEqual(
+                TranscriptCellView.height(for: item, width: 640, isExpanded: false),
+                TranscriptCellView.height(for: item, width: 640, isExpanded: true),
+                accuracy: 0.5
+            )
+        }
+    }
+
     func testUnchangedSnapshotReusesEveryMeasuredHeight() {
         let items = [
             makeItem(id: "one", body: "First"),
@@ -174,6 +245,90 @@ final class TranscriptLayoutPerformanceTests: XCTestCase {
 
         XCTAssertEqual(instrumentation.inspectedItemCount, 100)
         XCTAssertEqual(instrumentation.hintedUpdateCount, 100)
+    }
+
+    func testPresentationSnapshotProducesAtomicTailHintsForStreaming() {
+        let items = (0..<20_000).map { index in
+            makeItem(id: "item-\(index)", body: "Stable \(index)")
+        }
+        var snapshot = TranscriptPresentationSnapshot(items: items, revision: 40)
+        let oldSnapshot = snapshot
+        let tailIndex = items.count - 1
+
+        snapshot.mutateRows(IndexSet(integer: tailIndex)) { updated in
+            updated[tailIndex].body += " streamed"
+        }
+
+        var instrumentation = TranscriptCollectionUpdate.PlanningInstrumentation()
+        let update = TranscriptCollectionUpdate.plan(
+            from: oldSnapshot.items,
+            to: snapshot.items,
+            oldRevision: oldSnapshot.revision,
+            newRevision: snapshot.revision,
+            hint: snapshot.changeHint,
+            instrumentation: &instrumentation
+        )
+
+        XCTAssertEqual(update, .tailChange(tailIndex))
+        XCTAssertEqual(instrumentation.inspectedItemCount, 1)
+        XCTAssertEqual(instrumentation.hintedUpdateCount, 1)
+    }
+
+    func testSkippedSnapshotCannotApplyAStaleRowHint() {
+        let items = (0..<2_000).map { index in
+            makeItem(id: "item-\(index)", body: "Stable \(index)")
+        }
+        let rendered = TranscriptPresentationSnapshot(items: items, revision: 10)
+        var skipped = rendered
+        skipped.mutateRows(IndexSet(integer: items.count - 1)) { updated in
+            updated[updated.count - 1].body += " first"
+        }
+        var latest = skipped
+        latest.mutateRows(IndexSet(integer: items.count - 1)) { updated in
+            updated[updated.count - 1].body += " second"
+        }
+
+        var instrumentation = TranscriptCollectionUpdate.PlanningInstrumentation()
+        let update = TranscriptCollectionUpdate.plan(
+            from: rendered.items,
+            to: latest.items,
+            oldRevision: rendered.revision,
+            newRevision: latest.revision,
+            hint: latest.changeHint,
+            instrumentation: &instrumentation
+        )
+
+        XCTAssertEqual(update, .tailChange(items.count - 1))
+        XCTAssertEqual(instrumentation.hintedUpdateCount, 0)
+        XCTAssertEqual(
+            instrumentation.inspectedItemCount,
+            items.count,
+            "A revision gap must fall back to structural validation instead of trusting a stale hint"
+        )
+    }
+
+    func testRepeatedSwiftUIUpdateAtSameRevisionDoesNotRescanHistory() {
+        let items = (0..<20_000).map { index in
+            makeItem(id: "item-\(index)", body: "Stable \(index)")
+        }
+        var instrumentation = TranscriptCollectionUpdate.PlanningInstrumentation()
+
+        let update = TranscriptCollectionUpdate.plan(
+            from: items,
+            to: items,
+            oldRevision: 25,
+            newRevision: 25,
+            hint: .rowsChanged(
+                indices: IndexSet(integer: items.count - 1),
+                fromRevision: 24,
+                toRevision: 25
+            ),
+            instrumentation: &instrumentation
+        )
+
+        XCTAssertEqual(update, .unchanged)
+        XCTAssertEqual(instrumentation.inspectedItemCount, 0)
+        XCTAssertEqual(instrumentation.hintedUpdateCount, 0)
     }
 
     func testHintWithBrokenRevisionContinuityFallsBackToStructuralPlanning() {

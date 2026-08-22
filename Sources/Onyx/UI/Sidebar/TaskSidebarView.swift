@@ -1,8 +1,14 @@
+import AppKit
 import SwiftUI
 
 struct TaskSidebarView: View {
     @ObservedObject var model: OnyxAppModel
+    @ObservedObject var projectCatalog: ProjectCatalogModel
     @Environment(\.onyxWindowPresentationContext) private var windowPresentation
+    let providerConnectionID: ProviderConnectionID
+    let providerConnections: [OnyxApplicationHost.WorkspaceConnection]
+    let onSelectTask: @MainActor (ProviderConnectionID, String) -> Void
+    let onProjectFailure: ProjectCatalogFailureHandler
     var searchFocusRequest = 0
     @FocusState private var isSearchFocused: Bool
 
@@ -10,33 +16,45 @@ struct TaskSidebarView: View {
         VStack(spacing: 0) {
             header
             search
-            scopePicker
             projectCard
+            scopePicker
 
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 3) {
-                    let pinned = model.isShowingArchivedThreads ? [] : model.visibleThreads.filter(\.isPinned)
-                    let recent = model.isShowingArchivedThreads ? model.visibleThreads : model.visibleThreads.filter { !$0.isPinned }
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    projectListHeader
 
-                    if !pinned.isEmpty {
-                        SidebarSectionLabel(title: "Pinned", count: pinned.count)
-                        ForEach(pinned) { thread in threadRow(thread) }
+                    ForEach(displayedProjectGroups) { group in
+                        projectHeader(group)
+                            .padding(.top, 5)
+                        if group.tasks.isEmpty {
+                            Text("No tasks yet")
+                                .font(.system(size: 10.5))
+                                .foregroundStyle(.tertiary)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                        } else {
+                            ForEach(group.tasks) { task in threadRow(task) }
+                        }
                     }
 
-                    if !recent.isEmpty {
+                    if !sidebarGrouping.unassigned.isEmpty {
                         SidebarSectionLabel(
-                            title: model.isShowingArchivedThreads ? "Archived" : "Recent",
-                            count: recent.count
+                            title: projectCatalog.projects.isEmpty
+                                ? (model.isShowingArchivedThreads ? "Archived" : "Tasks")
+                                : "Other Tasks",
+                            count: sidebarGrouping.unassigned.count
                         )
-                            .padding(.top, 9)
-                        ForEach(recent) { thread in threadRow(thread) }
+                        .padding(.top, displayedProjectGroups.isEmpty ? 4 : 10)
+                        ForEach(sidebarGrouping.unassigned) { task in threadRow(task) }
                     }
 
-                    if model.visibleThreads.isEmpty, !model.isLoadingThreadList {
+                    if sidebarGrouping.taskCount == 0,
+                       displayedProjectGroups.isEmpty,
+                       !model.isLoadingThreadList {
                         sidebarEmptyState
                     }
                 }
-                .padding(.horizontal, 9)
+                .padding(.horizontal, 8)
                 .padding(.bottom, 14)
             }
             .overlay(alignment: .top) {
@@ -48,8 +66,7 @@ struct TaskSidebarView: View {
                 }
             }
         }
-        .background(.ultraThinMaterial)
-        .background(OnyxTheme.sidebar.opacity(0.92))
+        .background(OnyxTheme.sidebar)
         .overlay(alignment: .trailing) {
             Rectangle().fill(OnyxTheme.border).frame(width: OnyxTheme.hairline)
         }
@@ -58,24 +75,24 @@ struct TaskSidebarView: View {
     private var header: some View {
         HStack(spacing: 9) {
             VStack(alignment: .leading, spacing: 1) {
-                Text("ONYX")
-                    .font(.system(size: 11, weight: .bold, design: .rounded))
-                    .tracking(1.7)
-                Text("Agent workspace")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.secondary)
+                Text("Onyx")
+                    .font(.system(size: 14, weight: .semibold))
             }
             Spacer()
             Button(action: model.newTask) {
                 Image(systemName: "square.and.pencil")
                     .font(.system(size: 13, weight: .semibold))
-                    .frame(width: 28, height: 28)
-                    .background(OnyxTheme.accentGradient)
-                    .foregroundStyle(.white)
+                    .frame(width: 27, height: 27)
+                    .background(Color.primary.opacity(0.055))
+                    .foregroundStyle(.primary)
                     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .stroke(OnyxTheme.border, lineWidth: OnyxTheme.hairline)
+                    }
             }
             .buttonStyle(.plain)
-            .help("New task (⌘N)")
+            .onyxHelp("New task (⌘N)")
             .accessibilityLabel("New task")
             .accessibilityHint("Creates a new task")
         }
@@ -108,14 +125,14 @@ struct TaskSidebarView: View {
         }
         .padding(.horizontal, 9)
         .frame(height: 31)
-        .background(OnyxTheme.surface.opacity(0.72))
+        .background(OnyxTheme.surface)
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .stroke(OnyxTheme.border, lineWidth: OnyxTheme.hairline)
         }
         .padding(.horizontal, 10)
-        .padding(.bottom, 10)
+        .padding(.bottom, 8)
         .onExitCommand {
             if model.searchText.isEmpty {
                 isSearchFocused = false
@@ -134,16 +151,26 @@ struct TaskSidebarView: View {
     }
 
     private var projectCard: some View {
-        Button(action: { model.chooseWorkspace(window: windowPresentation.window) }) {
-            HStack(spacing: 9) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .fill(OnyxTheme.raisedSurface)
-                    Image(systemName: "folder.fill")
-                        .font(.system(size: 11))
-                        .foregroundStyle(OnyxTheme.iris)
+        Menu {
+            ForEach(projectCatalog.projects) { project in
+                Button {
+                    model.selectWorkspace(project.folderPath)
+                } label: {
+                    Label(project.displayName, systemImage: "folder")
                 }
-                .frame(width: 27, height: 27)
+            }
+            if !projectCatalog.projects.isEmpty {
+                Divider()
+            }
+            Button(action: beginImportProject) {
+                Label("Add Project…", systemImage: "folder.badge.plus")
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "folder")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 20, height: 20)
 
                 VStack(alignment: .leading, spacing: 1) {
                     Text(model.projectName)
@@ -151,7 +178,7 @@ struct TaskSidebarView: View {
                         .lineLimit(1)
                     Text(model.selectedThreadID == "onyx:welcome"
                         ? (model.draftWorkspacePath ?? "Choose a local folder")
-                        : (model.selectedThread?.branch ?? "Local workspace"))
+                        : (model.selectedThread?.cwd ?? "Local workspace"))
                         .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -161,35 +188,79 @@ struct TaskSidebarView: View {
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundStyle(.tertiary)
             }
+            .padding(.horizontal, 8)
+            .frame(height: 38)
+            .background(Color.primary.opacity(0.025))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Workspace")
         .accessibilityValue(workspaceAccessibilityValue)
-        .accessibilityHint("Opens the folder chooser")
-        .padding(.horizontal, 12)
-        .padding(.bottom, 13)
+        .accessibilityHint("Chooses an imported project or adds a folder")
+        .padding(.horizontal, 10)
+        .padding(.bottom, 9)
+    }
+
+    private var projectListHeader: some View {
+        HStack(spacing: 6) {
+            Text("Projects")
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(.tertiary)
+            Spacer()
+            if projectCatalog.isLoading {
+                ProgressView()
+                    .controlSize(.mini)
+                    .accessibilityLabel("Loading projects")
+            }
+            Button(action: beginImportProject) {
+                Image(systemName: "plus")
+                    .font(.system(size: 10, weight: .bold))
+                    .frame(width: 22, height: 20)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .onyxHelp("Add a project folder")
+            .accessibilityLabel("Add project")
+            .accessibilityHint("Opens a folder chooser; you can also create a new folder there")
+        }
+        .padding(.horizontal, 7)
+        .padding(.bottom, 2)
     }
 
     private var scopePicker: some View {
-        Picker(
-            "Task list",
-            selection: Binding(
-                get: { model.threadListScope },
-                set: { model.setThreadListScope($0) }
-            )
-        ) {
+        HStack(spacing: 2) {
             ForEach(ThreadListScope.allCases) { scope in
-                Text(scope.label).tag(scope)
+                Button {
+                    model.setThreadListScope(scope)
+                } label: {
+                    Text(scope.label)
+                        .font(.system(size: 10.5, weight: model.threadListScope == scope ? .semibold : .medium))
+                        .foregroundStyle(model.threadListScope == scope ? Color.primary : Color.secondary)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 24)
+                        .background {
+                            if model.threadListScope == scope {
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .fill(Color.primary.opacity(0.075))
+                            }
+                        }
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(model.threadListScope == scope ? .isSelected : [])
+                .accessibilityLabel(scope.label)
+                .accessibilityHint("Shows (scope.label.lowercased()) tasks")
             }
         }
-        .labelsHidden()
-        .pickerStyle(.segmented)
-        .controlSize(.small)
+        .padding(2)
+        .background(Color.primary.opacity(0.025))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .padding(.horizontal, 10)
-        .padding(.bottom, 10)
+        .padding(.bottom, 9)
         .disabled(!isConnected)
+        .opacity(isConnected ? 1 : 0.55)
         .accessibilityLabel("Task list")
         .accessibilityHint("Choose active or archived tasks")
     }
@@ -216,30 +287,112 @@ struct TaskSidebarView: View {
     private var workspaceAccessibilityValue: String {
         let location = model.selectedThreadID == "onyx:welcome"
             ? (model.draftWorkspacePath ?? "No folder selected")
-            : (model.selectedThread?.branch ?? "Local workspace")
+            : (model.selectedThread?.cwd ?? "Local workspace")
         return "\(model.projectName), \(location)"
     }
 
+    private var providerDisplayName: String {
+        providerConnections.first(where: { $0.id == providerConnectionID })?.displayName
+            ?? (providerConnectionID == .codexDefault ? "Codex" : "Provider")
+    }
+
+    private var sidebarGrouping: ProjectTaskGrouping {
+        var references = projectCatalog.taskReferences(for: model.threadListScope)
+        if let welcome = model.visibleThreads.first(where: { $0.id == "onyx:welcome" }) {
+            var projected = welcome
+            projected.cwd = model.draftWorkspacePath
+            references.append(ProjectTaskReference(
+                providerConnectionID: providerConnectionID,
+                providerDisplayName: providerDisplayName,
+                thread: projected
+            ))
+        }
+        return ProjectTaskSidebarProjection.group(
+            references,
+            by: projectCatalog.projects,
+            searchText: model.searchText
+        )
+    }
+
+    private var displayedProjectGroups: [ProjectTaskGroup] {
+        if model.isShowingArchivedThreads || !model.searchText
+            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return sidebarGrouping.groups.filter { !$0.tasks.isEmpty }
+        }
+        return sidebarGrouping.groups
+    }
+
+    private func projectHeader(_ group: ProjectTaskGroup) -> some View {
+        ProjectSidebarHeader(
+            project: group.project,
+            taskCount: group.tasks.count,
+            canMoveUp: projectCatalog.canMoveProject(id: group.id, offset: -1),
+            canMoveDown: projectCatalog.canMoveProject(id: group.id, offset: 1),
+            select: { model.selectWorkspace(group.project.folderPath) },
+            rename: { beginRenameProject(group.project) },
+            moveUp: {
+                Task {
+                    await projectCatalog.moveProject(
+                        id: group.id,
+                        offset: -1,
+                        onFailure: onProjectFailure
+                    )
+                }
+            },
+            moveDown: {
+                Task {
+                    await projectCatalog.moveProject(
+                        id: group.id,
+                        offset: 1,
+                        onFailure: onProjectFailure
+                    )
+                }
+            },
+            remove: { beginRemoveProject(group.project) }
+        )
+    }
+
     @ViewBuilder
-    private func threadRow(_ thread: RuntimeThread) -> some View {
+    private func threadRow(_ task: ProjectTaskReference) -> some View {
+        let isCurrentProvider = task.providerConnectionID == providerConnectionID
+        let thread = task.thread
+        let attention = isCurrentProvider
+            ? model.taskAttention(for: thread)
+            : thread.status.sidebarTaskAttention
         Button {
-            model.selectThread(thread.id)
+            onSelectTask(task.providerConnectionID, thread.id)
         } label: {
             TaskSidebarRow(
                 thread: thread,
-                attention: model.taskAttention(for: thread),
-                isSelected: model.selectedThreadID == thread.id,
-                isArchived: model.isShowingArchivedThreads
+                attention: attention,
+                isSelected: isCurrentProvider && model.selectedThreadID == thread.id,
+                isArchived: model.isShowingArchivedThreads,
+                providerName: providerConnections.count > 1 ? task.providerDisplayName : nil
             )
         }
         .buttonStyle(.plain)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(thread.title)
-        .accessibilityValue(threadAccessibilityValue(thread, isArchived: model.isShowingArchivedThreads))
-        .accessibilityHint(model.selectedThreadID == thread.id ? "Selected task" : "Selects this task")
-        .accessibilityAddTraits(model.selectedThreadID == thread.id ? .isSelected : [])
+        .accessibilityValue(threadAccessibilityValue(
+            thread,
+            providerName: task.providerDisplayName,
+            attention: attention,
+            isArchived: model.isShowingArchivedThreads
+        ))
+        .accessibilityHint(
+            isCurrentProvider && model.selectedThreadID == thread.id
+                ? "Selected task"
+                : "Opens this task"
+        )
+        .accessibilityAddTraits(
+            isCurrentProvider && model.selectedThreadID == thread.id ? .isSelected : []
+        )
         .contextMenu {
-            if model.isShowingArchivedThreads {
+            if !isCurrentProvider {
+                Button("Open in \(task.providerDisplayName)") {
+                    onSelectTask(task.providerConnectionID, thread.id)
+                }
+            } else if model.isShowingArchivedThreads {
                 Button("Restore Task") { model.restore(thread.id) }
                 if model.supports(.threadDeletion) {
                     Divider()
@@ -271,12 +424,76 @@ struct TaskSidebarView: View {
         }
     }
 
-    private func threadAccessibilityValue(_ thread: RuntimeThread, isArchived: Bool) -> String {
-        var details: [String] = []
+    private func threadAccessibilityValue(
+        _ thread: RuntimeThread,
+        providerName: String,
+        attention: RuntimeTaskAttention,
+        isArchived: Bool
+    ) -> String {
+        var details = [providerName]
         if thread.isPinned { details.append("Pinned") }
-        details.append(isArchived ? "Archived" : model.taskAttention(for: thread).label)
+        details.append(isArchived ? "Archived" : attention.label)
         if !thread.preview.isEmpty { details.append(thread.preview) }
         return details.joined(separator: ". ")
+    }
+
+    private func beginImportProject() {
+        projectCatalog.chooseAndImportProject(
+            window: windowPresentation.window,
+            initialFolderPath: model.draftWorkspacePath,
+            onFailure: onProjectFailure
+        ) { imported in
+            model.selectWorkspace(imported.folderPath)
+        }
+    }
+
+    private func beginRenameProject(_ project: ProjectCatalogRecord) {
+        let alert = NSAlert()
+        alert.messageText = "Rename project"
+        alert.informativeText = "This changes only the name shown in Onyx. The folder is not renamed."
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(string: project.displayName)
+        field.frame = NSRect(x: 0, y: 0, width: 320, height: 24)
+        field.setAccessibilityLabel("Project name")
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        guard let window = windowPresentation.window else { return }
+        alert.beginSheetModal(for: window) { response in
+            let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard response == .alertFirstButtonReturn, !name.isEmpty else { return }
+            Task { @MainActor in
+                await projectCatalog.renameProject(
+                    id: project.id,
+                    displayName: name,
+                    onFailure: onProjectFailure
+                )
+            }
+        }
+        DispatchQueue.main.async {
+            alert.window.makeFirstResponder(field)
+            field.selectText(nil)
+        }
+    }
+
+    private func beginRemoveProject(_ project: ProjectCatalogRecord) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Remove \(project.displayName) from Onyx?"
+        alert.informativeText = "The folder and everything inside it will stay exactly where they are. Tasks from this folder will appear under Other Tasks."
+        alert.addButton(withTitle: "Remove from Onyx")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons.first?.hasDestructiveAction = true
+        guard let window = windowPresentation.window else { return }
+        alert.beginSheetModal(for: window) { response in
+            guard response == .alertFirstButtonReturn else { return }
+            Task { @MainActor in
+                await projectCatalog.removeProject(
+                    id: project.id,
+                    onFailure: onProjectFailure
+                )
+            }
+        }
     }
 }
 
@@ -286,9 +503,8 @@ private struct SidebarSectionLabel: View {
 
     var body: some View {
         HStack {
-            Text(title.uppercased())
-                .font(.system(size: 9.5, weight: .bold))
-                .tracking(0.8)
+            Text(title)
+                .font(.system(size: 10.5, weight: .medium))
             Spacer()
             Text("\(count)")
                 .font(.system(size: 9.5, weight: .medium, design: .monospaced))
@@ -301,18 +517,80 @@ private struct SidebarSectionLabel: View {
     }
 }
 
+private struct ProjectSidebarHeader: View {
+    let project: ProjectCatalogRecord
+    let taskCount: Int
+    let canMoveUp: Bool
+    let canMoveDown: Bool
+    let select: () -> Void
+    let rename: () -> Void
+    let moveUp: () -> Void
+    let moveDown: () -> Void
+    let remove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Button(action: select) {
+                HStack(spacing: 6) {
+                    Image(systemName: "folder")
+                        .font(.system(size: 9.5, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Text(project.displayName)
+                        .font(.system(size: 11, weight: .semibold))
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Text("\(taskCount)")
+                        .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .onyxHelp("Start a new task in \(project.folderPath)")
+            .accessibilityLabel(project.displayName)
+            .accessibilityValue("\(taskCount) \(taskCount == 1 ? "task" : "tasks")")
+            .accessibilityHint("Starts a new task in this project")
+
+            Menu {
+                Button("Rename…", action: rename)
+                Divider()
+                Button("Move Up", action: moveUp)
+                    .disabled(!canMoveUp)
+                Button("Move Down", action: moveDown)
+                    .disabled(!canMoveDown)
+                Divider()
+                Button("Remove from Onyx…", role: .destructive, action: remove)
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 10, weight: .bold))
+                    .frame(width: 22, height: 20)
+                    .contentShape(Rectangle())
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .onyxHelp("Manage \(project.displayName)")
+            .accessibilityLabel("Manage \(project.displayName)")
+        }
+        .padding(.leading, 7)
+        .padding(.trailing, 2)
+        .padding(.bottom, 2)
+    }
+}
+
 private struct TaskSidebarRow: View {
     let thread: RuntimeThread
     let attention: RuntimeTaskAttention
     let isSelected: Bool
     let isArchived: Bool
+    let providerName: String?
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
             statusIndicator
                 .padding(.top, 5)
 
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     Text(thread.title)
                         .font(.system(size: 12.5, weight: isSelected ? .semibold : .medium))
@@ -327,9 +605,19 @@ private struct TaskSidebarRow: View {
                     }
                 }
                 HStack(spacing: 5) {
+                    if thread.isPinned && !isArchived {
+                        Image(systemName: "pin.fill")
+                            .font(.system(size: 8))
+                            .foregroundStyle(OnyxTheme.iris.opacity(0.78))
+                            .accessibilityHidden(true)
+                    }
                     Text(thread.preview)
                         .lineLimit(1)
                     Spacer(minLength: 4)
+                    if let providerName {
+                        Text(providerName)
+                            .lineLimit(1)
+                    }
                     Text(thread.updatedAt, style: .relative)
                 }
                 .font(.system(size: 10.5))
@@ -337,20 +625,20 @@ private struct TaskSidebarRow: View {
             }
         }
         .padding(.horizontal, 9)
-        .padding(.vertical, 8)
+        .padding(.vertical, 7)
         .background {
             if isSelected {
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .fill(OnyxTheme.raisedSurface.opacity(0.78))
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.primary.opacity(0.055))
                     .overlay(alignment: .leading) {
                         Capsule()
-                            .fill(OnyxTheme.accentGradient)
-                            .frame(width: 2.5)
-                            .padding(.vertical, 7)
+                            .fill(OnyxTheme.iris)
+                            .frame(width: 2)
+                            .padding(.vertical, 6)
                     }
             }
         }
-        .contentShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     @ViewBuilder
@@ -400,6 +688,17 @@ extension RuntimeThreadStatus {
         case .waitingForApproval: "Needs approval"
         case .failed: "Failed"
         case .unknown: "Status unknown"
+        }
+    }
+
+    var sidebarTaskAttention: RuntimeTaskAttention {
+        switch self {
+        case .waitingForInput: .needsInput
+        case .waitingForApproval: .needsApproval
+        case .failed: .failed
+        case .running: .working
+        case .idle: .ready
+        case .unknown: .unknown
         }
     }
 }

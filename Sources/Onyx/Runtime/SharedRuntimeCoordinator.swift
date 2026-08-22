@@ -139,6 +139,12 @@ final class SharedRuntimeCoordinator: AgentRuntime, @unchecked Sendable {
         }
     }
 
+    func listAllThreads(archived: Bool) async throws -> [RuntimeThread] {
+        try await withAccountOperation { [runtime] in
+            try await runtime.listAllThreads(archived: archived)
+        }
+    }
+
     func readThread(id: String) async throws -> RuntimeConversation {
         try await withAccountOperation { [runtime] in
             try await runtime.readThread(id: id)
@@ -160,6 +166,12 @@ final class SharedRuntimeCoordinator: AgentRuntime, @unchecked Sendable {
     func forkThread(id: String) async throws -> RuntimeThread {
         try await withAccountOperation { [runtime] in
             try await runtime.forkThread(id: id)
+        }
+    }
+
+    func forkEphemeralThread(id: String) async throws -> RuntimeConversation {
+        try await withAccountOperation { [runtime] in
+            try await runtime.forkEphemeralThread(id: id)
         }
     }
 

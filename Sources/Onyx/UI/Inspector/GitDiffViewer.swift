@@ -12,6 +12,10 @@ final class GitDiffViewerModel: ObservableObject {
 
     enum State: Equatable {
         case noProject
+        /// A persisted project path is known, but the checkout has not been
+        /// touched yet. Review uses this gate so opening the pane alone cannot
+        /// trigger a macOS protected-folder prompt.
+        case needsExplicitLoad(String)
         case loading
         case loaded(GitRepositorySnapshot)
         case empty(GitRepositorySnapshot)
@@ -54,6 +58,22 @@ final class GitDiffViewerModel: ObservableObject {
 
     func load(path: String?) async {
         await performLoad(path: path, isRefresh: false)
+    }
+
+    /// Updates the project shown by the inspector without reading it. The
+    /// caller should invoke `load(path:)` only after an intentional,
+    /// project-scoped user action.
+    func prepare(path: String?) {
+        let usablePath = Self.normalizedProjectPath(path)
+        guard usablePath != projectPath || snapshot == nil else { return }
+        revision += 1
+        operationRevision += 1
+        activeOperation = nil
+        actionErrorMessage = nil
+        isRefreshing = false
+        projectPath = usablePath
+        selectedFileID = nil
+        state = usablePath.map(State.needsExplicitLoad) ?? .noProject
     }
 
     func refresh() async {
@@ -128,10 +148,7 @@ final class GitDiffViewerModel: ObservableObject {
     }
 
     private func performLoad(path: String?, isRefresh: Bool) async {
-        let normalizedPath = path?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let usablePath = normalizedPath.flatMap { value in
-            value.isEmpty ? nil : URL(fileURLWithPath: value, isDirectory: true).standardizedFileURL.path
-        }
+        let usablePath = Self.normalizedProjectPath(path)
         if activeOperation != nil, usablePath == projectPath { return }
         revision += 1
         let expectedRevision = revision
@@ -194,6 +211,13 @@ final class GitDiffViewerModel: ObservableObject {
             }
             selectedFileID = nil
             state = .failed(error.localizedDescription)
+        }
+    }
+
+    private static func normalizedProjectPath(_ path: String?) -> String? {
+        let normalizedPath = path?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalizedPath.flatMap { value in
+            value.isEmpty ? nil : URL(fileURLWithPath: value, isDirectory: true).standardizedFileURL.path
         }
     }
 
@@ -354,7 +378,11 @@ struct GitDiffViewerView: View {
             stateContent
         }
         .task(id: projectPath) {
-            await diffModel.load(path: projectPath)
+            // A task cwd may be inside a macOS protected folder. Merely
+            // opening Review must not read it (and therefore must not trigger
+            // a broad Documents permission prompt). The state gate below
+            // gives the user an explicit project-scoped action instead.
+            diffModel.prepare(path: projectPath)
         }
         .alert(
             "Discard file changes?",
@@ -392,7 +420,7 @@ struct GitDiffViewerView: View {
                 Spacer(minLength: 4)
                 reviewButton
             }
-            Text("Inspect, stage, unstage, or discard individual file changes. Ask Codex to review the whole checkout.")
+            Text("Inspect, stage, unstage, or discard individual file changes. Ask \(model.runtimeDisplayName) to review the whole checkout.")
                 .font(.system(size: 10.5))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -414,6 +442,20 @@ struct GitDiffViewerView: View {
                     model.chooseWorkspace(window: windowPresentation.window)
                 }
                 .controlSize(.small)
+            }
+        case let .needsExplicitLoad(path):
+            repositoryState(
+                title: "Review \(URL(fileURLWithPath: path).lastPathComponent)",
+                detail: "Onyx has not accessed \(path). Choose Inspect Changes to read this Git checkout. If it is under Documents, macOS may label its request “Documents Folder.”",
+                icon: "hand.raised"
+            ) {
+                Button("Inspect Changes", systemImage: "arrow.triangle.branch") {
+                    Task { await diffModel.load(path: path) }
+                }
+                .controlSize(.small)
+                .buttonStyle(.borderedProminent)
+                .tint(OnyxTheme.iris)
+                .accessibilityLabel("Inspect changes in \(URL(fileURLWithPath: path).lastPathComponent)")
             }
         case .loading:
             HStack(spacing: 8) {
@@ -611,7 +653,7 @@ struct GitDiffViewerView: View {
             Label("Resolve this conflict before changing its Git state.", systemImage: "exclamationmark.triangle")
                 .font(.system(size: 10.5))
                 .foregroundStyle(OnyxTheme.warning)
-                .help("Resolve the conflict before staging, unstaging, or discarding this file")
+                .onyxHelp("Resolve the conflict before staging, unstaging, or discarding this file")
                 .accessibilityLabel("Resolve the conflict in \(file.path) before using Git actions")
         } else {
             HStack(spacing: 6) {
@@ -622,7 +664,7 @@ struct GitDiffViewerView: View {
                         Label("Stage", systemImage: "plus.rectangle.on.rectangle")
                     }
                     .disabled(!diffModel.canPerform(.stage, on: file.id))
-                    .help("Stage all changes in \(file.path)")
+                    .onyxHelp("Stage all changes in \(file.path)")
                     .accessibilityLabel("Stage \(file.path)")
 
                     Button(role: .destructive) {
@@ -631,7 +673,7 @@ struct GitDiffViewerView: View {
                         Label("Discard…", systemImage: "arrow.uturn.backward")
                     }
                     .disabled(!diffModel.canPerform(.discard, on: file.id))
-                    .help("Discard all unstaged changes in \(file.path)")
+                    .onyxHelp("Discard all unstaged changes in \(file.path)")
                     .accessibilityLabel("Discard changes in \(file.path)")
                 } else {
                     Button {
@@ -640,7 +682,7 @@ struct GitDiffViewerView: View {
                         Label("Unstage", systemImage: "minus.rectangle")
                     }
                     .disabled(!diffModel.canPerform(.unstage, on: file.id))
-                    .help("Move \(file.path) back to unstaged changes")
+                    .onyxHelp("Move \(file.path) back to unstaged changes")
                     .accessibilityLabel("Unstage \(file.path)")
                 }
                 Spacer(minLength: 0)
@@ -667,7 +709,7 @@ struct GitDiffViewerView: View {
                     Image(systemName: "xmark")
                 }
                 .buttonStyle(.plain)
-                .help("Dismiss Git error")
+                .onyxHelp("Dismiss Git error")
                 .accessibilityLabel("Dismiss Git error")
             }
             .padding(8)
@@ -825,7 +867,7 @@ struct GitDiffViewerView: View {
             .controlSize(.small)
             .buttonStyle(.plain)
             .disabled(diffModel.isRefreshing)
-            .help("Refresh repository changes")
+            .onyxHelp("Refresh repository changes")
             .accessibilityLabel("Refresh repository changes")
         } else {
             Button {
@@ -836,7 +878,7 @@ struct GitDiffViewerView: View {
             .controlSize(.small)
             .buttonStyle(.bordered)
             .disabled(diffModel.isRefreshing)
-            .help("Refresh repository changes")
+            .onyxHelp("Refresh repository changes")
             .accessibilityLabel("Refresh repository changes")
         }
     }
@@ -857,12 +899,12 @@ struct GitDiffViewerView: View {
         } else if model.isReviewRunning {
             reviewProgress("Reviewing")
         } else {
-            Button("Ask Codex to Review", action: model.startReview)
+            Button("Ask \(model.runtimeDisplayName) to Review", action: model.startReview)
                 .controlSize(.small)
                 .buttonStyle(.borderedProminent)
                 .tint(OnyxTheme.iris)
                 .disabled(!model.canStartReview)
-                .help("Review staged, unstaged, and untracked project changes")
+                .onyxHelp("Review staged, unstaged, and untracked project changes")
         }
     }
 

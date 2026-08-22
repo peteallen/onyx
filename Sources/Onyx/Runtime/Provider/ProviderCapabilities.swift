@@ -114,6 +114,80 @@ struct ProviderCapabilitySet: Codable, Equatable, Hashable, Sendable {
 
 }
 
+/// Records which capability dimensions were actually present in provider
+/// metadata. A generic OpenAI-compatible `/models` row often contains only an
+/// ID; the adapter still uses text as its safe chat baseline, but the UI must
+/// not present that baseline as a provider-verified text-only declaration.
+struct ProviderCapabilityEvidence: Codable, Equatable, Hashable, Sendable {
+    let inputModalitiesAdvertised: Bool
+    let outputModalitiesAdvertised: Bool
+    let supportedParametersAdvertised: Bool
+    let reasoningEffortsAdvertised: Bool
+
+    init(
+        inputModalitiesAdvertised: Bool,
+        outputModalitiesAdvertised: Bool,
+        supportedParametersAdvertised: Bool,
+        reasoningEffortsAdvertised: Bool
+    ) {
+        self.inputModalitiesAdvertised = inputModalitiesAdvertised
+        self.outputModalitiesAdvertised = outputModalitiesAdvertised
+        self.supportedParametersAdvertised = supportedParametersAdvertised
+        self.reasoningEffortsAdvertised = reasoningEffortsAdvertised
+    }
+
+    var isUnknown: Bool {
+        !inputModalitiesAdvertised
+            && !outputModalitiesAdvertised
+            && !supportedParametersAdvertised
+            && !reasoningEffortsAdvertised
+    }
+
+    var isPartial: Bool {
+        !isUnknown && !isFullyAdvertised
+    }
+
+    var isFullyAdvertised: Bool {
+        inputModalitiesAdvertised
+            && outputModalitiesAdvertised
+            && supportedParametersAdvertised
+            && reasoningEffortsAdvertised
+    }
+
+    static let unknown = Self(
+        inputModalitiesAdvertised: false,
+        outputModalitiesAdvertised: false,
+        supportedParametersAdvertised: false,
+        reasoningEffortsAdvertised: false
+    )
+
+    /// Used by descriptors constructed from an explicit, typed capability set
+    /// rather than a partially shaped remote response.
+    static let advertised = Self(
+        inputModalitiesAdvertised: true,
+        outputModalitiesAdvertised: true,
+        supportedParametersAdvertised: true,
+        reasoningEffortsAdvertised: true
+    )
+
+    func pickerSummary(
+        inputModalities: Set<ProviderInputModality>,
+        reasoningEfforts: [String]
+    ) -> String {
+        if isUnknown { return "Capabilities unknown" }
+
+        var values: [String] = []
+        if inputModalitiesAdvertised {
+            values.append(inputModalities.contains(.image) ? "Images" : "Text")
+        }
+        if reasoningEffortsAdvertised, !reasoningEfforts.isEmpty {
+            values.append("Reasoning")
+        }
+        if isPartial { values.append("Partial metadata") }
+        return values.isEmpty ? "Capability metadata available" : values.joined(separator: " · ")
+    }
+}
+
 /// A provider model as exposed by a discovery endpoint.  It is intentionally
 /// separate from `RuntimeModel`, whose shape is optimized for the existing
 /// Codex session UI and connection-scoped selection.
@@ -123,8 +197,16 @@ struct ProviderModelDescriptor: Identifiable, Codable, Equatable, Hashable, Send
     let description: String?
     let wireProtocol: ProviderWireProtocol
     let capabilities: ProviderCapabilitySet
+    let capabilityEvidence: ProviderCapabilityEvidence
     let contextLength: Int?
     let maxCompletionTokens: Int?
+
+    var pickerCapabilitySummary: String {
+        capabilityEvidence.pickerSummary(
+            inputModalities: capabilities.inputModalities,
+            reasoningEfforts: capabilities.reasoningEfforts
+        )
+    }
 
     init(
         id: String,
@@ -132,6 +214,7 @@ struct ProviderModelDescriptor: Identifiable, Codable, Equatable, Hashable, Send
         description: String? = nil,
         wireProtocol: ProviderWireProtocol,
         capabilities: ProviderCapabilitySet,
+        capabilityEvidence: ProviderCapabilityEvidence = .advertised,
         contextLength: Int? = nil,
         maxCompletionTokens: Int? = nil
     ) throws {
@@ -145,6 +228,7 @@ struct ProviderModelDescriptor: Identifiable, Codable, Equatable, Hashable, Send
         self.description = description?.nilIfBlank
         self.wireProtocol = wireProtocol
         self.capabilities = capabilities
+        self.capabilityEvidence = capabilityEvidence
         self.contextLength = contextLength
         self.maxCompletionTokens = maxCompletionTokens
     }
@@ -155,18 +239,24 @@ struct ProviderModelDescriptor: Identifiable, Codable, Equatable, Hashable, Send
         case description
         case wireProtocol
         case capabilities
+        case capabilityEvidence
         case contextLength
         case maxCompletionTokens
     }
 
     init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        let capabilities = try container.decode(ProviderCapabilitySet.self, forKey: .capabilities)
         try self.init(
             id: container.decode(String.self, forKey: .id),
             displayName: container.decodeIfPresent(String.self, forKey: .displayName),
             description: container.decodeIfPresent(String.self, forKey: .description),
             wireProtocol: container.decode(ProviderWireProtocol.self, forKey: .wireProtocol),
-            capabilities: container.decode(ProviderCapabilitySet.self, forKey: .capabilities),
+            capabilities: capabilities,
+            capabilityEvidence: container.decodeIfPresent(
+                ProviderCapabilityEvidence.self,
+                forKey: .capabilityEvidence
+            ) ?? Self.inferredLegacyEvidence(for: capabilities),
             contextLength: container.decodeIfPresent(Int.self, forKey: .contextLength),
             maxCompletionTokens: container.decodeIfPresent(Int.self, forKey: .maxCompletionTokens)
         )
@@ -181,6 +271,10 @@ struct ProviderModelDescriptor: Identifiable, Codable, Equatable, Hashable, Send
         }
 
         let architecture = value["architecture"]
+        let inputModalitiesAdvertised = architecture?["input_modalities"]?.arrayValue != nil
+        let outputModalitiesAdvertised = architecture?["output_modalities"]?.arrayValue != nil
+        let supportedParametersAdvertised = value["supported_parameters"]?.arrayValue != nil
+        let reasoningEffortsAdvertised = value["reasoning"]?["supported_efforts"]?.arrayValue != nil
         let inputModalities = Self.decodeSet(
             architecture?["input_modalities"],
             as: ProviderInputModality.self,
@@ -211,6 +305,12 @@ struct ProviderModelDescriptor: Identifiable, Codable, Equatable, Hashable, Send
                 supportedParameters: supportedParameters,
                 reasoningEfforts: reasoningEfforts
             ),
+            capabilityEvidence: ProviderCapabilityEvidence(
+                inputModalitiesAdvertised: inputModalitiesAdvertised,
+                outputModalitiesAdvertised: outputModalitiesAdvertised,
+                supportedParametersAdvertised: supportedParametersAdvertised,
+                reasoningEffortsAdvertised: reasoningEffortsAdvertised
+            ),
             contextLength: value["context_length"]?.intValue,
             maxCompletionTokens: value["top_provider"]?["max_completion_tokens"]?.intValue
         )
@@ -234,6 +334,21 @@ struct ProviderModelDescriptor: Identifiable, Codable, Equatable, Hashable, Send
             guard let raw = value.stringValue else { return nil }
             return T(rawValue: raw)
         })
+    }
+
+    /// Older cached catalogs predate explicit evidence flags. Preserve
+    /// non-baseline metadata that can only have come from a provider response,
+    /// while treating the old text-only defaults as unknown rather than making
+    /// a stronger claim during migration.
+    private static func inferredLegacyEvidence(
+        for capabilities: ProviderCapabilitySet
+    ) -> ProviderCapabilityEvidence {
+        ProviderCapabilityEvidence(
+            inputModalitiesAdvertised: capabilities.inputModalities != [.text],
+            outputModalitiesAdvertised: capabilities.outputModalities != [.text],
+            supportedParametersAdvertised: !capabilities.supportedParameters.isEmpty,
+            reasoningEffortsAdvertised: !capabilities.reasoningEfforts.isEmpty
+        )
     }
 }
 
@@ -313,6 +428,7 @@ struct ProviderConnectionDescriptor: Identifiable, Codable, Equatable, Hashable,
     let wireProtocol: ProviderWireProtocol
     let endpoint: URL
     let credential: ProviderCredentialReference
+    let transportSecurity: ProviderConnectionTransportSecurity
     let transportCapabilities: Set<ProviderTransportCapability>
 
     init(
@@ -322,6 +438,7 @@ struct ProviderConnectionDescriptor: Identifiable, Codable, Equatable, Hashable,
         wireProtocol: ProviderWireProtocol,
         endpoint: URL,
         credential: ProviderCredentialReference,
+        transportSecurity: ProviderConnectionTransportSecurity = .requireTLS,
         transportCapabilities: Set<ProviderTransportCapability> = []
     ) throws {
         guard !id.rawValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -341,8 +458,15 @@ struct ProviderConnectionDescriptor: Identifiable, Codable, Equatable, Hashable,
               endpoint.query == nil, endpoint.fragment == nil else {
             throw ProviderCapabilityError.invalidEndpoint(endpoint.absoluteString)
         }
-        if scheme == "http" && !Self.isLoopbackHost(host) {
-            throw ProviderCapabilityError.insecureEndpoint(endpoint.absoluteString)
+        if scheme == "http" {
+            guard ProviderBaseURLNormalizer.isAllowedInsecureHTTPHost(host),
+                  transportSecurity == .allowInsecureHTTP
+            else {
+                throw ProviderCapabilityError.insecureEndpoint(endpoint.absoluteString)
+            }
+            guard credential.kind == .none else {
+                throw ProviderCapabilityError.insecureCredential(endpoint.absoluteString)
+            }
         }
         self.id = id
         self.adapterID = adapterID
@@ -351,6 +475,7 @@ struct ProviderConnectionDescriptor: Identifiable, Codable, Equatable, Hashable,
         self.endpoint = endpoint
         self.credential = credential
         self.transportCapabilities = transportCapabilities
+        self.transportSecurity = transportSecurity
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -361,6 +486,7 @@ struct ProviderConnectionDescriptor: Identifiable, Codable, Equatable, Hashable,
         case endpoint
         case credential
         case transportCapabilities
+        case transportSecurity
     }
 
     init(from decoder: any Decoder) throws {
@@ -372,19 +498,15 @@ struct ProviderConnectionDescriptor: Identifiable, Codable, Equatable, Hashable,
             wireProtocol: container.decode(ProviderWireProtocol.self, forKey: .wireProtocol),
             endpoint: container.decode(URL.self, forKey: .endpoint),
             credential: container.decode(ProviderCredentialReference.self, forKey: .credential),
+            transportSecurity: container.decodeIfPresent(
+                ProviderConnectionTransportSecurity.self,
+                forKey: .transportSecurity
+            ) ?? .requireTLS,
             transportCapabilities: container.decodeIfPresent(
                 Set<ProviderTransportCapability>.self,
                 forKey: .transportCapabilities
             ) ?? []
         )
-    }
-
-    private static func isLoopbackHost(_ host: String) -> Bool {
-        let normalized = host.lowercased()
-        return normalized == "localhost"
-            || normalized == "127.0.0.1"
-            || normalized == "::1"
-            || normalized == "[::1]"
     }
 
     /// Descriptor only: this does not create an adapter, read a key, or
@@ -468,6 +590,7 @@ enum ProviderCapabilityError: LocalizedError, Equatable, Sendable {
     case emptyDisplayName
     case invalidEndpoint(String)
     case insecureEndpoint(String)
+    case insecureCredential(String)
     case emptyModelID
     case missingModelField(String)
     case unexpectedCredentialLocator(ProviderCredentialReference.Kind)
@@ -475,6 +598,7 @@ enum ProviderCapabilityError: LocalizedError, Equatable, Sendable {
     case protocolMismatch(expected: ProviderWireProtocol, actual: ProviderWireProtocol)
     case missingCapabilities([ProviderCapabilityRequirement])
     case unsupportedLocalImagePath(String)
+    case unreadableLocalImagePath(String)
     case invalidImageURL(String)
     case emptyTurnInput
 
@@ -484,14 +608,16 @@ enum ProviderCapabilityError: LocalizedError, Equatable, Sendable {
         case .emptyAdapterID: "Provider adapter ID cannot be empty."
         case .emptyDisplayName: "Provider display name cannot be empty."
         case let .invalidEndpoint(endpoint): "Provider endpoint is invalid: \(endpoint)."
-        case let .insecureEndpoint(endpoint): "Provider endpoint must use HTTPS unless it is loopback: \(endpoint)."
+        case let .insecureEndpoint(endpoint): "Provider endpoint must use HTTPS unless clear-text HTTP was explicitly acknowledged for a literal loopback, private-network, or link-local IP address: \(endpoint)."
+        case let .insecureCredential(endpoint): "Provider credentials cannot be configured for clear-text HTTP; use HTTPS: \(endpoint)."
         case .emptyModelID: "Provider model ID cannot be empty."
         case let .missingModelField(field): "Provider model metadata is missing \(field)."
         case let .unexpectedCredentialLocator(kind): "Credential kind \(kind.rawValue) cannot use a keychain locator."
         case let .missingCredentialLocator(kind): "Credential kind \(kind.rawValue) requires a keychain locator."
         case let .protocolMismatch(expected, actual): "Provider protocol mismatch: expected \(expected.rawValue), got \(actual.rawValue)."
         case let .missingCapabilities(requirements): "Provider model is missing capabilities: \(requirements)."
-        case let .unsupportedLocalImagePath(path): "A local image path must be resolved to a data URL before sending to a remote provider: \(path)."
+        case let .unsupportedLocalImagePath(path): "The selected local image format is not supported by this provider: \(path)."
+        case let .unreadableLocalImagePath(path): "The selected local image could not be read safely: \(path)."
         case let .invalidImageURL(value): "Image input is not an HTTP(S) URL or image data URL: \(value)."
         case .emptyTurnInput: "A provider turn must contain text or an image."
         }

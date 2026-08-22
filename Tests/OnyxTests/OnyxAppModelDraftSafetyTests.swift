@@ -5,6 +5,285 @@ import XCTest
 
 @MainActor
 final class OnyxAppModelDraftSafetyTests: XCTestCase {
+    func testProviderWithoutCatalogUsesNeutralModelPlaceholder() async {
+        let suiteName = "OnyxAppModelDraftSafetyTests.neutral-model-placeholder.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let runtime = DraftSafetyRuntime(
+            initialThreads: [],
+            failurePoint: .none,
+            capabilities: [.streaming],
+            kind: .local
+        )
+        let model = OnyxAppModel(runtime: runtime, defaults: defaults, startsWithNewTask: true)
+
+        model.start()
+        await waitUntil("The local provider did not connect") {
+            model.canRunAgent && model.selectedThreadID == DraftSafetyFixture.welcomeThreadID
+        }
+
+        XCTAssertEqual(model.selectedModelName, "Choose model")
+    }
+
+    func testModelUsageIsRecordedAfterAcceptedSendNotWhenModelIsPicked() async {
+        let suiteName = "OnyxAppModelDraftSafetyTests.usage.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(DraftSafetyFixture.workspacePath, forKey: "Onyx.lastWorkspacePath")
+
+        let runtime = DraftSafetyRuntime(
+            initialThreads: [],
+            failurePoint: .none,
+            capabilities: [.streaming]
+        )
+        var usedModels: [String] = []
+        let model = OnyxAppModel(
+            runtime: runtime,
+            defaults: defaults,
+            modelUsageRecorder: { usedModels.append($0) }
+        )
+
+        model.start()
+        await waitUntil("The new-task composer did not load") {
+            model.canRunAgent && model.selectedThreadID == DraftSafetyFixture.welcomeThreadID
+        }
+
+        model.selectModel("explicit-model")
+        XCTAssertTrue(usedModels.isEmpty, "Picking a model must not count as using it.")
+
+        model.composerText = "Send this with the selected model"
+        model.sendComposer()
+        await waitUntilAsync("The turn did not reach the runtime") {
+            await runtime.recordedStartTurns().count == 1
+        }
+        await waitUntil("The accepted send did not record model usage") {
+            usedModels == ["explicit-model"]
+        }
+    }
+
+    func testFailedSendDoesNotRecordModelUsage() async {
+        let suiteName = "OnyxAppModelDraftSafetyTests.failed-usage.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let runtime = DraftSafetyRuntime(
+            initialThreads: [DraftSafetyFixture.threadA],
+            failurePoint: .startTurn,
+            capabilities: [.streaming]
+        )
+        var usedModels: [String] = []
+        let model = OnyxAppModel(
+            runtime: runtime,
+            defaults: defaults,
+            modelUsageRecorder: { usedModels.append($0) }
+        )
+
+        model.start()
+        await waitUntil("Thread A did not load") {
+            model.canRunAgent && model.selectedThreadID == DraftSafetyFixture.threadA.id
+        }
+        model.selectModel("explicit-model")
+        model.composerText = "This request fails"
+        model.sendComposer()
+        await waitUntilAsync("The failing turn did not reach the runtime") {
+            await runtime.recordedStartTurns().count == 1
+        }
+        await runtime.releaseFailure()
+        await waitUntil("The failed send did not surface an error") {
+            model.notice?.title == "Could not send"
+        }
+        XCTAssertTrue(usedModels.isEmpty)
+    }
+
+    func testExistingTaskDisplaysAndDispatchesItsPinnedModel() async {
+        let suiteName = "OnyxAppModelDraftSafetyTests.pinned-model.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set("window-picker-model", forKey: "Onyx.selectedModelID")
+
+        let pinnedThread = RuntimeThread(
+            id: "pinned-model-thread",
+            title: "Pinned model task",
+            preview: "Pinned model task",
+            cwd: DraftSafetyFixture.workspacePath,
+            updatedAt: .now,
+            status: .idle,
+            isPinned: false,
+            runtime: .codex,
+            model: "task-pinned-model",
+            branch: nil
+        )
+        let runtime = DraftSafetyRuntime(
+            initialThreads: [pinnedThread],
+            failurePoint: .none,
+            capabilities: [.streaming]
+        )
+        let model = OnyxAppModel(runtime: runtime, defaults: defaults)
+
+        model.start()
+        await waitUntil("The pinned-model task did not load") {
+            model.canRunAgent && model.selectedThreadID == pinnedThread.id
+        }
+
+        model.selectModel("window-picker-model")
+        XCTAssertEqual(model.selectedModelID, "window-picker-model")
+        XCTAssertEqual(model.selectedTaskModelID, "task-pinned-model")
+        XCTAssertEqual(model.selectedModelName, "task-pinned-model")
+
+        model.composerText = "Continue this task"
+        model.sendComposer()
+        await waitUntilAsync("The pinned-model turn did not reach the runtime") {
+            await runtime.recordedStartTurns().count == 1
+        }
+        let turn = await runtime.recordedStartTurns()[0]
+        XCTAssertEqual(turn.model, "task-pinned-model")
+    }
+
+    func testSwitchingPinnedTasksRevalidatesReasoningEffortBeforeSend() async {
+        let suiteName = "OnyxAppModelDraftSafetyTests.pinned-reasoning.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let taskA = RuntimeThread(
+            id: "reasoning-task-a",
+            title: "Reasoning task A",
+            preview: "Reasoning task A",
+            cwd: DraftSafetyFixture.workspacePath,
+            updatedAt: Date(timeIntervalSince1970: 2),
+            status: .idle,
+            isPinned: false,
+            runtime: .codex,
+            model: "reasoning-model-a",
+            branch: nil
+        )
+        let taskB = RuntimeThread(
+            id: "reasoning-task-b",
+            title: "Reasoning task B",
+            preview: "Reasoning task B",
+            cwd: DraftSafetyFixture.workspacePath,
+            updatedAt: Date(timeIntervalSince1970: 1),
+            status: .idle,
+            isPinned: false,
+            runtime: .codex,
+            model: "reasoning-model-b",
+            branch: nil
+        )
+        let runtime = DraftSafetyRuntime(
+            initialThreads: [taskA, taskB],
+            failurePoint: .none,
+            capabilities: [.streaming],
+            availableModels: [
+                RuntimeModel(
+                    id: "reasoning-model-a",
+                    displayName: "Reasoning model A",
+                    description: nil,
+                    isDefault: true,
+                    defaultReasoningEffort: "high",
+                    reasoningEfforts: ["high"],
+                    supportedRequestParameters: [.reasoningEffort]
+                ),
+                RuntimeModel(
+                    id: "reasoning-model-b",
+                    displayName: "Reasoning model B",
+                    description: nil,
+                    isDefault: false,
+                    defaultReasoningEffort: "low",
+                    reasoningEfforts: ["low"],
+                    supportedRequestParameters: [.reasoningEffort]
+                )
+            ]
+        )
+        let model = OnyxAppModel(runtime: runtime, defaults: defaults)
+
+        model.start()
+        await waitUntil("Reasoning task A did not load") {
+            model.canRunAgent && model.selectedThreadID == taskA.id && !model.isLoadingThread
+        }
+        model.selectReasoningEffort("high")
+        XCTAssertEqual(model.selectedReasoningEffort, "high")
+
+        model.selectThread(taskB.id)
+        await waitUntil("Reasoning task B did not load") {
+            model.selectedThreadID == taskB.id && !model.isLoadingThread
+        }
+        XCTAssertEqual(
+            model.selectedReasoningEffort,
+            "low",
+            "Task B must not retain task A's unsupported reasoning effort."
+        )
+
+        model.composerText = "Continue with task B's supported effort"
+        model.sendComposer()
+        await waitUntilAsync("The task B turn did not reach the runtime") {
+            await runtime.recordedStartTurns().count == 1
+        }
+        let turn = await runtime.recordedStartTurns()[0]
+        XCTAssertEqual(turn.model, "reasoning-model-b")
+        XCTAssertEqual(turn.reasoningEffort, "low")
+    }
+
+    func testNewTaskContextTransfersBetweenProviderModelsWithoutCountingUsage() async throws {
+        let sourceSuiteName = "OnyxAppModelDraftSafetyTests.transfer.source.\(UUID().uuidString)"
+        let targetSuiteName = "OnyxAppModelDraftSafetyTests.transfer.target.\(UUID().uuidString)"
+        let sourceDefaults = UserDefaults(suiteName: sourceSuiteName)!
+        let targetDefaults = UserDefaults(suiteName: targetSuiteName)!
+        sourceDefaults.removePersistentDomain(forName: sourceSuiteName)
+        targetDefaults.removePersistentDomain(forName: targetSuiteName)
+        defer {
+            sourceDefaults.removePersistentDomain(forName: sourceSuiteName)
+            targetDefaults.removePersistentDomain(forName: targetSuiteName)
+        }
+
+        var recordedUsage: [String] = []
+        let source = OnyxAppModel(
+            runtime: nil,
+            defaults: sourceDefaults,
+            modelUsageRecorder: { recordedUsage.append($0) }
+        )
+        let target = OnyxAppModel(
+            runtime: nil,
+            defaults: targetDefaults,
+            startsWithNewTask: true,
+            modelUsageRecorder: { recordedUsage.append($0) }
+        )
+        source.composerText = "Keep this exact draft"
+        source.selectWorkspace("/tmp/provider-switch-project")
+        source.permissionLabel = "Read only"
+        source.selectedReasoningEffort = "high"
+        // Use a representative in-memory image draft without touching disk.
+        let image = ComposerImageDraft(
+            input: .imageURL("data:image/png;base64,YQ=="),
+            displayName: "transfer.png",
+            byteCount: 1
+        )
+        let context = try XCTUnwrap(source.captureNewTaskContext())
+        let completeContext = OnyxAppModel.NewTaskContext(
+            composerText: context.composerText,
+            composerImages: [image],
+            workspacePath: context.workspacePath,
+            reasoningEffort: context.reasoningEffort,
+            permissionLabel: context.permissionLabel
+        )
+
+        target.selectModel("target-provider-model")
+        source.restoreNewTaskContext(completeContext)
+        OnyxApplicationHost.transferNewTaskContext(from: source, to: target)
+
+        XCTAssertEqual(target.selectedModelID, "target-provider-model")
+        XCTAssertEqual(target.composerText, "Keep this exact draft")
+        XCTAssertEqual(target.composerImages, [image])
+        XCTAssertEqual(target.draftWorkspacePath, "/tmp/provider-switch-project")
+        XCTAssertEqual(target.permissionLabel, "Read only")
+        XCTAssertEqual(target.selectedReasoningEffort, "high")
+        XCTAssertTrue(recordedUsage.isEmpty, "Switching providers or models must not count as use.")
+    }
+
     func testWorkspaceValidationPersistsDraftAndChoosingWorkspaceKeepsItUntilSuccessfulSend() async throws {
         let fixture = makeFixture(initialThreads: [], workspacePath: nil)
         defer { fixture.cleanUp() }
@@ -35,6 +314,10 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
         model.sendComposer()
 
         XCTAssertEqual(model.composerText, "", "A valid send should still clear the composer immediately.")
+        XCTAssertTrue(
+            model.isTurnRunning,
+            "The chat must show its inline waiting state immediately, before provider setup finishes."
+        )
         await waitUntilAsync("The valid draft never reached the runtime") {
             await fixture.runtime.recordedStartTurns().count == 1
         }
@@ -63,7 +346,7 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
         model.composerText = exactDraft
         model.sendComposer()
 
-        XCTAssertEqual(model.notice?.title, "Codex is unavailable")
+        XCTAssertEqual(model.notice?.title, "Agent runtime is unavailable")
         XCTAssertEqual(model.composerText, exactDraft)
         let persisted = defaults.dictionary(forKey: "Onyx.composerDrafts") as? [String: String]
         XCTAssertEqual(persisted?[DraftSafetyFixture.welcomeThreadID], exactDraft)
@@ -364,13 +647,14 @@ private actor DraftSafetyRuntime: AgentRuntime {
         case startTurn
     }
 
-    nonisolated let kind = AgentRuntimeKind.codex
+    nonisolated let kind: AgentRuntimeKind
     nonisolated let events: AsyncStream<AgentRuntimeEvent>
 
     private let continuation: AsyncStream<AgentRuntimeEvent>.Continuation
     private let initialThreads: [RuntimeThread]
     private let failurePoint: FailurePoint
     private let capabilities: RuntimeCapabilities
+    private let availableModels: [RuntimeModel]
     private var createdThreads: [String: RuntimeThread] = [:]
     private var startThreadRequests: [StartThreadRequest] = []
     private var startTurns: [StartTurnRequest] = []
@@ -379,11 +663,15 @@ private actor DraftSafetyRuntime: AgentRuntime {
     init(
         initialThreads: [RuntimeThread],
         failurePoint: FailurePoint,
-        capabilities: RuntimeCapabilities
+        capabilities: RuntimeCapabilities,
+        availableModels: [RuntimeModel] = [],
+        kind: AgentRuntimeKind = .codex
     ) {
+        self.kind = kind
         self.initialThreads = initialThreads
         self.failurePoint = failurePoint
         self.capabilities = capabilities
+        self.availableModels = availableModels
         let stream = AsyncStream.makeStream(of: AgentRuntimeEvent.self)
         events = stream.stream
         continuation = stream.continuation
@@ -403,7 +691,7 @@ private actor DraftSafetyRuntime: AgentRuntime {
                 requiresAuthentication: true
             ),
             availableLoginMethods: [],
-            availableModels: [],
+            availableModels: availableModels,
             capabilities: capabilities
         )
     }
@@ -422,7 +710,7 @@ private actor DraftSafetyRuntime: AgentRuntime {
         case DraftSafetyFixture.threadB.id:
             RuntimeConversation(thread: DraftSafetyFixture.threadB, items: [DraftSafetyFixture.itemB])
         default:
-            if let thread = createdThreads[id] {
+            if let thread = initialThreads.first(where: { $0.id == id }) ?? createdThreads[id] {
                 RuntimeConversation(thread: thread, items: [])
             } else {
                 throw AgentRuntimeError.missingField("test thread \(id)")

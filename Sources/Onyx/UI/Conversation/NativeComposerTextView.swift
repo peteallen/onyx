@@ -8,6 +8,8 @@ struct NativeComposerTextView: NSViewRepresentable {
     let onSubmit: () -> Void
     let onPasteImages: ([NSImage]) -> Void
 
+    private static let placeholder = "Describe what you want to build or change"
+
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
     }
@@ -24,6 +26,8 @@ struct NativeComposerTextView: NSViewRepresentable {
         textView.delegate = context.coordinator
         textView.onSubmit = onSubmit
         textView.onPasteImages = onPasteImages
+        textView.placeholder = Self.placeholder
+        textView.setAccessibilityPlaceholderValue(Self.placeholder)
         textView.isRichText = false
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
@@ -49,9 +53,11 @@ struct NativeComposerTextView: NSViewRepresentable {
         context.coordinator.parent = self
         textView.onSubmit = onSubmit
         textView.onPasteImages = onPasteImages
+        textView.placeholder = Self.placeholder
         textView.isEditable = isEnabled
         if textView.string != text {
             textView.string = text
+            textView.needsDisplay = true
             context.coordinator.updateHeight()
         }
     }
@@ -88,6 +94,22 @@ struct NativeComposerTextView: NSViewRepresentable {
 fileprivate final class ComposerTextView: NSTextView {
     var onSubmit: (() -> Void)?
     var onPasteImages: (([NSImage]) -> Void)?
+    var placeholder = "" {
+        didSet { needsDisplay = true }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard string.isEmpty, !placeholder.isEmpty else { return }
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font ?? NSFont.systemFont(ofSize: 14.5),
+            .foregroundColor: NSColor.placeholderTextColor,
+        ]
+        NSString(string: placeholder).draw(
+            at: NSPoint(x: textContainerInset.width + 1, y: textContainerInset.height),
+            withAttributes: attributes
+        )
+    }
 
     override func keyDown(with event: NSEvent) {
         let isReturn = event.keyCode == 36 || event.keyCode == 76
@@ -98,6 +120,11 @@ fileprivate final class ComposerTextView: NSTextView {
         super.keyDown(with: event)
     }
 
+
+    override func didChangeText() {
+        super.didChangeText()
+        needsDisplay = true
+    }
     override func paste(_ sender: Any?) {
         if let images = NSPasteboard.general.readObjects(
             forClasses: [NSImage.self],

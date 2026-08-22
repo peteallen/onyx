@@ -2,54 +2,87 @@ import AppKit
 import SwiftUI
 
 enum OnyxTheme {
-    static let rail = Color(red: 0.045, green: 0.047, blue: 0.058)
-    static let railRaised = Color(red: 0.09, green: 0.095, blue: 0.115)
-    static let iris = Color(red: 0.42, green: 0.36, blue: 0.98)
-    static let electric = Color(red: 0.25, green: 0.76, blue: 0.94)
-    static let success = Color(red: 0.24, green: 0.72, blue: 0.50)
-    static let warning = Color(red: 0.96, green: 0.64, blue: 0.25)
-    static let destructive = Color(red: 0.94, green: 0.35, blue: 0.40)
-
-    static let canvas = Color(
-        nsColor: NSColor(name: nil) { appearance in
-            appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-                ? NSColor(srgbRed: 0.070, green: 0.073, blue: 0.088, alpha: 1)
-                : NSColor(srgbRed: 0.965, green: 0.961, blue: 0.948, alpha: 1)
-        }
+    // A calm, native-feeling dark hierarchy: the canvas is nearly black, each
+    // adjacent surface is only just lighter, and color is saved for a focused
+    // action or a small state indicator.  Keep the public names stable; most
+    // of the app composes its visual language from these tokens.
+    static let rail = adaptiveColor(
+        dark: NSColor(srgbRed: 0.035, green: 0.036, blue: 0.039, alpha: 1),
+        light: NSColor(srgbRed: 0.930, green: 0.931, blue: 0.934, alpha: 1)
+    )
+    static let railRaised = adaptiveColor(
+        dark: NSColor(srgbRed: 0.105, green: 0.108, blue: 0.115, alpha: 1),
+        light: NSColor(srgbRed: 0.855, green: 0.858, blue: 0.865, alpha: 1)
+    )
+    // Color is an interaction signal, not a structural color.  These tokens
+    // also carry small status labels, so each appearance has its own restrained
+    // palette with at least 4.5:1 contrast on the sidebar and inspector.
+    static let iris = adaptiveColor(
+        dark: NSColor(srgbRed: 0.34, green: 0.57, blue: 0.90, alpha: 1),
+        light: NSColor(srgbRed: 0.20, green: 0.36, blue: 0.62, alpha: 1)
+    )
+    static let electric = adaptiveColor(
+        dark: NSColor(srgbRed: 0.41, green: 0.64, blue: 0.94, alpha: 1),
+        light: NSColor(srgbRed: 0.14, green: 0.39, blue: 0.54, alpha: 1)
+    )
+    static let success = adaptiveColor(
+        dark: NSColor(srgbRed: 0.37, green: 0.66, blue: 0.56, alpha: 1),
+        light: NSColor(srgbRed: 0.17, green: 0.40, blue: 0.31, alpha: 1)
+    )
+    static let warning = adaptiveColor(
+        dark: NSColor(srgbRed: 0.82, green: 0.61, blue: 0.31, alpha: 1),
+        light: NSColor(srgbRed: 0.44, green: 0.32, blue: 0.08, alpha: 1)
+    )
+    static let destructive = adaptiveColor(
+        dark: NSColor(srgbRed: 0.84, green: 0.39, blue: 0.41, alpha: 1),
+        light: NSColor(srgbRed: 0.62, green: 0.20, blue: 0.24, alpha: 1)
     )
 
-    static let sidebar = Color(
-        nsColor: NSColor(name: nil) { appearance in
-            appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-                ? NSColor(srgbRed: 0.085, green: 0.088, blue: 0.105, alpha: 1)
-                : NSColor(srgbRed: 0.925, green: 0.919, blue: 0.900, alpha: 1)
-        }
+    static let canvas = adaptiveColor(
+        dark: NSColor(srgbRed: 0.043, green: 0.044, blue: 0.047, alpha: 1),
+        light: NSColor(srgbRed: 0.966, green: 0.967, blue: 0.970, alpha: 1)
     )
 
-    static let surface = Color(
-        nsColor: NSColor(name: nil) { appearance in
-            appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-                ? NSColor(srgbRed: 0.105, green: 0.109, blue: 0.129, alpha: 1)
-                : NSColor(srgbRed: 0.995, green: 0.993, blue: 0.986, alpha: 1)
-        }
+    static let sidebar = adaptiveColor(
+        dark: NSColor(srgbRed: 0.052, green: 0.053, blue: 0.057, alpha: 1),
+        light: NSColor(srgbRed: 0.940, green: 0.941, blue: 0.944, alpha: 1)
     )
 
-    static let raisedSurface = Color(
-        nsColor: NSColor(name: nil) { appearance in
-            appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-                ? NSColor(srgbRed: 0.135, green: 0.140, blue: 0.163, alpha: 1)
-                : NSColor.white
-        }
+    static let surface = adaptiveColor(
+        dark: NSColor(srgbRed: 0.071, green: 0.073, blue: 0.079, alpha: 1),
+        light: NSColor(srgbRed: 0.984, green: 0.985, blue: 0.988, alpha: 1)
     )
 
-    static let border = Color.primary.opacity(0.105)
-    static let quietText = Color.secondary.opacity(0.78)
+    static let raisedSurface = adaptiveColor(
+        dark: NSColor(srgbRed: 0.095, green: 0.097, blue: 0.104, alpha: 1),
+        light: NSColor.white
+    )
+
+    static let chrome = adaptiveColor(
+        dark: NSColor(srgbRed: 0.043, green: 0.044, blue: 0.047, alpha: 1),
+        light: NSColor(srgbRed: 0.971, green: 0.972, blue: 0.975, alpha: 1)
+    )
+    static let inspector = adaptiveColor(
+        dark: NSColor(srgbRed: 0.050, green: 0.051, blue: 0.055, alpha: 1),
+        light: NSColor(srgbRed: 0.949, green: 0.950, blue: 0.953, alpha: 1)
+    )
+    static let border = Color.primary.opacity(0.065)
+    static let divider = Color.primary.opacity(0.055)
+    static let quietText = Color.secondary.opacity(0.72)
     static let hairline = 1.0 / (NSScreen.main?.backingScaleFactor ?? 2.0)
     static let accentGradient = LinearGradient(
         colors: [iris, electric],
         startPoint: .topLeading,
         endPoint: .bottomTrailing
     )
+
+    private static func adaptiveColor(dark: NSColor, light: NSColor) -> Color {
+        Color(
+            nsColor: NSColor(name: nil) { appearance in
+                appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
+            }
+        )
+    }
 }
 
 struct OnyxMark: View {

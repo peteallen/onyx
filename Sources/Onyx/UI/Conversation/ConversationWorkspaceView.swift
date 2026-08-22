@@ -2,78 +2,143 @@ import SwiftUI
 
 struct ConversationWorkspaceView: View {
     @ObservedObject var model: OnyxAppModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// The parent owns compact pane arbitration, so the header can describe
+    /// what is actually visible rather than only the persisted preference.
+    var sidebarDisplayed: Bool?
+    var onShowSidebar: (@MainActor () -> Void)?
+    var providerConnections: [OnyxApplicationHost.WorkspaceConnection] = []
+    var selectedProviderConnectionID: ProviderConnectionID = .codexDefault
+    var onSelectProviderConnection: @MainActor (ProviderConnectionID) -> Void = { _ in }
+    var rankedModelChoices: [OnyxApplicationHost.ProviderModelChoice] = []
+    var onSelectProviderModel: @MainActor (OnyxApplicationHost.ProviderModelChoice) -> Void = { _ in }
 
     var body: some View {
-        VStack(spacing: 0) {
-            ConversationHeaderView(model: model)
-            Divider().overlay(OnyxTheme.border)
+        GeometryReader { proxy in
+            let sideChatLayout = SideChatPanelLayout.resolve(availableWidth: proxy.size.width)
 
-            ZStack {
-                NativeTranscriptView(items: model.timeline)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            ZStack(alignment: .trailing) {
+                VStack(spacing: 0) {
+                    ConversationHeaderView(
+                        model: model,
+                        sidebarDisplayed: sidebarDisplayed ?? model.isSidebarVisible,
+                        onShowSidebar: onShowSidebar ?? { model.isSidebarVisible = true }
+                    )
+                    Divider().overlay(OnyxTheme.divider)
 
-                if model.isLoadingThread {
-                    VStack(spacing: 10) {
-                        ProgressView().controlSize(.small)
-                        Text("Loading task history…")
-                            .font(.system(size: 12.5))
-                            .foregroundStyle(.secondary)
+                    ZStack {
+                        NativeTranscriptView(
+                            items: model.transcriptSnapshot.items,
+                            isAwaitingResponse: (model.isTurnRunning || model.isSelectedReviewStarting)
+                                && model.activeUserInteraction == nil,
+                            workingLabel: model.isReviewRunning || model.isSelectedReviewStarting
+                                ? "Reviewing changes…"
+                                : "Working on a response…",
+                            revision: model.transcriptSnapshot.revision,
+                            changeHint: model.transcriptSnapshot.changeHint
+                        )
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                        if model.isLoadingThread {
+                            VStack(spacing: 10) {
+                                ProgressView().controlSize(.small)
+                                Text("Loading task history…")
+                                    .font(.system(size: 12.5))
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(18)
+                            .onyxPanel(radius: 12)
+                        } else if model.timeline.isEmpty {
+                            EmptyTranscriptView(isArchive: model.isShowingArchivedThreads)
+                        }
                     }
-                    .padding(18)
-                    .onyxPanel(radius: 12)
-                } else if model.timeline.isEmpty {
-                    EmptyTranscriptView(isArchive: model.isShowingArchivedThreads)
+
+                    VStack(spacing: 8) {
+                        if let interaction = model.activeUserInteraction {
+                            UserInteractionView(model: model, interaction: interaction)
+                                .id(interaction)
+                        }
+
+                        if model.session != nil,
+                           (model.loginAttempt != nil
+                            || (model.authState.requiresAuthentication && !model.authState.isSignedIn)) {
+                            AccountAccessStrip(model: model)
+                        }
+
+                        RuntimeStatusStrip(model: model)
+                        if model.isShowingArchivedThreads {
+                            ArchivedThreadStrip(model: model)
+                        } else {
+                            ComposerView(
+                                model: model,
+                                providerConnections: providerConnections,
+                                selectedProviderConnectionID: selectedProviderConnectionID,
+                                onSelectProviderConnection: onSelectProviderConnection,
+                                rankedModelChoices: rankedModelChoices,
+                                onSelectProviderModel: onSelectProviderModel
+                            )
+                        }
+                    }
+                    .frame(maxWidth: 860)
+                    .padding(.horizontal, 30)
+                    .padding(.bottom, 24)
+                }
+
+                if model.isSideChatPresented {
+                    SideChatPanelView(model: model)
+                        .frame(width: sideChatLayout.panelWidth)
+                        .frame(maxHeight: .infinity)
                 }
             }
-
-            VStack(spacing: 8) {
-                if let interaction = model.activeUserInteraction {
-                    UserInteractionView(model: model, interaction: interaction)
-                        .id(interaction)
-                }
-
-                if model.session != nil,
-                   (model.loginAttempt != nil
-                    || (model.authState.requiresAuthentication && !model.authState.isSignedIn)) {
-                    AccountAccessStrip(model: model)
-                }
-
-                RuntimeStatusStrip(model: model)
-                if model.isShowingArchivedThreads {
-                    ArchivedThreadStrip(model: model)
-                } else {
-                    ComposerView(model: model)
-                }
-            }
-            .frame(maxWidth: 808)
-            .padding(.horizontal, 24)
-            .padding(.bottom, 17)
+            .frame(width: proxy.size.width, height: proxy.size.height)
         }
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: model.isSideChatPresented)
         .background(OnyxTheme.canvas)
+    }
+}
+
+/// Keeps an ephemeral trailing panel useful without collapsing the main task
+/// at compact workspace widths. The panel overlays the transcript rather than
+/// consuming another permanent split-pane allocation (the project sidebar and
+/// inspector may already be visible outside this conversation surface).
+struct SideChatPanelLayout: Equatable {
+    static let minimumWidth: CGFloat = 300
+    static let preferredWidth: CGFloat = 380
+    static let maximumWidth: CGFloat = 460
+    static let compactHorizontalInset: CGFloat = 20
+
+    let panelWidth: CGFloat
+
+    static func resolve(availableWidth: CGFloat) -> Self {
+        let boundedAvailable = max(0, availableWidth - compactHorizontalInset)
+        let width = min(maximumWidth, max(minimumWidth, min(preferredWidth, boundedAvailable)))
+        return Self(panelWidth: width)
     }
 }
 
 private struct ConversationHeaderView: View {
     @ObservedObject var model: OnyxAppModel
+    let sidebarDisplayed: Bool
+    let onShowSidebar: @MainActor () -> Void
     @Environment(\.onyxWindowPresentationContext) private var windowPresentation
 
     var body: some View {
-        HStack(spacing: 10) {
-            if !model.isSidebarVisible {
+        HStack(spacing: 12) {
+            if !sidebarDisplayed {
                 Button {
-                    model.isSidebarVisible = true
+                    onShowSidebar()
                 } label: {
                     Image(systemName: "sidebar.leading")
                 }
                 .buttonStyle(.borderless)
-                .help("Show sidebar")
+                .onyxHelp("Show sidebar")
                 .accessibilityLabel("Show task sidebar")
                 .accessibilityHint("Reveals the task list")
             }
 
-            VStack(alignment: .leading, spacing: 1) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(model.selectedThread?.title ?? (model.isShowingArchivedThreads ? "Archived tasks" : "New task"))
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 14, weight: .semibold))
                     .lineLimit(1)
                 HStack(spacing: 5) {
                     Text(model.projectName)
@@ -89,6 +154,32 @@ private struct ConversationHeaderView: View {
 
             Spacer()
 
+            if model.isSideChatPresented {
+                Button(action: model.closeSideChat) {
+                    headerAction(
+                        title: "Side chat",
+                        systemImage: "bubble.left.and.bubble.right.fill",
+                        isSelected: true
+                    )
+                }
+                .buttonStyle(.plain)
+                .onyxHelp("Close side chat")
+                .accessibilityLabel("Close side chat")
+                .accessibilityHint("Returns focus to the durable task transcript")
+            } else if model.canOpenSideChat {
+                Button(action: model.openSideChat) {
+                    headerAction(
+                        title: "Side chat",
+                        systemImage: "bubble.left.and.bubble.right",
+                        isSelected: false
+                    )
+                }
+                .buttonStyle(.plain)
+                .onyxHelp("Ask a private follow-up without changing this task")
+                .accessibilityLabel("Open side chat")
+                .accessibilityHint("Creates an ephemeral fork with a copy of this task's context")
+            }
+
             if model.isShowingArchivedThreads {
                 Label("Archived", systemImage: "archivebox")
                     .font(.system(size: 11.5, weight: .medium))
@@ -100,34 +191,6 @@ private struct ConversationHeaderView: View {
                     .accessibilityElement(children: .ignore)
                     .accessibilityLabel("Task status")
                     .accessibilityValue("Archived")
-            } else if model.isSelectedReviewStarting {
-                HStack(spacing: 6) {
-                    ProgressView().controlSize(.mini)
-                    Text("Starting review")
-                }
-                .font(.system(size: 11.5, weight: .medium))
-                .foregroundStyle(OnyxTheme.electric)
-                .padding(.horizontal, 9)
-                .frame(height: 26)
-                .background(OnyxTheme.electric.opacity(0.08))
-                .clipShape(Capsule())
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel("Task status")
-                .accessibilityValue("Starting review")
-            } else if model.isTurnRunning {
-                HStack(spacing: 6) {
-                    ProgressView().controlSize(.mini)
-                    Text(model.isReviewRunning ? "Reviewing" : "Working")
-                }
-                .font(.system(size: 11.5, weight: .medium))
-                .foregroundStyle(OnyxTheme.electric)
-                .padding(.horizontal, 9)
-                .frame(height: 26)
-                .background(OnyxTheme.electric.opacity(0.08))
-                .clipShape(Capsule())
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel("Task status")
-                .accessibilityValue(model.isReviewRunning ? "Reviewing" : "Working")
             }
 
             if !model.isShowingArchivedThreads,
@@ -137,9 +200,11 @@ private struct ConversationHeaderView: View {
                     model.togglePin(id)
                 } label: {
                     Image(systemName: model.selectedThread?.isPinned == true ? "pin.fill" : "pin")
+                        .frame(width: 26, height: 26)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.borderless)
-                .help(pinActionLabel)
+                .onyxHelp(pinActionLabel)
                 .accessibilityLabel(pinActionLabel)
                 .accessibilityHint("Updates this task's pinned state")
             }
@@ -149,9 +214,11 @@ private struct ConversationHeaderView: View {
             } label: {
                 Image(systemName: "sidebar.right")
                     .foregroundStyle(model.isInspectorVisible ? OnyxTheme.iris : Color.secondary)
+                    .frame(width: 26, height: 26)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.borderless)
-            .help("Toggle context panel (⌘⌥B)")
+            .onyxHelp("Toggle context panel (⌘⌥B)")
             .accessibilityLabel(model.isInspectorVisible ? "Hide context panel" : "Show context panel")
             .accessibilityHint("Keyboard shortcut Command-Option-B")
 
@@ -166,6 +233,10 @@ private struct ConversationHeaderView: View {
                             }
                         }
                     } else {
+                        if model.canOpenSideChat {
+                            Button("Open Side Chat") { model.openSideChat() }
+                            Divider()
+                        }
                         Button("Rename…") { model.beginRename(id, window: windowPresentation.window) }
                         Button(model.selectedThread?.isPinned == true ? "Unpin" : "Pin") { model.togglePin(id) }
                         if model.supports(.threadForking) {
@@ -189,20 +260,33 @@ private struct ConversationHeaderView: View {
                 }
             } label: {
                 Image(systemName: "ellipsis")
+                    .frame(width: 26, height: 26)
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
-            .help("Task actions")
+            .onyxHelp("Task actions")
             .accessibilityLabel("Task actions")
         }
-        .padding(.horizontal, 14)
-        .padding(.top, 3)
-        .frame(height: 50)
-        .background(.bar)
+        .padding(.leading, 18)
+        .padding(.trailing, 14)
+        .padding(.top, 1)
+        .frame(height: 54)
+        .background(OnyxTheme.chrome)
     }
 
     private var pinActionLabel: String {
         model.selectedThread?.isPinned == true ? "Unpin task" : "Pin task"
+    }
+
+    private func headerAction(title: String, systemImage: String, isSelected: Bool) -> some View {
+        Label(title, systemImage: systemImage)
+            .font(.system(size: 11.5, weight: .medium))
+            .foregroundStyle(isSelected ? OnyxTheme.iris : Color.secondary)
+            .padding(.horizontal, 9)
+            .frame(height: 28)
+            .background(isSelected ? OnyxTheme.iris.opacity(0.10) : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .contentShape(Rectangle())
     }
 }
 
@@ -279,7 +363,9 @@ private struct RuntimeStatusStrip: View {
             HStack(spacing: 6) {
                 ProgressView()
                     .controlSize(.mini)
-                Text(model.session == nil ? "Connecting to Codex…" : "Reconnecting to Codex…")
+                Text(model.session == nil
+                    ? "Connecting to \(model.runtimeDisplayName)…"
+                    : "Reconnecting to \(model.runtimeDisplayName)…")
             }
                 .foregroundStyle(.secondary)
                 .font(.system(size: 10.5))
@@ -291,7 +377,7 @@ private struct RuntimeStatusStrip: View {
             )
         case .disconnected:
             reconnectRow(
-                message: "Codex disconnected",
+                message: "\(model.runtimeDisplayName) disconnected",
                 systemImage: "bolt.slash",
                 color: .secondary
             )
@@ -313,7 +399,7 @@ private struct RuntimeStatusStrip: View {
                 Button("Reconnect", action: model.reconnect)
                     .buttonStyle(.borderless)
                     .font(.system(size: 10.5, weight: .semibold))
-                    .accessibilityHint("Restarts Codex and refreshes the open task")
+                    .accessibilityHint("Restarts \(model.runtimeDisplayName) and refreshes the open task")
             }
         }
     }
@@ -363,6 +449,16 @@ private struct AccountAccessStrip: View {
             } else if model.isAuthenticating {
                 ProgressView().controlSize(.small)
             } else {
+                if model.primaryLoginMethod == nil {
+                    SettingsLink {
+                        Text("Open Settings")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(OnyxTheme.iris)
+                    .controlSize(.small)
+                    .accessibilityLabel("Open provider settings")
+                    .accessibilityHint("Choose Providers to add or update this connection's API key")
+                }
                 if let deviceMethod = model.deviceCodeLoginMethod {
                     Menu {
                         Button(deviceMethod.displayName) { model.startLogin(deviceMethod) }
@@ -371,7 +467,7 @@ private struct AccountAccessStrip: View {
                     }
                     .menuStyle(.borderlessButton)
                     .fixedSize()
-                    .help("More sign-in options")
+                    .onyxHelp("More sign-in options")
                 }
                 if let method = model.primaryLoginMethod {
                     Button(method.displayName) { model.startLogin(method) }
@@ -388,18 +484,40 @@ private struct AccountAccessStrip: View {
     }
 
     private var title: String {
-        guard let attempt = model.loginAttempt else { return "Sign in to run Codex" }
+        guard let attempt = model.loginAttempt else {
+            if model.primaryLoginMethod == nil {
+                return "\(model.runtimeDisplayName) needs credentials"
+            }
+            return "Sign in to run \(model.runtimeDisplayName)"
+        }
         return attempt.method.ceremony == .deviceCode ? "Enter this one-time code" : "Finish signing in in your browser"
     }
 
     private var detail: String {
-        model.loginAttempt?.method.detail
-            ?? "Your credentials stay with Codex and are never copied into Onyx."
+        if let detail = model.loginAttempt?.method.detail { return detail }
+        if model.primaryLoginMethod == nil {
+            return "Open Settings, choose Providers, and add or update this connection's API key."
+        }
+        return "Your credentials stay with \(model.runtimeDisplayName) and are never copied into Onyx."
     }
+}
+
+/// Layout constants for the composer toolbar. The conversation surface can get
+/// fairly narrow when the task list and context panel are open, so the toolbar
+/// deliberately spends its available width on the model picker and keeps
+/// secondary controls discoverable behind compact icon menus.
+enum ComposerToolbarLayout {
+    static let horizontalPadding: CGFloat = 10
+    static let rowHeight: CGFloat = 36
 }
 
 private struct ComposerView: View {
     @ObservedObject var model: OnyxAppModel
+    let providerConnections: [OnyxApplicationHost.WorkspaceConnection]
+    let selectedProviderConnectionID: ProviderConnectionID
+    let onSelectProviderConnection: @MainActor (ProviderConnectionID) -> Void
+    let rankedModelChoices: [OnyxApplicationHost.ProviderModelChoice]
+    let onSelectProviderModel: @MainActor (OnyxApplicationHost.ProviderModelChoice) -> Void
     @Environment(\.onyxWindowPresentationContext) private var windowPresentation
     @State private var textHeight: CGFloat = 46
 
@@ -443,129 +561,425 @@ private struct ComposerView: View {
             .padding(.horizontal, 12)
             .padding(.top, 4)
 
-            HStack(spacing: 10) {
-                Button(action: { model.chooseComposerImages(window: windowPresentation.window) }) {
-                    Image(systemName: "plus")
-                        .frame(width: 24, height: 24)
-                }
-                .buttonStyle(.borderless)
-                .disabled(!model.canAttachImages)
-                .help(model.canAttachImages ? "Attach images" : "This runtime does not support image input")
-                .accessibilityLabel("Attach images")
-                .accessibilityHint("Choose one or more images to include with this message")
-
-                Menu {
-                    if let models = model.session?.availableModels, !models.isEmpty {
-                        ForEach(models) { runtimeModel in
-                            Button {
-                                model.selectModel(runtimeModel.id)
-                            } label: {
-                                if runtimeModel.id == model.selectedModelID {
-                                    Label(runtimeModel.displayName, systemImage: "checkmark")
-                                } else {
-                                    Text(runtimeModel.displayName)
-                                }
-                            }
-                        }
-                    } else {
-                        Text("Models load after connection")
-                    }
-                } label: {
-                    HStack(spacing: 4) {
-                        Text(model.selectedModelName)
-                        Image(systemName: "chevron.down")
-                            .font(.system(size: 8, weight: .bold))
-                    }
-                    .font(.system(size: 11.5, weight: .medium))
-                }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-
-                if !model.availableReasoningEfforts.isEmpty {
-                    Menu {
-                        ForEach(model.availableReasoningEfforts, id: \.self) { effort in
-                            Button {
-                                model.selectReasoningEffort(effort)
-                            } label: {
-                                if effort == model.selectedReasoningEffort {
-                                    Label(effort.capitalized, systemImage: "checkmark")
-                                } else {
-                                    Text(effort.capitalized)
-                                }
-                            }
-                        }
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "brain")
-                            Text(model.selectedReasoningEffortName)
-                        }
-                        .font(.system(size: 11.5))
-                        .foregroundStyle(.secondary)
-                    }
-                    .menuStyle(.borderlessButton)
-                    .fixedSize()
-                }
-
-                Menu {
-                    Button("Read only") { model.permissionLabel = "Read only" }
-                    Button("Workspace") { model.permissionLabel = "Workspace" }
-                    Button("Full access") { model.permissionLabel = "Full access" }
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "shield")
-                        Text(model.permissionLabel)
-                    }
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(.secondary)
-                }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-
-                Spacer()
-
-                if model.isSelectedReviewStarting {
-                    ProgressView()
-                        .controlSize(.small)
-                        .frame(width: 29, height: 29)
-                        .help("Starting code review")
-                } else if model.isTurnRunning {
-                    Button(action: model.interrupt) {
-                        Image(systemName: "stop.fill")
-                            .font(.system(size: 9, weight: .bold))
-                            .frame(width: 28, height: 28)
-                            .background(Color.primary)
-                            .foregroundStyle(OnyxTheme.canvas)
-                            .clipShape(Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .help("Stop")
-                } else {
-                    Button(action: model.sendComposer) {
-                        Image(systemName: "arrow.up")
-                            .font(.system(size: 12, weight: .bold))
-                            .frame(width: 29, height: 29)
-                            .background(canSend ? AnyShapeStyle(OnyxTheme.accentGradient) : AnyShapeStyle(Color.secondary.opacity(0.16)))
-                            .foregroundStyle(canSend ? Color.white : Color.secondary.opacity(0.58))
-                            .clipShape(Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(!canSend)
-                    .help("Send (Return)")
-                }
+            // ViewThatFits measures the full-label candidate at its intrinsic
+            // width before falling back. This is important for arbitrary
+            // provider/model names: a fixed breakpoint would either truncate
+            // short names too early or still overflow a long vLLM name.
+            ViewThatFits(in: .horizontal) {
+                regularToolbarCandidate
+                compactToolbar
+                minimalToolbar
             }
-            .padding(.horizontal, 10)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .frame(height: ComposerToolbarLayout.rowHeight)
+            .padding(.horizontal, ComposerToolbarLayout.horizontalPadding)
             .padding(.bottom, 8)
         }
-        .background(.regularMaterial)
-        .background(OnyxTheme.raisedSurface.opacity(0.84))
-        .clipShape(RoundedRectangle(cornerRadius: 17, style: .continuous))
+        .background(OnyxTheme.raisedSurface)
+        .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 17, style: .continuous)
-                .stroke(OnyxTheme.border, lineWidth: OnyxTheme.hairline)
+            RoundedRectangle(cornerRadius: 15, style: .continuous)
+                .stroke(OnyxTheme.border, lineWidth: 1)
         }
-        .shadow(color: Color.black.opacity(0.08), radius: 16, y: 6)
+        .shadow(color: SwiftUI.Color(white: 0, opacity: 0.075), radius: 9, y: 4)
     }
 
+    private var isComposingNewTask: Bool {
+        model.selectedThreadID == nil || model.selectedThreadID == "onyx:welcome"
+    }
+
+    private var selectedProviderName: String {
+        providerConnections.first(where: { $0.id == selectedProviderConnectionID })?.displayName
+            ?? model.session?.displayName
+            ?? "Provider"
+    }
+
+    private var selectedModelLabel: String {
+        model.session?.availableModels.first(where: { $0.id == model.selectedTaskModelID })?.displayName
+            ?? model.session?.availableModels.first(where: { $0.id == model.selectedModelID })?.displayName
+            ?? model.selectedTaskModelID
+            ?? model.selectedModelID
+            ?? "Choose model"
+    }
+
+    private var frequentChoices: [OnyxApplicationHost.ProviderModelChoice] {
+        Array(rankedModelChoices.filter { $0.usageCount > 0 }.prefix(5))
+    }
+
+    private func choicesForProvider(
+        _ connectionID: ProviderConnectionID
+    ) -> [OnyxApplicationHost.ProviderModelChoice] {
+        let promotedIDs = Set(frequentChoices.map(\.id))
+        return rankedModelChoices.filter {
+            $0.connection.id == connectionID && !promotedIDs.contains($0.id)
+        }
+    }
+
+    private func hasCatalog(for connectionID: ProviderConnectionID) -> Bool {
+        rankedModelChoices.contains { $0.connection.id == connectionID }
+    }
+
+    @ViewBuilder
+    private var regularToolbar: some View {
+        HStack(spacing: 10) {
+            attachImagesButton
+            regularProviderModelMenu
+            if !model.availableReasoningEfforts.isEmpty {
+                regularReasoningMenu
+            }
+            regularPermissionMenu
+            Spacer(minLength: 0)
+            sendButton
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+    }
+
+    /// Keep the wide row's trailing send action anchored to the composer edge
+    /// after it is selected. The hidden fixed-size copy gives ViewThatFits the
+    /// true intrinsic width for its fit check without constraining the visible
+    /// row to that width (which would otherwise center the whole toolbar).
+    private var regularToolbarCandidate: some View {
+        ZStack {
+            regularToolbar
+            regularToolbar
+                .fixedSize(horizontal: true, vertical: false)
+                .hidden()
+                .accessibilityHidden(true)
+                .allowsHitTesting(false)
+        }
+    }
+
+    @ViewBuilder
+    private var compactToolbar: some View {
+        HStack(spacing: 8) {
+            attachImagesButton
+            compactProviderModelMenu
+            if !model.availableReasoningEfforts.isEmpty {
+                compactReasoningMenu
+            }
+            compactPermissionMenu
+            Spacer(minLength: 2)
+            sendButton
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+    }
+
+    @ViewBuilder
+    private var minimalToolbar: some View {
+        HStack(spacing: 8) {
+            attachImagesButton
+            minimalProviderModelMenu
+            minimalOptionsMenu
+            Spacer(minLength: 2)
+            sendButton
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+    }
+
+    private var attachImagesButton: some View {
+        Button(action: { model.chooseComposerImages(window: windowPresentation.window) }) {
+            Image(systemName: "plus")
+                .frame(width: 24, height: 24)
+        }
+        .buttonStyle(.borderless)
+        .disabled(!model.canAttachImages)
+        .onyxHelp(model.canAttachImages ? "Attach images" : "This runtime does not support image input")
+        .accessibilityLabel("Attach images")
+        .accessibilityHint("Choose one or more images to include with this message")
+    }
+
+    @ViewBuilder
+    private var providerModelMenuContent: some View {
+        if isComposingNewTask {
+            if !frequentChoices.isEmpty {
+                Section("Frequent & recent") {
+                    ForEach(frequentChoices) { choice in
+                        modelChoiceButton(choice, showsProvider: true)
+                    }
+                }
+            }
+            ForEach(providerConnections) { connection in
+                let choices = choicesForProvider(connection.id)
+                if !choices.isEmpty {
+                    Section(connection.displayName) {
+                        ForEach(choices) { choice in modelChoiceButton(choice) }
+                    }
+                } else if !hasCatalog(for: connection.id) {
+                    Section(connection.displayName) {
+                        if connection.id == selectedProviderConnectionID {
+                            Text("Models load after connection")
+                        } else {
+                            Button("Browse \(connection.displayName) models…") {
+                                onSelectProviderConnection(connection.id)
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            Text("This task uses \(selectedProviderName) / \(selectedModelLabel)")
+        }
+    }
+
+    private var regularProviderModelMenu: some View {
+        Menu {
+            providerModelMenuContent
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "point.3.connected.trianglepath.dotted")
+                Text("\(selectedProviderName) / \(selectedModelLabel)")
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .bold))
+            }
+            .font(.system(size: 11.5, weight: .medium))
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize(horizontal: true, vertical: false)
+        .onyxHelp(isComposingNewTask ? "Choose a provider and model for this new task" : "Task provider and model")
+        .accessibilityLabel("Provider and model")
+        .accessibilityValue("\(selectedProviderName), \(selectedModelLabel)")
+    }
+
+    private var compactProviderModelMenu: some View {
+        Menu {
+            providerModelMenuContent
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "point.3.connected.trianglepath.dotted")
+                Text("\(selectedProviderName) / \(selectedModelLabel)")
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(width: 100, alignment: .leading)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .bold))
+            }
+            .font(.system(size: 11.5, weight: .medium))
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .menuStyle(.borderlessButton)
+        .frame(width: 120, alignment: .leading)
+        .layoutPriority(1)
+        .onyxHelp(isComposingNewTask ? "Choose a provider and model for this new task" : "Task provider and model")
+        .accessibilityLabel("Provider and model")
+        .accessibilityValue("\(selectedProviderName), \(selectedModelLabel)")
+    }
+
+    private var minimalProviderModelMenu: some View {
+        Menu {
+            providerModelMenuContent
+        } label: {
+            Image(systemName: "point.3.connected.trianglepath.dotted")
+                .frame(width: 28, height: 28)
+        }
+        .menuStyle(.borderlessButton)
+        .onyxHelp(isComposingNewTask ? "Choose a provider and model for this new task" : "Task provider and model")
+        .accessibilityLabel("Provider and model")
+        .accessibilityValue("\(selectedProviderName), \(selectedModelLabel)")
+    }
+
+    @ViewBuilder
+    private var reasoningMenuContent: some View {
+        ForEach(model.availableReasoningEfforts, id: \.self) { effort in
+            Button {
+                model.selectReasoningEffort(effort)
+            } label: {
+                if effort == model.selectedReasoningEffort {
+                    Label(effort.capitalized, systemImage: "checkmark")
+                } else {
+                    Text(effort.capitalized)
+                }
+            }
+        }
+    }
+
+    private var regularReasoningMenu: some View {
+        Menu {
+            reasoningMenuContent
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "brain")
+                Text(model.selectedReasoningEffortName)
+            }
+            .font(.system(size: 11.5))
+            .foregroundStyle(.secondary)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize(horizontal: true, vertical: false)
+        .onyxHelp("Choose reasoning effort")
+        .accessibilityLabel("Reasoning effort")
+        .accessibilityValue(model.selectedReasoningEffortName)
+    }
+
+    private var compactReasoningMenu: some View {
+        Menu {
+            reasoningMenuContent
+        } label: {
+            Image(systemName: "brain")
+                .frame(width: 28, height: 28)
+                .foregroundStyle(.secondary)
+        }
+        .menuStyle(.borderlessButton)
+        .frame(width: 28, height: 28)
+        .onyxHelp("Choose reasoning effort (currently \(model.selectedReasoningEffortName))")
+        .accessibilityLabel("Reasoning effort")
+        .accessibilityValue(model.selectedReasoningEffortName)
+    }
+
+    @ViewBuilder
+    private var permissionMenuContent: some View {
+        Button("Read only") { model.permissionLabel = "Read only" }
+        Button("Workspace") { model.permissionLabel = "Workspace" }
+        Button("Full access") { model.permissionLabel = "Full access" }
+    }
+
+    private var regularPermissionMenu: some View {
+        Menu {
+            permissionMenuContent
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "shield")
+                Text(model.permissionLabel)
+            }
+            .font(.system(size: 11.5))
+            .foregroundStyle(.secondary)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize(horizontal: true, vertical: false)
+        .onyxHelp("Choose task permissions")
+        .accessibilityLabel("Task permissions")
+        .accessibilityValue(model.permissionLabel)
+    }
+
+    private var compactPermissionMenu: some View {
+        Menu {
+            permissionMenuContent
+        } label: {
+            Image(systemName: "shield")
+                .frame(width: 28, height: 28)
+                .foregroundStyle(.secondary)
+        }
+        .menuStyle(.borderlessButton)
+        .frame(width: 28, height: 28)
+        .onyxHelp("Choose task permissions (currently \(model.permissionLabel))")
+        .accessibilityLabel("Task permissions")
+        .accessibilityValue(model.permissionLabel)
+    }
+
+    @ViewBuilder
+    private var minimalOptionsMenuContent: some View {
+        if !model.availableReasoningEfforts.isEmpty {
+            Section("Reasoning") {
+                reasoningMenuContent
+            }
+        }
+        Section("Permissions") {
+            permissionMenuContent
+        }
+    }
+
+    private var minimalOptionsMenu: some View {
+        Menu {
+            minimalOptionsMenuContent
+        } label: {
+            Image(systemName: "slider.horizontal.3")
+                .frame(width: 28, height: 28)
+                .foregroundStyle(.secondary)
+        }
+        .menuStyle(.borderlessButton)
+        .frame(width: 28, height: 28)
+        .onyxHelp("Choose reasoning effort and task permissions")
+        .accessibilityLabel("Task options")
+        .accessibilityValue(
+            model.availableReasoningEfforts.isEmpty
+                ? model.permissionLabel
+                : "\(model.selectedReasoningEffortName), \(model.permissionLabel)"
+        )
+    }
+
+    @ViewBuilder
+    private var sendButton: some View {
+        if model.isSelectedReviewStarting {
+            ProgressView()
+                .controlSize(.small)
+                .frame(width: 29, height: 29)
+                .onyxHelp("Starting code review")
+        } else if model.isTurnRunning, isComposingNewTask {
+            ProgressView()
+                .controlSize(.small)
+                .frame(width: 29, height: 29)
+                .onyxHelp("Starting task")
+                .accessibilityLabel("Starting task")
+        } else if model.isTurnRunning {
+            Button(action: model.interrupt) {
+                Image(systemName: "stop.fill")
+                    .font(.system(size: 9, weight: .bold))
+                    .frame(width: 28, height: 28)
+                    .background(Color.primary)
+                    .foregroundStyle(OnyxTheme.canvas)
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .onyxHelp("Stop")
+            .accessibilityLabel("Stop task")
+        } else {
+            Button(action: model.sendComposer) {
+                Image(systemName: "arrow.up")
+                    .font(.system(size: 12, weight: .bold))
+                    .frame(width: 29, height: 29)
+                    .background(canSend ? AnyShapeStyle(OnyxTheme.accentGradient) : AnyShapeStyle(Color.secondary.opacity(0.16)))
+                    .foregroundStyle(canSend ? Color.white : Color.secondary.opacity(0.58))
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!canSend)
+            .onyxHelp("Send (Return)")
+            .accessibilityLabel("Send message")
+        }
+    }
+
+    @ViewBuilder
+    private func modelChoiceButton(
+        _ choice: OnyxApplicationHost.ProviderModelChoice,
+        showsProvider: Bool = false
+    ) -> some View {
+        Button {
+            onSelectProviderModel(choice)
+        } label: {
+            let selected = choice.connection.id == selectedProviderConnectionID
+                && choice.model.id == model.selectedModelID
+            HStack {
+                if selected { Image(systemName: "checkmark") }
+                if showsProvider {
+                    Text("\(choice.model.displayName) · \(choice.connection.displayName)")
+                } else {
+                    Text(choice.model.displayName)
+                }
+                if choice.model.capabilityEvidence.inputModalitiesAdvertised,
+                   choice.model.inputModalities.contains(.image) {
+                    Image(systemName: "photo")
+                }
+                if choice.model.capabilityEvidence.reasoningEffortsAdvertised,
+                   !choice.model.reasoningEfforts.isEmpty {
+                    Image(systemName: "brain")
+                }
+                if choice.model.capabilityEvidence.isUnknown {
+                    Label("Capabilities unknown", systemImage: "questionmark.circle")
+                        .foregroundStyle(.secondary)
+                } else if choice.model.capabilityEvidence.isPartial {
+                    Image(systemName: "questionmark.circle")
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .accessibilityLabel(
+            showsProvider
+                ? "\(choice.model.displayName), \(choice.connection.displayName)"
+                : choice.model.displayName
+        )
+        .accessibilityValue(choice.model.pickerCapabilitySummary)
+    }
 }
 
 private struct ComposerImagePreviewRow: View {

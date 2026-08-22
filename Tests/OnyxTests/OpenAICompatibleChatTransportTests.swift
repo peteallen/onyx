@@ -236,10 +236,10 @@ final class OpenAICompatibleChatTransportTests: XCTestCase {
         XCTAssertTrue(consumer.isCancelled)
     }
 
-    func testRejectsModeMismatchAndRequiresExplicitOptInForLANHTTP() async throws {
+    func testRejectsUnsafeHTTPAndRequiresAcknowledgementWithoutBearerForPrivateIP() async throws {
         XCTAssertThrowsError(
             try OpenAICompatibleChatTransport(
-                endpoint: URL(string: "http://lan-provider.example.test:8002/v1")!,
+                endpoint: URL(string: "http://192.168.2.170:8002/v1")!,
                 session: makeMockSession()
             )
         ) { error in
@@ -247,11 +247,41 @@ final class OpenAICompatibleChatTransportTests: XCTestCase {
         }
         XCTAssertNoThrow(
             try OpenAICompatibleChatTransport(
-                endpoint: URL(string: "http://lan-provider.example.test:8002/v1")!,
+                endpoint: URL(string: "http://192.168.2.170:8002/v1")!,
                 allowsInsecureHTTP: true,
                 session: makeMockSession()
             )
         )
+        for endpoint in [
+            "http://provider.example.test:8002/v1",
+            "http://8.8.8.8:8002/v1",
+        ] {
+            XCTAssertThrowsError(
+                try OpenAICompatibleChatTransport(
+                    endpoint: URL(string: endpoint)!,
+                    allowsInsecureHTTP: true,
+                    session: makeMockSession()
+                )
+            ) { error in
+                XCTAssertEqual(
+                    error as? OpenAICompatibleChatTransportError,
+                    .insecureEndpoint
+                )
+            }
+        }
+        XCTAssertThrowsError(
+            try OpenAICompatibleChatTransport(
+                endpoint: URL(string: "http://127.0.0.1:8002/v1")!,
+                bearerToken: "must-not-send",
+                allowsInsecureHTTP: true,
+                session: makeMockSession()
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? OpenAICompatibleChatTransportError,
+                .insecureBearerToken
+            )
+        }
 
         let transport = try makeTransport()
         do {
@@ -260,6 +290,67 @@ final class OpenAICompatibleChatTransportTests: XCTestCase {
         } catch let error as OpenAICompatibleChatTransportError {
             XCTAssertEqual(error, .requestModeMismatch(expectedStreaming: true))
         }
+    }
+
+    func testRedirectPolicyBlocksTLSDowngradeAndAllOriginChanges() throws {
+        let secureEndpoint = try XCTUnwrap(URL(string: "https://provider.example/v1/chat/completions"))
+        let sameOriginEndpoint = try XCTUnwrap(URL(string: "https://provider.example/v2/chat/completions"))
+        let localHTTP = try XCTUnwrap(URL(string: "http://192.168.2.170:8002/v1/chat/completions"))
+        let alternateSecureEndpoint = try XCTUnwrap(URL(string: "https://regional.provider.example/v1/chat/completions"))
+        let localHTTPS = try XCTUnwrap(URL(string: "https://192.168.2.170:8443/v1/chat/completions"))
+
+        XCTAssertFalse(
+            ProviderHTTPRedirectPolicy.allowsRedirect(
+                from: secureEndpoint,
+                to: localHTTP,
+                transportSecurity: .allowInsecureHTTP,
+                hasBearerCredential: false
+            ),
+            "An HTTPS provider request must never be redirected down to HTTP."
+        )
+        XCTAssertFalse(
+            ProviderHTTPRedirectPolicy.allowsRedirect(
+                from: secureEndpoint,
+                to: alternateSecureEndpoint,
+                transportSecurity: .requireTLS,
+                hasBearerCredential: false
+            ),
+            "An unauthenticated request still contains private chat history and must not follow a cross-origin redirect."
+        )
+        XCTAssertFalse(
+            ProviderHTTPRedirectPolicy.allowsRedirect(
+                from: secureEndpoint,
+                to: alternateSecureEndpoint,
+                transportSecurity: .requireTLS,
+                hasBearerCredential: true
+            ),
+            "A bearer-authenticated request must not follow a cross-origin redirect."
+        )
+        XCTAssertFalse(
+            ProviderHTTPRedirectPolicy.allowsRedirect(
+                from: secureEndpoint,
+                to: localHTTPS,
+                transportSecurity: .requireTLS,
+                hasBearerCredential: false
+            ),
+            "A redirect to another host must be rejected even when both URLs use TLS."
+        )
+        XCTAssertTrue(
+            ProviderHTTPRedirectPolicy.allowsRedirect(
+                from: secureEndpoint,
+                to: sameOriginEndpoint,
+                transportSecurity: .requireTLS,
+                hasBearerCredential: false
+            )
+        )
+        XCTAssertTrue(
+            ProviderHTTPRedirectPolicy.allowsRedirect(
+                from: secureEndpoint,
+                to: sameOriginEndpoint,
+                transportSecurity: .requireTLS,
+                hasBearerCredential: true
+            )
+        )
     }
 
     private func makeTransport(

@@ -28,6 +28,8 @@
     <string>15.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Onyx connects to local model servers that you configure, such as a vLLM endpoint.</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
     <key>NSSupportsAutomaticGraphicsSwitching</key>

@@ -4,34 +4,33 @@
 
 Onyx is the desktop product. Agent runtimes are replaceable integrations.
 
-The complete production runtime path today is:
+The production runtime paths today are:
 
 ```text
 Native SwiftUI/AppKit presentation
                 |
  per-window OnyxAppModel + provider-neutral models
                 |
- app-lifetime SharedRuntimeCoordinator
+ app-lifetime provider-scoped SharedRuntimeCoordinator
                 |
         AgentRuntime protocol
-                |
- RuntimeRegistry.codexOnly at composition
-                |
- default Codex connection -> CodexRuntime
-                |
-      codex app-server (stdio JSONL)
+          /                 \
+ CodexRuntime        OpenAICompatibleRuntime
+      |                       |
+codex app-server       /models + /chat/completions
+ (stdio JSONL)              (HTTP/SSE)
 ```
 
-That is the production adapter graph today. The registry still resolves exactly
-one default Codex connection, while the Settings surface separately persists
-OpenAI-compatible connections for the provider runtime slice.
+The registry resolves the default Codex connection. The composition host also
+resolves each app-owned OpenAI-compatible connection and keeps its runtime,
+tasks, drafts, and model identity provider-scoped.
 
-The OpenAI-compatible path now includes a URL-validated HTTP/SSE transport,
-Keychain-backed bearer lookup, `/models` discovery, capability negotiation, and
-a provider-owned conversation store. It is intentionally not registered in the
-default production selector yet: remote endpoints do not provide Codex's local
-tools, approvals, sandbox, or durable task lifecycle, so those controls are
-advertised as unavailable. Claude/Anthropic remains descriptor-only. See
+The OpenAI-compatible path includes a URL-validated, redirect-protected HTTP/SSE
+transport, Keychain-backed bearer lookup, `/models` discovery, capability
+negotiation, a provider-owned conversation store, and production model
+selection. Remote endpoints do not provide Codex's local tools, approvals,
+sandbox, or durable task lifecycle, so those controls are advertised as
+unavailable. Claude/Anthropic remains descriptor-only. See
 `PROVIDER_EXTENSIBILITY.md` for the exact boundary.
 
 In the current implementation, the application owns:
@@ -40,19 +39,19 @@ In the current implementation, the application owns:
 - provider-neutral request, event, transcript, and capability models;
 - provider connection Settings, safe endpoint validation, model discovery, and
   Keychain-only bearer credential persistence;
-- capability-aware controls for the connected Codex session;
-- the Codex-only registry and its opaque adapter, connection, and
-  connection-scoped model identity types;
+- capability-aware controls for the selected provider and model;
+- the Codex registry plus app-owned OpenAI-compatible connections and
+  connection-scoped model identities;
 - performance budgets and local presentation caches.
 
 Each runtime owns only its provider-specific execution behavior. For Codex,
 that includes ChatGPT authentication, persisted Codex threads, tools,
 approvals, sandboxing, compaction, and streamed events.
 
-The registry identities are not yet threaded through session, task, draft, and
-model-selection state. Visible tasks still use Codex thread IDs and model
-strings directly, so collision-safe multi-provider state is not a production
-behavior.
+Provider identity is threaded through window restoration, task selection,
+draft preferences, local provider conversations, and model usage ranking.
+Existing tasks are immutable with respect to provider/model switching; the
+unified picker is active only while composing a new task.
 
 A versioned conversation catalog exists as a tested foundation but is not yet
 wired into production task discovery. The shared-runtime coordinator is wired
@@ -67,8 +66,7 @@ windows update without overwriting one another. Legacy single-window state
 migrates once into the first restored workspace, and sign-out clears
 account-owned selected-task, draft, and workspace preferences from known
 window namespaces, including windows that are currently closed.
-Provider-neutral restoration, account-scoped catalog persistence, and a
-second usable provider remain incomplete.
+Cross-provider continuation and a native Anthropic runtime remain incomplete.
 
 ## Why app-server stays behind an adapter
 
@@ -99,8 +97,8 @@ part of the distribution plan.
 ## Runtime protocol boundary
 
 - Implemented controls use advertised runtime capabilities where available.
-  Provider connection management is implemented in Settings; production
-  workspace selection is still Codex-only.
+  Provider connection management is implemented in Settings, and the
+  production new-task picker spans Codex plus saved OpenAI-compatible models.
 - Threads, turns, common transcript items, approvals, plans, and collaboration
   activity use provider-neutral models. Usage and the remaining rich item
   taxonomy do not yet have complete product surfaces.

@@ -739,6 +739,10 @@ final class OnyxAppModelRaceTests: XCTestCase {
         let startedTurns = await fixture.runtime.recordedStartTurns()
         XCTAssertTrue(startedTurns.isEmpty)
         XCTAssertEqual(model.notice?.title, "Answer the pending request first")
+        XCTAssertEqual(
+            model.notice?.detail,
+            "Race test runtime is waiting for your response before this task can continue."
+        )
         XCTAssertEqual(model.composerText, "This must not become a turn while approval is pending")
     }
 
@@ -763,6 +767,47 @@ final class OnyxAppModelRaceTests: XCTestCase {
         XCTAssertTrue(model.threads.contains(where: { $0.id == Fixture.threadAID }))
         let archivedThreadIDs = await fixture.runtime.recordedArchivedThreadIDs()
         XCTAssertTrue(archivedThreadIDs.isEmpty)
+    }
+
+    func testOpeningCollaborationAgentLoadsUnlistedChildAndKeepsParentTask() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        model.start()
+        await waitUntil("The runtime did not finish its initial load") {
+            model.connectionState == .connected("Race test runtime")
+                && model.selectedThreadID == Fixture.threadAID
+                && !model.isLoadingThread
+        }
+
+        let agent = RuntimeCollaborationAgent(
+            id: Fixture.childThreadID,
+            path: "/root/image_attachments",
+            status: .working,
+            message: "Inspecting the attachment",
+            updatedAt: .now
+        )
+        XCTAssertFalse(model.threads.contains { $0.id == Fixture.childThreadID })
+
+        model.openCollaborationAgent(agent)
+
+        await waitUntil("The child collaboration task did not load") {
+            model.selectedThreadID == Fixture.childThreadID
+                && !model.isLoadingThread
+                && model.timeline == [Fixture.childItem]
+        }
+
+        XCTAssertTrue(model.threads.contains { $0.id == Fixture.threadAID })
+        XCTAssertTrue(model.threads.contains { $0.id == Fixture.childThreadID })
+        XCTAssertEqual(model.selectedThread?.title, Fixture.childThread.title)
+
+        model.selectThread(Fixture.threadAID)
+        await waitUntil("The parent task could not be restored after viewing its child") {
+            model.selectedThreadID == Fixture.threadAID
+                && !model.isLoadingThread
+                && model.timeline == [Fixture.itemA]
+        }
     }
 
     func testExternalArchivePurgesPendingInteractionAndDraft() async {
@@ -856,6 +901,7 @@ private struct Fixture {
     static let threadBID = "race-thread-B"
     static let archivedThreadID = "race-thread-archived"
     static let createdThreadID = "race-thread-created"
+    static let childThreadID = "race-thread-child"
     static let sharedItemID = "shared-stream-item"
     static let deltaFromA = " [buffered delta from A]"
     static let workspacePath = "/tmp/onyx-race-tests"
@@ -875,10 +921,24 @@ private struct Fixture {
         title: "Created thread",
         updatedAt: 3
     )
+    static let childThread = makeThread(
+        id: childThreadID,
+        title: "Image Attachments",
+        updatedAt: 4
+    )
     static let itemA = makeItem(body: "A history")
     static let itemB = makeItem(body: "B history")
     static let refreshedItem = makeItem(body: "A history from the refreshed snapshot")
     static let archivedItem = makeItem(body: "Archived history")
+    static let childItem = TimelineItem(
+        id: "child-history-item",
+        kind: .assistantMessage,
+        title: nil,
+        body: "Child history",
+        status: .completed,
+        timestamp: Date(timeIntervalSince1970: 4),
+        detail: nil
+    )
     static let deltaDuringRefresh = " [buffered refresh delta]"
     static let interactionForA = makeInteraction(
         id: "interaction-for-A",
@@ -1149,6 +1209,8 @@ private actor RaceTestRuntime: AgentRuntime {
             return RuntimeConversation(thread: Fixture.threadB, items: [Fixture.itemB])
         case Fixture.archivedThreadID:
             return RuntimeConversation(thread: Fixture.archivedThread, items: [Fixture.archivedItem])
+        case Fixture.childThreadID:
+            return RuntimeConversation(thread: Fixture.childThread, items: [Fixture.childItem])
         default:
             if let thread = createdThreads[id] {
                 return RuntimeConversation(thread: thread, items: [])

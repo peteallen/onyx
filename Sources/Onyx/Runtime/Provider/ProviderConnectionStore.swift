@@ -98,6 +98,7 @@ actor ProviderConnectionStore {
 
     @discardableResult
     func upsert(_ connection: ProviderConnectionRecord) throws -> ProviderConnectionRecord {
+        let connection = try connection.revalidated()
         var snapshot = try load()
         if let index = snapshot.connections.firstIndex(where: { $0.id == connection.id }) {
             snapshot.connections[index] = connection
@@ -107,6 +108,26 @@ actor ProviderConnectionStore {
         try validate(snapshot)
         try persist(snapshot)
         return connection
+    }
+
+    /// Applies a field-scoped mutation to the latest record while holding the
+    /// store actor's read/validate/write transaction. Runtime discovery uses
+    /// this so a model-catalog refresh cannot overwrite settings saved by the
+    /// user (and settings can use it to preserve discovery metadata).
+    @discardableResult
+    func update(
+        id: ProviderConnectionID,
+        _ mutation: @Sendable (inout ProviderConnectionRecord) throws -> Void
+    ) throws -> ProviderConnectionRecord {
+        var snapshot = try load()
+        guard let index = snapshot.connections.firstIndex(where: { $0.id == id }) else {
+            throw ProviderConnectionStoreError.connectionNotFound(id)
+        }
+        try mutation(&snapshot.connections[index])
+        snapshot.connections[index] = try snapshot.connections[index].revalidated()
+        try validate(snapshot)
+        try persist(snapshot)
+        return snapshot.connections[index]
     }
 
     @discardableResult

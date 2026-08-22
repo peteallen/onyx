@@ -54,6 +54,31 @@ final class GitDiffViewerTests: XCTestCase {
         XCTAssertEqual(model.state, .notRepository)
     }
 
+    func testPreparingProjectDoesNotReadUntilExplicitInspection() async {
+        let reader = SequencedSnapshotReader(responses: [
+            .init(path: "/Users/test/Documents/project", delayNanoseconds: 0, snapshot: snapshot(branch: "main")),
+        ])
+        let model = GitDiffViewerModel(reader: reader)
+
+        model.prepare(path: " /Users/test/Documents/project ")
+
+        XCTAssertEqual(model.state, .needsExplicitLoad("/Users/test/Documents/project"))
+        XCTAssertTrue(reader.recordedReadPaths.isEmpty)
+
+        await model.load(path: "/Users/test/Documents/project")
+
+        XCTAssertEqual(reader.recordedReadPaths, ["/Users/test/Documents/project"])
+        guard case .loaded = model.state else {
+            return XCTFail("Explicit inspection should load the repository")
+        }
+
+        model.prepare(path: "/Users/test/Documents/project")
+        guard case .loaded = model.state else {
+            return XCTFail("Re-rendering the same project should preserve its loaded snapshot")
+        }
+        XCTAssertEqual(reader.recordedReadPaths, ["/Users/test/Documents/project"])
+    }
+
     func testRenderPlanBoundsFilesHunksLinesAndMetadata() {
         let lines = (1 ... 5).map { (number: Int) in
             GitDiffLine(kind: .addition, content: "line \(number)", newLineNumber: number)
@@ -307,9 +332,14 @@ private final class SequencedSnapshotReader: GitRepositoryReading, @unchecked Se
 
     private let lock = NSLock()
     private var responses: [Response]
+    private var readPaths: [String] = []
 
     init(responses: [Response]) {
         self.responses = responses
+    }
+
+    var recordedReadPaths: [String] {
+        lock.withLock { readPaths }
     }
 
     func readStatus(at path: String) async throws -> GitRepositoryStatus {
@@ -322,6 +352,7 @@ private final class SequencedSnapshotReader: GitRepositoryReading, @unchecked Se
     }
 
     func readSnapshot(at path: String) async throws -> GitRepositorySnapshot {
+        lock.withLock { readPaths.append(path) }
         let response = try nextResponse(for: path)
         if response.delayNanoseconds > 0 {
             try await Task.sleep(nanoseconds: response.delayNanoseconds)

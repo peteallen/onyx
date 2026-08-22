@@ -14,6 +14,7 @@ protocol ProviderModelDiscovery: Sendable {
 enum ProviderModelDiscoveryError: LocalizedError, Equatable, Sendable {
     case invalidEndpoint
     case insecureEndpoint
+    case insecureBearerCredential
     case invalidCredential
     case invalidHTTPResponse
     case httpFailure(statusCode: Int)
@@ -26,7 +27,9 @@ enum ProviderModelDiscoveryError: LocalizedError, Equatable, Sendable {
         case .invalidEndpoint:
             "The provider URL is not a valid HTTP(S) endpoint."
         case .insecureEndpoint:
-            "This endpoint uses HTTP without an explicit insecure-network acknowledgement."
+            "Clear-text HTTP is allowed only after acknowledgement and only for a literal loopback, private-network, or link-local IP address. Use HTTPS for hostnames and public IPs."
+        case .insecureBearerCredential:
+            "Bearer credentials cannot be sent over clear-text HTTP. Use HTTPS or choose No authentication."
         case .invalidCredential:
             "The API bearer token cannot be sent to this endpoint."
         case .invalidHTTPResponse:
@@ -58,6 +61,13 @@ struct URLSessionProviderModelDiscovery: ProviderModelDiscovery, Sendable {
         credential: ProviderBearerCredential?
     ) async throws -> [ProviderModelDescriptor] {
         let endpoint = try Self.modelsURL(for: connection)
+        if endpoint.scheme?.lowercased() == "http", credential != nil {
+            // A credential may arrive here from an older caller even when the
+            // record says `none`; reject it before constructing a request so a
+            // clear-text connection can never accidentally carry a bearer
+            // header.
+            throw ProviderModelDiscoveryError.insecureBearerCredential
+        }
         var request = URLRequest(url: endpoint)
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -74,10 +84,19 @@ struct URLSessionProviderModelDiscovery: ProviderModelDiscovery, Sendable {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
 
+        // URLSession follows redirects by default. Re-wrap the injected
+        // session with the same configuration plus the provider redirect
+        // policy so discovery cannot silently leave its validated endpoint.
+        let protectedSession = ProviderRedirectProtectedSession(
+            wrapping: session,
+            transportSecurity: connection.transportSecurity,
+            hasBearerCredential: credential != nil
+        )
+
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(for: request)
+            (data, response) = try await protectedSession.session.data(for: request)
             try Task.checkCancellation()
         } catch is CancellationError {
             throw CancellationError()
@@ -123,11 +142,15 @@ struct URLSessionProviderModelDiscovery: ProviderModelDiscovery, Sendable {
             throw ProviderModelDiscoveryError.invalidEndpoint
         }
 
-        if scheme == "http",
-           connection.transportSecurity != .allowInsecureHTTP,
-           !Self.isLoopback(host)
-        {
-            throw ProviderModelDiscoveryError.insecureEndpoint
+        if scheme == "http" {
+            guard ProviderBaseURLNormalizer.isAllowedInsecureHTTPHost(host),
+                  connection.transportSecurity == .allowInsecureHTTP
+            else {
+                throw ProviderModelDiscoveryError.insecureEndpoint
+            }
+            guard connection.authMode != .bearer else {
+                throw ProviderModelDiscoveryError.insecureBearerCredential
+            }
         }
 
         guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
@@ -148,14 +171,6 @@ struct URLSessionProviderModelDiscovery: ProviderModelDiscovery, Sendable {
             throw ProviderModelDiscoveryError.invalidEndpoint
         }
         return url
-    }
-
-    private static func isLoopback(_ host: String) -> Bool {
-        let normalized = host.lowercased()
-        return normalized == "localhost"
-            || normalized == "127.0.0.1"
-            || normalized == "::1"
-            || normalized == "[::1]"
     }
 
     private static func makeDefaultSession() -> URLSession {
@@ -256,16 +271,28 @@ struct ProviderConnectionDraft: Identifiable, Equatable, Sendable, CustomStringC
         return value.isEmpty ? nil : value
     }
 
-    var hasNonLoopbackHTTP: Bool {
+    /// True for a syntactically valid HTTP URL, regardless of whether its
+    /// host is eligible for the narrowly-scoped clear-text exception.
+    var usesHTTP: Bool {
         guard let url = URL(string: trimmedBaseURL),
               url.scheme?.lowercased() == "http",
               let host = url.host,
               !host.isEmpty
         else { return false }
-        let normalized = host.lowercased()
-        return ![
-            "localhost", "127.0.0.1", "::1", "[::1]"
-        ].contains(normalized)
+        return true
+    }
+
+    var insecureHTTPHostClassification: ProviderBaseURLNormalizer.InsecureHTTPHostClassification? {
+        guard let url = URL(string: trimmedBaseURL),
+              url.scheme?.lowercased() == "http",
+              let host = url.host,
+              !host.isEmpty
+        else { return nil }
+        return ProviderBaseURLNormalizer.insecureHTTPHostClassification(host)
+    }
+
+    var hasAllowedInsecureHTTPHost: Bool {
+        insecureHTTPHostClassification?.isAllowed == true
     }
 
     var urlValidationMessage: String? {
@@ -287,7 +314,7 @@ struct ProviderConnectionDraft: Identifiable, Equatable, Sendable, CustomStringC
     func makeRecord(
         discovery: ProviderConnectionDiscoveryMetadata? = nil
     ) throws -> ProviderConnectionRecord {
-        let security: ProviderConnectionTransportSecurity = hasNonLoopbackHTTP
+        let security: ProviderConnectionTransportSecurity = usesHTTP
             && allowInsecureHTTP
             ? .allowInsecureHTTP
             : .requireTLS
@@ -311,6 +338,8 @@ enum ProviderSettingsError: LocalizedError, Equatable, Sendable {
     case missingBaseURL
     case invalidBaseURL(String)
     case insecureHTTPRequiresAcknowledgement
+    case insecureHTTPHostNotAllowed
+    case insecureHTTPBearerCredential
     case missingBearerCredential
     case discoveryRequiresValidDraft
     case connectionNotFound
@@ -325,7 +354,11 @@ enum ProviderSettingsError: LocalizedError, Equatable, Sendable {
             "Enter the provider base URL."
         case let .invalidBaseURL(detail): detail
         case .insecureHTTPRequiresAcknowledgement:
-            "Acknowledge the clear-text LAN warning before using this URL."
+            "Acknowledge clear-text HTTP before using this URL, even when it points to a local IP address."
+        case .insecureHTTPHostNotAllowed:
+            "Clear-text HTTP is only allowed for a literal loopback, private-network, or link-local IP address. Hostnames and public IPs must use HTTPS."
+        case .insecureHTTPBearerCredential:
+            "Bearer authentication cannot be used over clear-text HTTP. Use HTTPS or choose No authentication."
         case .missingBearerCredential:
             "Enter an API bearer token, or choose No authentication."
         case .discoveryRequiresValidDraft:
@@ -344,11 +377,45 @@ private enum ProviderSettingsURLValidation {
     static func message(for error: ProviderConnectionRecordError) -> String {
         switch error {
         case .insecureHTTPRequiresExplicitOptIn:
-            "This non-local HTTP URL needs an explicit clear-text LAN acknowledgement."
+            "This clear-text HTTP URL needs an explicit acknowledgement, including for local IP addresses."
+        case .insecureHTTPHostNotAllowed:
+            "Clear-text HTTP is only allowed for a literal loopback, private-network, or link-local IP address. Hostnames and public IPs must use HTTPS."
+        case .insecureHTTPBearerCredentialNotAllowed:
+            "Bearer authentication cannot be used over clear-text HTTP. Use HTTPS or choose No authentication."
         case .invalidBaseURL:
             "Enter a valid HTTP(S) base URL without credentials, query parameters, or fragments."
         case .emptyConnectionID, .emptyDisplayName:
             "Complete the connection details."
+        }
+    }
+}
+
+/// The subset of a settings draft that determines which endpoint and
+/// credential scope owns a discovered model catalog. The credential remains in
+/// its opaque container so this comparison cannot accidentally make it
+/// printable or persist it.
+private struct ProviderDraftDiscoveryScope: Equatable {
+    let connectionID: ProviderConnectionID
+    let baseURL: String
+    let authMode: ProviderConnectionAuthMode
+    let allowInsecureHTTP: Bool
+    let typedCredential: ProviderBearerCredential?
+    let usesStoredCredential: Bool
+
+    init(_ draft: ProviderConnectionDraft) {
+        connectionID = draft.id
+        baseURL = draft.trimmedBaseURL
+        authMode = draft.authMode
+        allowInsecureHTTP = draft.allowInsecureHTTP
+        if draft.authMode == .bearer {
+            let token = draft.bearerToken.trimmingCharacters(in: .whitespacesAndNewlines)
+            typedCredential = token.isEmpty ? nil : try? ProviderBearerCredential(token)
+            usesStoredCredential = token.isEmpty
+                && draft.hasStoredCredential
+                && !draft.removeStoredCredential
+        } else {
+            typedCredential = nil
+            usesStoredCredential = false
         }
     }
 }
@@ -372,7 +439,15 @@ final class ProviderSettingsModel: ObservableObject {
     let credentialStore: any CredentialStore
     let discovery: any ProviderModelDiscovery
 
+    /// The application host uses this boundary to evict any live runtime that
+    /// was created from the previous connection record. Keeping the callback
+    /// here also makes save/delete semantics testable without coupling this
+    /// settings model to workspace composition.
+    var onConnectionMutation: (@MainActor (ProviderConnectionID) -> Void)?
+
     private var hasStarted = false
+    private var draftRevision: UInt64 = 0
+    private var catalogScope: ProviderDraftDiscoveryScope?
 
     init(
         connectionStore: ProviderConnectionStore = ProviderConnectionStore(),
@@ -400,12 +475,15 @@ final class ProviderSettingsModel: ObservableObject {
             if let selectedConnectionID,
                let connection = connections.first(where: { $0.id == selectedConnectionID }) {
                 draft = await makeDraft(for: connection)
+                catalogScope = catalogScopeForLoadedDraft(draft)
             } else if let first = connections.first {
                 selectedConnectionID = first.id
                 draft = await makeDraft(for: first)
+                catalogScope = catalogScopeForLoadedDraft(draft)
             } else {
                 selectedConnectionID = nil
                 draft = .new()
+                catalogScope = nil
             }
             errorMessage = nil
         } catch {
@@ -414,21 +492,38 @@ final class ProviderSettingsModel: ObservableObject {
     }
 
     func beginAdd() {
+        draftRevision &+= 1
         selectedConnectionID = nil
         draft = .new()
+        catalogScope = nil
         lastDiscoveredModels = []
         errorMessage = nil
         statusMessage = nil
     }
 
+    /// Draft fields that define catalog ownership should invalidate visible
+    /// discovery immediately. Other edits (name, default model, request
+    /// behavior) intentionally leave the current catalog usable.
+    func updateDraftDiscoveryScope() {
+        let currentScope = ProviderDraftDiscoveryScope(draft)
+        guard catalogScope != nil, catalogScope != currentScope else { return }
+        catalogScope = nil
+        lastDiscoveredModels = []
+        statusMessage = "Connection details changed. Models will refresh when you save."
+        errorMessage = nil
+    }
+
     func beginEdit(_ id: ProviderConnectionID) {
         guard let connection = connections.first(where: { $0.id == id }) else { return }
+        draftRevision &+= 1
+        let revision = draftRevision
         selectedConnectionID = id
         Task { [weak self] in
             guard let self else { return }
             let loadedDraft = await makeDraft(for: connection)
-            guard selectedConnectionID == id else { return }
+            guard selectedConnectionID == id, draftRevision == revision else { return }
             draft = loadedDraft
+            catalogScope = catalogScopeForLoadedDraft(loadedDraft)
             lastDiscoveredModels = []
             errorMessage = nil
             statusMessage = nil
@@ -439,13 +534,37 @@ final class ProviderSettingsModel: ObservableObject {
     /// is selected. The durable JSON record never contains the token.
     @discardableResult
     func saveDraft() async -> Bool {
-        guard !isSaving else { return false }
+        guard !isSaving, !isDiscovering else { return false }
         isSaving = true
         defer { isSaving = false }
 
         let existing = connections.first(where: { $0.id == draft.id })
+        let preflightRecord: ProviderConnectionRecord
+        do {
+            preflightRecord = try makeRecordForSave()
+        } catch {
+            errorMessage = userFacing(error)
+            return false
+        }
+
+        let shouldAutomaticallyDiscover = existing == nil
+            || catalogScope != ProviderDraftDiscoveryScope(draft)
+            || preflightRecord.discovery.discoveredModelIDs.isEmpty
+        let draftDiscoveryScopeChanged = catalogScope != ProviderDraftDiscoveryScope(draft)
+        var automaticDiscoveryFailed = false
+        var automaticallyDiscoveredCount: Int?
+        if shouldAutomaticallyDiscover {
+            statusMessage = "Checking the provider for models…"
+            let models = await discoverModels()
+            automaticallyDiscoveredCount = models?.count
+            automaticDiscoveryFailed = models == nil
+        }
+
         let record: ProviderConnectionRecord
         do {
+            // Discovery can select the first advertised model and attach its
+            // capability metadata to the draft, so rebuild the durable record
+            // from that result before writing it.
             record = try makeRecordForSave()
         } catch {
             errorMessage = userFacing(error)
@@ -456,9 +575,63 @@ final class ProviderSettingsModel: ObservableObject {
             let previousCredential = try await credentialStore.credential(
                 for: record.credentialKey
             )
+            let endpointOrAuthChanged = existing.map {
+                $0.baseURL != record.baseURL
+                    || $0.authMode != record.authMode
+                    || $0.transportSecurity != record.transportSecurity
+            } ?? false
+            let credentialChanged: Bool
+            if record.authMode == .bearer {
+                let typedToken = draft.bearerToken.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                )
+                let typedCredential = typedToken.isEmpty
+                    ? nil
+                    : try ProviderBearerCredential(typedToken)
+                credentialChanged = typedCredential.map { $0 != previousCredential } ?? false
+            } else {
+                credentialChanged = previousCredential != nil
+            }
+            let shouldRotateConversationScope = existing != nil
+                && (endpointOrAuthChanged || credentialChanged)
             try await updateCredential(for: record, existing: existing)
             do {
-                try await connectionStore.upsert(record)
+                if existing != nil {
+                    // Apply only user-editable settings to the latest stored
+                    // record. Discovery can refresh its metadata concurrently;
+                    // saving a form must not overwrite that newer catalog with
+                    // the draft's stale copy.
+                    _ = try await connectionStore.update(id: record.id) { current in
+                        let discoveryScopeChanged = current.baseURL != record.baseURL
+                            || current.authMode != record.authMode
+                            || current.transportSecurity != record.transportSecurity
+                        current.displayName = record.displayName
+                        current.baseURL = record.baseURL
+                        current.selectedModelID = record.selectedModelID
+                        current.authMode = record.authMode
+                        current.transportSecurity = record.transportSecurity
+                        current.transportCapabilities = record.transportCapabilities
+                        current.requestBehavior = record.requestBehavior
+                        if shouldRotateConversationScope {
+                            current.conversationScopeID = ProviderConnectionRecord
+                                .makeConversationScopeID()
+                        }
+                        let draftDiscoveryIsNewer = record.discovery.lastSucceededAt.map { date in
+                            date >= (current.discovery.lastSucceededAt ?? .distantPast)
+                        } ?? false
+                        if discoveryScopeChanged
+                            || draftDiscoveryScopeChanged
+                            || draftDiscoveryIsNewer
+                        {
+                            // A catalog belongs to an endpoint/auth scope. Keep
+                            // the newest catalog tested in this draft, or clear
+                            // the old scope's catalog when discovery failed.
+                            current.discovery = record.discovery
+                        }
+                    }
+                } else {
+                    try await connectionStore.upsert(record)
+                }
             } catch {
                 await restoreCredentialAfterFailedSave(
                     existing: existing,
@@ -470,8 +643,17 @@ final class ProviderSettingsModel: ObservableObject {
             connections = try await connectionStore.connections()
                 .sorted { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
             selectedConnectionID = record.id
-            draft = await makeDraft(for: record)
-            statusMessage = "Saved \(record.displayName)."
+            let savedRecord = try await connectionStore.connection(id: record.id) ?? record
+            draft = await makeDraft(for: savedRecord)
+            catalogScope = catalogScopeForLoadedDraft(draft)
+            onConnectionMutation?(record.id)
+            if let automaticallyDiscoveredCount {
+                statusMessage = "Saved \(savedRecord.displayName) with \(automaticallyDiscoveredCount) model\(automaticallyDiscoveredCount == 1 ? "" : "s")."
+            } else if automaticDiscoveryFailed {
+                statusMessage = "Saved \(savedRecord.displayName). Models were not available; enter a model ID or retry discovery."
+            } else {
+                statusMessage = "Saved \(savedRecord.displayName)."
+            }
             errorMessage = nil
             return true
         } catch {
@@ -485,6 +667,10 @@ final class ProviderSettingsModel: ObservableObject {
             guard let removed = try await connectionStore.remove(id: id) else {
                 throw ProviderSettingsError.connectionNotFound
             }
+            // The durable endpoint is already gone. Evict its runtime before
+            // any best-effort Keychain cleanup so an open workspace cannot
+            // keep sending to deleted provider settings if that cleanup fails.
+            onConnectionMutation?(id)
             if removed.authMode == .bearer {
                 try await credentialStore.removeCredential(
                     for: ProviderCredentialKey(connectionID: id)
@@ -496,6 +682,7 @@ final class ProviderSettingsModel: ObservableObject {
                 if let first = connections.first {
                     selectedConnectionID = first.id
                     draft = await makeDraft(for: first)
+                    catalogScope = catalogScopeForLoadedDraft(draft)
                 } else {
                     beginAdd()
                 }
@@ -524,6 +711,8 @@ final class ProviderSettingsModel: ObservableObject {
             errorMessage = userFacing(error)
             return nil
         }
+        let revision = draftRevision
+        let draftSnapshot = draft
 
         do {
             let credential = try await credentialForDiscovery(for: record)
@@ -531,14 +720,22 @@ final class ProviderSettingsModel: ObservableObject {
                 for: record,
                 credential: credential
             )
+            guard !models.isEmpty else {
+                throw ProviderModelDiscoveryError.noModels
+            }
+            guard draftRevision == revision, draft == draftSnapshot else {
+                return nil
+            }
             let ids = models.map(\.id)
             let now = Date()
             draft.discoveredModelIDs = ids
             draft.discovery = ProviderConnectionDiscoveryMetadata(
                 lastAttemptedAt: now,
                 lastSucceededAt: now,
-                discoveredModelIDs: ids
+                discoveredModelIDs: ids,
+                discoveredModels: models
             )
+            catalogScope = ProviderDraftDiscoveryScope(draftSnapshot)
             lastDiscoveredModels = models
             if draft.trimmedModelID == nil,
                let first = ids.first {
@@ -548,10 +745,14 @@ final class ProviderSettingsModel: ObservableObject {
             errorMessage = nil
             return models
         } catch {
+            guard draftRevision == revision, draft == draftSnapshot else {
+                return nil
+            }
             let attempted = ProviderConnectionDiscoveryMetadata(
                 lastAttemptedAt: Date(),
                 lastSucceededAt: draft.discovery.lastSucceededAt,
-                discoveredModelIDs: draft.discovery.discoveredModelIDs
+                discoveredModelIDs: draft.discovery.discoveredModelIDs,
+                discoveredModels: draft.discovery.discoveredModels
             )
             draft.discovery = attempted
             errorMessage = userFacing(error)
@@ -573,6 +774,27 @@ final class ProviderSettingsModel: ObservableObject {
         return ProviderConnectionDraft(connection: connection, hasStoredCredential: hasCredential)
     }
 
+    /// The Settings picker shows only a catalog that belongs to the current
+    /// endpoint/auth draft. A stale catalog remains preserved in its saved
+    /// record until the user saves the changed connection, but is never offered
+    /// as if it came from the newly typed endpoint.
+    var currentDraftDiscoveredModels: [ProviderModelDescriptor] {
+        guard catalogScope == ProviderDraftDiscoveryScope(draft) else { return [] }
+        return draft.discovery.discoveredModels
+    }
+
+    var currentDraftDiscoveredModelIDs: [String] {
+        guard catalogScope == ProviderDraftDiscoveryScope(draft) else { return [] }
+        return draft.discovery.discoveredModelIDs
+    }
+
+    private func catalogScopeForLoadedDraft(
+        _ loadedDraft: ProviderConnectionDraft
+    ) -> ProviderDraftDiscoveryScope? {
+        guard !loadedDraft.discovery.discoveredModelIDs.isEmpty else { return nil }
+        return ProviderDraftDiscoveryScope(loadedDraft)
+    }
+
     private func makeRecordForSave() throws -> ProviderConnectionRecord {
         guard !draft.trimmedDisplayName.isEmpty else {
             throw ProviderSettingsError.missingDisplayName
@@ -580,10 +802,18 @@ final class ProviderSettingsModel: ObservableObject {
         guard !draft.trimmedBaseURL.isEmpty else {
             throw ProviderSettingsError.missingBaseURL
         }
-        if draft.hasNonLoopbackHTTP && !draft.allowInsecureHTTP {
-            throw ProviderSettingsError.insecureHTTPRequiresAcknowledgement
+        if draft.usesHTTP {
+            guard draft.hasAllowedInsecureHTTPHost else {
+                throw ProviderSettingsError.insecureHTTPHostNotAllowed
+            }
+            guard draft.allowInsecureHTTP else {
+                throw ProviderSettingsError.insecureHTTPRequiresAcknowledgement
+            }
+            guard draft.authMode != .bearer else {
+                throw ProviderSettingsError.insecureHTTPBearerCredential
+            }
         }
-        let security: ProviderConnectionTransportSecurity = draft.hasNonLoopbackHTTP
+        let security: ProviderConnectionTransportSecurity = draft.usesHTTP
             && draft.allowInsecureHTTP
             ? .allowInsecureHTTP
             : .requireTLS
@@ -593,6 +823,9 @@ final class ProviderSettingsModel: ObservableObject {
                 transportSecurity: security
             )
         } catch let error as ProviderConnectionRecordError {
+            if case .insecureHTTPBearerCredentialNotAllowed = error {
+                throw ProviderSettingsError.insecureHTTPBearerCredential
+            }
             throw ProviderSettingsError.invalidBaseURL(
                 ProviderSettingsURLValidation.message(for: error)
             )
@@ -603,15 +836,24 @@ final class ProviderSettingsModel: ObservableObject {
                 throw ProviderSettingsError.missingBearerCredential
             }
         }
-        let discovery = draft.discovery
+        let discovery = catalogScope == ProviderDraftDiscoveryScope(draft)
+            ? draft.discovery
+            : ProviderConnectionDiscoveryMetadata()
+        let existingConnection = connections.first(where: { $0.id == draft.id })
+        let conversationScopeID = existingConnection?.conversationScopeID
+            ?? ProviderConnectionRecord.makeConversationScopeID()
         // OpenAI-compatible chat endpoints are expected to support SSE
-        // streaming. A newly-created connection has no prior record from
-        // which to inherit endpoint capabilities, so default it to the
-        // capabilities the runtime actually requires. Existing records keep
-        // their explicitly persisted values so a future capability editor can
-        // narrow them deliberately.
-        let existingCapabilities = connections.first(where: { $0.id == draft.id })?
-            .transportCapabilities ?? [.streaming, .streamUsage]
+        // streaming. Early previews wrote an empty set, which cannot run a
+        // chat turn at all; upgrade that legacy value on the next save while
+        // preserving any non-empty explicit capability selection.
+        let persistedCapabilities = connections.first(where: { $0.id == draft.id })?
+            .transportCapabilities
+        let existingCapabilities: Set<ProviderTransportCapability>
+        if let persistedCapabilities, !persistedCapabilities.isEmpty {
+            existingCapabilities = persistedCapabilities
+        } else {
+            existingCapabilities = [.streaming, .streamUsage]
+        }
         do {
             return try ProviderConnectionRecord(
                 id: draft.id,
@@ -624,7 +866,8 @@ final class ProviderSettingsModel: ObservableObject {
                 discovery: discovery,
                 requestBehavior: OpenAICompatibleRequestBehavior(
                     enableThinking: draft.enableThinking ? false : nil
-                )
+                ),
+                conversationScopeID: conversationScopeID
             )
         } catch let error as ProviderConnectionRecordError {
             throw ProviderSettingsError.invalidBaseURL(
@@ -639,10 +882,18 @@ final class ProviderSettingsModel: ObservableObject {
         else {
             throw ProviderSettingsError.discoveryRequiresValidDraft
         }
-        if draft.hasNonLoopbackHTTP && !draft.allowInsecureHTTP {
-            throw ProviderSettingsError.insecureHTTPRequiresAcknowledgement
+        if draft.usesHTTP {
+            guard draft.hasAllowedInsecureHTTPHost else {
+                throw ProviderSettingsError.insecureHTTPHostNotAllowed
+            }
+            guard draft.allowInsecureHTTP else {
+                throw ProviderSettingsError.insecureHTTPRequiresAcknowledgement
+            }
+            guard draft.authMode != .bearer else {
+                throw ProviderSettingsError.insecureHTTPBearerCredential
+            }
         }
-        let security: ProviderConnectionTransportSecurity = draft.hasNonLoopbackHTTP
+        let security: ProviderConnectionTransportSecurity = draft.usesHTTP
             && draft.allowInsecureHTTP
             ? .allowInsecureHTTP
             : .requireTLS
@@ -658,7 +909,9 @@ final class ProviderSettingsModel: ObservableObject {
                 discovery: draft.discovery,
                 requestBehavior: OpenAICompatibleRequestBehavior(
                     enableThinking: draft.enableThinking ? false : nil
-                )
+                ),
+                conversationScopeID: connections.first(where: { $0.id == draft.id })?
+                    .conversationScopeID ?? ProviderConnectionRecord.makeConversationScopeID()
             )
         } catch let error as ProviderConnectionRecordError {
             throw ProviderSettingsError.invalidBaseURL(

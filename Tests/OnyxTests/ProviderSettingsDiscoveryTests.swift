@@ -37,9 +37,8 @@ final class ProviderSettingsDiscoveryTests: XCTestCase {
         let connection = try ProviderConnectionRecord(
             id: ProviderConnectionID("local.qwen"),
             displayName: "Qwen",
-            baseURL: URL(string: "http://lan-provider.example.test:8002/v1")!,
-            authMode: .bearer,
-            transportSecurity: .allowInsecureHTTP
+            baseURL: URL(string: "https://provider.example.test/v1")!,
+            authMode: .bearer
         )
         let credential = try ProviderBearerCredential("fixture-key")
 
@@ -49,17 +48,58 @@ final class ProviderSettingsDiscoveryTests: XCTestCase {
         )
 
         XCTAssertEqual(models.map(\.id), ["Qwen/Qwen3.8-27B-FP8"])
+        XCTAssertTrue(try XCTUnwrap(models.first).capabilityEvidence.isUnknown)
         let request = try XCTUnwrap(probe.request)
-        XCTAssertEqual(request.url?.absoluteString, "http://lan-provider.example.test:8002/v1/models")
+        XCTAssertEqual(request.url?.absoluteString, "https://provider.example.test/v1/models")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer fixture-key")
     }
 
-    func testConnectionInitializerRejectsLANHTTPWithoutPersistedOptIn() throws {
+    func testProductionDiscoveryRejectsHTTPHostnamesAndBearerCredentials() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ProviderSettingsURLProtocol.self]
+        let discovery = URLSessionProviderModelDiscovery(
+            session: URLSession(configuration: configuration)
+        )
+
+        XCTAssertThrowsError(
+            try ProviderConnectionRecord(
+                id: ProviderConnectionID("unsafe.hostname"),
+                displayName: "Unsafe hostname",
+                baseURL: URL(string: "http://provider.example.test/v1")!,
+                authMode: .none,
+                transportSecurity: .allowInsecureHTTP
+            )
+        ) { error in
+            guard case .insecureHTTPHostNotAllowed = error as? ProviderConnectionRecordError else {
+                return XCTFail("Expected HTTP hostname rejection, got \(error)")
+            }
+        }
+
+        let localConnection = try ProviderConnectionRecord(
+            id: ProviderConnectionID("local.noauth"),
+            displayName: "Local no auth",
+            baseURL: URL(string: "http://192.168.2.170:8002/v1")!,
+            authMode: .none,
+            transportSecurity: .allowInsecureHTTP
+        )
+        let credential = try ProviderBearerCredential("must-not-send")
+        do {
+            _ = try await discovery.discoverModels(
+                for: localConnection,
+                credential: credential
+            )
+            XCTFail("Expected bearer-over-HTTP discovery rejection")
+        } catch let error as ProviderModelDiscoveryError {
+            XCTAssertEqual(error, .insecureBearerCredential)
+        }
+    }
+
+    func testConnectionInitializerRejectsPrivateIPHTTPWithoutPersistedOptIn() throws {
         XCTAssertThrowsError(
             try ProviderConnectionRecord(
                 id: ProviderConnectionID("unsafe"),
                 displayName: "Unsafe",
-                baseURL: URL(string: "http://lan-provider.example.test:8002/v1")!,
+                baseURL: URL(string: "http://192.168.2.170:8002/v1")!,
                 authMode: .none
             )
         ) { error in

@@ -66,6 +66,59 @@ final class ProviderCapabilitiesTests: XCTestCase {
         XCTAssertEqual(catalog, [model])
     }
 
+    func testGenericVLLMCatalogKeepsTextBaselineButMarksCapabilitiesUnknown() throws {
+        let model = try ProviderModelDescriptor.openRouter(from: .object([
+            "id": .string("Qwen/Qwen3.8-27B-FP8"),
+            "object": .string("model"),
+            "owned_by": .string("vllm"),
+        ]))
+
+        XCTAssertEqual(model.capabilities.inputModalities, [.text])
+        XCTAssertEqual(model.capabilities.outputModalities, [.text])
+        XCTAssertTrue(model.capabilities.supportedParameters.isEmpty)
+        XCTAssertTrue(model.capabilityEvidence.isUnknown)
+        XCTAssertEqual(model.pickerCapabilitySummary, "Capabilities unknown")
+    }
+
+    func testCapabilityEvidenceRoundTripsAndLegacyTextOnlyCatalogDecodesAsUnknown() throws {
+        let descriptor = try ProviderModelDescriptor(
+            id: "image-model",
+            wireProtocol: .openAIChatCompletions,
+            capabilities: ProviderCapabilitySet(inputModalities: [.text, .image]),
+            capabilityEvidence: ProviderCapabilityEvidence(
+                inputModalitiesAdvertised: true,
+                outputModalitiesAdvertised: false,
+                supportedParametersAdvertised: false,
+                reasoningEffortsAdvertised: false
+            )
+        )
+        let roundTripped = try JSONDecoder().decode(
+            ProviderModelDescriptor.self,
+            from: JSONEncoder().encode(descriptor)
+        )
+        XCTAssertEqual(roundTripped, descriptor)
+        XCTAssertTrue(roundTripped.capabilityEvidence.isPartial)
+
+        let legacy = """
+        {
+          "id": "legacy-text-only",
+          "displayName": "Legacy",
+          "wireProtocol": "openAIChatCompletions",
+          "capabilities": {
+            "inputModalities": ["text"],
+            "outputModalities": ["text"],
+            "supportedParameters": [],
+            "reasoningEfforts": []
+          }
+        }
+        """
+        let decodedLegacy = try JSONDecoder().decode(
+            ProviderModelDescriptor.self,
+            from: Data(legacy.utf8)
+        )
+        XCTAssertTrue(decodedLegacy.capabilityEvidence.isUnknown)
+    }
+
     func testOpenAICompatibleCodecPreservesHistoryTextImagesReasoningAndUsage() throws {
         let connection = try ProviderConnectionDescriptor.openRouter()
         let model = try ProviderModelDescriptor(
@@ -143,7 +196,7 @@ final class ProviderCapabilitiesTests: XCTestCase {
         }
     }
 
-    func testCodecRejectsClaudeProtocolUnsupportedCapabilitiesAndUnresolvedLocalImages() throws {
+    func testCodecRejectsClaudeProtocolUnsupportedCapabilitiesAndResolvesSelectedLocalImages() throws {
         let connection = try ProviderConnectionDescriptor.openRouter()
         let claude = try ProviderModelDescriptor(
             id: "claude-sonnet",
@@ -188,18 +241,25 @@ final class ProviderCapabilitiesTests: XCTestCase {
                 inputModalities: [.text, .image]
             )
         )
-        XCTAssertThrowsError(
-            try OpenAICompatibleChatRequestBuilder.make(
-                connection: connection,
-                model: imageModel,
-                inputs: [.localImagePath("/tmp/private.png")]
-            )
-        ) { error in
-            XCTAssertEqual(
-                error as? ProviderCapabilityError,
-                .unsupportedLocalImagePath("/tmp/private.png")
-            )
-        }
+        let localImage = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OnyxProviderCapabilities-\(UUID().uuidString).png")
+        let imageBytes = Data([0x89, 0x50, 0x4E, 0x47])
+        try imageBytes.write(to: localImage)
+        defer { try? FileManager.default.removeItem(at: localImage) }
+        let localImageRequest = try OpenAICompatibleChatRequestBuilder.make(
+            connection: connection,
+            model: imageModel,
+            inputs: [.localImagePath(localImage.path)]
+        )
+        let localImageParts = try XCTUnwrap(
+            localImageRequest.payload["messages"]?.arrayValue?.last?["content"]?.arrayValue
+        )
+        XCTAssertEqual(
+            localImageParts.first?["image_url"],
+            .object([
+                "url": .string("data:image/png;base64,\(imageBytes.base64EncodedString())"),
+            ])
+        )
 
         XCTAssertThrowsError(
             try OpenAICompatibleChatRequestBuilder.make(
@@ -322,6 +382,67 @@ final class ProviderCapabilitiesTests: XCTestCase {
                 error as? ProviderCapabilityError,
                 .invalidEndpoint("https://example.com/v1?api_key=secret")
             )
+        }
+    }
+
+    func testLegacyDescriptorUsesSameAcknowledgedLocalIPNoCredentialHTTPPolicy() throws {
+        XCTAssertThrowsError(
+            try ProviderConnectionDescriptor(
+                id: ProviderConnectionID("http.unacknowledged"),
+                adapterID: RuntimeAdapterID("test.adapter"),
+                displayName: "Unacknowledged",
+                wireProtocol: .openAIChatCompletions,
+                endpoint: URL(string: "http://127.0.0.1:8000/v1")!,
+                credential: .none
+            )
+        ) { error in
+            guard case .insecureEndpoint = error as? ProviderCapabilityError else {
+                return XCTFail("Expected acknowledgement rejection, got \(error)")
+            }
+        }
+
+        XCTAssertNoThrow(
+            try ProviderConnectionDescriptor(
+                id: ProviderConnectionID("http.private"),
+                adapterID: RuntimeAdapterID("test.adapter"),
+                displayName: "Private",
+                wireProtocol: .openAIChatCompletions,
+                endpoint: URL(string: "http://192.168.1.20:8000/v1")!,
+                credential: .none,
+                transportSecurity: .allowInsecureHTTP
+            )
+        )
+
+        XCTAssertThrowsError(
+            try ProviderConnectionDescriptor(
+                id: ProviderConnectionID("http.hostname"),
+                adapterID: RuntimeAdapterID("test.adapter"),
+                displayName: "Hostname",
+                wireProtocol: .openAIChatCompletions,
+                endpoint: URL(string: "http://provider.example.test:8000/v1")!,
+                credential: .none,
+                transportSecurity: .allowInsecureHTTP
+            )
+        ) { error in
+            guard case .insecureEndpoint = error as? ProviderCapabilityError else {
+                return XCTFail("Expected hostname rejection, got \(error)")
+            }
+        }
+
+        XCTAssertThrowsError(
+            try ProviderConnectionDescriptor(
+                id: ProviderConnectionID("http.credential"),
+                adapterID: RuntimeAdapterID("test.adapter"),
+                displayName: "Credential",
+                wireProtocol: .openAIChatCompletions,
+                endpoint: URL(string: "http://10.0.0.8:8000/v1")!,
+                credential: try .keychainAPIKey(service: "dev.peteallen.onyx.test"),
+                transportSecurity: .allowInsecureHTTP
+            )
+        ) { error in
+            guard case .insecureCredential = error as? ProviderCapabilityError else {
+                return XCTFail("Expected bearer-over-HTTP rejection, got \(error)")
+            }
         }
     }
 }

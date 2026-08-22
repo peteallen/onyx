@@ -1,8 +1,9 @@
 # Provider extensibility boundary
 
 Onyx's default workspace ships OpenAI Codex through `codex app-server`. It also
-contains a tested OpenAI-compatible runtime that can be configured from
-Settings, while the production workspace selector remains Codex-only for now.
+ships a tested OpenAI-compatible runtime configured from Settings. Both appear
+in one production new-task model picker; a selected task remains bound to its
+original provider and model.
 
 ## What is implemented
 
@@ -19,22 +20,28 @@ Settings, while the production workspace selector remains Codex-only for now.
 - OpenRouter /models-shaped metadata can be projected into
   ProviderModelDescriptor. Unknown future fields are ignored.
 - OpenAICompatibleChatRequestBuilder produces a deterministic
-  /chat/completions JSON body for text and already-resolved HTTP/data-URL
-  images. It validates streaming, usage, reasoning, image, and protocol
-  requirements before encoding.
-- Provider Settings validates and normalizes HTTP(S) endpoints, requires an
-  explicit acknowledgement for non-loopback clear-text HTTP, discovers models
-  through `/models`, and stores bearer values only through Keychain.
+  /chat/completions JSON body for text, HTTP/data-URL images, and validated
+  bounded local image attachments converted to data URLs. It validates
+  streaming, usage, reasoning, image, and protocol requirements before
+  encoding.
+- Provider Settings validates and normalizes HTTP(S) endpoints, restricts
+  clear-text HTTP to explicitly acknowledged literal loopback/private/link-local
+  IPs with no bearer credential, discovers models through `/models`, and stores
+  bearer values only through Keychain.
 - OpenAICompatibleRuntime streams chat-completions responses and persists
   provider-owned conversation history locally. It advertises only the controls
   the endpoint can actually support; Codex-local tools, approvals, and sandbox
   execution are unavailable on this adapter.
+- Cached catalogs for every configured connection load before provider
+  switching, so manually selected or previously discovered vLLM models are
+  directly selectable. Capability metadata is persisted without credentials;
+  missing metadata is treated conservatively.
 
 The catalog projector and request builder remain pure discovery/encoding
 components. The Claude descriptor is configuration metadata only; there is no
 Anthropic Messages codec or runtime adapter.
 
-## Why this is not an OpenRouter or Claude adapter yet
+## Why this is not a Claude or remote-tool adapter yet
 
 AgentRuntime includes durable thread discovery/resume, Codex approvals,
 sandbox policy, local terminal/tool execution, steering, archive/fork/delete,
@@ -43,19 +50,17 @@ not provide those semantics, and Anthropic's native Messages API is a
 different wire protocol. Implementing a fake adapter that silently drops
 those controls would make the desktop behavior misleading.
 
-The OpenAI-compatible adapter intentionally has no RuntimeRegistry registration
-in the default composition yet. A future production selector can add it after
-the conversation catalog, restoration, and provider-scoped UI are wired
-together. Any adapter must define an explicit mapping for lifecycle features
-that its upstream does not provide (or mark them unavailable in session
-capabilities), add a provider-owned conversation store, and prove live
-stream/error behavior.
+The composition host resolves saved OpenAI-compatible connections beside the
+registry-owned default Codex connection. Any future adapter must still define
+an explicit mapping for lifecycle features that its upstream does not provide
+(or mark them unavailable in session capabilities), add a provider-owned
+conversation store, and prove live stream/error behavior.
 
 Provider request capabilities are deliberately not projected directly into
 AgentRuntime capabilities. For example, a remote model advertising tools says
 nothing about Onyx's local tool execution and approval semantics; the eventual
 adapter must prove and advertise those product-level behaviors separately.
 
-Local image paths are intentionally rejected by the codec. A future adapter
-must resolve them to a validated image data URL or provider-upload reference
-before crossing the remote endpoint boundary.
+Local image paths selected in the composer are revalidated, bounded, and
+resolved to image data URLs before crossing the remote endpoint boundary; the
+filesystem path itself is not sent to the provider.

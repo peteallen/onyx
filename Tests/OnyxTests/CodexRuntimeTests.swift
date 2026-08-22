@@ -129,6 +129,78 @@ final class CodexRuntimeTests: XCTestCase {
         XCTAssertEqual(session.availableModels.first?.defaultReasoningEffort, "low")
         XCTAssertEqual(session.availableModels.first?.reasoningEfforts, ["low", "high"])
     }
+
+    func testCompleteThreadCatalogFollowsEveryCursorWithoutLosingOrDuplicatingRows() async throws {
+        let transport = PaginatedCodexTransport()
+        let runtime = CodexRuntime(client: transport)
+
+        let threads = try await runtime.listAllThreads(archived: false)
+        let requests = await transport.recordedListRequests()
+
+        XCTAssertEqual(Set(threads.map(\.id)), Set((0 ..< 205).map { "thread-" + String($0) }))
+        XCTAssertEqual(threads.count, 205)
+        XCTAssertEqual(requests.map { $0.params["limit"]?.intValue }, [100, 100, 100])
+        XCTAssertEqual(requests.map { $0.params["cursor"]?.stringValue }, [nil, "page-2", "page-3"])
+        XCTAssertEqual(requests.map { $0.params["archived"]?.boolValue }, [false, false, false])
+    }
+}
+
+private actor PaginatedCodexTransport: CodexAppServerTransport {
+    struct Request: Sendable {
+        let method: String
+        let params: JSONValue
+    }
+
+    nonisolated let events: AsyncStream<AppServerEvent>
+    private var requests: [Request] = []
+
+    init() {
+        events = AsyncStream { continuation in continuation.finish() }
+    }
+
+    func start() async throws -> AppServerConnection {
+        AppServerConnection(generation: 1, initializeResponse: .object([:]))
+    }
+
+    func stop() async {}
+
+    func request(method: String, params: JSONValue) async throws -> JSONValue {
+        requests.append(Request(method: method, params: params))
+        guard method == "thread/list" else { return .object([:]) }
+
+        let page: Range<Int>
+        let nextCursor: String?
+        switch params["cursor"]?.stringValue {
+        case nil:
+            page = 0 ..< 100
+            nextCursor = "page-2"
+        case "page-2":
+            page = 100 ..< 200
+            nextCursor = "page-3"
+        default:
+            page = 200 ..< 205
+            nextCursor = nil
+        }
+        var result: [String: JSONValue] = [
+            "data": .array(page.map { index in
+                .object([
+                    "id": .string("thread-" + String(index)),
+                    "name": .string("Task " + String(index)),
+                    "preview": .string("Task " + String(index)),
+                    "updatedAt": .integer(index + 1),
+                    "status": .object(["type": .string("idle")]),
+                ])
+            }),
+        ]
+        if let nextCursor { result["nextCursor"] = .string(nextCursor) }
+        return .object(result)
+    }
+
+    func respond(id _: RuntimeRequestID, result _: JSONValue) async throws {}
+
+    func recordedListRequests() -> [Request] {
+        requests.filter { $0.method == "thread/list" }
+    }
 }
 
 private actor RecordingCodexTransport: CodexAppServerTransport {

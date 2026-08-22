@@ -404,7 +404,7 @@ final class DelegationCoreTests: XCTestCase {
         XCTAssertEqual(events.last?.state, .succeeded)
     }
 
-    func testRunningCancellationFreesConcurrencySlotBeforeExecutorReturns() async throws {
+    func testRunningCancellationIsTerminalButRetainsPhysicalConcurrencySlot() async throws {
         let firstStarted = AsyncGate()
         let releaseFirst = AsyncGate()
         let secondStarted = AsyncGate()
@@ -428,10 +428,196 @@ final class DelegationCoreTests: XCTestCase {
         await firstStarted.wait()
 
         _ = try await coordinator.cancel(first.jobID)
-        try await waitForGate(secondStarted, description: "queued job to start after cancellation")
+        do {
+            _ = try await coordinator.result(for: first.jobID)
+            XCTFail("Expected authoritative cancellation")
+        } catch let DelegationResultError.cancelled(cancellation) {
+            XCTAssertEqual(cancellation.reason, .user)
+        }
+        try await Task.sleep(for: .milliseconds(25))
+        let secondStartedWhileFirstExecutorWasRunning = await secondStarted.opened()
+        XCTAssertFalse(
+            secondStartedWhileFirstExecutorWasRunning,
+            "A non-cooperative provider call must retain its physical concurrency slot"
+        )
+
+        await releaseFirst.open()
+        try await waitForGate(secondStarted, description: "queued job to start after executor exit")
         let result = try await coordinator.result(for: second.jobID)
         XCTAssertEqual(result.text, "second")
+    }
+
+    func testQueuedCancellationRequestPreservesQueuedState() async throws {
+        let firstStarted = AsyncGate()
+        let releaseFirst = AsyncGate()
+        let executor = ClosureDelegationExecutor(connectionID: qwenConnection) {
+            request,
+            _ in
+            if request.id == DelegationJobID("queue-blocker") {
+                await firstStarted.open()
+                await releaseFirst.wait()
+            }
+            return DelegationOutput(text: "done")
+        }
+        let coordinator = try DelegationCoordinator(
+            executors: [executor],
+            maxConcurrentJobs: 1
+        )
+        let blocker = try await coordinator.submit(makeRequest(id: "queue-blocker"))
+        let queued = try await coordinator.submit(makeRequest(id: "queued-cancel"))
+        await firstStarted.wait()
+
+        _ = try await coordinator.cancel(queued.jobID)
+        let events = await Self.collectEvents(from: queued.events)
+        let cancellationRequest = try XCTUnwrap(events.first { event in
+            if case .cancellationRequested = event { return true }
+            return false
+        })
+        XCTAssertEqual(cancellationRequest.state, .queued)
+        XCTAssertFalse(events.contains { if case .started = $0 { true } else { false } })
+
         await releaseFirst.open()
+        _ = try await coordinator.result(for: blocker.jobID)
+    }
+
+    func testTerminalJobRetentionEvictsOldestRecord() async throws {
+        let executor = ClosureDelegationExecutor(connectionID: qwenConnection) {
+            request,
+            _ in DelegationOutput(text: request.id.rawValue)
+        }
+        let coordinator = try DelegationCoordinator(
+            executors: [executor],
+            maxRetainedTerminalJobs: 2
+        )
+
+        for id in ["retained-one", "retained-two", "retained-three"] {
+            let handle = try await coordinator.submit(makeRequest(id: id))
+            _ = try await coordinator.result(for: handle.jobID)
+        }
+
+        do {
+            _ = try await coordinator.snapshot(for: DelegationJobID("retained-one"))
+            XCTFail("Expected the oldest terminal job to be evicted")
+        } catch {
+            XCTAssertEqual(
+                error as? DelegationCoordinatorError,
+                .unknownJob(DelegationJobID("retained-one"))
+            )
+        }
+        let secondState = try await coordinator
+            .snapshot(for: DelegationJobID("retained-two")).state
+        let thirdState = try await coordinator
+            .snapshot(for: DelegationJobID("retained-three")).state
+        XCTAssertEqual(secondState, .succeeded)
+        XCTAssertEqual(thirdState, .succeeded)
+    }
+
+    func testEvictedNonCooperativeJobIDCannotBeReused() async throws {
+        let stuckStarted = AsyncGate()
+        let releaseStuck = AsyncGate()
+        let executor = ClosureDelegationExecutor(connectionID: qwenConnection) {
+            request,
+            _ in
+            if request.id == DelegationJobID("evicted-stuck") {
+                await stuckStarted.open()
+                // Deliberately ignore cancellation so the physical task stays
+                // alive after its logical record reaches terminal state.
+                await releaseStuck.wait()
+                return DelegationOutput(text: "late old output")
+            }
+            return DelegationOutput(text: "retention trigger")
+        }
+        let coordinator = try DelegationCoordinator(
+            executors: [executor],
+            maxConcurrentJobs: 2,
+            maxRetainedTerminalJobs: 1
+        )
+        let stuck = try await coordinator.submit(makeRequest(id: "evicted-stuck"))
+        await stuckStarted.wait()
+        _ = try await coordinator.cancel(stuck.jobID)
+
+        let trigger = try await coordinator.submit(makeRequest(id: "eviction-trigger"))
+        _ = try await coordinator.result(for: trigger.jobID)
+        do {
+            _ = try await coordinator.snapshot(for: stuck.jobID)
+            XCTFail("Expected the cancelled record to be evicted")
+        } catch {
+            XCTAssertEqual(
+                error as? DelegationCoordinatorError,
+                .unknownJob(stuck.jobID)
+            )
+        }
+
+        do {
+            _ = try await coordinator.submit(makeRequest(id: "evicted-stuck"))
+            XCTFail("An evicted ID must remain reserved while its executor is alive")
+        } catch {
+            XCTAssertEqual(
+                error as? DelegationCoordinatorError,
+                .duplicateJobID(stuck.jobID)
+            )
+        }
+
+        await releaseStuck.open()
+    }
+
+    func testCancelledEventConsumerIsRemovedFromRunningJob() async throws {
+        let started = AsyncGate()
+        let release = AsyncGate()
+        let executor = ClosureDelegationExecutor(connectionID: qwenConnection) {
+            _, _ in
+            await started.open()
+            await release.wait()
+            return DelegationOutput(text: "done")
+        }
+        let coordinator = try DelegationCoordinator(executors: [executor])
+        let handle = try await coordinator.submit(makeRequest(id: "subscriber-cancel"))
+        await started.wait()
+        let jobID = handle.jobID
+        let stream = try await coordinator.events(for: jobID)
+        let consumer = Task {
+            var iterator = stream.makeAsyncIterator()
+            while await iterator.next() != nil {}
+        }
+        try await waitUntil("event subscriber registration") {
+            try await coordinator.activeSubscriberCount(for: jobID) == 2
+        }
+
+        consumer.cancel()
+        _ = await consumer.result
+        try await waitUntil("cancelled event subscriber removal") {
+            try await coordinator.activeSubscriberCount(for: jobID) == 1
+        }
+
+        await release.open()
+        _ = try await coordinator.result(for: jobID)
+    }
+
+    func testDroppedEventStreamUnregistersSubscriber() async throws {
+        let started = AsyncGate()
+        let release = AsyncGate()
+        let executor = ClosureDelegationExecutor(connectionID: qwenConnection) {
+            _, _ in
+            await started.open()
+            await release.wait()
+            return DelegationOutput(text: "done")
+        }
+        let coordinator = try DelegationCoordinator(executors: [executor])
+        let handle = try await coordinator.submit(makeRequest(id: "dropped-stream"))
+        await started.wait()
+
+        do {
+            let dropped = try await coordinator.events(for: handle.jobID)
+            let subscriberCount = try await coordinator.activeSubscriberCount(for: handle.jobID)
+            XCTAssertEqual(subscriberCount, 2)
+            _ = dropped
+        }
+
+        try await waitUntil("dropped event stream removal") {
+            try await coordinator.activeSubscriberCount(for: handle.jobID) == 1
+        }
+        await release.open()
+        _ = try await coordinator.result(for: handle.jobID)
     }
 
     func testProgressAndLifecycleOrderingRemainPerJobUnderConcurrency() async throws {

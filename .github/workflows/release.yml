@@ -39,7 +39,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -178,6 +178,19 @@ jobs:
           fi
           echo "enabled=1" >> "$GITHUB_OUTPUT"
 
+      - name: Require notarization before publishing
+        if: steps.metadata.outputs.publish == 'true'
+        shell: zsh -euo pipefail {0}
+        env:
+          SIGNING_ENABLED: ${{ steps.signing.outputs.enabled }}
+          NOTARIZATION_ENABLED: ${{ steps.notarization.outputs.enabled }}
+        run: |
+          if [[ "$SIGNING_ENABLED" != "true" || "$NOTARIZATION_ENABLED" != "1" ]]; then
+            print -u2 -- "Publishing requires Developer ID signing and notarization."
+            print -u2 -- "Run an artifact-only workflow with publish_release=false until both are configured."
+            exit 1
+          fi
+
       - name: Run unit tests
         shell: zsh -euo pipefail {0}
         run: /usr/bin/swift test --disable-sandbox
@@ -201,7 +214,7 @@ jobs:
           )
 
       - name: Upload workflow artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ steps.metadata.outputs.artifact_name }}
           path: |

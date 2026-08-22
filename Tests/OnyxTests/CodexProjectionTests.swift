@@ -470,6 +470,10 @@ final class CodexProjectionTests: XCTestCase {
         XCTAssertFalse(projected.body.contains("thread-parent"))
         XCTAssertEqual(projected.collaboration?.agents.count, 2)
         XCTAssertEqual(
+            Set(projected.collaboration?.agents.map(\.id) ?? []),
+            Set(["thread-child-a", "thread-child-b"])
+        )
+        XCTAssertEqual(
             Set(projected.collaboration?.agents.map(\.status) ?? []),
             Set([.working, .completed])
         )
@@ -490,6 +494,7 @@ final class CodexProjectionTests: XCTestCase {
         XCTAssertEqual(projected.title, "Agent started")
         XCTAssertEqual(projected.body, "Image Attachments")
         XCTAssertEqual(projected.detail, "Collaboration")
+        XCTAssertEqual(projected.collaboration?.agents.first?.id, "thread-child")
         XCTAssertEqual(projected.collaboration?.agents.first?.status, .working)
         XCTAssertFalse(projected.body.contains("agentThreadId"))
     }

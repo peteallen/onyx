@@ -183,7 +183,7 @@ enum OpenAICompatibleChatRequestBuilder {
                     parts.append(.text(text))
                 }
             case let .localImagePath(path):
-                throw ProviderCapabilityError.unsupportedLocalImagePath(path)
+                parts.append(.imageURL(try Self.localImageDataURL(path)))
             case let .imageURL(value):
                 guard Self.isAllowedImageURL(value) else {
                     throw ProviderCapabilityError.invalidImageURL(value)
@@ -221,7 +221,12 @@ enum OpenAICompatibleChatRequestBuilder {
             requirements.append(.input(.text))
         }
         if historyParts.contains(where: { if case .imageURL = $0 { true } else { false } })
-            || inputs.contains(where: { if case .imageURL = $0 { true } else { false } })
+            || inputs.contains(where: {
+                switch $0 {
+                case .imageURL, .localImagePath: true
+                case .text: false
+                }
+            })
         {
             requirements.append(.input(.image))
         }
@@ -247,4 +252,50 @@ enum OpenAICompatibleChatRequestBuilder {
             && !payload.isEmpty
             && Data(base64Encoded: String(payload), options: []) != nil
     }
+
+    /// File-pickers produce local paths, while OpenAI-compatible chat APIs
+    /// accept image URLs or data URLs. Resolve only the validated image types
+    /// we offer in the composer, keep the payload bounded, and send a data URL
+    /// so the provider never needs access to the user's filesystem path.
+    private static func localImageDataURL(_ path: String) throws -> String {
+        let url = URL(fileURLWithPath: path)
+        let extensionName = url.pathExtension.lowercased()
+        let mimeType: String
+        switch extensionName {
+        case "png": mimeType = "image/png"
+        case "jpg", "jpeg": mimeType = "image/jpeg"
+        case "gif": mimeType = "image/gif"
+        case "webp": mimeType = "image/webp"
+        case "heic", "heif": mimeType = "image/heic"
+        default:
+            throw ProviderCapabilityError.unsupportedLocalImagePath(path)
+        }
+
+        let attributes: [FileAttributeKey: Any]
+        do {
+            attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        } catch {
+            throw ProviderCapabilityError.unreadableLocalImagePath(path)
+        }
+        guard attributes[.type] as? FileAttributeType == .typeRegular,
+              let size = (attributes[.size] as? NSNumber)?.intValue,
+              size > 0,
+              size <= maximumLocalImageBytes
+        else {
+            throw ProviderCapabilityError.unreadableLocalImagePath(path)
+        }
+
+        let data: Data
+        do {
+            data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        } catch {
+            throw ProviderCapabilityError.unreadableLocalImagePath(path)
+        }
+        guard !data.isEmpty, data.count <= maximumLocalImageBytes else {
+            throw ProviderCapabilityError.unreadableLocalImagePath(path)
+        }
+        return "data:\(mimeType);base64,\(data.base64EncodedString())"
+    }
+
+    private static let maximumLocalImageBytes = 20 * 1_024 * 1_024
 }

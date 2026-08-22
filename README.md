@@ -9,18 +9,25 @@ Codex desktop app. It keeps the familiar project, task, transcript, approval,
 diff, and terminal workflow while giving the interface a faster native render
 path and a distinct polished-stone visual language.
 
-The default production workspace still starts one provider/runtime path: OpenAI
-Codex through `codex app-server`. A Codex-only registry resolves that default
-connection, and the native UI consumes the provider-neutral `AgentRuntime`
+Onyx is an independent, unofficial project. It is not affiliated with,
+endorsed by, or sponsored by OpenAI.
+
+OpenAI Codex through `codex app-server` remains the default runtime. Saved
+OpenAI-compatible connections are also available in the production workspace:
+the new-task picker shows frequent and recent models first, then every cached
+model grouped by provider, and switches provider plus model in one action.
+Bearer credentials stay in Keychain, `/models` metadata drives capability-aware
+controls, and provider-owned conversations stream into a local store. Existing
+tasks remain pinned to the provider and model that created them. Claude/
+Anthropic remains a future adapter. See
+[docs/PROVIDER_EXTENSIBILITY.md](docs/PROVIDER_EXTENSIBILITY.md) for the exact
 boundary.
 
-The repository also contains a tested OpenAI-compatible runtime slice: provider
-connections can be added and edited in Settings, bearer credentials are stored
-through Keychain, `/models` discovery is supported, and conversations stream
-into a provider-owned local store. Those saved connections are not yet wired
-into the production workspace selector, and Claude/Anthropic remains a future
-adapter. See [docs/PROVIDER_EXTENSIBILITY.md](docs/PROVIDER_EXTENSIBILITY.md)
-for the exact boundary.
+The sidebar groups tasks under an app-owned project catalog with add, rename,
+reorder, and metadata-only removal. The three workspace panes are resizable,
+tool activity is collapsed by default, collaboration agents are navigable, and
+Codex tasks can open an isolated ephemeral side chat without changing durable
+task history.
 
 Within the Codex path, the Git inspector supports per-file stage, unstage, and
 confirmed recoverable discard; the Files inspector supports project-local
@@ -44,28 +51,64 @@ scripts/package-app.sh debug
 ```
 
 That creates `dist/Onyx.app` and includes the custom Onyx app icon. The packaging
-command does not launch or stop the app. To make an isolated preview build that
-can live beside the default build, give it a different destination, display
-name, and bundle ID:
+command does not launch or stop the app. For previews, always reuse the stable
+path, display name, and bundle identifier:
 
 ```bash
-scripts/package-app.sh debug "dist-check/Onyx Preview.app" \
-  --display-name "Onyx Preview" \
-  --bundle-id app.onyx.preview
+scripts/package-preview.sh
 ```
 
-The display name and bundle ID can also be supplied through
-`ONYX_APP_DISPLAY_NAME` and `ONYX_BUNDLE_IDENTIFIER`. Run
-`scripts/package-app.sh --help` for version/build-number options. The separate
-destination prevents overwriting the default bundle, the display name makes the
-preview recognizable in macOS, and the bundle ID gives it an independent app
-identity.
+To package, replace, and launch that same preview identity in one step, use
+`scripts/run-preview.sh`.
+
+This always replaces `dist-preview/Onyx Preview.app` with bundle ID
+`app.onyx.preview`; it never invents a timestamped app identity. If that exact
+preview is running, quit it first or pass `--stop-running`. That option resolves
+the process from the existing preview executable, sends only that process a
+graceful termination signal, and refuses to force-kill anything. The preview
+owns its stdio `codex app-server`, so that child exits through the app's normal
+shutdown/process-pipe lifecycle; the script never searches for or kills a
+machine-wide `codex app-server`.
 
 Packaging is staged and verified beside the destination before it replaces an
-existing bundle. If that exact destination is currently running, the command
-refuses to overwrite it. Prefer a different destination for test builds. The
-explicit `--allow-running-overwrite` escape hatch only replaces the files; it
-never quits or relaunches the running process.
+existing bundle atomically. If that exact destination is currently running,
+the general package command refuses to overwrite it. Its explicit
+`--allow-running-overwrite` escape hatch only replaces files; it never quits or
+relaunches a process.
+
+Ad-hoc signatures have a code-hash identity that changes on every build. To keep
+privacy and automation approvals stable, the preview helper automatically uses
+the first valid Code Signing identity in the default user Keychain. Override that
+choice with a SHA-1 fingerprint when necessary:
+
+```bash
+ONYX_PREVIEW_CODESIGN_IDENTITY='CERTIFICATE_SHA1' \
+scripts/package-preview.sh --stop-running
+```
+
+An Apple Development or local identity is development-only and is not a
+substitute for Developer ID distribution signing or notarization. A machine
+without a valid identity now fails closed so it cannot silently produce a
+preview whose permissions reset on every rebuild. Set
+`ONYX_PREVIEW_CODESIGN_IDENTITY=-` only when an explicitly ad-hoc preview is
+acceptable. For an explicitly certificate-pinned identity, set
+`ONYX_PREVIEW_CODESIGN_REQUIREMENT` to a requirement body such as
+`identifier "app.onyx.preview" and anchor trusted and certificate leaf =
+H"CERTIFICATE_SHA1"`. `scripts/package-app.sh --help` exposes the same advanced
+override for other package destinations.
+
+If this checkout has already created older preview/development bundles,
+LaunchServices may retain their old registrations. The repair helper unregisters
+only repo-local legacy Onyx IDs (including timestamped previews), then registers
+the stable bundle:
+
+```bash
+scripts/repair-preview-registration.sh
+```
+
+The helper never uses the destructive `lsregister -delete` database reset. Its
+default mode is limited to this checkout; its optional `--gc` mode is broader
+and is available only when deleted old paths still appear in Finder.
 
 ## Releases
 
@@ -80,11 +123,12 @@ under `dist-release/`. It works without Apple credentials for local testing,
 while Developer ID signing and notarization activate when their optional
 credentials are configured.
 
-GitHub Actions runs the full test and packaging path for every pull request. A
-tag such as `v0.2.0` publishes a downloadable DMG to GitHub Releases; the manual
-Release workflow can also make an artifact-only dry run or publish a release at
-the selected commit. See [docs/RELEASING.md](docs/RELEASING.md) for the exact
-commands, safeguards, and optional repository secrets.
+GitHub Actions runs the full test and packaging path for every pull request. The
+manual Release workflow can make an artifact-only development build at any
+selected commit. Publishing a tag or GitHub Release fails closed until
+Developer ID signing and notarization are configured. See
+[docs/RELEASING.md](docs/RELEASING.md) for the exact commands, safeguards, and
+required publication secrets.
 
 Onyx resolves Codex in this order:
 

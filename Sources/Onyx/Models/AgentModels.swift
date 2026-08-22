@@ -37,6 +37,10 @@ struct RuntimeCapabilities: OptionSet, Sendable {
     /// from `diffs`: a provider may be able to display changes without running
     /// a review, or run a review without supplying a native diff surface.
     static let codeReview = Self(rawValue: 1 << 14)
+    /// The runtime can fork a task into a live, non-durable conversation while
+    /// retaining the parent's context. This is intentionally separate from
+    /// ordinary durable task forking.
+    static let ephemeralThreadForking = Self(rawValue: 1 << 15)
 }
 
 struct RuntimeSession: Sendable, Equatable {
@@ -166,6 +170,46 @@ struct RuntimeModel: Identifiable, Sendable, Hashable {
     let isDefault: Bool
     let defaultReasoningEffort: String?
     let reasoningEfforts: [String]
+    /// Provider-advertised request metadata. These fields describe the model
+    /// only; they never imply that Onyx can execute local tools or approvals.
+    let inputModalities: Set<ProviderInputModality>
+    let supportedRequestParameters: Set<ProviderRequestParameter>
+    /// Distinguishes provider-advertised metadata from the conservative text
+    /// baseline used when a generic `/models` response contains only an ID.
+    let capabilityEvidence: ProviderCapabilityEvidence
+
+    init(
+        id: String,
+        displayName: String,
+        description: String?,
+        isDefault: Bool,
+        defaultReasoningEffort: String?,
+        reasoningEfforts: [String],
+        inputModalities: Set<ProviderInputModality> = [.text, .image],
+        supportedRequestParameters: Set<ProviderRequestParameter> = [],
+        capabilityEvidence: ProviderCapabilityEvidence = .advertised
+    ) {
+        self.id = id
+        self.displayName = displayName
+        self.description = description
+        self.isDefault = isDefault
+        self.defaultReasoningEffort = defaultReasoningEffort
+        self.reasoningEfforts = reasoningEfforts
+        self.inputModalities = inputModalities
+        self.supportedRequestParameters = supportedRequestParameters
+        self.capabilityEvidence = capabilityEvidence
+    }
+
+    /// Compact picker copy. Tool metadata is deliberately omitted: the
+    /// OpenAI-compatible runtime does not implement Onyx tool execution, so a
+    /// remote model advertising a `tools` parameter must not produce a tools
+    /// badge in the desktop UI.
+    var pickerCapabilitySummary: String {
+        capabilityEvidence.pickerSummary(
+            inputModalities: inputModalities,
+            reasoningEfforts: reasoningEfforts
+        )
+    }
 }
 
 enum RuntimeSandboxMode: String, Sendable, Codable, CaseIterable {

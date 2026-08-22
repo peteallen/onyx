@@ -5,6 +5,7 @@ import SwiftUI
 /// settings tab and never mixed with these API credentials.
 struct ProviderSettingsView: View {
     @ObservedObject var model: ProviderSettingsModel
+    @Environment(\.openWindow) private var openWindow
     @State private var pendingDelete: ProviderConnectionRecord?
     @State private var isShowingDeleteConfirmation = false
 
@@ -17,6 +18,21 @@ struct ProviderSettingsView: View {
         .navigationSplitViewStyle(.balanced)
         .task {
             await model.start()
+        }
+        .onChange(of: model.draft.baseURL) { _, _ in
+            model.updateDraftDiscoveryScope()
+        }
+        .onChange(of: model.draft.authMode) { _, _ in
+            model.updateDraftDiscoveryScope()
+        }
+        .onChange(of: model.draft.allowInsecureHTTP) { _, _ in
+            model.updateDraftDiscoveryScope()
+        }
+        .onChange(of: model.draft.bearerToken) { _, _ in
+            model.updateDraftDiscoveryScope()
+        }
+        .onChange(of: model.draft.removeStoredCredential) { _, _ in
+            model.updateDraftDiscoveryScope()
         }
         .alert(
             "Remove provider connection?",
@@ -49,6 +65,9 @@ struct ProviderSettingsView: View {
                                 .contextMenu {
                                     Button("Edit") {
                                         model.selectConnection(connection.id)
+                                    }
+                                    Button("Open Workspace") {
+                                        openWorkspace(for: connection)
                                     }
                                     Button("Remove", role: .destructive) {
                                         pendingDelete = connection
@@ -186,6 +205,15 @@ struct ProviderSettingsView: View {
             Spacer(minLength: 12)
 
             if model.selectedConnectionID != nil {
+                if let connection = model.connections.first(where: { $0.id == model.draft.id }) {
+                    Button {
+                        openWorkspace(for: connection)
+                    } label: {
+                        Label("Open Workspace", systemImage: "arrow.up.right.square")
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel("Open workspace for \(connection.displayName)")
+                }
                 Button {
                     guard let connection = model.connections.first(where: { $0.id == model.draft.id }) else {
                         return
@@ -207,7 +235,7 @@ struct ProviderSettingsView: View {
 
     private var securitySection: some View {
         Section {
-            if model.draft.hasNonLoopbackHTTP {
+            if model.draft.usesHTTP {
                 VStack(alignment: .leading, spacing: 10) {
                     Label(
                         "This endpoint uses unencrypted HTTP",
@@ -216,17 +244,35 @@ struct ProviderSettingsView: View {
                     .font(.headline)
                     .foregroundStyle(OnyxTheme.warning)
 
-                    Text("Traffic, including prompts and responses, can be read or changed on the network. Only enable this for a network you trust, such as your private LAN.")
+                    Text("Traffic, including prompts and responses, can be read or changed on the network. Clear-text HTTP is limited to literal loopback, private-network, or link-local IP addresses, and still requires your acknowledgement.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
 
-                    Toggle(
-                        "I understand the risk and allow clear-text LAN traffic",
-                        isOn: $model.draft.allowInsecureHTTP
-                    )
-                    .toggleStyle(.checkbox)
-                    .accessibilityLabel("Allow insecure HTTP")
-                    .accessibilityHint("Required before Onyx can contact a non-loopback HTTP endpoint")
+                    if model.draft.hasAllowedInsecureHTTPHost {
+                        Toggle(
+                            "I understand the risk and allow clear-text HTTP",
+                            isOn: $model.draft.allowInsecureHTTP
+                        )
+                        .toggleStyle(.checkbox)
+                        .accessibilityLabel("Allow insecure HTTP")
+                        .accessibilityHint("Required before Onyx can contact any HTTP endpoint, including a local IP")
+                    } else {
+                        Label(
+                            "This HTTP host is not allowed. Use HTTPS or enter a literal loopback, private-network, or link-local IP address.",
+                            systemImage: "nosign"
+                        )
+                        .font(.callout.weight(.medium))
+                        .foregroundStyle(OnyxTheme.destructive)
+                    }
+
+                    if model.draft.authMode == .bearer {
+                        Label(
+                            "Bearer authentication cannot be used over clear-text HTTP. Switch to HTTPS before saving.",
+                            systemImage: "key.slash"
+                        )
+                        .font(.callout.weight(.medium))
+                        .foregroundStyle(OnyxTheme.destructive)
+                    }
                 }
                 .padding(.vertical, 4)
             } else {
@@ -239,7 +285,7 @@ struct ProviderSettingsView: View {
         } header: {
             Text("Transport security")
         } footer: {
-            Text("Localhost and 127.0.0.1 are allowed for local development. Onyx never treats a LAN HTTP URL as safe implicitly.")
+            Text("Onyx never resolves hostnames to decide whether HTTP is safe. HTTPS is required for hostnames and public IP addresses; clear-text HTTP always needs an explicit acknowledgement.")
         }
     }
 
@@ -328,7 +374,13 @@ struct ProviderSettingsView: View {
                 Picker("Discovered models", selection: $model.draft.selectedModelID) {
                     Text("No default model").tag("")
                     ForEach(modelIDsForPicker, id: \.self) { id in
-                        Text(id).tag(id)
+                        HStack {
+                            Text(modelDisplayName(for: id))
+                            Spacer()
+                            Text(modelCapabilitySummary(for: id))
+                                .foregroundStyle(.secondary)
+                        }
+                        .tag(id)
                     }
                 }
                 .accessibilityLabel("Discovered models")
@@ -344,7 +396,7 @@ struct ProviderSettingsView: View {
         } header: {
             Text("Models")
         } footer: {
-            Text("Discovery is optional. You can enter a model ID manually when the provider does not expose /models.")
+            Text("Onyx discovers models automatically when you save. Generic vLLM catalogs often omit capability metadata; those models remain text-safe and show capabilities as unknown until the provider advertises more. You can also enter a model ID manually or refresh with Test & Discover.")
         }
     }
 
@@ -368,11 +420,23 @@ struct ProviderSettingsView: View {
     }
 
     private var modelIDsForPicker: [String] {
-        var values = model.draft.discoveredModelIDs
+        var values = model.currentDraftDiscoveredModelIDs
         if let selected = model.draft.trimmedModelID, !values.contains(selected) {
             values.append(selected)
         }
         return values
+    }
+
+    private func modelDescriptor(for id: String) -> ProviderModelDescriptor? {
+        model.currentDraftDiscoveredModels.first { $0.id == id }
+    }
+
+    private func modelDisplayName(for id: String) -> String {
+        modelDescriptor(for: id)?.displayName ?? id
+    }
+
+    private func modelCapabilitySummary(for id: String) -> String {
+        modelDescriptor(for: id)?.pickerCapabilitySummary ?? "Capabilities unknown"
     }
 
     private var editorActions: some View {
@@ -384,6 +448,7 @@ struct ProviderSettingsView: View {
             .tint(OnyxTheme.iris)
             .disabled(
                 model.isSaving
+                    || model.isDiscovering
                     || model.draft.trimmedDisplayName.isEmpty
                     || model.draft.trimmedBaseURL.isEmpty
             )
@@ -407,6 +472,10 @@ struct ProviderSettingsView: View {
                 .accessibilityLabel("Revert provider changes")
             }
         }
+    }
+
+    private func openWorkspace(for connection: ProviderConnectionRecord) {
+        openWindow(value: WorkspaceWindowID(providerConnectionID: connection.id))
     }
 }
 
