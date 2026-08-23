@@ -10,7 +10,7 @@ final class CodexAppServerResilienceTests: XCTestCase {
           case "$line" in
             *'"method":"initialize"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
             *'"method":"initialized"'*) ;;
-            *'"method":"crash"'*) exit 23 ;;
+            *'"method":"crash"'*) exec 1>&-; sleep 0.02; exit 23 ;;
           esac
         done
         """#
@@ -46,6 +46,71 @@ final class CodexAppServerResilienceTests: XCTestCase {
             XCTAssertEqual(status, 23)
         }
 
+        await client.stop()
+    }
+
+    func testOutputEOFWhileProcessRemainsAliveFallsBackToProtocolFailure() async throws {
+        let counterURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("onyx-eof-fallback-\(UUID().uuidString).count")
+        defer { try? FileManager.default.removeItem(at: counterURL) }
+
+        let script = #"""
+        counter_path="$0"
+        count=0
+        if [ -f "$counter_path" ]; then count=$(cat "$counter_path"); fi
+        count=$((count + 1))
+        printf '%s' "$count" > "$counter_path"
+        while IFS= read -r line; do
+          id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')
+          case "$line" in
+            *'"method":"initialize"'*) printf '{"id":%s,"result":{"generation":%s}}\n' "$id" "$count" ;;
+            *'"method":"initialized"'*) ;;
+            *'"method":"closeOutput"'*)
+              if [ "$count" -eq 1 ]; then exec 1>&-; sleep 5; else printf '{"id":%s,"result":{"ok":true}}\n' "$id"; fi
+              ;;
+            *'"method":"echo"'*) printf '{"id":%s,"result":{"ok":true}}\n' "$id" ;;
+          esac
+        done
+        """#
+        let client = CodexAppServerClient(
+            executableURL: URL(fileURLWithPath: "/bin/sh"),
+            processArguments: ["-c", script, counterURL.path]
+        )
+
+        let connection = try await client.start()
+        let request = Task {
+            try await client.request(method: "closeOutput", params: .object([:]))
+        }
+
+        let stopped: (generation: UInt64, reason: String)
+        do {
+            stopped = try await nextStoppedEvent(in: client.events)
+        } catch {
+            await client.stop()
+            _ = await request.result
+            throw error
+        }
+
+        XCTAssertEqual(stopped.generation, connection.generation)
+        XCTAssertTrue(stopped.reason.contains("closed its output stream"), stopped.reason)
+
+        switch await request.result {
+        case .success:
+            XCTFail("A request must fail when app-server closes stdout while remaining alive")
+        case let .failure(error):
+            guard case let .protocolFailure(message) = error as? AgentRuntimeError else {
+                return XCTFail("Expected protocolFailure, got \(error)")
+            }
+            XCTAssertTrue(message.contains("closed its output stream"), message)
+        }
+
+        // The fallback must fully retire the old generation so callers can
+        // reconnect immediately while the terminated process is being reaped.
+        let second = try await client.start()
+        XCTAssertNotEqual(connection.generation, second.generation)
+        XCTAssertEqual(second.initializeResponse["generation"]?.intValue, 2)
+        let echo = try await client.request(method: "echo", params: .object([:]))
+        XCTAssertEqual(echo["ok"]?.boolValue, true)
         await client.stop()
     }
 

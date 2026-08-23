@@ -114,7 +114,7 @@ final class TranscriptAttachmentTests: XCTestCase {
     }
 
     @MainActor
-    func testRoutineActivityStartsAsASlimBorderlessRowAndTogglesWithAnAccessibleDisclosureControl() {
+    func testRoutineActivityStartsAsASlimBorderlessRowAndTogglesWithAnAccessibleDisclosureControl() throws {
         var callbacks: [Bool] = []
         let item = TimelineItem(
             id: "compact-tool",
@@ -163,16 +163,39 @@ final class TranscriptAttachmentTests: XCTestCase {
         XCTAssertEqual(cell.subviews.filter { $0 is TranscriptResourceLinkView }.count, 0)
         cell.frame.size.height = TranscriptCellView.height(for: item, width: 640, isExpanded: false)
         cell.layout()
+        let headerPoint = NSPoint(x: 120, y: cell.bounds.maxY - 8)
         XCTAssertTrue(
-            cell.hitTest(NSPoint(x: 120, y: cell.bounds.maxY - 8)) === cell.expansionControl,
+            cell.hitTest(headerPoint) === cell,
             "The whole compact header should be a click target, not only the chevron"
         )
+        XCTAssertFalse(
+            cell.subviews.compactMap { ($0 as? NSTextField)?.stringValue }.contains(item.body),
+            "Collapsed activity must not allocate its complete hidden payload"
+        )
 
-        cell.toggleExpansion()
+        let headerClick = try XCTUnwrap(
+            NSEvent.mouseEvent(
+                with: .leftMouseDown,
+                location: headerPoint,
+                modifierFlags: [],
+                timestamp: 0,
+                windowNumber: 0,
+                context: nil,
+                eventNumber: 1,
+                clickCount: 1,
+                pressure: 1
+            )
+        )
+        cell.mouseDown(with: headerClick)
+
         XCTAssertTrue(cell.isExpanded)
         XCTAssertEqual(callbacks, [true])
         XCTAssertEqual(cell.expansionControl.accessibilityValue() as? String, "Expanded")
         XCTAssertEqual(cell.subviews.filter { $0 is TranscriptResourceLinkView }.count, 1)
+        XCTAssertTrue(
+            cell.subviews.compactMap { ($0 as? NSTextField)?.stringValue }.contains(item.body),
+            "Expanding should materialize the complete original payload"
+        )
 
         cell.toggleExpansion()
         XCTAssertFalse(cell.isExpanded)
@@ -198,8 +221,8 @@ final class TranscriptAttachmentTests: XCTestCase {
         runningCell.configure(with: running, isExpanded: false)
         let runningLabels = runningCell.subviews.compactMap { ($0 as? NSTextField)?.stringValue }
         XCTAssertTrue(runningLabels.contains("Running"))
-        XCTAssertEqual(runningCell.layer?.borderWidth, 0)
-        XCTAssertEqual(runningCell.layer?.backgroundColor, NSColor.clear.cgColor)
+        XCTAssertGreaterThan(runningCell.layer?.borderWidth ?? 0, 0)
+        XCTAssertNotEqual(runningCell.layer?.backgroundColor, NSColor.clear.cgColor)
 
         let failure = TimelineItem(
             id: "tool-failure",
@@ -235,6 +258,175 @@ final class TranscriptAttachmentTests: XCTestCase {
         let summary = TranscriptCellView.compactSummary(for: long)
         XCTAssertEqual(summary.count, 180)
         XCTAssertTrue(summary.hasSuffix("…"))
+
+        var markdown = item
+        markdown.kind = .reasoning
+        markdown.body = "\n## **Built** the [preview](https://example.test)"
+        XCTAssertEqual(
+            TranscriptCellView.compactSummary(for: markdown),
+            "Built the preview",
+            "Compact activity should not expose Markdown punctuation"
+        )
+        XCTAssertEqual(
+            TranscriptCellView.compactSummary(for: markdown, maximumCharacters: 1),
+            "B"
+        )
+
+        var addedLine = item
+        addedLine.body = "+ added.swift"
+        XCTAssertEqual(
+            TranscriptCellView.compactSummary(for: addedLine),
+            "+ added.swift",
+            "Collapsed command and diff previews must preserve literal evidence markers"
+        )
+
+        var removedLine = item
+        removedLine.kind = .fileChange
+        removedLine.body = "- removed.swift"
+        XCTAssertEqual(TranscriptCellView.compactSummary(for: removedLine), "- removed.swift")
+    }
+
+    @MainActor
+    func testPlanStartsAsAQuietProgressLineAndExpandsOnDemand() {
+        let plan = TimelineItem(
+            id: "active-plan",
+            kind: .plan,
+            title: "Plan",
+            body: "[x] Inspect the current UI\n[~] Simplify the transcript\n[ ] Verify the preview",
+            status: .running,
+            timestamp: .now,
+            detail: nil
+        )
+
+        XCTAssertTrue(plan.kind.isCollapsibleActivity)
+        XCTAssertEqual(
+            TranscriptCellView.compactSummary(for: plan),
+            "1/3 complete  ·  Simplify the transcript"
+        )
+
+        let cell = TranscriptCellView(frame: NSRect(x: 0, y: 0, width: 640, height: 48))
+        cell.configure(with: plan, isExpanded: false)
+        XCTAssertEqual(cell.layer?.borderWidth, 0)
+        XCTAssertEqual(cell.layer?.backgroundColor, NSColor.clear.cgColor)
+        XCTAssertEqual(cell.expansionControl.accessibilityValue() as? String, "Collapsed")
+
+        var oversizedPlan = plan
+        oversizedPlan.body = Array(repeating: "[x] Finished", count: 300).joined(separator: "\n")
+        XCTAssertEqual(
+            TranscriptCellView.compactSummary(for: oversizedPlan),
+            "256/256 complete",
+            "Collapsed plan summaries must inspect a bounded number of lines"
+        )
+    }
+
+    @MainActor
+    func testTranscriptBodyRendersMarkdownWithNativeTextAttributes() throws {
+        let item = TimelineItem(
+            id: "markdown-message",
+            kind: .assistantMessage,
+            title: nil,
+            body: "# Result\n\n- **Built** the [preview](https://example.test)\n- Uses `native AppKit`",
+            status: .completed,
+            timestamp: .now,
+            detail: nil
+        )
+
+        let rendered = TranscriptCellView.bodyAttributedText(for: item)
+        XCTAssertEqual(
+            rendered.string,
+            "Result\n\n• Built the preview\n• Uses native AppKit"
+        )
+
+        let text = rendered.string as NSString
+        let headingFont = try XCTUnwrap(
+            rendered.attribute(.font, at: text.range(of: "Result").location, effectiveRange: nil) as? NSFont
+        )
+        XCTAssertGreaterThan(headingFont.pointSize, 14.5)
+
+        let boldFont = try XCTUnwrap(
+            rendered.attribute(.font, at: text.range(of: "Built").location, effectiveRange: nil) as? NSFont
+        )
+        XCTAssertTrue(NSFontManager.shared.traits(of: boldFont).contains(.boldFontMask))
+
+        let codeFont = try XCTUnwrap(
+            rendered.attribute(.font, at: text.range(of: "native AppKit").location, effectiveRange: nil) as? NSFont
+        )
+        XCTAssertTrue(codeFont.fontDescriptor.symbolicTraits.contains(.monoSpace))
+        XCTAssertEqual(
+            rendered.attribute(.link, at: text.range(of: "preview").location, effectiveRange: nil) as? URL,
+            URL(string: "https://example.test")
+        )
+    }
+
+    @MainActor
+    func testCommandAndFileChangeBodiesRemainExactLiteralEvidence() {
+        let body = "# not a heading\n---\n- removed\n+ added\n**literal markers**"
+        for kind in [TimelineItemKind.command, .fileChange, .tool] {
+            let item = TimelineItem(
+                id: "literal-\(kind.rawValue)",
+                kind: kind,
+                title: nil,
+                body: body,
+                status: .completed,
+                timestamp: .now,
+                detail: nil
+            )
+            XCTAssertEqual(TranscriptCellView.bodyAttributedText(for: item).string, body)
+        }
+    }
+
+    @MainActor
+    func testMarkdownLinksAllowOnlyHTTPAndHTTPS() throws {
+        let item = TimelineItem(
+            id: "markdown-link-boundary",
+            kind: .assistantMessage,
+            title: nil,
+            body: "[web](https://example.test) [file](file:///tmp/private) [settings](x-apple.systempreferences:privacy)",
+            status: .completed,
+            timestamp: .now,
+            detail: nil
+        )
+
+        let rendered = TranscriptCellView.bodyAttributedText(for: item)
+        let text = rendered.string as NSString
+        XCTAssertEqual(
+            rendered.attribute(.link, at: text.range(of: "web").location, effectiveRange: nil) as? URL,
+            URL(string: "https://example.test")
+        )
+        XCTAssertNil(rendered.attribute(.link, at: text.range(of: "file").location, effectiveRange: nil))
+        XCTAssertNil(rendered.attribute(.link, at: text.range(of: "settings").location, effectiveRange: nil))
+    }
+
+    @MainActor
+    func testManyLineMarkdownUsesExactPlainTextFallback() {
+        let body = Array(
+            repeating: "- **literal**",
+            count: TranscriptMarkdownRenderer.maximumMarkdownLines + 1
+        ).joined(separator: "\n")
+        let rendered = TranscriptMarkdownRenderer.attributedString(
+            markdown: body,
+            baseFont: .systemFont(ofSize: 14.5)
+        )
+
+        XCTAssertEqual(rendered.string, body)
+    }
+
+    @MainActor
+    func testVeryLargeTranscriptBodyUsesExactPlainTextFallback() {
+        let body = "**" + String(repeating: "x", count: TranscriptMarkdownRenderer.maximumMarkdownUTF8Bytes) + "**"
+        let rendered = TranscriptMarkdownRenderer.attributedString(
+            markdown: body,
+            baseFont: .systemFont(ofSize: 14.5)
+        )
+
+        XCTAssertEqual(rendered.string, body)
+        XCTAssertNil(
+            rendered.attribute(
+                NSAttributedString.Key("NSInlinePresentationIntent"),
+                at: 0,
+                effectiveRange: nil
+            )
+        )
     }
 
     @MainActor

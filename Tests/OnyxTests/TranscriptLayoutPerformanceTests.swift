@@ -52,9 +52,9 @@ final class TranscriptLayoutPerformanceTests: XCTestCase {
     }
 
     @MainActor
-    func testActionableActivityKindsAreNeverCollapsedByDefault() {
+    func testApprovalsAndErrorsRemainVisibleWhilePlansUseCompactProgress() {
         let body = "Actionable status"
-        for kind in [TimelineItemKind.approval, .error, .plan] {
+        for kind in [TimelineItemKind.approval, .error] {
             let item = TimelineItem(
                 id: "always-visible-\(kind.rawValue)",
                 kind: kind,
@@ -72,6 +72,22 @@ final class TranscriptLayoutPerformanceTests: XCTestCase {
                 accuracy: 0.5
             )
         }
+
+        let plan = TimelineItem(
+            id: "compact-plan",
+            kind: .plan,
+            title: "Plan",
+            body: "[x] Inspect\n[~] Simplify\n[ ] Verify",
+            status: .running,
+            timestamp: .now,
+            detail: nil
+        )
+        XCTAssertTrue(plan.kind.isCollapsibleActivity)
+        XCTAssertFalse(plan.kind.defaultExpanded)
+        XCTAssertLessThan(
+            TranscriptCellView.height(for: plan, width: 640, isExpanded: false),
+            TranscriptCellView.height(for: plan, width: 640, isExpanded: true)
+        )
     }
 
     func testUnchangedSnapshotReusesEveryMeasuredHeight() {
@@ -134,6 +150,52 @@ final class TranscriptLayoutPerformanceTests: XCTestCase {
         XCTAssertEqual(state.instrumentation.measurementCount, 3)
         XCTAssertEqual(state.instrumentation.cacheHitCount, 2)
         XCTAssertEqual(state.instrumentation.invalidatedRowCount, 0)
+    }
+
+    @MainActor
+    func testStatusChangeCombinedWithStructuralReloadDoesNotReuseStaleHeight() {
+        let running = TimelineItem(
+            id: "live-tool",
+            kind: .tool,
+            title: "Search",
+            body: "Result",
+            status: .running,
+            timestamp: .now,
+            detail: nil
+        )
+        var completed = running
+        completed.status = .completed
+        let newItems = [completed, makeItem(id: "assistant", body: "Finished")]
+        var state = TranscriptLayoutState()
+
+        let runningHeight = state.height(
+            for: running,
+            width: 640,
+            isExpanded: false
+        ) {
+            TranscriptCellView.height(for: running, width: 640, isExpanded: false)
+        }
+        let update = TranscriptCollectionUpdate.plan(from: [running], to: newItems)
+        XCTAssertEqual(update, .reloadAll)
+        state.prepare(for: update, newItems: newItems)
+
+        let expectedCompletedHeight = TranscriptCellView.height(
+            for: completed,
+            width: 640,
+            isExpanded: false
+        )
+        let renderedCompletedHeight = state.height(
+            for: completed,
+            width: 640,
+            isExpanded: false
+        ) {
+            expectedCompletedHeight
+        }
+
+        XCTAssertNotEqual(runningHeight, expectedCompletedHeight)
+        XCTAssertEqual(renderedCompletedHeight, expectedCompletedHeight)
+        XCTAssertEqual(state.instrumentation.measurementCount, 2)
+        XCTAssertEqual(state.instrumentation.cacheHitCount, 0)
     }
 
     func testSameIdentityEditsInvalidateOnlyTheirRows() {
@@ -272,6 +334,34 @@ final class TranscriptLayoutPerformanceTests: XCTestCase {
         XCTAssertEqual(update, .tailChange(tailIndex))
         XCTAssertEqual(instrumentation.inspectedItemCount, 1)
         XCTAssertEqual(instrumentation.hintedUpdateCount, 1)
+    }
+
+    func testPresentationSnapshotCoalescesAppendHintsWithoutRescanningHistory() {
+        let items = (0..<20_000).map { index in
+            makeItem(id: "item-\(index)", body: "Stable \(index)")
+        }
+        var snapshot = TranscriptPresentationSnapshot(items: items, revision: 40)
+        let original = snapshot
+
+        snapshot.append(makeItem(id: "appended-one", body: "First append"))
+        let intermediate = snapshot
+        snapshot.append(makeItem(id: "appended-two", body: "Second append"))
+
+        for rendered in [original, intermediate] {
+            var instrumentation = TranscriptCollectionUpdate.PlanningInstrumentation()
+            let update = TranscriptCollectionUpdate.plan(
+                from: rendered.items,
+                to: snapshot.items,
+                oldRevision: rendered.revision,
+                newRevision: snapshot.revision,
+                hint: snapshot.changeHint,
+                instrumentation: &instrumentation
+            )
+
+            XCTAssertEqual(update, .append(rendered.items.count..<snapshot.items.count))
+            XCTAssertEqual(instrumentation.inspectedItemCount, 0)
+            XCTAssertEqual(instrumentation.hintedUpdateCount, 1)
+        }
     }
 
     func testSkippedSnapshotCannotApplyAStaleRowHint() {

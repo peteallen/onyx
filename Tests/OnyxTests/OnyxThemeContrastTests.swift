@@ -53,6 +53,30 @@ final class OnyxThemeContrastTests: XCTestCase {
         }
     }
 
+    func testInactiveControlTextMeetsSmallTextContrastInBothAppearances() throws {
+        let appearances: [(name: String, value: NSAppearance)] = try [
+            ("light", XCTUnwrap(NSAppearance(named: .aqua))),
+            ("dark", XCTUnwrap(NSAppearance(named: .darkAqua))),
+        ]
+
+        for appearance in appearances {
+            let foreground = try resolvedRGB(
+                OnyxTheme.inactiveControlText,
+                appearance: appearance.value
+            )
+            let background = try resolvedRGB(
+                OnyxTheme.inspector,
+                appearance: appearance.value
+            )
+            let ratio = contrastRatio(foreground, background)
+            XCTAssertGreaterThanOrEqual(
+                ratio,
+                4.5,
+                "Inactive control text has only \(String(format: "%.2f", ratio)):1 contrast in \(appearance.name) mode"
+            )
+        }
+    }
+
     private func resolvedRGB(_ color: Color, appearance: NSAppearance) throws -> RGB {
         var resolved: NSColor?
         appearance.performAsCurrentDrawingAppearance {

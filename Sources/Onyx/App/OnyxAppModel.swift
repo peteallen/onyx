@@ -78,11 +78,28 @@ struct TranscriptPresentationSnapshot: Equatable {
     }
 
     mutating func append(_ item: TimelineItem) {
+        let previousRevision = revision
+        let previousCount = items.count
         revision &+= 1
         items.append(item)
-        // Structural mutations are cheap to recognise as tail appends and do
-        // not satisfy the row-hint contract.
-        changeHint = nil
+        if case let .itemsAppended(startIndex, fromRevision, toRevision) = changeHint,
+           toRevision == previousRevision,
+           let appendedCount = Int(exactly: toRevision - fromRevision),
+           previousCount == startIndex + appendedCount {
+            // Preserve the lineage across coalesced SwiftUI publications. A
+            // controller may have rendered any earlier revision in this run.
+            changeHint = .itemsAppended(
+                startIndex: startIndex,
+                fromRevision: fromRevision,
+                toRevision: revision
+            )
+        } else {
+            changeHint = .itemsAppended(
+                startIndex: previousCount,
+                fromRevision: previousRevision,
+                toRevision: revision
+            )
+        }
     }
 
     mutating func replaceRow(at index: Int, with item: TimelineItem) {

@@ -16,13 +16,11 @@ struct TaskSidebarView: View {
         VStack(spacing: 0) {
             header
             search
-            projectCard
-            scopePicker
+            projectListHeader
+                .padding(.horizontal, 8)
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 2) {
-                    projectListHeader
-
                     ForEach(displayedProjectGroups) { group in
                         projectHeader(group)
                             .padding(.top, 5)
@@ -96,7 +94,7 @@ struct TaskSidebarView: View {
             .accessibilityLabel("New task")
             .accessibilityHint("Creates a new task")
         }
-        .frame(height: 50)
+        .frame(height: 44)
         .padding(.horizontal, 13)
         .padding(.top, 2)
     }
@@ -124,7 +122,7 @@ struct TaskSidebarView: View {
             }
         }
         .padding(.horizontal, 9)
-        .frame(height: 31)
+        .frame(height: 30)
         .background(OnyxTheme.surface)
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay {
@@ -132,7 +130,7 @@ struct TaskSidebarView: View {
                 .stroke(OnyxTheme.border, lineWidth: OnyxTheme.hairline)
         }
         .padding(.horizontal, 10)
-        .padding(.bottom, 8)
+        .padding(.bottom, 7)
         .onExitCommand {
             if model.searchText.isEmpty {
                 isSearchFocused = false
@@ -150,59 +148,6 @@ struct TaskSidebarView: View {
         }
     }
 
-    private var projectCard: some View {
-        Menu {
-            ForEach(projectCatalog.projects) { project in
-                Button {
-                    model.selectWorkspace(project.folderPath)
-                } label: {
-                    Label(project.displayName, systemImage: "folder")
-                }
-            }
-            if !projectCatalog.projects.isEmpty {
-                Divider()
-            }
-            Button(action: beginImportProject) {
-                Label("Add Project…", systemImage: "folder.badge.plus")
-            }
-        } label: {
-            HStack(spacing: 8) {
-                Image(systemName: "folder")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 20, height: 20)
-
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(model.projectName)
-                        .font(.system(size: 12.5, weight: .semibold))
-                        .lineLimit(1)
-                    Text(model.selectedThreadID == "onyx:welcome"
-                        ? (model.draftWorkspacePath ?? "Choose a local folder")
-                        : (model.selectedThread?.cwd ?? "Local workspace"))
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-                Spacer()
-                Image(systemName: "chevron.up.chevron.down")
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(.tertiary)
-            }
-            .padding(.horizontal, 8)
-            .frame(height: 38)
-            .background(Color.primary.opacity(0.025))
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Workspace")
-        .accessibilityValue(workspaceAccessibilityValue)
-        .accessibilityHint("Chooses an imported project or adds a folder")
-        .padding(.horizontal, 10)
-        .padding(.bottom, 9)
-    }
-
     private var projectListHeader: some View {
         HStack(spacing: 6) {
             Text("Projects")
@@ -214,6 +159,7 @@ struct TaskSidebarView: View {
                     .controlSize(.mini)
                     .accessibilityLabel("Loading projects")
             }
+            scopePicker
             Button(action: beginImportProject) {
                 Image(systemName: "plus")
                     .font(.system(size: 10, weight: .bold))
@@ -226,23 +172,23 @@ struct TaskSidebarView: View {
             .accessibilityHint("Opens a folder chooser; you can also create a new folder there")
         }
         .padding(.horizontal, 7)
-        .padding(.bottom, 2)
+        .padding(.bottom, 3)
     }
 
     private var scopePicker: some View {
-        HStack(spacing: 2) {
+        HStack(spacing: 0) {
             ForEach(ThreadListScope.allCases) { scope in
                 Button {
                     model.setThreadListScope(scope)
                 } label: {
                     Text(scope.label)
-                        .font(.system(size: 10.5, weight: model.threadListScope == scope ? .semibold : .medium))
+                        .font(.system(size: 9.5, weight: model.threadListScope == scope ? .semibold : .medium))
                         .foregroundStyle(model.threadListScope == scope ? Color.primary : Color.secondary)
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 24)
+                        .padding(.horizontal, 6)
+                        .frame(height: 20)
                         .background {
                             if model.threadListScope == scope {
-                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                RoundedRectangle(cornerRadius: 5, style: .continuous)
                                     .fill(Color.primary.opacity(0.075))
                             }
                         }
@@ -251,14 +197,12 @@ struct TaskSidebarView: View {
                 .buttonStyle(.plain)
                 .accessibilityAddTraits(model.threadListScope == scope ? .isSelected : [])
                 .accessibilityLabel(scope.label)
-                .accessibilityHint("Shows (scope.label.lowercased()) tasks")
+                .accessibilityHint("Shows \(scope.label.lowercased()) tasks")
             }
         }
-        .padding(2)
+        .padding(1)
         .background(Color.primary.opacity(0.025))
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .padding(.horizontal, 10)
-        .padding(.bottom, 9)
+        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         .disabled(!isConnected)
         .opacity(isConnected ? 1 : 0.55)
         .accessibilityLabel("Task list")
@@ -282,13 +226,6 @@ struct TaskSidebarView: View {
     private var isConnected: Bool {
         if case .connected = model.connectionState { return true }
         return false
-    }
-
-    private var workspaceAccessibilityValue: String {
-        let location = model.selectedThreadID == "onyx:welcome"
-            ? (model.draftWorkspacePath ?? "No folder selected")
-            : (model.selectedThread?.cwd ?? "Local workspace")
-        return "\(model.projectName), \(location)"
     }
 
     private var providerDisplayName: String {
@@ -597,7 +534,7 @@ private struct TaskSidebarRow: View {
                         .foregroundStyle(.primary)
                         .lineLimit(1)
                     Spacer(minLength: 4)
-                    if !isArchived {
+                    if !isArchived, attention.showsSidebarAttentionLabel {
                         Text(attention.label)
                             .font(.system(size: 9.5, weight: .semibold))
                             .foregroundStyle(attention.sidebarColor)
@@ -625,7 +562,7 @@ private struct TaskSidebarRow: View {
             }
         }
         .padding(.horizontal, 9)
-        .padding(.vertical, 7)
+        .padding(.vertical, 5.5)
         .background {
             if isSelected {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -699,6 +636,15 @@ extension RuntimeThreadStatus {
         case .running: .working
         case .idle: .ready
         case .unknown: .unknown
+        }
+    }
+}
+
+extension RuntimeTaskAttention {
+    var showsSidebarAttentionLabel: Bool {
+        switch self {
+        case .working, .needsInput, .needsApproval, .failed, .unknown: true
+        case .ready: false
         }
     }
 }

@@ -80,6 +80,69 @@ enum CodexAppServerHandshake {
     ])
 }
 
+/// Bridges the process termination callback to the actor without waiting for
+/// the actor hop. Stdout EOF and `Process.terminationHandler` are delivered
+/// independently, so the callback must publish its status synchronously; the
+/// actor task that reports the stopped event can arrive later.
+private final class ProcessTerminationObserver: @unchecked Sendable {
+    private let statusLock = NSLock()
+    private let stream: AsyncStream<Int32>
+    private let continuation: AsyncStream<Int32>.Continuation
+    private var status: Int32?
+
+    init() {
+        let stream = AsyncStream.makeStream(
+            of: Int32.self,
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        self.stream = stream.stream
+        continuation = stream.continuation
+    }
+
+    func record(_ status: Int32) {
+        statusLock.lock()
+        defer { statusLock.unlock() }
+        self.status = status
+        continuation.yield(status)
+        continuation.finish()
+    }
+
+    var recordedStatus: Int32? {
+        statusLock.lock()
+        defer { statusLock.unlock() }
+        return status
+    }
+
+    func finish() {
+        statusLock.lock()
+        defer { statusLock.unlock() }
+        continuation.finish()
+    }
+
+    func wait(for timeout: Duration) async -> Int32? {
+        await withTaskGroup(of: Int32?.self) { group in
+            group.addTask { [stream] in
+                for await status in stream {
+                    return status
+                }
+                return nil
+            }
+            group.addTask {
+                do {
+                    try await Task.sleep(for: timeout)
+                } catch {
+                    return nil
+                }
+                return nil
+            }
+
+            let result = await group.next() ?? nil
+            group.cancelAll()
+            return result
+        }
+    }
+}
+
 actor CodexAppServerClient: CodexAppServerTransport {
     nonisolated let events: AsyncStream<AppServerEvent>
 
@@ -92,12 +155,27 @@ actor CodexAppServerClient: CodexAppServerTransport {
     private var errorHandle: FileHandle?
     private var outputTask: Task<Void, Never>?
     private var errorTask: Task<Void, Never>?
+    /// A stdout EOF can arrive just before `Process.terminationHandler` runs.
+    /// Keep the connection alive briefly so the termination status wins that
+    /// race; `finishStreamEnd` still provides a bounded protocol fallback for
+    /// a server that closes stdout while remaining alive.
+    private var streamEndTask: Task<Void, Never>?
+    private var terminationObserver: ProcessTerminationObserver?
     private var outputFramer = JSONLFramer()
     private var errorFramer = JSONLFramer(maximumRecordBytes: 8 * 1_024 * 1_024)
     private var nextRequestID = 1
     private var nextConnectionGeneration: UInt64 = 0
     private var activeConnectionGeneration: UInt64?
     private var pending: [Int: PendingRequest] = [:]
+
+    /// Process termination is normally delivered immediately after stdout
+    /// closes, but the two callbacks are independent.  This short grace
+    /// period avoids classifying a normal process exit as a protocol failure.
+    /// Keep this comfortably above stdout/termination callback scheduling
+    /// jitter seen on slower CI runners. A one-second upper bound still makes
+    /// a live server's broken transport fail promptly without misclassifying
+    /// a legitimate process exit as a protocol failure.
+    private static let streamEndGracePeriod: Duration = .seconds(1)
 
     private struct PendingRequest {
         let connectionGeneration: UInt64
@@ -120,6 +198,8 @@ actor CodexAppServerClient: CodexAppServerTransport {
     deinit {
         outputTask?.cancel()
         errorTask?.cancel()
+        streamEndTask?.cancel()
+        terminationObserver?.finish()
         process?.terminate()
         eventContinuation.finish()
     }
@@ -149,13 +229,15 @@ actor CodexAppServerClient: CodexAppServerTransport {
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
         let process = Process()
+        let terminationObserver = ProcessTerminationObserver()
         process.executableURL = executableURL
         process.arguments = processArguments
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
-        process.terminationHandler = { [weak self] process in
+        process.terminationHandler = { [weak self, terminationObserver] process in
             let status = process.terminationStatus
+            terminationObserver.record(status)
             Task { [weak self] in
                 await self?.processExited(status: status, generation: generation)
             }
@@ -165,9 +247,11 @@ actor CodexAppServerClient: CodexAppServerTransport {
             try process.run()
         } catch {
             activeConnectionGeneration = nil
+            terminationObserver.finish()
             throw error
         }
         self.process = process
+        self.terminationObserver = terminationObserver
         input = stdinPipe.fileHandleForWriting
 
         let output = stdoutPipe.fileHandleForReading
@@ -371,8 +455,34 @@ actor CodexAppServerClient: CodexAppServerTransport {
 
     private func streamEnded(generation: UInt64, reason: String) {
         guard activeConnectionGeneration == generation else { return }
-        if let process, !process.isRunning {
-            processExited(status: process.terminationStatus, generation: generation)
+
+        // stdout EOF and Process.terminationHandler can be delivered in
+        // either order. Defer the protocol-failure decision long enough for
+        // the termination handler to provide the real exit status, while
+        // retaining a bounded fallback for a live server.
+        streamEndTask?.cancel()
+        let terminationObserver = self.terminationObserver
+        streamEndTask = Task { [weak self, terminationObserver] in
+            let status = await terminationObserver?.wait(for: Self.streamEndGracePeriod)
+            guard !Task.isCancelled else { return }
+            await self?.finishStreamEnd(
+                generation: generation,
+                reason: reason,
+                terminationStatus: status
+            )
+        }
+    }
+
+    private func finishStreamEnd(
+        generation: UInt64,
+        reason: String,
+        terminationStatus: Int32?
+    ) {
+        guard activeConnectionGeneration == generation else { return }
+        streamEndTask = nil
+
+        if let terminationStatus = terminationStatus ?? terminationObserver?.recordedStatus {
+            processExited(status: terminationStatus, generation: generation)
             return
         }
         closeConnection(
@@ -407,8 +517,12 @@ actor CodexAppServerClient: CodexAppServerTransport {
 
         outputTask?.cancel()
         errorTask?.cancel()
+        streamEndTask?.cancel()
+        terminationObserver?.finish()
         outputTask = nil
         errorTask = nil
+        streamEndTask = nil
+        terminationObserver = nil
 
         outputHandle?.readabilityHandler = nil
         errorHandle?.readabilityHandler = nil

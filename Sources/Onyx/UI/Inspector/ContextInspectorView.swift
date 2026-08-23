@@ -6,14 +6,18 @@ struct ContextInspectorView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 1) {
+            HStack(spacing: 2) {
                 ForEach(InspectorTab.allCases) { tab in
                     Button {
                         model.inspectorTab = tab
                     } label: {
                         Label(tab.label, systemImage: tab.icon)
-                            .font(.system(size: 11.5, weight: model.inspectorTab == tab ? .semibold : .medium))
-                            .foregroundStyle(model.inspectorTab == tab ? Color.primary : Color.secondary)
+                            .font(.system(size: 11.5, weight: model.inspectorTab == tab ? .semibold : .regular))
+                            .foregroundStyle(
+                                model.inspectorTab == tab
+                                    ? Color.primary
+                                    : OnyxTheme.inactiveControlText
+                            )
                             .frame(maxWidth: .infinity)
                             .frame(height: 34)
                             .background {
@@ -28,9 +32,9 @@ struct ContextInspectorView: View {
                     .accessibilityHint("Shows the \(tab.label.lowercased()) section")
                 }
             }
-            .padding(.horizontal, 12)
+            .padding(.horizontal, 14)
             .padding(.top, 12)
-            .padding(.bottom, 10)
+            .padding(.bottom, 9)
             .accessibilityElement(children: .contain)
             .accessibilityLabel("Context panel sections")
 
@@ -45,8 +49,8 @@ struct ContextInspectorView: View {
                         GitDiffViewerView(model: model)
                     }
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 6)
             }
         }
         .background(OnyxTheme.inspector)
@@ -86,7 +90,7 @@ private struct SummaryInspector: View {
                     ) {
                         Text(lastPlan.body)
                             .font(.system(size: 11.5))
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(OnyxTheme.quietText)
                             .fixedSize(horizontal: false, vertical: true)
                             .accessibilityLabel("Latest plan update: \(lastPlan.body)")
                     }
@@ -110,6 +114,11 @@ private struct SummaryInspector: View {
         .onChange(of: model.selectedThreadID) { _, _ in
             resetDisclosureState()
         }
+        .onChange(of: model.collaborationAgents.filter { $0.status.isLive }.count) { _, liveCount in
+            if liveCount > 0 {
+                isAgentsExpanded = true
+            }
+        }
     }
 
     private var changes: [TimelineItem] {
@@ -132,13 +141,13 @@ private struct SummaryInspector: View {
             if let explanation = plan.explanation?.trimmingCharacters(in: .whitespacesAndNewlines),
                !explanation.isEmpty {
                 Text(explanation)
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 11))
+                    .foregroundStyle(OnyxTheme.quietText)
                     .fixedSize(horizontal: false, vertical: true)
             }
             if plan.steps.isEmpty {
                 Text("No plan steps yet")
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(OnyxTheme.quietText)
             } else {
                 ForEach(Array(plan.steps.enumerated()), id: \.offset) { _, step in
                     HStack(alignment: .firstTextBaseline, spacing: 7) {
@@ -146,8 +155,8 @@ private struct SummaryInspector: View {
                             .foregroundStyle(planColor(for: step.status))
                             .accessibilityHidden(true)
                         Text(step.text)
-                            .font(.system(size: 11))
-                            .foregroundStyle(step.status == .completed ? .secondary : .primary)
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(step.status == .completed ? OnyxTheme.quietText : Color.primary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     .accessibilityElement(children: .ignore)
@@ -179,23 +188,23 @@ private struct SummaryInspector: View {
                             .accessibilityHidden(true)
                         VStack(alignment: .leading, spacing: 1) {
                             Text(agent.displayName)
-                                .foregroundStyle(.primary)
+                                .foregroundStyle(Color.primary)
                                 .lineLimit(1)
                             if let message = agent.message?.trimmingCharacters(in: .whitespacesAndNewlines),
                                !message.isEmpty {
                                 Text(message)
-                                    .font(.system(size: 10))
-                                    .foregroundStyle(.secondary)
+                                    .font(.system(size: 10.5))
+                                    .foregroundStyle(OnyxTheme.quietText)
                                     .lineLimit(2)
                             }
                         }
                         Spacer(minLength: 4)
                         Text(agent.status.label)
-                            .font(.system(size: 9.5, weight: .medium))
+                            .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(agentColor(for: agent.status))
                         Image(systemName: "chevron.forward")
                             .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(.quaternary)
                             .accessibilityHidden(true)
                     }
                     .contentShape(Rectangle())
@@ -224,7 +233,7 @@ private struct SummaryInspector: View {
                             .font(.system(size: 9, weight: .semibold))
                             .accessibilityHidden(true)
                     }
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(OnyxTheme.quietText)
                     .contentShape(Rectangle())
                     .frame(minHeight: 26)
                 }
@@ -253,15 +262,15 @@ private struct SummaryInspector: View {
             )
             if changes.isEmpty {
                 Text("No file changes recorded in this task")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.tertiary)
+                    .font(.system(size: 11))
+                    .foregroundStyle(OnyxTheme.quietText)
             } else {
                 VStack(alignment: .leading, spacing: 4) {
                     ForEach(changes.prefix(4)) { change in
                         HStack(spacing: 7) {
                             Image(systemName: "doc.badge.ellipsis")
                                 .font(.system(size: 10.5))
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(OnyxTheme.quietText)
                                 .accessibilityHidden(true)
                             Text(change.title ?? "Changed file")
                                 .lineLimit(1)
@@ -273,8 +282,8 @@ private struct SummaryInspector: View {
                 }
                 if changes.count > 4 {
                     Text("More changes are available in Files and Review")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(OnyxTheme.quietText)
                 }
                 Button {
                     model.inspectorTab = .files
@@ -349,7 +358,7 @@ private struct SummaryInspector: View {
 
     private func resetDisclosureState() {
         isPlanExpanded = model.selectedPlan?.timelineStatus == .running
-        isAgentsExpanded = false
+        isAgentsExpanded = model.collaborationAgents.contains { $0.status.isLive }
         isChangesExpanded = false
         isEnvironmentExpanded = true
         showsAllAgents = false
@@ -437,7 +446,7 @@ private struct FilesInspector: View {
                     .accessibilityLabel("Project actions")
                 }
             }
-            .font(.system(size: 12.5))
+            .font(.system(size: 13))
             .padding(.bottom, 5)
 
             if isPreviewPresented {
@@ -453,10 +462,9 @@ private struct FilesInspector: View {
                     let touched = model.timeline.filter { $0.kind == .fileChange }
                     if !touched.isEmpty {
                         Divider().padding(.vertical, 7)
-                        Text("TOUCHED THIS TASK")
-                            .font(.system(size: 9.5, weight: .bold))
-                            .tracking(0.8)
-                            .foregroundStyle(.tertiary)
+                        Text("Touched this task")
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundStyle(OnyxTheme.quietText)
                         ForEach(touched) { item in
                             FileTreeRow(icon: "doc.badge.ellipsis", name: item.title ?? "Changed file", depth: 0)
                         }
@@ -561,7 +569,7 @@ private struct FilesInspector: View {
                                     .foregroundStyle(.secondary)
                                 VStack(alignment: .leading, spacing: 1) {
                                     Text(file.name)
-                                        .foregroundStyle(.primary)
+                                        .foregroundStyle(Color.primary)
                                         .lineLimit(1)
                                     if file.relativePath != file.name {
                                         Text(file.relativePath)
@@ -952,7 +960,7 @@ private struct SourcePreviewLineView: View {
                 .fill(OnyxTheme.border)
                 .frame(width: OnyxTheme.hairline)
             Text(line.text.isEmpty ? " " : line.text)
-                .foregroundStyle(.primary)
+                .foregroundStyle(Color.primary)
                 .padding(.horizontal, 7)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: true, vertical: false)
@@ -978,16 +986,16 @@ private struct InspectorSection<Content: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
             Label(title, systemImage: icon)
-                .font(.system(size: 12.5, weight: .semibold))
-            VStack(alignment: .leading, spacing: 8) {
+                .font(.system(size: 13, weight: .semibold))
+            VStack(alignment: .leading, spacing: 7) {
                 content
             }
-            .font(.system(size: 11))
-            .foregroundStyle(.secondary)
+            .font(.system(size: 11.5))
+            .foregroundStyle(OnyxTheme.quietText)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 4)
-        .padding(.vertical, 14)
+        .padding(.vertical, 13)
     }
 }
 
@@ -1001,15 +1009,17 @@ private struct InspectorValueRow: View {
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
             Text(label)
-                .foregroundStyle(.secondary)
-            Spacer(minLength: 8)
+                .fontWeight(.medium)
+                .foregroundStyle(OnyxTheme.quietText)
+                .frame(width: 68, alignment: .leading)
             Text(value)
-                .foregroundStyle(.primary)
-                .multilineTextAlignment(.trailing)
+                .foregroundStyle(Color.primary)
+                .multilineTextAlignment(.leading)
                 .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
         }
-        .font(.system(size: 11))
+        .font(.system(size: 11.5))
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .combine)
     }
@@ -1020,13 +1030,13 @@ private struct InspectorPathRow: View {
     let path: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
+        VStack(alignment: .leading, spacing: 4) {
             Text(label)
-                .font(.system(size: 10.5))
-                .foregroundStyle(.secondary)
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(OnyxTheme.quietText)
             Text(path)
-                .font(.system(size: 10.5, design: .monospaced))
-                .foregroundStyle(.primary)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(Color.primary)
                 .textSelection(.enabled)
                 .lineLimit(2)
                 .truncationMode(.middle)
@@ -1062,7 +1072,7 @@ private struct InspectorDisclosureSection<Content: View>: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 9) {
             Button {
                 withAnimation(.easeOut(duration: 0.14)) {
                     isExpanded.toggle()
@@ -1070,18 +1080,18 @@ private struct InspectorDisclosureSection<Content: View>: View {
             } label: {
                 HStack(spacing: 7) {
                     Label(title, systemImage: icon)
-                        .font(.system(size: 12.5, weight: .semibold))
-                        .foregroundStyle(.primary)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Color.primary)
                     Spacer(minLength: 8)
                     if !summary.isEmpty {
                         Text(summary)
-                            .font(.system(size: 10.5))
-                            .foregroundStyle(.secondary)
+                            .font(.system(size: 11))
+                            .foregroundStyle(OnyxTheme.quietText)
                             .lineLimit(1)
                     }
                     Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(.tertiary)
+                        .font(.system(size: 8.5, weight: .semibold))
+                        .foregroundStyle(.quaternary)
                 }
                 .contentShape(Rectangle())
             }
@@ -1090,17 +1100,17 @@ private struct InspectorDisclosureSection<Content: View>: View {
             .accessibilityHint(accessibilityHint)
 
             if isExpanded {
-                VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: 9) {
                     content
                 }
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
+                .font(.system(size: 11.5))
+                .foregroundStyle(OnyxTheme.quietText)
                 .transition(.opacity)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 4)
-        .padding(.vertical, 12)
+        .padding(.vertical, 13)
     }
 }
 

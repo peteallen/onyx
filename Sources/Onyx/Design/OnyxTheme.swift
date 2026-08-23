@@ -63,12 +63,16 @@ enum OnyxTheme {
         light: NSColor(srgbRed: 0.971, green: 0.972, blue: 0.975, alpha: 1)
     )
     static let inspector = adaptiveColor(
-        dark: NSColor(srgbRed: 0.050, green: 0.051, blue: 0.055, alpha: 1),
-        light: NSColor(srgbRed: 0.949, green: 0.950, blue: 0.953, alpha: 1)
+        dark: NSColor(srgbRed: 0.062, green: 0.063, blue: 0.068, alpha: 1),
+        light: NSColor(srgbRed: 0.957, green: 0.958, blue: 0.961, alpha: 1)
     )
     static let border = Color.primary.opacity(0.065)
     static let divider = Color.primary.opacity(0.055)
-    static let quietText = Color.secondary.opacity(0.72)
+    static let quietText = Color.secondary.opacity(0.90)
+    static let inactiveControlText = adaptiveColor(
+        dark: NSColor(srgbRed: 0.640, green: 0.640, blue: 0.660, alpha: 1),
+        light: NSColor(srgbRed: 0.380, green: 0.380, blue: 0.400, alpha: 1)
+    )
     static let hairline = 1.0 / (NSScreen.main?.backingScaleFactor ?? 2.0)
     static let accentGradient = LinearGradient(
         colors: [iris, electric],
