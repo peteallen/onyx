@@ -648,6 +648,68 @@ struct TranscriptLayoutState {
     }
 }
 
+/// Keeps the flow-layout delegate's row width and section insets on one
+/// sizing contract. AppKit requires the row to be *strictly* narrower than
+/// the collection width after insets; an exact fit enters undefined layout
+/// behavior and can crash while a hosting view is being resized.
+struct TranscriptFlowMetrics: Equatable {
+    static let maximumReadableWidth: CGFloat = 840
+    // Normal panes keep a quiet gutter; very narrow transition frames let
+    // that gutter yield before they let a row overflow.
+    static let preferredHorizontalInset: CGFloat = 24
+    static let layoutSafetyWidth: CGFloat = 1
+
+    let itemWidth: CGFloat
+    let horizontalInset: CGFloat
+
+    init(collectionWidth rawCollectionWidth: CGFloat) {
+        let collectionWidth = rawCollectionWidth.isFinite
+            ? max(0, rawCollectionWidth)
+            : 0
+        guard collectionWidth > Self.layoutSafetyWidth else {
+            itemWidth = 0
+            horizontalInset = 0
+            return
+        }
+
+        // Margins stay at their preferred size for normal panes, but yield
+        // during transient narrow layout passes instead of forcing a 320pt
+        // row into a smaller collection view.
+        itemWidth = min(
+            Self.maximumReadableWidth,
+            max(
+                1,
+                collectionWidth
+                    - Self.preferredHorizontalInset * 2
+                    - Self.layoutSafetyWidth
+            )
+        )
+        horizontalInset = max(
+            0,
+            (collectionWidth - itemWidth - Self.layoutSafetyWidth) / 2
+        )
+    }
+}
+
+private final class TranscriptCollectionFlowLayout: NSCollectionViewFlowLayout {
+    override func shouldInvalidateLayout(forBoundsChange newBounds: NSRect) -> Bool {
+        guard let collectionView else {
+            return super.shouldInvalidateLayout(forBoundsChange: newBounds)
+        }
+        return collectionView.bounds.width != newBounds.width
+            || super.shouldInvalidateLayout(forBoundsChange: newBounds)
+    }
+
+    override func invalidationContext(forBoundsChange newBounds: NSRect) -> NSCollectionViewLayoutInvalidationContext {
+        let context = super.invalidationContext(forBoundsChange: newBounds)
+        if let flowContext = context as? NSCollectionViewFlowLayoutInvalidationContext {
+            flowContext.invalidateFlowLayoutDelegateMetrics = true
+            flowContext.invalidateFlowLayoutAttributes = true
+        }
+        return context
+    }
+}
+
 final class TranscriptViewController: NSViewController, NSCollectionViewDataSource, NSCollectionViewDelegateFlowLayout {
     private static let itemIdentifier = NSUserInterfaceItemIdentifier("OnyxTranscriptItem")
     private static let pendingItemIdentifier = NSUserInterfaceItemIdentifier("OnyxTranscriptPendingItem")
@@ -688,7 +750,7 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
 
     private let collectionView = NSCollectionView()
     private let scrollView = NSScrollView()
-    private let layout = NSCollectionViewFlowLayout()
+    private let layout = TranscriptCollectionFlowLayout()
     private var items: [TimelineItem] = []
     private var itemsRevision: UInt64?
     private var layoutState = TranscriptLayoutState()
@@ -716,7 +778,11 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         // any detail from the disclosure control.
         layout.minimumLineSpacing = 6
         layout.minimumInteritemSpacing = 0
-        layout.sectionInset = NSEdgeInsets(top: 18, left: 24, bottom: 24, right: 24)
+        // The delegate supplies the centered horizontal inset from the live
+        // collection width. Keep the layout's fallback inset zero so AppKit
+        // never combines a stale 24pt margin with a transiently tiny hosting
+        // view during a resize.
+        layout.sectionInset = NSEdgeInsets(top: 18, left: 0, bottom: 24, right: 0)
         layout.scrollDirection = .vertical
 
         collectionView.collectionViewLayout = layout
@@ -939,7 +1005,7 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         layout collectionViewLayout: NSCollectionViewLayout,
         sizeForItemAt indexPath: IndexPath
     ) -> NSSize {
-        let width = readableWidth
+        let width = flowMetrics.itemWidth
         if pendingResponse.isVisible, indexPath.item == displayRows.count {
             return NSSize(width: width, height: TranscriptPendingResponseView.rowHeight)
         }
@@ -963,8 +1029,13 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         layout collectionViewLayout: NSCollectionViewLayout,
         insetForSectionAt section: Int
     ) -> NSEdgeInsets {
-        let horizontal = max(22, (collectionView.bounds.width - readableWidth) / 2)
-        return NSEdgeInsets(top: 18, left: horizontal, bottom: 24, right: horizontal)
+        let metrics = flowMetrics
+        return NSEdgeInsets(
+            top: 18,
+            left: metrics.horizontalInset,
+            bottom: 24,
+            right: metrics.horizontalInset
+        )
     }
 
     override func viewDidLayout() {
@@ -975,10 +1046,25 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
     }
 
     private var readableWidth: CGFloat {
-        // Wide windows should feel like a conversation canvas, not a narrow
-        // phone column. This still stays comfortably readable while matching
-        // the native Codex workspace's broader text measure.
-        min(840, max(320, collectionView.bounds.width - 44))
+        flowMetrics.itemWidth
+    }
+
+    private var flowMetrics: TranscriptFlowMetrics {
+        // During an NSWindow resize, the clip view and its document view can
+        // report their new widths in separate AppKit layout passes. Size rows
+        // against the smaller width so cached attributes never overflow the
+        // viewport in that transition.
+        TranscriptFlowMetrics(
+            collectionWidth: min(
+                collectionView.bounds.width,
+                max(
+                    0,
+                    scrollView.contentView.bounds.width
+                        - scrollView.contentInsets.left
+                        - scrollView.contentInsets.right
+                )
+            )
+        )
     }
 
     private var isNearBottom: Bool {
@@ -1202,26 +1288,21 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
             return
         }
 
-        let oldRange = change.displayStart..<change.oldDisplayCount
         let newRange = change.displayStart..<displayRows.count
         if change.oldTailIDs == change.newTailIDs {
             let indexPaths = Set(newRange.map { IndexPath(item: $0, section: 0) })
             guard !indexPaths.isEmpty else { return }
-            let context = NSCollectionViewLayoutInvalidationContext()
-            context.invalidateItems(at: indexPaths)
-            layout.invalidateLayout(with: context)
+            // Reloading is the only mutation; the flow layout now invalidates
+            // its delegate metrics atomically when its width changes.
             collectionView.reloadItems(at: indexPaths)
             return
         }
 
-        collectionView.performBatchUpdates {
-            collectionView.deleteItems(
-                at: Set(oldRange.map { IndexPath(item: $0, section: 0) })
-            )
-            collectionView.insertItems(
-                at: Set(newRange.map { IndexPath(item: $0, section: 0) })
-            )
-        }
+        // A changed projection replaces collection topology (for example, a
+        // live tool row joining a compact activity group). A single reload is
+        // safer than delete/insert batch mutations while SwiftUI is laying out
+        // the hosted controller, and this path is much rarer than streaming.
+        collectionView.reloadData()
     }
 
     private func rebuildDisplayIndex() {
@@ -1284,9 +1365,9 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         }
         guard !displayIndices.isEmpty else { return }
         let indexPaths = Set(displayIndices.map { IndexPath(item: $0, section: 0) })
-        let context = NSCollectionViewLayoutInvalidationContext()
-        context.invalidateItems(at: indexPaths)
-        layout.invalidateLayout(with: context)
+        // Reloading the items is the single layout mutation. A separate manual
+        // invalidation here is re-entrant when this update is driven by an
+        // `NSHostingView` layout pass and has caused production crashes.
         collectionView.reloadItems(at: indexPaths)
     }
 
@@ -1321,7 +1402,6 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         guard oldIDs != displayRows.map(\.id) else { return }
 
         collectionView.reloadData()
-        layout.invalidateLayout()
         // Do not move the viewport when opening an older group; the expanded
         // children appear in place and the user can keep reading from there.
     }
@@ -1344,7 +1424,7 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
 }
 
 private final class TranscriptPendingResponseView: NSView {
-    static let rowHeight: CGFloat = 38
+    static let rowHeight: CGFloat = 34
 
     private let spinner = NSProgressIndicator()
     private let label = NSTextField(labelWithString: "Working")
@@ -1354,8 +1434,11 @@ private final class TranscriptPendingResponseView: NSView {
 
         spinner.style = .spinning
         spinner.controlSize = .small
-        label.font = .systemFont(ofSize: 12.5, weight: .medium)
-        label.textColor = .systemBlue
+        label.font = .systemFont(ofSize: 12, weight: .regular)
+        label.textColor = .secondaryLabelColor
+        label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 1
+        label.usesSingleLineMode = true
         addSubview(spinner)
         addSubview(label)
         setAccessibilityElement(true)
@@ -1375,12 +1458,22 @@ private final class TranscriptPendingResponseView: NSView {
         // and compact activity labels. The spinner sits in the quiet icon
         // gutter instead of pushing the message itself farther into the row.
         let leading: CGFloat = 4
-        spinner.frame = NSRect(x: leading, y: 10, width: 16, height: 16)
+        let spinnerSize: CGFloat = 16
+        spinner.frame = NSRect(
+            x: leading,
+            y: floor((bounds.height - spinnerSize) / 2),
+            width: spinnerSize,
+            height: spinnerSize
+        )
+        let labelHeight = min(
+            bounds.height,
+            ceil(label.font?.boundingRectForFont.height ?? 16) + 4
+        )
         label.frame = NSRect(
             x: leading + 24,
-            y: 8,
+            y: floor((bounds.height - labelHeight) / 2),
             width: max(0, bounds.width - leading - 24),
-            height: 20
+            height: labelHeight
         )
     }
 
@@ -1410,23 +1503,26 @@ private final class TranscriptPendingCollectionItem: NSCollectionViewItem {
 /// It intentionally has no provider payload of its own: opening it restores
 /// the original child rows, including their individual disclosure controls.
 final class TranscriptActivityGroupView: NSView {
-    static let rowHeight: CGFloat = 34
+    static let rowHeight: CGFloat = 30
 
     private let icon = NSTextField(labelWithString: "⌁")
     private let titleLabel = NSTextField(labelWithString: "Activity")
     let expansionControl = NSButton(title: "▸", target: nil, action: nil)
     private var group: TranscriptActivityGroup?
+    private var fullTitle = "Activity"
     private var onToggle: ((Bool) -> Void)?
     private(set) var isExpanded = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
 
-        icon.font = .systemFont(ofSize: 14, weight: .medium)
+        icon.font = .systemFont(ofSize: 12, weight: .medium)
         icon.textColor = .tertiaryLabelColor
-        titleLabel.font = .systemFont(ofSize: 12.5, weight: .medium)
+        titleLabel.font = .systemFont(ofSize: 12, weight: .medium)
         titleLabel.textColor = .secondaryLabelColor
         titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.maximumNumberOfLines = 1
+        titleLabel.usesSingleLineMode = true
 
         expansionControl.isBordered = false
         expansionControl.bezelStyle = .regularSquare
@@ -1459,7 +1555,8 @@ final class TranscriptActivityGroupView: NSView {
         self.group = group
         self.isExpanded = isExpanded
         self.onToggle = onToggle
-        titleLabel.stringValue = "\(group.title)  ·  \(group.summary)"
+        fullTitle = "\(group.title)  ·  \(group.summary)"
+        titleLabel.stringValue = fullTitle
         expansionControl.title = isExpanded ? "⌃" : "▸"
         expansionControl.setAccessibilityLabel(
             "\(isExpanded ? "Collapse" : "Expand") \(group.title)"
@@ -1473,6 +1570,7 @@ final class TranscriptActivityGroupView: NSView {
     override func prepareForReuse() {
         super.prepareForReuse()
         group = nil
+        fullTitle = "Activity"
         onToggle = nil
         isExpanded = false
     }
@@ -1519,15 +1617,27 @@ final class TranscriptActivityGroupView: NSView {
 
     override func layout() {
         super.layout()
-        let leading: CGFloat = 12
+        // Match the icon and text axes used by individual quiet activity rows
+        // so a rollup reads as part of the same execution stream.
+        let leading: CGFloat = 4
         icon.frame = NSRect(x: leading, y: bounds.midY - 9, width: 20, height: 18)
         let disclosureWidth: CGFloat = 22
-        let textX = leading + 28
+        let textX: CGFloat = 27
         titleLabel.frame = NSRect(
             x: textX,
             y: bounds.midY - 9,
             width: max(0, bounds.width - textX - disclosureWidth - 8),
             height: 18
+        )
+        titleLabel.attributedStringValue = TranscriptCellView.tailTruncatedSingleLine(
+            NSAttributedString(
+                string: fullTitle,
+                attributes: [
+                    .font: titleLabel.font ?? NSFont.systemFont(ofSize: 12),
+                    .foregroundColor: titleLabel.textColor ?? NSColor.secondaryLabelColor,
+                ]
+            ),
+            width: titleLabel.bounds.width
         )
         expansionControl.frame = NSRect(
             x: max(0, bounds.width - disclosureWidth),
@@ -1857,6 +1967,8 @@ enum TranscriptMarkdownRenderer {
 final class TranscriptCellView: NSView {
     static let maximumVisibleAttachments = TranscriptLayoutState.maximumVisibleAttachments
     static let maximumVisibleLinks = TranscriptLayoutState.maximumVisibleLinks
+    private static let messageFontSize: CGFloat = 14
+    private static let userBubbleHorizontalPadding: CGFloat = 14
 
     private let bubbleBackground = NSView()
     private let avatar = NSTextField(labelWithString: "◆")
@@ -1873,6 +1985,7 @@ final class TranscriptCellView: NSView {
     private var attachmentViews: [TranscriptAttachmentView] = []
     private var linkViews: [TranscriptResourceLinkView] = []
     private var item: TimelineItem?
+    private var fullTitleAttributedText = NSAttributedString()
     private var onToggle: ((Bool) -> Void)?
     private(set) var isExpanded = true
     private var isExpandable = false
@@ -1885,9 +1998,8 @@ final class TranscriptCellView: NSView {
         super.init(frame: frameRect)
         wantsLayer = true
         bubbleBackground.wantsLayer = true
-        bubbleBackground.layer?.cornerRadius = 11
-        bubbleBackground.layer?.borderWidth = 1
-        bubbleBackground.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.18).cgColor
+        bubbleBackground.layer?.cornerRadius = 12
+        bubbleBackground.layer?.borderWidth = 0
         addSubview(bubbleBackground)
         addSubview(avatar)
         addSubview(titleLabel)
@@ -1899,13 +2011,16 @@ final class TranscriptCellView: NSView {
 
         avatar.font = .systemFont(ofSize: 12, weight: .semibold)
         avatar.textColor = NSColor.systemIndigo
-        titleLabel.font = .systemFont(ofSize: 12.5, weight: .semibold)
+        titleLabel.font = .systemFont(ofSize: 12, weight: .medium)
         titleLabel.lineBreakMode = .byTruncatingTail
-        summaryLabel.font = .systemFont(ofSize: 12.5, weight: .regular)
+        titleLabel.maximumNumberOfLines = 1
+        titleLabel.usesSingleLineMode = true
+        summaryLabel.font = .systemFont(ofSize: 12, weight: .regular)
         summaryLabel.textColor = .secondaryLabelColor
         summaryLabel.lineBreakMode = .byTruncatingTail
         summaryLabel.maximumNumberOfLines = 1
-        bodyLabel.font = .systemFont(ofSize: 14.5, weight: .regular)
+        summaryLabel.usesSingleLineMode = true
+        bodyLabel.font = .systemFont(ofSize: Self.messageFontSize, weight: .regular)
         bodyLabel.textColor = .labelColor
         bodyLabel.isSelectable = true
         bodyLabel.allowsEditingTextAttributes = true
@@ -1959,7 +2074,8 @@ final class TranscriptCellView: NSView {
         self.isExpanded = self.isExpandable ? isExpanded : true
         self.onToggle = onToggle
 
-        titleLabel.attributedStringValue = Self.headerAttributedText(for: item, isExpanded: self.isExpanded)
+        fullTitleAttributedText = Self.headerAttributedText(for: item, isExpanded: self.isExpanded)
+        titleLabel.attributedStringValue = fullTitleAttributedText
         summaryLabel.stringValue = Self.compactSummary(for: item)
         bodyLabel.font = Self.bodyFont(for: item)
         // A collapsed activity may hide megabytes of provider output. Do not
@@ -1978,11 +2094,11 @@ final class TranscriptCellView: NSView {
         let isExpandedRoutineActivity = item.kind.isRoutineActivity && self.isExpanded
         layer?.cornerRadius = isProminentActivity ? 10 : (isExpandedRoutineActivity ? 8 : 0)
         layer?.borderWidth = isProminentActivity ? 1 : 0
-        layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.4).cgColor
+        layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.22).cgColor
         layer?.backgroundColor = if isProminentActivity {
             backgroundColor(for: item.kind).cgColor
         } else if isExpandedRoutineActivity {
-            NSColor.controlBackgroundColor.withAlphaComponent(0.28).cgColor
+            NSColor.controlBackgroundColor.withAlphaComponent(0.18).cgColor
         } else {
             NSColor.clear.cgColor
         }
@@ -2003,6 +2119,7 @@ final class TranscriptCellView: NSView {
         removeMediaViews()
         onToggle = nil
         item = nil
+        fullTitleAttributedText = NSAttributedString()
         isExpandable = false
         isExpanded = true
     }
@@ -2078,11 +2195,12 @@ final class TranscriptCellView: NSView {
         layer?.backgroundColor = if isProminentActivity {
             backgroundColor(for: item.kind).cgColor
         } else if isExpandedRoutineActivity {
-            NSColor.controlBackgroundColor.withAlphaComponent(0.28).cgColor
+            NSColor.controlBackgroundColor.withAlphaComponent(0.18).cgColor
         } else {
             NSColor.clear.cgColor
         }
-        titleLabel.attributedStringValue = Self.headerAttributedText(for: item, isExpanded: isExpanded)
+        fullTitleAttributedText = Self.headerAttributedText(for: item, isExpanded: isExpanded)
+        titleLabel.attributedStringValue = fullTitleAttributedText
         summaryLabel.isHidden = !collapsed || item.body.isEmpty
         bodyLabel.isHidden = collapsed || item.body.isEmpty
         detailLabel.stringValue = detailText(for: item, collapsed: collapsed)
@@ -2147,7 +2265,7 @@ final class TranscriptCellView: NSView {
         guard let item else { return }
         let metrics = Self.metrics(for: item, width: bounds.width, isExpanded: isExpanded)
         if item.kind == .userMessage {
-            let horizontalInset: CGFloat = 15
+            let horizontalInset = Self.userBubbleHorizontalPadding
             bubbleBackground.frame = NSRect(
                 x: max(0, metrics.contentX - horizontalInset),
                 y: 0,
@@ -2170,6 +2288,10 @@ final class TranscriptCellView: NSView {
             y: headerTop - metrics.titleHeight,
             width: max(0, metrics.contentWidth - metrics.statusWidth - disclosureWidth - 8),
             height: metrics.titleHeight
+        )
+        titleLabel.attributedStringValue = Self.tailTruncatedSingleLine(
+            fullTitleAttributedText,
+            width: titleLabel.bounds.width
         )
         statusLabel.frame = NSRect(
             x: metrics.contentX + max(0, metrics.contentWidth - metrics.statusWidth - disclosureWidth),
@@ -2284,17 +2406,19 @@ final class TranscriptCellView: NSView {
         let isRoutineActivity = item.kind.isRoutineActivity
         let isQuietRoutineActivity = isRoutineActivity && item.status == .completed
         let isCollapsed = item.kind.isCollapsibleActivity && !isExpanded
-        let horizontalInset: CGFloat = isUser ? 15 : (isActivity ? (isQuietRoutineActivity ? 5 : 14) : 0)
+        let horizontalInset: CGFloat = isUser
+            ? userBubbleHorizontalPadding
+            : (isActivity ? (isQuietRoutineActivity ? 5 : 14) : 0)
         let userBubbleMaximum = min(560, width * 0.78)
         let preferredUserBubbleWidth = item.attachments.isEmpty && item.links.isEmpty
-            ? item.body.preferredBubbleWidth(fontSize: 14.5)
+            ? item.body.preferredBubbleWidth(fontSize: messageFontSize)
             : max(360, width * 0.56)
-        let userBubbleWidth = min(userBubbleMaximum, max(132, preferredUserBubbleWidth))
+        let userBubbleWidth = min(userBubbleMaximum, max(52, preferredUserBubbleWidth))
         let contentX: CGFloat = isUser
             ? max(0, width - userBubbleWidth) + horizontalInset
             : (isActivity ? (isQuietRoutineActivity ? 22 : 34) + horizontalInset : 28)
         let trailing: CGFloat = isUser ? horizontalInset : (isActivity ? horizontalInset : 28)
-        let contentWidth = max(100, width - contentX - trailing)
+        let contentWidth = max(isUser ? 22 : 100, width - contentX - trailing)
         let title = displayTitle(for: item)
         let titleHeight: CGFloat = title.isEmpty ? 0 : 18
         let detailString = isCollapsed ? "" : visibleDetail(for: item)
@@ -2359,9 +2483,12 @@ final class TranscriptCellView: NSView {
         if isQuietRoutineActivity && isCollapsed {
             top = 5
             bottom = 5
+        } else if isUser {
+            top = 10
+            bottom = 10
         } else {
-            top = isActivity || isUser ? (isCollapsed ? 10 : 13) : 8
-            bottom = isActivity || isUser ? (isCollapsed ? 9 : 12) : 10
+            top = isActivity ? (isCollapsed ? 10 : 13) : 8
+            bottom = isActivity ? (isCollapsed ? 9 : 12) : 10
         }
         let showsStatus = item.status != .completed
         let statusWidth: CGFloat = isActivity && titleHeight > 0 && showsStatus ? 68 : 0
@@ -2431,6 +2558,61 @@ final class TranscriptCellView: NSView {
         return String(oneLine.prefix(maximumCharacters - 1)) + "…"
     }
 
+    /// AppKit clips an attributed `NSTextField` at its frame edge on some
+    /// hosted-layout paths even when the field requests tail truncation. Put
+    /// the ellipsis in the attributed value itself so compact activity rows
+    /// retain an unmistakable disclosure cue at every pane width.
+    static func tailTruncatedSingleLine(
+        _ source: NSAttributedString,
+        width rawWidth: CGFloat
+    ) -> NSAttributedString {
+        let width = rawWidth.isFinite ? max(0, rawWidth - 1) : 0
+        guard source.length > 0, width > 0 else { return NSAttributedString() }
+        guard source.size().width <= width else {
+            let string = source.string
+            var characterEnds: [Int] = [0]
+            characterEnds.reserveCapacity(string.count + 1)
+            var utf16Length = 0
+            for character in string {
+                utf16Length += String(character).utf16.count
+                characterEnds.append(utf16Length)
+            }
+
+            let ellipsisAttributes = source.attributes(
+                at: max(0, source.length - 1),
+                effectiveRange: nil
+            )
+            let ellipsis = NSAttributedString(string: "…", attributes: ellipsisAttributes)
+            guard ellipsis.size().width <= width else { return NSAttributedString() }
+
+            var lowerBound = 0
+            var upperBound = max(0, characterEnds.count - 1)
+            while lowerBound < upperBound {
+                let midpoint = (lowerBound + upperBound + 1) / 2
+                let candidate = NSMutableAttributedString(
+                    attributedString: source.attributedSubstring(
+                        from: NSRange(location: 0, length: characterEnds[midpoint])
+                    )
+                )
+                candidate.append(ellipsis)
+                if candidate.size().width <= width {
+                    lowerBound = midpoint
+                } else {
+                    upperBound = midpoint - 1
+                }
+            }
+
+            let result = NSMutableAttributedString(
+                attributedString: source.attributedSubstring(
+                    from: NSRange(location: 0, length: characterEnds[lowerBound])
+                )
+            )
+            result.append(ellipsis)
+            return result
+        }
+        return source
+    }
+
     private static func compactPlanSummary(from body: String) -> String? {
         // Plans are provider content too. Inspect a fixed prefix and a bounded
         // number of lines so a malformed giant plan cannot block the main actor
@@ -2480,7 +2662,7 @@ final class TranscriptCellView: NSView {
     private static func bodyFont(for item: TimelineItem) -> NSFont {
         item.kind == .command
             ? .monospacedSystemFont(ofSize: 12.5, weight: .regular)
-            : .systemFont(ofSize: 14.5, weight: .regular)
+            : .systemFont(ofSize: messageFontSize, weight: .regular)
     }
 
     private static func displayBody(_ item: TimelineItem, isExpanded: Bool) -> String {
@@ -2534,7 +2716,7 @@ final class TranscriptCellView: NSView {
             return NSAttributedString(
                 string: title,
                 attributes: [
-                    .font: NSFont.systemFont(ofSize: 12.5, weight: .semibold),
+                    .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
                     .foregroundColor: NSColor.labelColor,
                 ]
             )
@@ -2547,7 +2729,7 @@ final class TranscriptCellView: NSView {
             return NSAttributedString(
                 string: title.isEmpty ? summary : title,
                 attributes: [
-                    .font: NSFont.systemFont(ofSize: 12.5, weight: .medium),
+                    .font: NSFont.systemFont(ofSize: 12, weight: .medium),
                     .foregroundColor: NSColor.secondaryLabelColor,
                 ]
             )
@@ -2556,7 +2738,7 @@ final class TranscriptCellView: NSView {
         let headline = NSMutableAttributedString(
             string: title,
             attributes: [
-                .font: NSFont.systemFont(ofSize: 12.5, weight: .medium),
+                .font: NSFont.systemFont(ofSize: 12, weight: .medium),
                 .foregroundColor: NSColor.secondaryLabelColor,
             ]
         )
@@ -2564,7 +2746,7 @@ final class TranscriptCellView: NSView {
             NSAttributedString(
                 string: "  ·  \(summary)",
                 attributes: [
-                    .font: NSFont.systemFont(ofSize: 12.5, weight: .regular),
+                    .font: NSFont.systemFont(ofSize: 12, weight: .regular),
                     .foregroundColor: NSColor.tertiaryLabelColor,
                 ]
             )
@@ -2618,8 +2800,8 @@ final class TranscriptCellView: NSView {
         switch status {
         case .failed: NSColor.systemRed.withAlphaComponent(0.15)
         case .declined: NSColor.systemOrange.withAlphaComponent(0.15)
-        case .running: NSColor.systemBlue.withAlphaComponent(0.14)
-        case .pending: NSColor.systemGray.withAlphaComponent(0.14)
+        case .running: NSColor.systemBlue.withAlphaComponent(0.10)
+        case .pending: NSColor.systemGray.withAlphaComponent(0.10)
         case .completed: NSColor.systemGreen.withAlphaComponent(0.14)
         }
     }
@@ -2652,13 +2834,13 @@ final class TranscriptCellView: NSView {
     private func backgroundColor(for kind: TimelineItemKind) -> NSColor {
         switch kind {
         case .userMessage:
-            NSColor.controlBackgroundColor.withAlphaComponent(0.96)
+            NSColor.controlBackgroundColor.withAlphaComponent(0.72)
         case .error:
             NSColor.systemRed.withAlphaComponent(0.09)
         case .approval:
             NSColor.systemOrange.withAlphaComponent(0.10)
         case _ where kind.isActivity:
-            NSColor.controlBackgroundColor.withAlphaComponent(0.72)
+            NSColor.controlBackgroundColor.withAlphaComponent(0.38)
         default:
             .clear
         }
@@ -3239,7 +3421,7 @@ private extension String {
             ?? ""
         let font = NSFont.systemFont(ofSize: fontSize)
         let measured = (widestLine as NSString).size(withAttributes: [.font: font]).width
-        return ceil(measured + 30)
+        return ceil(measured + 28)
     }
 }
 
@@ -3251,6 +3433,6 @@ private extension NSAttributedString {
             options: [.usesLineFragmentOrigin, .usesFontLeading]
         )
         let baseFont = attribute(.font, at: 0, effectiveRange: nil) as? NSFont
-        return max((baseFont?.pointSize ?? 14.5) + 5, ceil(rect.height) + 2)
+        return max((baseFont?.pointSize ?? 14) + 5, ceil(rect.height) + 2)
     }
 }

@@ -22,6 +22,8 @@ final class OnyxWorkspacePersistenceStore {
         "threadListScope",
         "selectedThreadID",
         "composerDrafts",
+        "taskModelOverrides",
+        "taskModelDefaults",
         "lastWorkspacePath",
         "terminalHeight",
     ]
@@ -29,6 +31,8 @@ final class OnyxWorkspacePersistenceStore {
     private static let accountOwnedSuffixes = [
         "selectedThreadID",
         "composerDrafts",
+        "taskModelOverrides",
+        "taskModelDefaults",
         "lastWorkspacePath",
     ]
 

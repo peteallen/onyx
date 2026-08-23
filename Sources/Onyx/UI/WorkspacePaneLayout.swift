@@ -9,7 +9,9 @@ import SwiftUI
 enum WorkspacePaneLayout {
     static let commandRailWidth: CGFloat = 52
     static let dividerWidth: CGFloat = 7
-    static let minimumConversationWidth: CGFloat = 420
+    /// Protect enough room for the transcript and composer to remain the
+    /// primary workspace, even when both supporting panes are open.
+    static let minimumConversationWidth: CGFloat = 640
 
     static let sidebarDefaultWidth: CGFloat = 264
     static let sidebarMinimumWidth: CGFloat = 220
@@ -19,13 +21,24 @@ enum WorkspacePaneLayout {
     static let inspectorMinimumWidth: CGFloat = 280
     static let inspectorMaximumWidth: CGFloat = 480
 
-    /// Keep the existing compact-workspace behavior in one place so the
-    /// splitter calculations and the visibility rule use the same breakpoint.
-    static let compactBreakpoint: CGFloat = 1_180
+    /// The narrowest width where both panes can occupy space without pushing
+    /// the conversation below its protected width. Below this point a
+    /// requested inspector temporarily takes the side-pane slot; the sidebar
+    /// preference remains intact for wider windows.
+    static let compactBreakpoint: CGFloat = commandRailWidth
+        + dividerWidth * 2
+        + sidebarMinimumWidth
+        + inspectorMinimumWidth
+        + minimumConversationWidth
     static let accessibilityStep: CGFloat = 24
 
     static let sidebarWidthPreferenceSuffix = "Onyx.sidebarWidth"
     static let inspectorWidthPreferenceSuffix = "Onyx.inspectorWidth"
+
+    static func isCompact(totalWidth: CGFloat) -> Bool {
+        guard totalWidth.isFinite else { return false }
+        return totalWidth < compactBreakpoint
+    }
 
     /// Whether the task sidebar is actually occupying workspace width. At
     /// compact sizes the inspector temporarily takes precedence without

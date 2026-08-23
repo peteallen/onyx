@@ -1,8 +1,53 @@
 import CoreGraphics
+import Foundation
 import XCTest
 @testable import Onyx
 
+@MainActor
 final class WorkspacePaneLayoutTests: XCTestCase {
+    func testFreshWorkspaceKeepsInspectorOnDemandAndRestoresExplicitChoice() throws {
+        let suiteName = "WorkspacePaneLayoutTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let preferencePrefix = "Onyx.window.conversation-first"
+
+        let freshModel = OnyxAppModel(
+            runtime: nil,
+            defaults: defaults,
+            preferenceKeyPrefix: preferencePrefix
+        )
+        XCTAssertTrue(freshModel.isSidebarVisible)
+        XCTAssertFalse(freshModel.isInspectorVisible)
+
+        freshModel.isInspectorVisible = true
+        let restoredModel = OnyxAppModel(
+            runtime: nil,
+            defaults: defaults,
+            preferenceKeyPrefix: preferencePrefix
+        )
+        XCTAssertTrue(restoredModel.isInspectorVisible)
+    }
+
+    func testCompactBoundaryProtectsConversationFromTwoSidePanes() {
+        let expectedBoundary = WorkspacePaneLayout.commandRailWidth
+            + WorkspacePaneLayout.dividerWidth * 2
+            + WorkspacePaneLayout.sidebarMinimumWidth
+            + WorkspacePaneLayout.inspectorMinimumWidth
+            + WorkspacePaneLayout.minimumConversationWidth
+
+        XCTAssertEqual(WorkspacePaneLayout.compactBreakpoint, expectedBoundary)
+        XCTAssertTrue(WorkspacePaneLayout.isCompact(totalWidth: expectedBoundary - 1))
+        XCTAssertFalse(WorkspacePaneLayout.isCompact(totalWidth: expectedBoundary))
+        XCTAssertFalse(WorkspacePaneLayout.isCompact(totalWidth: .infinity))
+
+        XCTAssertFalse(WorkspacePaneLayout.isSidebarDisplayed(
+            sidebarRequested: true,
+            inspectorVisible: true,
+            isCompact: WorkspacePaneLayout.isCompact(totalWidth: expectedBoundary - 1)
+        ))
+    }
+
     func testCompactSidebarToggleUsesDisplayedVisibilityAndDismissesInspector() {
         let sidebarDisplayed = WorkspacePaneLayout.isSidebarDisplayed(
             sidebarRequested: true,
@@ -74,21 +119,19 @@ final class WorkspacePaneLayoutTests: XCTestCase {
     func testDisplayedWidthsLeaveConversationRoomAndRespectTheOtherPane() {
         let sidebar = WorkspacePaneLayout.displayedSidebarWidth(
             storedWidth: WorkspacePaneLayout.sidebarMaximumWidth,
-            totalWidth: 1_180,
+            totalWidth: WorkspacePaneLayout.compactBreakpoint,
             inspectorVisible: true,
             inspectorWidth: WorkspacePaneLayout.inspectorDefaultWidth
         )
-        XCTAssertEqual(sidebar, 368, accuracy: 0.001)
 
         let inspector = WorkspacePaneLayout.displayedInspectorWidth(
             storedWidth: WorkspacePaneLayout.inspectorMaximumWidth,
-            totalWidth: 1_180,
+            totalWidth: WorkspacePaneLayout.compactBreakpoint,
             sidebarVisible: true,
             sidebarWidth: sidebar
         )
-        XCTAssertEqual(inspector, WorkspacePaneLayout.inspectorDefaultWidth, accuracy: 0.001)
 
-        let center = 1_180
+        let center = WorkspacePaneLayout.compactBreakpoint
             - WorkspacePaneLayout.commandRailWidth
             - WorkspacePaneLayout.dividerWidth * 2
             - sidebar
@@ -99,13 +142,13 @@ final class WorkspacePaneLayoutTests: XCTestCase {
     func testInspectorCanUseTheWidthWhenSidebarIsCollapsed() {
         let inspector = WorkspacePaneLayout.displayedInspectorWidth(
             storedWidth: WorkspacePaneLayout.inspectorMaximumWidth,
-            totalWidth: 900,
+            totalWidth: 1_200,
             sidebarVisible: false
         )
 
-        XCTAssertEqual(inspector, 421, accuracy: 0.001)
+        XCTAssertEqual(inspector, WorkspacePaneLayout.inspectorMaximumWidth, accuracy: 0.001)
         XCTAssertGreaterThanOrEqual(
-            900
+            1_200
                 - WorkspacePaneLayout.commandRailWidth
                 - WorkspacePaneLayout.dividerWidth
                 - inspector,

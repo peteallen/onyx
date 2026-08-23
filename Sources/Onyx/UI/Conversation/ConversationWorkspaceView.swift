@@ -24,7 +24,6 @@ struct ConversationWorkspaceView: View {
                         sidebarDisplayed: sidebarDisplayed ?? model.isSidebarVisible,
                         onShowSidebar: onShowSidebar ?? { model.isSidebarVisible = true }
                     )
-                    Divider().overlay(OnyxTheme.divider)
 
                     ZStack {
                         NativeTranscriptView(
@@ -79,9 +78,9 @@ struct ConversationWorkspaceView: View {
                             )
                         }
                     }
-                    .frame(maxWidth: 860)
-                    .padding(.horizontal, 30)
-                    .padding(.bottom, 24)
+                    .frame(maxWidth: 900)
+                    .padding(.horizontal, 32)
+                    .padding(.bottom, 20)
                 }
 
                 if model.isSideChatPresented {
@@ -123,7 +122,7 @@ private struct ConversationHeaderView: View {
     @Environment(\.onyxWindowPresentationContext) private var windowPresentation
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             if !sidebarDisplayed {
                 Button {
                     onShowSidebar()
@@ -136,20 +135,19 @@ private struct ConversationHeaderView: View {
                 .accessibilityHint("Reveals the task list")
             }
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(model.selectedThread?.title ?? (model.isShowingArchivedThreads ? "Archived tasks" : "New task"))
-                    .font(.system(size: 14, weight: .semibold))
-                    .lineLimit(1)
-                HStack(spacing: 5) {
-                    Text(model.projectName)
-                    if let branch = model.selectedThread?.branch {
-                        Text("/")
-                        Text(branch)
-                    }
-                }
-                .font(.system(size: 10.5))
+            Image(systemName: "folder")
+                .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(.secondary)
+
+            Text(model.selectedThread?.title ?? (model.isShowingArchivedThreads ? "Archived tasks" : "New task"))
+                .font(.system(size: 14, weight: .semibold))
                 .lineLimit(1)
+
+            if let branch = model.selectedThread?.branch {
+                Text(branch)
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
             }
 
             Spacer()
@@ -267,11 +265,14 @@ private struct ConversationHeaderView: View {
             .onyxHelp("Task actions")
             .accessibilityLabel("Task actions")
         }
-        .padding(.leading, 18)
-        .padding(.trailing, 14)
-        .padding(.top, 1)
-        .frame(height: 54)
+        .padding(.horizontal, 14)
+        .frame(height: 50)
         .background(OnyxTheme.chrome)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(OnyxTheme.divider)
+                .frame(height: OnyxTheme.hairline)
+        }
     }
 
     private var pinActionLabel: String {
@@ -575,13 +576,13 @@ private struct ComposerView: View {
             .padding(.horizontal, ComposerToolbarLayout.horizontalPadding)
             .padding(.bottom, 8)
         }
-        .background(OnyxTheme.raisedSurface)
-        .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
+        .background(OnyxTheme.composerSurface)
+        .clipShape(RoundedRectangle(cornerRadius: 17, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 15, style: .continuous)
+            RoundedRectangle(cornerRadius: 17, style: .continuous)
                 .stroke(OnyxTheme.border, lineWidth: 1)
         }
-        .shadow(color: SwiftUI.Color(white: 0, opacity: 0.075), radius: 9, y: 4)
+        .shadow(color: SwiftUI.Color(white: 0, opacity: 0.12), radius: 13, y: 6)
     }
 
     private var isComposingNewTask: Bool {
@@ -600,6 +601,14 @@ private struct ComposerView: View {
             ?? model.selectedTaskModelID
             ?? model.selectedModelID
             ?? "Choose model"
+    }
+
+    private var pickerSelectedModelID: String? {
+        isComposingNewTask ? model.selectedModelID : model.selectedTaskModelID
+    }
+
+    private var currentTaskProviderChoices: [OnyxApplicationHost.ProviderModelChoice] {
+        rankedModelChoices.filter { $0.connection.id == selectedProviderConnectionID }
     }
 
     private var frequentChoices: [OnyxApplicationHost.ProviderModelChoice] {
@@ -717,8 +726,27 @@ private struct ComposerView: View {
                 }
             }
         } else {
-            Text("This task uses \(selectedProviderName) / \(selectedModelLabel)")
+            Section("Next turn") {
+                if currentTaskProviderChoices.isEmpty {
+                    Text("Models load after connection")
+                } else {
+                    ForEach(currentTaskProviderChoices) { choice in
+                        modelChoiceButton(choice)
+                    }
+                }
+            }
+            if model.selectedTaskModelOverrideID != nil {
+                Divider()
+                Button("Use task default · \(taskDefaultModelLabel)") {
+                    model.resetSelectedTaskModel()
+                }
+            }
         }
+    }
+
+    private var taskDefaultModelLabel: String {
+        let id = model.selectedTaskDefaultModelID ?? "provider default"
+        return model.session?.availableModels.first(where: { $0.id == id })?.displayName ?? id
     }
 
     private var regularProviderModelMenu: some View {
@@ -737,7 +765,7 @@ private struct ComposerView: View {
         }
         .menuStyle(.borderlessButton)
         .fixedSize(horizontal: true, vertical: false)
-        .onyxHelp(isComposingNewTask ? "Choose a provider and model for this new task" : "Task provider and model")
+        .onyxHelp(isComposingNewTask ? "Choose a provider and model for this new task" : "Choose the model for the next turn")
         .accessibilityLabel("Provider and model")
         .accessibilityValue("\(selectedProviderName), \(selectedModelLabel)")
     }
@@ -761,7 +789,7 @@ private struct ComposerView: View {
         .menuStyle(.borderlessButton)
         .frame(width: 120, alignment: .leading)
         .layoutPriority(1)
-        .onyxHelp(isComposingNewTask ? "Choose a provider and model for this new task" : "Task provider and model")
+        .onyxHelp(isComposingNewTask ? "Choose a provider and model for this new task" : "Choose the model for the next turn")
         .accessibilityLabel("Provider and model")
         .accessibilityValue("\(selectedProviderName), \(selectedModelLabel)")
     }
@@ -774,7 +802,7 @@ private struct ComposerView: View {
                 .frame(width: 28, height: 28)
         }
         .menuStyle(.borderlessButton)
-        .onyxHelp(isComposingNewTask ? "Choose a provider and model for this new task" : "Task provider and model")
+        .onyxHelp(isComposingNewTask ? "Choose a provider and model for this new task" : "Choose the model for the next turn")
         .accessibilityLabel("Provider and model")
         .accessibilityValue("\(selectedProviderName), \(selectedModelLabel)")
     }
@@ -945,10 +973,14 @@ private struct ComposerView: View {
         showsProvider: Bool = false
     ) -> some View {
         Button {
-            onSelectProviderModel(choice)
+            if isComposingNewTask {
+                onSelectProviderModel(choice)
+            } else {
+                model.selectTaskModel(choice.model.id)
+            }
         } label: {
             let selected = choice.connection.id == selectedProviderConnectionID
-                && choice.model.id == model.selectedModelID
+                && choice.model.id == pickerSelectedModelID
             HStack {
                 if selected { Image(systemName: "checkmark") }
                 if showsProvider {
@@ -963,6 +995,10 @@ private struct ComposerView: View {
                 if choice.model.capabilityEvidence.reasoningEffortsAdvertised,
                    !choice.model.reasoningEfforts.isEmpty {
                     Image(systemName: "brain")
+                }
+                if choice.model.serverAdvertisesToolUse {
+                    Image(systemName: "wrench.and.screwdriver")
+                        .foregroundStyle(OnyxTheme.warning)
                 }
                 if choice.model.capabilityEvidence.isUnknown {
                     Label("Capabilities unknown", systemImage: "questionmark.circle")
@@ -979,6 +1015,7 @@ private struct ComposerView: View {
                 : choice.model.displayName
         )
         .accessibilityValue(choice.model.pickerCapabilitySummary)
+        .onyxHelp(choice.model.pickerCapabilitySummary)
     }
 }
 

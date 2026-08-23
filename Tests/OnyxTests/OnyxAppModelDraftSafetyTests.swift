@@ -144,6 +144,174 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
         XCTAssertEqual(turn.model, "task-pinned-model")
     }
 
+    func testExistingTaskCanChooseModelForNextTurnAndResetToTaskDefault() async throws {
+        let suiteName = "OnyxAppModelDraftSafetyTests.task-model-override.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let runtime = DraftSafetyRuntime(
+            initialThreads: [DraftSafetyFixture.threadA],
+            failurePoint: .none,
+            capabilities: [.streaming],
+            availableModels: [
+                RuntimeModel(
+                    id: "test-model",
+                    displayName: "Task default",
+                    description: nil,
+                    isDefault: true,
+                    defaultReasoningEffort: nil,
+                    reasoningEfforts: []
+                ),
+                RuntimeModel(
+                    id: "alternate-model",
+                    displayName: "Alternate model",
+                    description: nil,
+                    isDefault: false,
+                    defaultReasoningEffort: nil,
+                    reasoningEfforts: []
+                ),
+            ]
+        )
+        let model = OnyxAppModel(runtime: runtime, defaults: defaults)
+        model.start()
+        await waitUntil("The task did not load") {
+            model.canRunAgent && model.selectedThreadID == DraftSafetyFixture.threadA.id
+        }
+
+        XCTAssertEqual(model.selectedTaskDefaultModelID, "test-model")
+        XCTAssertEqual(model.selectedTaskModelID, "test-model")
+
+        model.selectTaskModel("alternate-model")
+        XCTAssertEqual(model.selectedTaskModelID, "alternate-model")
+        XCTAssertEqual(
+            (defaults.dictionary(forKey: "Onyx.taskModelOverrides") as? [String: String])?[DraftSafetyFixture.threadA.id],
+            "alternate-model"
+        )
+        XCTAssertEqual(
+            (defaults.dictionary(forKey: "Onyx.taskModelDefaults") as? [String: String])?[DraftSafetyFixture.threadA.id],
+            "test-model"
+        )
+
+        model.composerText = "Continue with the alternate model"
+        model.sendComposer()
+        await waitUntilAsync("The overridden model turn did not reach the runtime") {
+            await runtime.recordedStartTurns().count == 1
+        }
+        let recordedTurns = await runtime.recordedStartTurns()
+        let turn = try XCTUnwrap(recordedTurns.first)
+        XCTAssertEqual(turn.model, "alternate-model")
+
+        // Both Codex app-server and OpenAI-compatible providers can publish
+        // the model used by the latest turn back onto the task. That update
+        // must not redefine the reset target as the override itself.
+        await runtime.publishThreadModel(
+            threadID: DraftSafetyFixture.threadA.id,
+            modelID: "alternate-model"
+        )
+        await waitUntil("The task model update did not reach the app model") {
+            model.selectedThread?.model == "alternate-model"
+        }
+        XCTAssertEqual(model.selectedTaskDefaultModelID, "test-model")
+        XCTAssertEqual(model.selectedTaskModelID, "alternate-model")
+
+        model.resetSelectedTaskModel()
+        XCTAssertEqual(model.selectedTaskModelID, "test-model")
+        XCTAssertNil(defaults.dictionary(forKey: "Onyx.taskModelOverrides"))
+        XCTAssertEqual(
+            (defaults.dictionary(forKey: "Onyx.taskModelDefaults") as? [String: String])?[DraftSafetyFixture.threadA.id],
+            "test-model"
+        )
+
+        model.composerText = "Return to the task default"
+        model.sendComposer()
+        await waitUntilAsync("The reset model turn did not reach the runtime") {
+            await runtime.recordedStartTurns().count == 2
+        }
+        let resetTurns = await runtime.recordedStartTurns()
+        let resetTurn = try XCTUnwrap(resetTurns.last)
+        XCTAssertEqual(resetTurn.model, "test-model")
+    }
+
+    func testExistingTaskWithoutRecordedModelSnapshotsProviderDefaultBeforeSwitching() async throws {
+        let suiteName = "OnyxAppModelDraftSafetyTests.task-model-provider-default.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        var legacyThread = DraftSafetyFixture.threadA
+        legacyThread.model = nil
+        let runtime = DraftSafetyRuntime(
+            initialThreads: [legacyThread],
+            failurePoint: .none,
+            capabilities: [.streaming],
+            availableModels: [
+                RuntimeModel(
+                    id: "provider-default",
+                    displayName: "Provider default",
+                    description: nil,
+                    isDefault: true,
+                    defaultReasoningEffort: nil,
+                    reasoningEfforts: []
+                ),
+                RuntimeModel(
+                    id: "alternate-model",
+                    displayName: "Alternate model",
+                    description: nil,
+                    isDefault: false,
+                    defaultReasoningEffort: nil,
+                    reasoningEfforts: []
+                ),
+            ]
+        )
+        let model = OnyxAppModel(runtime: runtime, defaults: defaults)
+        model.start()
+        await waitUntil("The legacy task did not load") {
+            model.canRunAgent && model.selectedThreadID == legacyThread.id
+        }
+
+        XCTAssertEqual(model.selectedTaskDefaultModelID, "provider-default")
+        model.selectTaskModel("alternate-model")
+        XCTAssertEqual(
+            (defaults.dictionary(forKey: "Onyx.taskModelDefaults") as? [String: String])?[legacyThread.id],
+            "provider-default"
+        )
+        XCTAssertEqual(model.selectedTaskDefaultModelID, "provider-default")
+        model.resetSelectedTaskModel()
+        XCTAssertEqual(model.selectedTaskModelID, "provider-default")
+    }
+
+    func testProviderDeletedTaskClearsPersistedModelSelectionState() async throws {
+        let suiteName = "OnyxAppModelDraftSafetyTests.task-model-delete.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let runtime = DraftSafetyRuntime(
+            initialThreads: [DraftSafetyFixture.threadA],
+            failurePoint: .none,
+            capabilities: [.streaming]
+        )
+        let model = OnyxAppModel(runtime: runtime, defaults: defaults)
+        model.start()
+        await waitUntil("The task did not load") {
+            model.canRunAgent && model.selectedThreadID == DraftSafetyFixture.threadA.id
+        }
+        model.selectTaskModel("alternate-model")
+        XCTAssertFalse(model.taskModelOverrides.isEmpty)
+        XCTAssertFalse(model.taskModelDefaults.isEmpty)
+
+        await runtime.publishThreadDeleted(DraftSafetyFixture.threadA.id)
+        await waitUntil("The provider deletion did not remove the task") {
+            !model.threads.contains(where: { $0.id == DraftSafetyFixture.threadA.id })
+        }
+
+        XCTAssertTrue(model.taskModelOverrides.isEmpty)
+        XCTAssertTrue(model.taskModelDefaults.isEmpty)
+        XCTAssertNil(defaults.object(forKey: "Onyx.taskModelOverrides"))
+        XCTAssertNil(defaults.object(forKey: "Onyx.taskModelDefaults"))
+    }
+
     func testSwitchingPinnedTasksRevalidatesReasoningEffortBeforeSend() async {
         let suiteName = "OnyxAppModelDraftSafetyTests.pinned-reasoning.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -706,9 +874,15 @@ private actor DraftSafetyRuntime: AgentRuntime {
     func readThread(id: String) async throws -> RuntimeConversation {
         switch id {
         case DraftSafetyFixture.threadA.id:
-            RuntimeConversation(thread: DraftSafetyFixture.threadA, items: [DraftSafetyFixture.itemA])
+            RuntimeConversation(
+                thread: initialThreads.first(where: { $0.id == id }) ?? DraftSafetyFixture.threadA,
+                items: [DraftSafetyFixture.itemA]
+            )
         case DraftSafetyFixture.threadB.id:
-            RuntimeConversation(thread: DraftSafetyFixture.threadB, items: [DraftSafetyFixture.itemB])
+            RuntimeConversation(
+                thread: initialThreads.first(where: { $0.id == id }) ?? DraftSafetyFixture.threadB,
+                items: [DraftSafetyFixture.itemB]
+            )
         default:
             if let thread = initialThreads.first(where: { $0.id == id }) ?? createdThreads[id] {
                 RuntimeConversation(thread: thread, items: [])
@@ -757,6 +931,18 @@ private actor DraftSafetyRuntime: AgentRuntime {
 
     func recordedStartTurns() -> [StartTurnRequest] {
         startTurns
+    }
+
+    func publishThreadModel(threadID: String, modelID: String) {
+        guard var thread = (initialThreads + Array(createdThreads.values)).first(where: {
+            $0.id == threadID
+        }) else { return }
+        thread.model = modelID
+        continuation.yield(.threadUpdated(thread))
+    }
+
+    func publishThreadDeleted(_ threadID: String) {
+        continuation.yield(.threadDeleted(threadID: threadID))
     }
 
     func releaseFailure() {

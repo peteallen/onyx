@@ -90,6 +90,50 @@ final class OnyxMultiwindowTests: XCTestCase {
         )
     }
 
+    func testDefaultModelLeadsUnusedChoicesButActualUsageStillWins() {
+        let suite = makeDefaults()
+        defer { suite.cleanUp() }
+        let host = OnyxApplicationHost(defaults: suite.defaults)
+        let connection = OnyxApplicationHost.WorkspaceConnection(
+            id: ProviderConnectionID("local.vllm.ranking"),
+            displayName: "Local vLLM",
+            isCodex: false
+        )
+        let alphabeticalFirst = RuntimeModel(
+            id: "alpha",
+            displayName: "Alpha",
+            description: nil,
+            isDefault: false,
+            defaultReasoningEffort: nil,
+            reasoningEfforts: []
+        )
+        let configuredDefault = RuntimeModel(
+            id: "zeta-default",
+            displayName: "Zeta default",
+            description: nil,
+            isDefault: true,
+            defaultReasoningEffort: nil,
+            reasoningEfforts: []
+        )
+
+        XCTAssertEqual(
+            host.rankedModelChoices(
+                connection: connection,
+                models: [alphabeticalFirst, configuredDefault]
+            ).map(\.model.id),
+            ["zeta-default", "alpha"]
+        )
+
+        host.recordModelUsage(connectionID: connection.id, modelID: alphabeticalFirst.id)
+        XCTAssertEqual(
+            host.rankedModelChoices(
+                connection: connection,
+                models: [alphabeticalFirst, configuredDefault]
+            ).map(\.model.id),
+            ["alpha", "zeta-default"]
+        )
+    }
+
     func testWindowRecordsAcceptedSendAgainstItsProviderAndSelectedModel() async throws {
         let suite = makeDefaults()
         defer { suite.cleanUp() }
@@ -154,7 +198,7 @@ final class OnyxMultiwindowTests: XCTestCase {
             wireProtocol: .openAIChatCompletions,
             capabilities: ProviderCapabilitySet(
                 inputModalities: [.text, .image],
-                supportedParameters: [.reasoningEffort],
+                supportedParameters: [.reasoningEffort, .tools, .toolChoice],
                 reasoningEfforts: ["low", "high"]
             )
         )
@@ -187,6 +231,15 @@ final class OnyxMultiwindowTests: XCTestCase {
         XCTAssertTrue(cached.isDefault)
         XCTAssertEqual(cached.inputModalities, [.text, .image])
         XCTAssertEqual(cached.supportedRequestParameters, [.reasoningEffort])
+        XCTAssertEqual(
+            cached.serverAdvertisedRequestParameters,
+            [.reasoningEffort, .tools, .toolChoice]
+        )
+        XCTAssertTrue(cached.serverAdvertisesToolUse)
+        XCTAssertEqual(
+            cached.pickerCapabilitySummary,
+            "Images · Reasoning · Server tools · Onyx tools unavailable"
+        )
         XCTAssertEqual(cached.reasoningEfforts, ["low", "high"])
     }
 

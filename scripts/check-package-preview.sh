@@ -13,6 +13,7 @@ script_text="$(<"$preview_script")"
 [[ "$script_text" == *'preview_bundle_identifier="app.onyx.preview"'* ]]
 [[ "$script_text" == *'preview_display_name="Onyx Preview"'* ]]
 [[ "$script_text" == *'preview_build_number="$(/bin/date -u +%Y%m%d%H%M%S)"'* ]]
+[[ "$script_text" == *'stable_signing_identity="71E83D4C74C2320E54ABA79ABA79B2D75B8A1B8A"'* ]]
 [[ "$script_text" == *'security find-identity -v -p codesigning'* ]]
 [[ "$script_text" == *'signing_identity="${match[1]}"'* ]]
 [[ "$script_text" == *'no valid code-signing identity found'* ]]

@@ -7,7 +7,13 @@ preview_executable="$preview_app/Contents/MacOS/Onyx"
 preview_bundle_identifier="app.onyx.preview"
 preview_display_name="Onyx Preview"
 preview_build_number="$(/bin/date -u +%Y%m%d%H%M%S)"
-signing_identity="${ONYX_PREVIEW_CODESIGN_IDENTITY:-}"
+# Keep the local preview tied to the certificate that already owns its macOS
+# privacy grants. An explicit environment override remains available for a
+# different machine or a rotated development certificate; silently choosing
+# whichever identity happens to sort first can make every rebuild look like a
+# new client to macOS.
+stable_signing_identity="71E83D4C74C2320E54ABA79ABA79B2D75B8A1B8A"
+signing_identity="${ONYX_PREVIEW_CODESIGN_IDENTITY:-$stable_signing_identity}"
 signing_requirement="${ONYX_PREVIEW_CODESIGN_REQUIREMENT:-}"
 stop_running=0
 
@@ -27,9 +33,11 @@ Options:
 Environment:
   ONYX_PREVIEW_CODESIGN_IDENTITY
       Persistent Code Signing identity (prefer its SHA-1 fingerprint). When
-      omitted, the first valid identity in the default user Keychain is used.
-      Set this to `-` only when an explicitly ad-hoc preview is required. If no
-      valid identity is found, packaging fails instead of silently using ad hoc.
+      omitted, Onyx uses the certificate that owns this preview's existing
+      macOS privacy grants. Set this when moving the preview to another
+      machine or rotating that certificate. Set it to `-` only when an
+      explicitly ad-hoc preview is required. If no valid identity is found,
+      packaging fails instead of silently using ad hoc.
   ONYX_PREVIEW_CODESIGN_REQUIREMENT
       Optional certificate-pinned requirement body after `designated =>`. Use
       only with ONYX_PREVIEW_CODESIGN_IDENTITY.

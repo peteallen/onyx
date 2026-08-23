@@ -105,6 +105,55 @@ final class OnyxSideChatTests: XCTestCase {
         XCTAssertFalse(model.threads.contains(where: { $0.id == SideChatFixture.fork.id }))
     }
 
+    func testSideChatKeepsDeltaThatArrivesBeforeMatchingItemStart() async {
+        let fixture = makeFixture(capabilities: [.streaming, .interruption, .ephemeralThreadForking])
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        model.start()
+        await waitUntil("Parent task did not load") {
+            model.selectedThreadID == SideChatFixture.parent.id
+        }
+        model.openSideChat()
+        await waitUntil("Fork did not open") { model.sideChatThreadID == SideChatFixture.fork.id }
+
+        await fixture.runtime.emit(
+            .itemDelta(
+                threadID: SideChatFixture.fork.id,
+                itemID: "early-side-answer",
+                delta: "Keep this early chunk."
+            )
+        )
+        await waitUntil("Early side-chat delta did not render") {
+            model.sideChatTimeline.contains {
+                $0.id == "early-side-answer" && $0.body == "Keep this early chunk."
+            }
+        }
+
+        await fixture.runtime.emit(
+            .itemStarted(
+                threadID: SideChatFixture.fork.id,
+                item: SideChatFixture.item(
+                    id: "early-side-answer",
+                    kind: .assistantMessage,
+                    body: "",
+                    status: .running
+                )
+            )
+        )
+        await waitUntil("The matching start erased already-rendered side-chat text") {
+            model.sideChatTimeline.contains {
+                $0.id == "early-side-answer"
+                    && $0.body == "Keep this early chunk."
+                    && $0.timestamp == Date(timeIntervalSince1970: 1)
+            }
+        }
+        XCTAssertEqual(
+            model.sideChatTimeline.filter { $0.id == "early-side-answer" }.count,
+            1
+        )
+    }
+
     func testNavigationClosesSideChatAndRejectsLateForkCompletion() async {
         let fixture = makeFixture(
             capabilities: [.streaming, .interruption, .ephemeralThreadForking],

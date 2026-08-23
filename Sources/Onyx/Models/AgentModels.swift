@@ -173,7 +173,16 @@ struct RuntimeModel: Identifiable, Sendable, Hashable {
     /// Provider-advertised request metadata. These fields describe the model
     /// only; they never imply that Onyx can execute local tools or approvals.
     let inputModalities: Set<ProviderInputModality>
+    /// Parameters the provider's model catalog says the server accepts. This
+    /// remains separate from `supportedRequestParameters`, which contains only
+    /// fields the active Onyx adapter can safely send and handle end to end.
+    let serverAdvertisedRequestParameters: Set<ProviderRequestParameter>
     let supportedRequestParameters: Set<ProviderRequestParameter>
+    /// Raw server capability names are retained separately from the
+    /// client-usable request parameters. For example, vLLM may advertise
+    /// `tool_use` while this runtime still lacks tool-call decoding and
+    /// execution.
+    let serverAdvertisedCapabilities: [String]
     /// Distinguishes provider-advertised metadata from the conservative text
     /// baseline used when a generic `/models` response contains only an ID.
     let capabilityEvidence: ProviderCapabilityEvidence
@@ -186,7 +195,9 @@ struct RuntimeModel: Identifiable, Sendable, Hashable {
         defaultReasoningEffort: String?,
         reasoningEfforts: [String],
         inputModalities: Set<ProviderInputModality> = [.text, .image],
+        serverAdvertisedRequestParameters: Set<ProviderRequestParameter> = [],
         supportedRequestParameters: Set<ProviderRequestParameter> = [],
+        serverAdvertisedCapabilities: [String] = [],
         capabilityEvidence: ProviderCapabilityEvidence = .advertised
     ) {
         self.id = id
@@ -196,18 +207,36 @@ struct RuntimeModel: Identifiable, Sendable, Hashable {
         self.defaultReasoningEffort = defaultReasoningEffort
         self.reasoningEfforts = reasoningEfforts
         self.inputModalities = inputModalities
+        self.serverAdvertisedRequestParameters = serverAdvertisedRequestParameters
         self.supportedRequestParameters = supportedRequestParameters
+        self.serverAdvertisedCapabilities = serverAdvertisedCapabilities
         self.capabilityEvidence = capabilityEvidence
     }
 
-    /// Compact picker copy. Tool metadata is deliberately omitted: the
-    /// OpenAI-compatible runtime does not implement Onyx tool execution, so a
-    /// remote model advertising a `tools` parameter must not produce a tools
-    /// badge in the desktop UI.
+    var serverAdvertisesToolUse: Bool {
+        serverAdvertisedRequestParameters.contains(.tools)
+            || serverAdvertisedRequestParameters.contains(.toolChoice)
+            || serverAdvertisedCapabilities.contains { rawValue in
+                let normalized = rawValue
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+                    .replacingOccurrences(of: "-", with: "_")
+                return normalized == "tool_use"
+                    || normalized == "tools"
+                    || normalized == "function_call"
+                    || normalized == "function_calling"
+            }
+    }
+
+    /// Compact picker copy distinguishes remote support from client support:
+    /// a provider can advertise tools without implying that Onyx can execute
+    /// or approve them.
     var pickerCapabilitySummary: String {
         capabilityEvidence.pickerSummary(
             inputModalities: inputModalities,
-            reasoningEfforts: reasoningEfforts
+            reasoningEfforts: reasoningEfforts,
+            serverAdvertisedParameters: serverAdvertisedRequestParameters,
+            serverAdvertisedCapabilities: serverAdvertisedCapabilities
         )
     }
 }

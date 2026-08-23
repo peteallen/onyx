@@ -49,11 +49,20 @@ final class ProviderCapabilitiesTests: XCTestCase {
         XCTAssertTrue(model.capabilities.supports(.input(.image)))
         XCTAssertTrue(model.capabilities.supports(.parameter(.tools)))
         XCTAssertTrue(model.capabilities.supports(.parameter(.toolChoice)))
+        XCTAssertTrue(model.capabilities.serverAdvertisesToolUse)
+        XCTAssertFalse(model.capabilities.supportsClient(.parameter(.tools)))
+        XCTAssertFalse(model.capabilities.supportsClient(.parameter(.toolChoice)))
+        XCTAssertFalse(model.capabilities.clientUsableParameters.contains(.tools))
+        XCTAssertFalse(model.capabilities.clientUsableParameters.contains(.toolChoice))
         XCTAssertTrue(model.capabilities.supports(.parameter(.structuredOutputs)))
         XCTAssertTrue(model.capabilities.supports(.reasoningEffort("high")))
         XCTAssertFalse(model.capabilities.supports(.reasoningEffort("medium")))
         XCTAssertEqual(model.contextLength, 200_000)
         XCTAssertEqual(model.maxCompletionTokens, 8_192)
+        XCTAssertEqual(
+            model.pickerCapabilitySummary,
+            "Images · Reasoning · Server tools · Onyx tools unavailable"
+        )
 
         let catalog = ProviderModelDescriptor.openRouterCatalog(
             from: .object([
@@ -78,6 +87,76 @@ final class ProviderCapabilitiesTests: XCTestCase {
         XCTAssertTrue(model.capabilities.supportedParameters.isEmpty)
         XCTAssertTrue(model.capabilityEvidence.isUnknown)
         XCTAssertEqual(model.pickerCapabilitySummary, "Capabilities unknown")
+    }
+
+    func testExactVLLMModelsResponsePreservesServerCapabilitiesAndContextLength() throws {
+        // This is the shape returned by the configured Qwen vLLM endpoint.
+        // Keep the provider-only fields in the fixture so parser changes do
+        // not silently throw away useful metadata when vLLM adds fields.
+        let response = """
+        {
+          "object": "list",
+          "data": [
+            {
+              "id": "Qwen/Qwen3.8-27B-FP8",
+              "object": "model",
+              "created": 1787446223,
+              "owned_by": "vllm",
+              "root": "/root/.cache/huggingface/local/qwen38-official-fp8-017b9c7a",
+              "parent": null,
+              "max_model_len": 262144,
+              "permission": [
+                {
+                  "id": "modelperm-89ef5994b9094a28",
+                  "object": "model_permission",
+                  "created": 1787446223,
+                  "allow_create_engine": false,
+                  "allow_sampling": true,
+                  "allow_logprobs": true,
+                  "allow_search_indices": false,
+                  "allow_view": true,
+                  "allow_fine_tuning": false,
+                  "organization": "*",
+                  "group": null,
+                  "is_blocking": false
+                }
+              ],
+              "capabilities": ["completion", "tool_use"]
+            }
+          ]
+        }
+        """
+        let value = try JSONDecoder().decode(
+            JSONValue.self,
+            from: Data(response.utf8)
+        )
+        let model = try XCTUnwrap(
+            ProviderModelDescriptor.openRouterCatalog(from: value).first
+        )
+
+        XCTAssertEqual(model.id, "Qwen/Qwen3.8-27B-FP8")
+        XCTAssertEqual(model.contextLength, 262_144)
+        XCTAssertEqual(
+            model.capabilities.serverAdvertisedCapabilities,
+            ["completion", "tool_use"]
+        )
+        XCTAssertTrue(model.capabilities.serverAdvertisesToolUse)
+        XCTAssertTrue(model.capabilities.supportedParameters.isEmpty)
+        XCTAssertTrue(model.capabilities.clientUsableParameters.isEmpty)
+        XCTAssertFalse(
+            model.capabilities.supportsClient(.parameter(.tools)),
+            "Server tool metadata must not imply an Onyx-executable tool runtime"
+        )
+        XCTAssertEqual(
+            model.pickerCapabilitySummary,
+            "Server tools · Onyx tools unavailable"
+        )
+
+        let roundTripped = try JSONDecoder().decode(
+            ProviderModelDescriptor.self,
+            from: JSONEncoder().encode(model)
+        )
+        XCTAssertEqual(roundTripped, model)
     }
 
     func testCapabilityEvidenceRoundTripsAndLegacyTextOnlyCatalogDecodesAsUnknown() throws {

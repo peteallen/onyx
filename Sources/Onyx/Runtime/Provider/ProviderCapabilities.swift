@@ -81,17 +81,107 @@ struct ProviderCapabilitySet: Codable, Equatable, Hashable, Sendable {
     let outputModalities: Set<ProviderOutputModality>
     let supportedParameters: Set<ProviderRequestParameter>
     let reasoningEfforts: [String]
+    /// Raw capability names reported by the provider's model catalog. These
+    /// are intentionally kept separate from `supportedParameters`: a server
+    /// can advertise a feature (for example vLLM's `tool_use`) that Onyx does
+    /// not yet implement as a client lifecycle. Unknown names are preserved so
+    /// a newer provider catalog does not silently lose information.
+    let serverAdvertisedCapabilities: [String]
 
     init(
         inputModalities: Set<ProviderInputModality> = [.text],
         outputModalities: Set<ProviderOutputModality> = [.text],
         supportedParameters: Set<ProviderRequestParameter> = [],
-        reasoningEfforts: [String] = []
+        reasoningEfforts: [String] = [],
+        serverAdvertisedCapabilities: [String] = []
     ) {
         self.inputModalities = inputModalities
         self.outputModalities = outputModalities
         self.supportedParameters = supportedParameters
         self.reasoningEfforts = reasoningEfforts
+        self.serverAdvertisedCapabilities = Self.normalizedServerCapabilities(
+            serverAdvertisedCapabilities
+        )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case inputModalities
+        case outputModalities
+        case supportedParameters
+        case reasoningEfforts
+        case serverAdvertisedCapabilities
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            inputModalities: try container.decodeIfPresent(
+                Set<ProviderInputModality>.self,
+                forKey: .inputModalities
+            ) ?? [.text],
+            outputModalities: try container.decodeIfPresent(
+                Set<ProviderOutputModality>.self,
+                forKey: .outputModalities
+            ) ?? [.text],
+            supportedParameters: try container.decodeIfPresent(
+                Set<ProviderRequestParameter>.self,
+                forKey: .supportedParameters
+            ) ?? [],
+            reasoningEfforts: try container.decodeIfPresent(
+                [String].self,
+                forKey: .reasoningEfforts
+            ) ?? [],
+            serverAdvertisedCapabilities: try container.decodeIfPresent(
+                [String].self,
+                forKey: .serverAdvertisedCapabilities
+            ) ?? []
+        )
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(inputModalities, forKey: .inputModalities)
+        try container.encode(outputModalities, forKey: .outputModalities)
+        try container.encode(supportedParameters, forKey: .supportedParameters)
+        try container.encode(reasoningEfforts, forKey: .reasoningEfforts)
+        // Keep older persisted catalogs compact while still decoding the new
+        // field whenever a provider actually advertises it.
+        if !serverAdvertisedCapabilities.isEmpty {
+            try container.encode(serverAdvertisedCapabilities, forKey: .serverAdvertisedCapabilities)
+        }
+    }
+
+    /// A model's remote tool metadata is useful to explain what the server
+    /// can do, but it is not a claim that Onyx can execute or approve tools.
+    var serverAdvertisesToolUse: Bool {
+        supportedParameters.contains(.tools)
+            || supportedParameters.contains(.toolChoice)
+            || serverAdvertisedCapabilities.contains { rawValue in
+                let normalized = rawValue
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+                    .replacingOccurrences(of: "-", with: "_")
+                return normalized == "tool_use"
+                    || normalized == "tools"
+                    || normalized == "function_call"
+                    || normalized == "function_calling"
+            }
+    }
+
+    /// Request parameters that the current OpenAI-compatible adapter can
+    /// actually use. Tool parameters remain server metadata until Onyx has a
+    /// decoder, approval surface, and execution lifecycle for tool calls.
+    var clientUsableParameters: Set<ProviderRequestParameter> {
+        supportedParameters.subtracting([.tools, .toolChoice])
+    }
+
+    private static func normalizedServerCapabilities(_ values: [String]) -> [String] {
+        var seen: Set<String> = []
+        return values.compactMap { rawValue in
+            let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty, seen.insert(value).inserted else { return nil }
+            return value
+        }
     }
 
     func supports(_ requirement: ProviderCapabilityRequirement) -> Bool {
@@ -103,6 +193,18 @@ struct ProviderCapabilitySet: Codable, Equatable, Hashable, Sendable {
         case let .reasoningEffort(effort):
             supportedParameters.contains(.reasoningEffort)
                 && reasoningEfforts.contains(effort)
+        }
+    }
+
+    /// Whether the model metadata is sufficient for a client feature. This
+    /// deliberately refuses server-only tool metadata until the runtime can
+    /// decode and execute the provider's tool-call protocol.
+    func supportsClient(_ requirement: ProviderCapabilityRequirement) -> Bool {
+        switch requirement {
+        case .parameter(.tools), .parameter(.toolChoice):
+            false
+        default:
+            supports(requirement)
         }
     }
 
@@ -172,10 +274,10 @@ struct ProviderCapabilityEvidence: Codable, Equatable, Hashable, Sendable {
 
     func pickerSummary(
         inputModalities: Set<ProviderInputModality>,
-        reasoningEfforts: [String]
+        reasoningEfforts: [String],
+        serverAdvertisedParameters: Set<ProviderRequestParameter> = [],
+        serverAdvertisedCapabilities: [String] = []
     ) -> String {
-        if isUnknown { return "Capabilities unknown" }
-
         var values: [String] = []
         if inputModalitiesAdvertised {
             values.append(inputModalities.contains(.image) ? "Images" : "Text")
@@ -183,6 +285,22 @@ struct ProviderCapabilityEvidence: Codable, Equatable, Hashable, Sendable {
         if reasoningEffortsAdvertised, !reasoningEfforts.isEmpty {
             values.append("Reasoning")
         }
+        let serverAdvertisesToolUse = serverAdvertisedParameters.contains(.tools)
+            || serverAdvertisedParameters.contains(.toolChoice)
+            || serverAdvertisedCapabilities.contains { rawValue in
+                let normalized = rawValue
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+                    .replacingOccurrences(of: "-", with: "_")
+                return normalized == "tool_use"
+                    || normalized == "tools"
+                    || normalized == "function_call"
+                    || normalized == "function_calling"
+            }
+        if serverAdvertisesToolUse {
+            values.append("Server tools · Onyx tools unavailable")
+        }
+        if values.isEmpty, isUnknown { return "Capabilities unknown" }
         if isPartial { values.append("Partial metadata") }
         return values.isEmpty ? "Capability metadata available" : values.joined(separator: " · ")
     }
@@ -204,7 +322,9 @@ struct ProviderModelDescriptor: Identifiable, Codable, Equatable, Hashable, Send
     var pickerCapabilitySummary: String {
         capabilityEvidence.pickerSummary(
             inputModalities: capabilities.inputModalities,
-            reasoningEfforts: capabilities.reasoningEfforts
+            reasoningEfforts: capabilities.reasoningEfforts,
+            serverAdvertisedParameters: capabilities.supportedParameters,
+            serverAdvertisedCapabilities: capabilities.serverAdvertisedCapabilities
         )
     }
 
@@ -293,6 +413,8 @@ struct ProviderModelDescriptor: Identifiable, Codable, Equatable, Hashable, Send
         let supportedParameters = Set(catalogParameters)
         let reasoningEfforts = value["reasoning"]?["supported_efforts"]?.arrayValue?
             .compactMap(\.stringValue) ?? []
+        let serverAdvertisedCapabilities = value["capabilities"]?.arrayValue?
+            .compactMap(\.stringValue) ?? []
 
         return try Self(
             id: id,
@@ -303,7 +425,8 @@ struct ProviderModelDescriptor: Identifiable, Codable, Equatable, Hashable, Send
                 inputModalities: inputModalities,
                 outputModalities: outputModalities,
                 supportedParameters: supportedParameters,
-                reasoningEfforts: reasoningEfforts
+                reasoningEfforts: reasoningEfforts,
+                serverAdvertisedCapabilities: serverAdvertisedCapabilities
             ),
             capabilityEvidence: ProviderCapabilityEvidence(
                 inputModalitiesAdvertised: inputModalitiesAdvertised,
@@ -311,7 +434,12 @@ struct ProviderModelDescriptor: Identifiable, Codable, Equatable, Hashable, Send
                 supportedParametersAdvertised: supportedParametersAdvertised,
                 reasoningEffortsAdvertised: reasoningEffortsAdvertised
             ),
-            contextLength: value["context_length"]?.intValue,
+            // vLLM exposes its context window as `max_model_len`, while
+            // OpenRouter uses `context_length`. Keep one provider-neutral
+            // context field and prefer the canonical OpenRouter value when a
+            // router includes both.
+            contextLength: value["context_length"]?.intValue
+                ?? value["max_model_len"]?.intValue,
             maxCompletionTokens: value["top_provider"]?["max_completion_tokens"]?.intValue
         )
     }

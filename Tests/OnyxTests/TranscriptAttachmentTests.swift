@@ -287,6 +287,47 @@ final class TranscriptAttachmentTests: XCTestCase {
     }
 
     @MainActor
+    func testCompactActivityHeaderEndsWithEllipsisInsideItsAssignedWidth() throws {
+        let item = TimelineItem(
+            id: "narrow-activity",
+            kind: .tool,
+            title: "Started 2 agents",
+            body: "Contrast Audit and Snapshot Review are checking the visual system in parallel.",
+            status: .completed,
+            timestamp: .now,
+            detail: nil
+        )
+        let width: CGFloat = 320
+        let height = TranscriptCellView.height(for: item, width: width, isExpanded: false)
+        let cell = TranscriptCellView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+
+        cell.configure(with: item, isExpanded: false)
+        cell.layout()
+
+        let titleLabel = try XCTUnwrap(
+            cell.subviews
+                .compactMap { $0 as? NSTextField }
+                .first { $0.stringValue.hasPrefix("Started 2 agents") }
+        )
+        XCTAssertTrue(titleLabel.stringValue.hasSuffix("…"))
+        XCTAssertLessThanOrEqual(titleLabel.attributedStringValue.size().width, titleLabel.bounds.width)
+        XCTAssertLessThanOrEqual(titleLabel.frame.maxX, cell.expansionControl.frame.minX)
+    }
+
+    @MainActor
+    func testTailTruncationPreservesComposedCharacters() {
+        let source = NSAttributedString(
+            string: "Reviewing 🧑🏽‍💻 provider capabilities and a deliberately long model name",
+            attributes: [.font: NSFont.systemFont(ofSize: 12)]
+        )
+        let rendered = TranscriptCellView.tailTruncatedSingleLine(source, width: 130)
+
+        XCTAssertTrue(rendered.string.hasSuffix("…"))
+        XCTAssertFalse(rendered.string.contains("�"))
+        XCTAssertLessThanOrEqual(rendered.size().width, 129)
+    }
+
+    @MainActor
     func testPlanStartsAsAQuietProgressLineAndExpandsOnDemand() {
         let plan = TimelineItem(
             id: "active-plan",

@@ -373,7 +373,9 @@ final class OnyxApplicationHost: ObservableObject {
                     defaultReasoningEffort: descriptor.capabilities.reasoningEfforts.first,
                     reasoningEfforts: descriptor.capabilities.reasoningEfforts,
                     inputModalities: descriptor.capabilities.inputModalities,
-                    supportedRequestParameters: descriptor.capabilities.supportedParameters,
+                    serverAdvertisedRequestParameters: descriptor.capabilities.supportedParameters,
+                    supportedRequestParameters: descriptor.capabilities.clientUsableParameters,
+                    serverAdvertisedCapabilities: descriptor.capabilities.serverAdvertisedCapabilities,
                     capabilityEvidence: descriptor.capabilityEvidence
                 )
             }
@@ -508,7 +510,7 @@ final class OnyxApplicationHost: ObservableObject {
         models: [RuntimeModel]
     ) -> [ProviderModelChoice] {
         let usage = modelUsageRecords()
-        return models.map { model in
+        return Self.rankModelChoices(models.map { model in
             let record = usage[modelUsageKey(connectionID: connection.id, modelID: model.id)]
             return ProviderModelChoice(
                 connection: connection,
@@ -516,14 +518,29 @@ final class OnyxApplicationHost: ObservableObject {
                 usageCount: record?.count ?? 0,
                 lastUsedAt: record?.lastUsedAt
             )
-        }
-        .sorted { lhs, rhs in
+        })
+    }
+
+    /// One comparator owns both per-provider sections and the cross-provider
+    /// frequent list. Besides keeping frequently used choices first, this
+    /// prevents a provider's default model from being alphabetically buried
+    /// when the user has no usage history yet.
+    static func rankModelChoices(
+        _ choices: [ProviderModelChoice]
+    ) -> [ProviderModelChoice] {
+        choices.sorted { lhs, rhs in
             if lhs.usageCount != rhs.usageCount { return lhs.usageCount > rhs.usageCount }
             if lhs.lastUsedAt != rhs.lastUsedAt {
                 return (lhs.lastUsedAt ?? .distantPast) > (rhs.lastUsedAt ?? .distantPast)
             }
             if lhs.model.isDefault != rhs.model.isDefault { return lhs.model.isDefault }
-            return lhs.model.displayName.localizedStandardCompare(rhs.model.displayName) == .orderedAscending
+            let modelOrder = lhs.model.displayName.localizedStandardCompare(rhs.model.displayName)
+            if modelOrder != .orderedSame { return modelOrder == .orderedAscending }
+            let providerOrder = lhs.connection.displayName.localizedStandardCompare(
+                rhs.connection.displayName
+            )
+            if providerOrder != .orderedSame { return providerOrder == .orderedAscending }
+            return lhs.id < rhs.id
         }
     }
 
@@ -655,6 +672,7 @@ struct OnyxWindowRootView: View {
     let windowID: WorkspaceWindowID
 
     @StateObject private var windowReference: OnyxWindowReference
+    @ObservedObject private var providerSettingsModel: ProviderSettingsModel
     @State private var selection: ProviderWorkspaceSelection
     @State private var catalogRefreshRevision: UInt64 = 0
     private let host: OnyxApplicationHost
@@ -664,6 +682,7 @@ struct OnyxWindowRootView: View {
     init(windowID: WorkspaceWindowID, host: OnyxApplicationHost) {
         self.windowID = windowID
         _windowReference = StateObject(wrappedValue: OnyxWindowReference())
+        _providerSettingsModel = ObservedObject(wrappedValue: host.providerSettingsModel)
         _selection = State(initialValue: ProviderWorkspaceSelection(
             windowID: windowID,
             model: host.makeWindowModel(for: windowID),
@@ -688,11 +707,8 @@ struct OnyxWindowRootView: View {
                 windowReference: windowReference
             )
         )
-        .task {
+        .task(id: providerSettingsModel.connections) {
             await refreshWorkspaceCatalogs()
-        }
-        .onReceive(host.providerSettingsModel.$connections) { _ in
-            Task { await refreshWorkspaceCatalogs() }
         }
         .onDisappear { selection.model.flushWindowState() }
     }
@@ -721,12 +737,14 @@ struct OnyxWindowRootView: View {
 
     @MainActor
     private func refreshWorkspaceCatalogs() async {
+        guard !Task.isCancelled else { return }
         catalogRefreshRevision &+= 1
         let refreshRevision = catalogRefreshRevision
         async let connectionCatalog = host.workspaceConnectionCatalog()
         async let catalogs = host.cachedProviderModelCatalogs()
         let (loadedConnectionCatalog, loadedCatalogs) = await (connectionCatalog, catalogs)
-        guard catalogRefreshRevision == refreshRevision else { return }
+        guard !Task.isCancelled,
+              catalogRefreshRevision == refreshRevision else { return }
         let loadedConnections = loadedConnectionCatalog.connections
 
         // Publish provider/model choices before loading the complete task
@@ -770,7 +788,8 @@ struct OnyxWindowRootView: View {
             connections: loadedConnections,
             connectionSourceComplete: loadedConnectionCatalog.sourceComplete
         )
-        guard catalogRefreshRevision == refreshRevision else { return }
+        guard !Task.isCancelled,
+              catalogRefreshRevision == refreshRevision else { return }
         for list in cachedTaskCatalog.lists {
             host.projectCatalogModel.replaceTasks(
                 for: list.providerConnectionID,
@@ -879,16 +898,14 @@ private struct ProviderWorkspaceContent: View {
             retaining: catalogs[selection.connectionID] ?? [],
             preferring: model.session?.availableModels
         )
-        return selection.availableConnections.flatMap { connection in
-            host.rankedModelChoices(connection: connection, models: catalogs[connection.id] ?? [])
-        }
-        .sorted { lhs, rhs in
-            if lhs.usageCount != rhs.usageCount { return lhs.usageCount > rhs.usageCount }
-            if lhs.lastUsedAt != rhs.lastUsedAt {
-                return (lhs.lastUsedAt ?? .distantPast) > (rhs.lastUsedAt ?? .distantPast)
+        return OnyxApplicationHost.rankModelChoices(
+            selection.availableConnections.flatMap { connection in
+                host.rankedModelChoices(
+                    connection: connection,
+                    models: catalogs[connection.id] ?? []
+                )
             }
-            return lhs.model.displayName.localizedStandardCompare(rhs.model.displayName) == .orderedAscending
-        }
+        )
     }
 
     @MainActor

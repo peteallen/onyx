@@ -6,7 +6,7 @@ struct ContextInspectorView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 2) {
+            HStack(spacing: 1) {
                 ForEach(InspectorTab.allCases) { tab in
                     Button {
                         model.inspectorTab = tab
@@ -19,7 +19,7 @@ struct ContextInspectorView: View {
                                     : OnyxTheme.inactiveControlText
                             )
                             .frame(maxWidth: .infinity)
-                            .frame(height: 34)
+                            .frame(height: 31)
                             .background {
                                 if model.inspectorTab == tab {
                                     RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -32,9 +32,9 @@ struct ContextInspectorView: View {
                     .accessibilityHint("Shows the \(tab.label.lowercased()) section")
                 }
             }
-            .padding(.horizontal, 14)
-            .padding(.top, 12)
-            .padding(.bottom, 9)
+            .padding(.horizontal, 12)
+            .padding(.top, 10)
+            .padding(.bottom, 8)
             .accessibilityElement(children: .contain)
             .accessibilityLabel("Context panel sections")
 
@@ -49,8 +49,8 @@ struct ContextInspectorView: View {
                         GitDiffViewerView(model: model)
                     }
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 6)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 2)
             }
         }
         .background(OnyxTheme.inspector)
@@ -994,8 +994,8 @@ private struct InspectorSection<Content: View>: View {
             .foregroundStyle(OnyxTheme.quietText)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 4)
-        .padding(.vertical, 13)
+        .padding(.horizontal, 2)
+        .padding(.vertical, 11)
     }
 }
 
@@ -1109,8 +1109,8 @@ private struct InspectorDisclosureSection<Content: View>: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 4)
-        .padding(.vertical, 13)
+        .padding(.horizontal, 2)
+        .padding(.vertical, 11)
     }
 }
 

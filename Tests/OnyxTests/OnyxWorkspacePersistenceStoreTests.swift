@@ -21,6 +21,8 @@ final class OnyxWorkspacePersistenceStoreTests: XCTestCase {
             "threadListScope": "all",
             "selectedThreadID": "legacy-thread",
             "composerDrafts": ["legacy-thread": "Unsent legacy draft"],
+            "taskModelOverrides": ["legacy-thread": "alternate-model"],
+            "taskModelDefaults": ["legacy-thread": "gpt-5"],
             "lastWorkspacePath": "/projects/legacy",
             "terminalHeight": 372.0,
         ]
@@ -67,12 +69,16 @@ final class OnyxWorkspacePersistenceStoreTests: XCTestCase {
         for prefix in [firstPrefix, dormantPrefix] {
             defaults.set("\(prefix)-thread", forKey: "\(prefix).selectedThreadID")
             defaults.set(["\(prefix)-thread": "Draft"], forKey: "\(prefix).composerDrafts")
+            defaults.set(["\(prefix)-thread": "alternate-model"], forKey: "\(prefix).taskModelOverrides")
+            defaults.set(["\(prefix)-thread": "gpt-5"], forKey: "\(prefix).taskModelDefaults")
             defaults.set("/projects/\(prefix)", forKey: "\(prefix).lastWorkspacePath")
             defaults.set(false, forKey: "\(prefix).sidebarVisible")
             defaults.set("gpt-5", forKey: "\(prefix).selectedModelID")
         }
         defaults.set("legacy-thread", forKey: "Onyx.selectedThreadID")
         defaults.set(["legacy-thread": "Legacy draft"], forKey: "Onyx.composerDrafts")
+        defaults.set(["legacy-thread": "alternate-model"], forKey: "Onyx.taskModelOverrides")
+        defaults.set(["legacy-thread": "gpt-5"], forKey: "Onyx.taskModelDefaults")
         defaults.set("/projects/legacy", forKey: "Onyx.lastWorkspacePath")
         defaults.set(true, forKey: "Onyx.sidebarVisible")
 
@@ -82,12 +88,16 @@ final class OnyxWorkspacePersistenceStoreTests: XCTestCase {
         for prefix in [firstPrefix, dormantPrefix] {
             XCTAssertNil(defaults.object(forKey: "\(prefix).selectedThreadID"))
             XCTAssertNil(defaults.object(forKey: "\(prefix).composerDrafts"))
+            XCTAssertNil(defaults.object(forKey: "\(prefix).taskModelOverrides"))
+            XCTAssertNil(defaults.object(forKey: "\(prefix).taskModelDefaults"))
             XCTAssertNil(defaults.object(forKey: "\(prefix).lastWorkspacePath"))
             XCTAssertEqual(defaults.object(forKey: "\(prefix).sidebarVisible") as? Bool, false)
             XCTAssertEqual(defaults.string(forKey: "\(prefix).selectedModelID"), "gpt-5")
         }
         XCTAssertNil(defaults.object(forKey: "Onyx.selectedThreadID"))
         XCTAssertNil(defaults.object(forKey: "Onyx.composerDrafts"))
+        XCTAssertNil(defaults.object(forKey: "Onyx.taskModelOverrides"))
+        XCTAssertNil(defaults.object(forKey: "Onyx.taskModelDefaults"))
         XCTAssertNil(defaults.object(forKey: "Onyx.lastWorkspacePath"))
         XCTAssertEqual(defaults.object(forKey: "Onyx.sidebarVisible") as? Bool, true)
     }

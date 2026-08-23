@@ -1004,7 +1004,12 @@ actor OpenAICompatibleRuntime: AgentRuntime {
                 defaultReasoningEffort: model.capabilities.reasoningEfforts.first,
                 reasoningEfforts: model.capabilities.reasoningEfforts,
                 inputModalities: model.capabilities.inputModalities,
-                supportedRequestParameters: model.capabilities.supportedParameters,
+                serverAdvertisedRequestParameters: model.capabilities.supportedParameters,
+                // Keep server-advertised tool metadata visible for honest
+                // picker copy, but expose only parameters this adapter can
+                // actually negotiate and execute.
+                supportedRequestParameters: model.capabilities.clientUsableParameters,
+                serverAdvertisedCapabilities: model.capabilities.serverAdvertisedCapabilities,
                 capabilityEvidence: model.capabilityEvidence
             )
         }

@@ -198,6 +198,12 @@ final class OnyxAppModel: ObservableObject {
             validateSelectedReasoningEffort()
         }
     }
+    @Published private(set) var taskModelOverrides: [String: String]
+    /// The provider-reported model captured when a task is first overridden.
+    /// Providers update `RuntimeThread.model` after a successful switched
+    /// turn, so deriving the reset target from the live thread would make the
+    /// override replace its own default.
+    @Published private(set) var taskModelDefaults: [String: String]
     @Published var selectedReasoningEffort: String? {
         didSet {
             if let selectedReasoningEffort {
@@ -323,6 +329,8 @@ final class OnyxAppModel: ObservableObject {
         static let bottomPanelVisible = "Onyx.bottomPanelVisible"
         static let inspectorTab = "Onyx.inspectorTab"
         static let selectedModel = "Onyx.selectedModelID"
+        static let taskModelOverrides = "Onyx.taskModelOverrides"
+        static let taskModelDefaults = "Onyx.taskModelDefaults"
         static let reasoningEffort = "Onyx.reasoningEffort"
         static let permissionLabel = "Onyx.permissionLabel"
         static let threadListScope = "Onyx.threadListScope"
@@ -368,12 +376,20 @@ final class OnyxAppModel: ObservableObject {
         let restoredDrafts = defaults.dictionary(
             forKey: preferenceNamespace.key(PreferenceKey.composerDrafts)
         ) as? [String: String] ?? [:]
+        let restoredTaskModelOverrides = defaults.dictionary(
+            forKey: preferenceNamespace.key(PreferenceKey.taskModelOverrides)
+        ) as? [String: String] ?? [:]
+        let restoredTaskModelDefaults = defaults.dictionary(
+            forKey: preferenceNamespace.key(PreferenceKey.taskModelDefaults)
+        ) as? [String: String] ?? [:]
 
         draftWorkspacePath = defaults.string(forKey: preferenceNamespace.key("Onyx.lastWorkspacePath"))
         composerDrafts = restoredDrafts
         composerDraftKey = Self.welcomeThread.id
         composerText = restoredDrafts[Self.welcomeThread.id] ?? ""
         composerImages = []
+        taskModelOverrides = restoredTaskModelOverrides
+        taskModelDefaults = restoredTaskModelDefaults
         isSidebarVisible = Self.boolPreference(
             preferenceNamespace.key(PreferenceKey.sidebarVisible),
             default: true,
@@ -381,7 +397,7 @@ final class OnyxAppModel: ObservableObject {
         )
         isInspectorVisible = Self.boolPreference(
             preferenceNamespace.key(PreferenceKey.inspectorVisible),
-            default: true,
+            default: false,
             defaults: defaults
         )
         isBottomPanelVisible = Self.boolPreference(
@@ -428,15 +444,34 @@ final class OnyxAppModel: ObservableObject {
         threads.first { $0.id == selectedThreadID }
     }
 
-    /// A durable task's model is pinned on its thread.  The window-level
-    /// `selectedModelID` is only the picker state for a new task and must not
-    /// leak into an existing task's label or request.
-    var selectedTaskModelID: String? {
+    /// The model originally recorded by the provider remains the task default.
+    /// A user-selected override applies only to this task and can be reset
+    /// without changing the new-task picker.
+    var selectedTaskDefaultModelID: String? {
+        guard let selectedThread,
+              selectedThread.id != Self.welcomeThread.id else { return nil }
+        let providerDefault = session?.availableModels.first(where: \.isDefault)?.id
+            ?? session?.availableModels.first?.id
+        guard let rawModel = taskModelDefaults[selectedThread.id]
+            ?? selectedThread.model
+            ?? providerDefault else { return nil }
+        let model = rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !model.isEmpty else { return nil }
+        return model
+    }
+
+    var selectedTaskModelOverrideID: String? {
         guard let selectedThread,
               selectedThread.id != Self.welcomeThread.id,
-              let model = selectedThread.model?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let model = taskModelOverrides[selectedThread.id]?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+              ),
               !model.isEmpty else { return nil }
         return model
+    }
+
+    var selectedTaskModelID: String? {
+        selectedTaskModelOverrideID ?? selectedTaskDefaultModelID
     }
 
     var selectedPlan: RuntimePlan? {
@@ -794,6 +829,42 @@ final class OnyxAppModel: ObservableObject {
 
     func selectModel(_ id: String) {
         selectedModelID = id
+    }
+
+    func selectTaskModel(_ id: String) {
+        guard let selectedThread,
+              selectedThread.id != Self.welcomeThread.id else { return }
+        let modelID = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !modelID.isEmpty else { return }
+
+        var updated = taskModelOverrides
+        var updatedDefaults = taskModelDefaults
+        let taskDefaultModelID = selectedTaskDefaultModelID
+        if modelID == taskDefaultModelID {
+            updated.removeValue(forKey: selectedThread.id)
+        } else {
+            // Preserve the provider-recorded model before the runtime can
+            // publish this override back onto `RuntimeThread.model`.
+            if updatedDefaults[selectedThread.id] == nil,
+               let taskDefaultModelID {
+                updatedDefaults[selectedThread.id] = taskDefaultModelID
+            }
+            updated[selectedThread.id] = modelID
+        }
+        guard updated != taskModelOverrides || updatedDefaults != taskModelDefaults else { return }
+        taskModelOverrides = updated
+        taskModelDefaults = updatedDefaults
+        persistTaskModelSelections()
+        validateSelectedReasoningEffort()
+    }
+
+    func resetSelectedTaskModel() {
+        guard let threadID = selectedThread?.id,
+              threadID != Self.welcomeThread.id,
+              taskModelOverrides[threadID] != nil else { return }
+        taskModelOverrides.removeValue(forKey: threadID)
+        persistTaskModelSelections()
+        validateSelectedReasoningEffort()
     }
 
     /// Captures only the welcome-task state that is safe to carry between
@@ -1564,7 +1635,8 @@ final class OnyxAppModel: ObservableObject {
             // choice. This keeps the request and its usage attribution
             // aligned even when the user never opens the picker.
             // Existing tasks are pinned to the model recorded on their
-            // thread. The window picker only chooses a model for a new task.
+            // thread unless this task has an explicit per-task override. The
+            // window picker only chooses a model for a new task.
             modelID: selectedTaskModelID ?? selectedRuntimeModel?.id ?? selectedModelID,
             reasoningEffort: selectedReasoningEffort,
             sandboxMode: selectedSandboxMode,
@@ -1598,7 +1670,7 @@ final class OnyxAppModel: ObservableObject {
             // established model. A fresh turn uses the model captured at send
             // time, so changing the picker while the request is in flight
             // cannot misattribute the usage.
-            var modelUsed = originThread?.model ?? context.modelID
+            var modelUsed = context.modelID ?? originThread?.model
             do {
                 if context.isNewThread {
                     guard let cwd = context.cwd else { return }
@@ -1629,6 +1701,9 @@ final class OnyxAppModel: ObservableObject {
 
                 guard let threadID = targetThreadID else { return }
                 if context.wasTurnRunning {
+                    // Steering has no model field, so an override selected
+                    // while a turn is active applies to the next fresh turn.
+                    modelUsed = originThread?.model ?? context.modelID
                     if !context.images.isEmpty,
                        selectedThreadID == threadID,
                        navigationRevision == context.navigationRevision {
@@ -1652,7 +1727,9 @@ final class OnyxAppModel: ObservableObject {
                     if !createdThread {
                         let conversation = try await runtime.resumeThread(id: threadID)
                         guard accountEpoch == context.accountEpoch, !Task.isCancelled else { return }
-                        modelUsed = conversation.thread.model ?? modelUsed
+                        modelUsed = context.modelID
+                            ?? conversation.thread.model
+                            ?? modelUsed
                         if selectedThreadID == threadID,
                            navigationRevision == context.navigationRevision {
                             replaceTimeline(conversation.items, authoritativeFor: conversation.thread.id)
@@ -2179,7 +2256,10 @@ final class OnyxAppModel: ObservableObject {
             plansByThreadID.removeValue(forKey: threadID)
             composerDrafts.removeValue(forKey: threadID)
             composerImageDrafts.removeValue(forKey: threadID)
+            taskModelOverrides.removeValue(forKey: threadID)
+            taskModelDefaults.removeValue(forKey: threadID)
             preferences.set(composerDrafts, forKey: preferenceKey(PreferenceKey.composerDrafts))
+            persistTaskModelSelections()
         case let .threadRefreshRequested(threadID):
             guard authState.canRun, !isSigningOut else { return }
             refreshThreadIfSelected(threadID)
@@ -2295,6 +2375,15 @@ final class OnyxAppModel: ObservableObject {
 
         switch event {
         case let .itemStarted(threadID, item) where threadID == sideThreadID:
+            var item = item
+            if let earlyDelta = sideChatPendingDeltas[item.id],
+               !earlyDelta.isEmpty,
+               !item.body.hasSuffix(earlyDelta) {
+                // Provider notifications can cross the actor boundary in the
+                // opposite order from their wire writes. Preserve text already
+                // rendered from an early delta when the matching start arrives.
+                item.body += earlyDelta
+            }
             if item.kind == .userMessage,
                let optimisticIndex = sideChatTimeline.lastIndex(where: {
                    $0.id.hasPrefix("side-optimistic:") && $0.body == item.body
@@ -2946,7 +3035,10 @@ final class OnyxAppModel: ObservableObject {
             pinnedThreadStore.remove(id)
             composerDrafts.removeValue(forKey: id)
             composerImageDrafts.removeValue(forKey: id)
+            taskModelOverrides.removeValue(forKey: id)
+            taskModelDefaults.removeValue(forKey: id)
             preferences.set(composerDrafts, forKey: preferenceKey(PreferenceKey.composerDrafts))
+            persistTaskModelSelections()
         } catch {
             guard accountEpoch == epoch, !Task.isCancelled else { return }
             notice = ("Could not delete task", error.localizedDescription)
@@ -3023,6 +3115,22 @@ final class OnyxAppModel: ObservableObject {
         modelUsageRecorder(modelID)
     }
 
+    private func persistTaskModelSelections() {
+        let overrideKey = preferenceKey(PreferenceKey.taskModelOverrides)
+        if taskModelOverrides.isEmpty {
+            preferences.removeObject(forKey: overrideKey)
+        } else {
+            preferences.set(taskModelOverrides, forKey: overrideKey)
+        }
+
+        let defaultKey = preferenceKey(PreferenceKey.taskModelDefaults)
+        if taskModelDefaults.isEmpty {
+            preferences.removeObject(forKey: defaultKey)
+        } else {
+            preferences.set(taskModelDefaults, forKey: defaultKey)
+        }
+    }
+
     /// Closes the local account boundary after the provider has confirmed
     /// logout. No task, transcript, draft, workspace, or async completion from
     /// the previous account may remain visible in the signed-out window.
@@ -3064,6 +3172,8 @@ final class OnyxAppModel: ObservableObject {
 
         composerDrafts.removeAll()
         composerImageDrafts.removeAll()
+        taskModelOverrides.removeAll()
+        taskModelDefaults.removeAll()
         pinnedThreadStore.removeAll()
         plansByThreadID.removeAll()
         draftWorkspacePath = nil
@@ -3087,6 +3197,8 @@ final class OnyxAppModel: ObservableObject {
 
         preferences.removeObject(forKey: preferenceKey(PreferenceKey.selectedThread))
         preferences.removeObject(forKey: preferenceKey(PreferenceKey.composerDrafts))
+        preferences.removeObject(forKey: preferenceKey(PreferenceKey.taskModelOverrides))
+        preferences.removeObject(forKey: preferenceKey(PreferenceKey.taskModelDefaults))
         preferences.removeObject(forKey: preferenceKey("Onyx.lastWorkspacePath"))
     }
 

@@ -72,7 +72,7 @@ struct OnyxWorkspaceView: View {
 
     var body: some View {
         GeometryReader { proxy in
-            let isCompact = proxy.size.width < WorkspacePaneLayout.compactBreakpoint
+            let isCompact = WorkspacePaneLayout.isCompact(totalWidth: proxy.size.width)
             let showSidebar = WorkspacePaneLayout.isSidebarDisplayed(
                 sidebarRequested: model.isSidebarVisible,
                 inspectorVisible: model.isInspectorVisible,
@@ -365,10 +365,9 @@ struct OnyxWorkspaceView: View {
     }
 }
 
-/// Gives the context surface the same visual breathing room as the native
-/// Codex workspace without changing the pane's persisted width or compact
-/// layout rules. The chrome is inset at wide widths so it reads as one quiet
-/// sheet instead of a second full-height application column.
+/// The inspector is supporting context, not a second dashboard. On roomy
+/// windows it floats as one restrained utility sheet; the sections inside stay
+/// flat so the inset does not reintroduce a stack of competing cards.
 private struct InspectorWorkspacePane: View {
     @ObservedObject var model: OnyxAppModel
     let width: CGFloat
@@ -384,11 +383,16 @@ private struct InspectorWorkspacePane: View {
             } else {
                 ContextInspectorView(model: model)
                     .frame(width: max(0, width - inset * 2))
-                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                     .overlay {
-                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
                             .stroke(OnyxTheme.border, lineWidth: OnyxTheme.hairline)
                     }
+                    .shadow(
+                        color: Color.black.opacity(0.10),
+                        radius: 12,
+                        y: 5
+                    )
                     .padding(inset)
             }
         }

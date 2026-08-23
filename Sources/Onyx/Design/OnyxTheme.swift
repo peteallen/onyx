@@ -58,13 +58,20 @@ enum OnyxTheme {
         light: NSColor.white
     )
 
+    /// The composer is the primary action surface. It needs a little more
+    /// separation than transcript activity without turning into a bright card.
+    static let composerSurface = adaptiveColor(
+        dark: NSColor(srgbRed: 0.075, green: 0.076, blue: 0.081, alpha: 1),
+        light: NSColor.white
+    )
+
     static let chrome = adaptiveColor(
         dark: NSColor(srgbRed: 0.043, green: 0.044, blue: 0.047, alpha: 1),
         light: NSColor(srgbRed: 0.971, green: 0.972, blue: 0.975, alpha: 1)
     )
     static let inspector = adaptiveColor(
-        dark: NSColor(srgbRed: 0.062, green: 0.063, blue: 0.068, alpha: 1),
-        light: NSColor(srgbRed: 0.957, green: 0.958, blue: 0.961, alpha: 1)
+        dark: NSColor(srgbRed: 0.076, green: 0.077, blue: 0.082, alpha: 1),
+        light: NSColor(srgbRed: 0.984, green: 0.985, blue: 0.988, alpha: 1)
     )
     static let border = Color.primary.opacity(0.065)
     static let divider = Color.primary.opacity(0.055)

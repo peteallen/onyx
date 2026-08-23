@@ -120,6 +120,9 @@ final class OnyxAppModelAuthBoundaryTests: XCTestCase {
         await waitUntil("The interaction did not reach the app model") {
             model.pendingUserInteractions == [AuthBoundaryFixture.interaction]
         }
+        model.selectTaskModel("account-a-private-override")
+        XCTAssertEqual(model.selectedTaskModelOverrideID, "account-a-private-override")
+        XCTAssertEqual(model.selectedTaskDefaultModelID, "test-model")
 
         model.signOut()
         await fixture.runtime.waitForRefreshToFinish()
@@ -144,8 +147,12 @@ final class OnyxAppModelAuthBoundaryTests: XCTestCase {
         XCTAssertEqual(model.timeline.map(\.id), ["onyx-welcome"])
         XCTAssertEqual(model.composerText, "")
         XCTAssertNil(model.draftWorkspacePath)
+        XCTAssertTrue(model.taskModelOverrides.isEmpty)
+        XCTAssertTrue(model.taskModelDefaults.isEmpty)
         XCTAssertNil(fixture.defaults.object(forKey: "Onyx.selectedThreadID"))
         XCTAssertNil(fixture.defaults.object(forKey: "Onyx.composerDrafts"))
+        XCTAssertNil(fixture.defaults.object(forKey: "Onyx.taskModelOverrides"))
+        XCTAssertNil(fixture.defaults.object(forKey: "Onyx.taskModelDefaults"))
         XCTAssertNil(fixture.defaults.object(forKey: "Onyx.lastWorkspacePath"))
         XCTAssertNil(fixture.defaults.object(forKey: "Onyx.pinnedThreadIDs"))
     }

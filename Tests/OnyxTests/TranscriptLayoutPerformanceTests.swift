@@ -1,8 +1,118 @@
 import AppKit
+import SwiftUI
 import XCTest
 @testable import Onyx
 
 final class TranscriptLayoutPerformanceTests: XCTestCase {
+    @MainActor
+    func testHostingViewSurvivesRepeatedRowChangesDuringLayout() throws {
+        let fixture = TranscriptLayoutMutationFixture()
+        let hostingView = NSHostingView(
+            rootView: TranscriptLayoutMutationHarness(fixture: fixture)
+        )
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 480),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        // The test owns this window through ARC. Letting `close()` also
+        // release it produces a false post-test over-release in XCTest's
+        // object-lifetime checker.
+        window.isReleasedWhenClosed = false
+        window.contentView = hostingView
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+
+        func layout(width: CGFloat = 720) {
+            window.setContentSize(NSSize(width: width, height: 480))
+            hostingView.needsLayout = true
+            hostingView.layoutSubtreeIfNeeded()
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.002))
+            hostingView.layoutSubtreeIfNeeded()
+        }
+
+        layout()
+        let collectionView = try XCTUnwrap(
+            hostingView.firstDescendant(ofType: NSCollectionView.self)
+        )
+        XCTAssertEqual(collectionView.numberOfItems(inSection: 0), 1)
+
+        // Exercise the reloadData paths that insert and remove the inline
+        // pending row around the provider's first visible token.
+        fixture.isAwaitingResponse = true
+        layout()
+        XCTAssertEqual(collectionView.numberOfItems(inSection: 0), 2)
+
+        fixture.appendAssistant(body: "", status: .running)
+        layout(width: 520)
+        XCTAssertEqual(collectionView.numberOfItems(inSection: 0), 3)
+
+        fixture.mutateTail(body: "First visible token", status: .running)
+        layout(width: 900)
+        XCTAssertEqual(collectionView.numberOfItems(inSection: 0), 2)
+
+        for step in 1...40 {
+            fixture.advance(step: step)
+            layout(width: step.isMultiple(of: 2) ? 520 : 900)
+        }
+        XCTAssertTrue(fixture.snapshot.items[1].body.contains("update 40"))
+
+        fixture.isAwaitingResponse = false
+        fixture.mutateTail(body: "Streaming complete", status: .completed)
+        layout()
+
+        // Exercise both ways activity topology changes: appending the second
+        // completed activity creates a group, and completing a running tail
+        // turns an existing row into a grouped child.
+        fixture.appendActivity(id: "group-one-command", kind: .command, status: .completed)
+        layout(width: 520)
+        fixture.appendActivity(id: "group-one-tool", kind: .tool, status: .completed)
+        layout(width: 900)
+
+        fixture.appendAssistant(body: "Activity boundary", status: .completed)
+        layout()
+        fixture.appendActivity(id: "group-two-command", kind: .command, status: .completed)
+        layout(width: 520)
+        fixture.appendActivity(id: "group-two-tool", kind: .tool, status: .running)
+        layout(width: 900)
+        fixture.mutateTail(body: "Tool finished", status: .completed)
+        layout()
+
+        let contentSize = collectionView.collectionViewLayout?.collectionViewContentSize ?? .zero
+        XCTAssertTrue(contentSize.width.isFinite)
+        XCTAssertTrue(contentSize.height.isFinite)
+        XCTAssertGreaterThanOrEqual(contentSize.width, 0)
+        XCTAssertGreaterThanOrEqual(contentSize.height, 0)
+        XCTAssertGreaterThan(fixture.snapshot.revision, 41)
+        XCTAssertEqual(fixture.snapshot.items[1].body, "Streaming complete")
+
+        // Drain deferred follow-scroll work before releasing the AppKit host.
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
+    }
+
+    func testFlowMetricsAlwaysLeaveStrictLayoutWidth() {
+        for collectionWidth: CGFloat in [0, 0.5, 1, 2, 48, 320, 520, 720, 900, 1_200] {
+            let metrics = TranscriptFlowMetrics(collectionWidth: collectionWidth)
+
+            XCTAssertTrue(metrics.itemWidth.isFinite)
+            XCTAssertTrue(metrics.horizontalInset.isFinite)
+            XCTAssertGreaterThanOrEqual(metrics.itemWidth, 0)
+            XCTAssertGreaterThanOrEqual(metrics.horizontalInset, 0)
+            if collectionWidth > TranscriptFlowMetrics.layoutSafetyWidth {
+                XCTAssertLessThan(
+                    metrics.itemWidth + metrics.horizontalInset * 2,
+                    collectionWidth
+                )
+            } else {
+                XCTAssertEqual(metrics.itemWidth, 0)
+                XCTAssertEqual(metrics.horizontalInset, 0)
+            }
+        }
+    }
+
     @MainActor
     func testExpansionIsPartOfHeightCacheAndInvalidatesOnlyTheToggledRow() {
         let item = TimelineItem(
@@ -474,5 +584,102 @@ final class TranscriptLayoutPerformanceTests: XCTestCase {
             timestamp: Date(timeIntervalSince1970: 1_000),
             detail: nil
         )
+    }
+}
+
+@MainActor
+private final class TranscriptLayoutMutationFixture: ObservableObject {
+    @Published var isAwaitingResponse = false
+    @Published var snapshot = TranscriptPresentationSnapshot(
+        items: [
+            TimelineItem(
+                id: "hosting-layout-user",
+                kind: .userMessage,
+                title: nil,
+                body: "Keep the transcript responsive.",
+                status: .completed,
+                timestamp: Date(timeIntervalSince1970: 1_000),
+                detail: nil
+            ),
+        ],
+        revision: 1
+    )
+
+    func advance(step: Int) {
+        mutateTail(
+            body: String(repeating: "streamed update \(step) ", count: 1 + step % 6),
+            status: step.isMultiple(of: 4) ? .completed : .running
+        )
+    }
+
+    func appendAssistant(body: String, status: TimelineItemStatus) {
+        var next = snapshot
+        next.append(
+            TimelineItem(
+                id: "hosting-layout-assistant-\(next.items.count)",
+                kind: .assistantMessage,
+                title: nil,
+                body: body,
+                status: status,
+                timestamp: Date(timeIntervalSince1970: 1_000 + Double(next.items.count)),
+                detail: nil
+            )
+        )
+        snapshot = next
+    }
+
+    func appendActivity(
+        id: String,
+        kind: TimelineItemKind,
+        status: TimelineItemStatus
+    ) {
+        var next = snapshot
+        next.append(
+            TimelineItem(
+                id: id,
+                kind: kind,
+                title: kind == .command ? "Run command" : "Use tool",
+                body: status == .running ? "Working" : "Finished",
+                status: status,
+                timestamp: Date(timeIntervalSince1970: 1_000 + Double(next.items.count)),
+                detail: nil
+            )
+        )
+        snapshot = next
+    }
+
+    func mutateTail(body: String, status: TimelineItemStatus) {
+        var next = snapshot
+        let index = next.items.count - 1
+        next.mutateRows(IndexSet(integer: index)) { items in
+            items[index].body = body
+            items[index].status = status
+        }
+        snapshot = next
+    }
+}
+
+private struct TranscriptLayoutMutationHarness: View {
+    @ObservedObject var fixture: TranscriptLayoutMutationFixture
+
+    var body: some View {
+        NativeTranscriptView(
+            items: fixture.snapshot.items,
+            isAwaitingResponse: fixture.isAwaitingResponse,
+            revision: fixture.snapshot.revision,
+            changeHint: fixture.snapshot.changeHint
+        )
+    }
+}
+
+private extension NSView {
+    func firstDescendant<View: NSView>(ofType type: View.Type) -> View? {
+        if let match = self as? View { return match }
+        for subview in subviews {
+            if let match = subview.firstDescendant(ofType: type) {
+                return match
+            }
+        }
+        return nil
     }
 }

@@ -304,13 +304,16 @@ final class OpenAICompatibleRuntimeTests: XCTestCase {
             }
             return .json(body: """
             {
-              "data": [{
-                "id": "fixture-model",
-                "architecture": {
-                  "input_modalities": ["text", "image"],
-                  "output_modalities": ["text"]
-                }
-              }]
+                "data": [{
+                  "id": "fixture-model",
+                  "architecture": {
+                    "input_modalities": ["text", "image"],
+                    "output_modalities": ["text"]
+                  },
+                  "supported_parameters": ["tools", "tool_choice"],
+                  "capabilities": ["completion", "tool_use"],
+                  "max_model_len": 262144
+                }]
             }
             """)
         }
@@ -326,7 +329,27 @@ final class OpenAICompatibleRuntimeTests: XCTestCase {
         let snapshot = try await runtime.connect()
 
         XCTAssertTrue(snapshot.capabilities.contains(.images))
+        XCTAssertFalse(snapshot.capabilities.contains(.tools))
         XCTAssertTrue(snapshot.availableModels.first?.inputModalities.contains(.image) == true)
+        XCTAssertEqual(
+            snapshot.availableModels.first?.serverAdvertisedCapabilities,
+            ["completion", "tool_use"]
+        )
+        XCTAssertEqual(
+            snapshot.availableModels.first?.serverAdvertisedRequestParameters,
+            [.tools, .toolChoice]
+        )
+        XCTAssertTrue(snapshot.availableModels.first?.serverAdvertisesToolUse == true)
+        XCTAssertEqual(
+            snapshot.availableModels.first?.pickerCapabilitySummary,
+            "Images · Server tools · Onyx tools unavailable · Partial metadata"
+        )
+        XCTAssertFalse(
+            snapshot.availableModels.first?.supportedRequestParameters.contains(.tools) == true
+        )
+        XCTAssertFalse(
+            snapshot.availableModels.first?.supportedRequestParameters.contains(.toolChoice) == true
+        )
     }
 
     func testFollowUpRequestRetainsResolvedOrderedImageHistoryAfterPersistence() async throws {
