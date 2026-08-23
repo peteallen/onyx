@@ -56,7 +56,8 @@ enabling work only, not a completed user surface.
 - [ ] Relaunch-persistent background terminal sessions and full terminal emulation
 - [x] Bounded project file browser with native open and Finder reveal
 - [x] Files-inspector quick-open search and bounded, numbered, selectable UTF-8 source preview
-- [ ] Global Command-P, syntax highlighting, symbol search, and code navigation
+- [x] Global Command-P quick open with window-local shared indexing and off-main bounded search
+- [ ] Syntax highlighting, symbol search, and code navigation
 - [x] Image thumbnails and accessible previews
 - [ ] Audio, PDF, document, and visualization presentation
 

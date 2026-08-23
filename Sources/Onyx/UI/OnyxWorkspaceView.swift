@@ -5,10 +5,13 @@ struct OnyxWorkspaceView: View {
     @ObservedObject private var projectCatalog: ProjectCatalogModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var terminalSession = TerminalSessionModel()
+    @StateObject private var sourceNavigator = ProjectSourceNavigatorModel()
     @State private var storedTerminalHeight: Double
     @State private var storedSidebarWidth: Double
     @State private var storedInspectorWidth: Double
     @State private var searchFocusRequest = 0
+    @State private var quickOpenFocusRequest = 0
+    @State private var isQuickOpenPresented = false
     @State private var isCompactLayout = false
     private let terminalHeightPreferenceKey: String
     private let sidebarWidthPreferenceKey: String
@@ -147,6 +150,7 @@ struct OnyxWorkspaceView: View {
                             )
                             InspectorWorkspacePane(
                                 model: model,
+                                sourceNavigator: sourceNavigator,
                                 width: inspectorWidth
                             )
                                 .frame(maxHeight: .infinity, alignment: .top)
@@ -170,6 +174,18 @@ struct OnyxWorkspaceView: View {
                             .frame(height: CGFloat(storedTerminalHeight))
                             .transition(reduceMotion ? .identity : .move(edge: .bottom).combined(with: .opacity))
                     }
+                }
+            }
+            .overlay {
+                if isQuickOpenPresented {
+                    ProjectQuickOpenView(
+                        navigator: sourceNavigator,
+                        projectPath: currentProjectPath,
+                        focusRequest: quickOpenFocusRequest,
+                        chooseProject: chooseProject,
+                        dismiss: { isQuickOpenPresented = false },
+                        open: openQuickOpenResult
+                    )
                 }
             }
             .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: model.isSidebarVisible)
@@ -282,14 +298,10 @@ struct OnyxWorkspaceView: View {
         .workspace(
             model: model,
             windowProvider: windowProvider,
-            openProject: {
-                projectCatalog.chooseAndImportProject(
-                    window: windowProvider(),
-                    initialFolderPath: model.draftWorkspacePath,
-                    onFailure: presentProjectFailure
-                ) { imported in
-                    model.selectWorkspace(imported.folderPath)
-                }
+            openProject: chooseProject,
+            openQuickOpen: {
+                isQuickOpenPresented = true
+                quickOpenFocusRequest += 1
             },
             focusTaskSearch: {
                 let sidebarDisplayed = WorkspacePaneLayout.isSidebarDisplayed(
@@ -310,6 +322,30 @@ struct OnyxWorkspaceView: View {
                 )
                 toggleSidebar(sidebarDisplayed: sidebarDisplayed, isCompact: isCompactLayout)
             }
+        )
+    }
+
+    private var currentProjectPath: String? {
+        model.selectedProjectPath
+    }
+
+    private func chooseProject() {
+        projectCatalog.chooseAndImportProject(
+            window: windowProvider(),
+            initialFolderPath: model.draftWorkspacePath,
+            onFailure: presentProjectFailure
+        ) { imported in
+            model.selectWorkspace(imported.folderPath)
+        }
+    }
+
+    @MainActor
+    private func openQuickOpenResult(_ file: ProjectSourceFile) {
+        isQuickOpenPresented = false
+        ProjectQuickOpenWorkspaceRouting.open(
+            file,
+            model: model,
+            navigator: sourceNavigator
         )
     }
 
@@ -366,10 +402,11 @@ struct OnyxWorkspaceView: View {
 /// full available height when the user explicitly opens them.
 private struct InspectorWorkspacePane: View {
     @ObservedObject var model: OnyxAppModel
+    @ObservedObject var sourceNavigator: ProjectSourceNavigatorModel
     let width: CGFloat
 
     var body: some View {
-        ContextInspectorView(model: model)
+        ContextInspectorView(model: model, sourceNavigator: sourceNavigator)
             .frame(width: width)
         .frame(width: width)
         .frame(maxHeight: .infinity, alignment: .top)

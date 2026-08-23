@@ -830,9 +830,18 @@ final class OnyxMultiwindowTests: XCTestCase {
             defaults: suite.defaults,
             preferenceKeyPrefix: WorkspaceWindowID().preferenceKeyPrefix
         )
+        var firstQuickOpenCount = 0
+        var secondQuickOpenCount = 0
         let firstCommands = OnyxWindowCommandContext.workspace(
             model: first,
             windowProvider: { nil },
+            openQuickOpen: { firstQuickOpenCount += 1 },
+            focusTaskSearch: {}
+        )
+        let secondCommands = OnyxWindowCommandContext.workspace(
+            model: second,
+            windowProvider: { nil },
+            openQuickOpen: { secondQuickOpenCount += 1 },
             focusTaskSearch: {}
         )
 
@@ -841,6 +850,14 @@ final class OnyxMultiwindowTests: XCTestCase {
         firstCommands.toggleTerminal()
         XCTAssertTrue(first.isBottomPanelVisible)
         XCTAssertFalse(second.isBottomPanelVisible)
+
+        firstCommands.openQuickOpen()
+        XCTAssertEqual(firstQuickOpenCount, 1)
+        XCTAssertEqual(secondQuickOpenCount, 0)
+
+        secondCommands.openQuickOpen()
+        XCTAssertEqual(firstQuickOpenCount, 1)
+        XCTAssertEqual(secondQuickOpenCount, 1)
     }
 
     private func seedWindow(

@@ -364,7 +364,7 @@ struct GitDiffViewerView: View {
     @State private var pendingDiscard: GitDiffFile?
 
     private var projectPath: String? {
-        model.selectedThread?.cwd ?? model.draftWorkspacePath
+        model.selectedProjectPath
     }
 
     var body: some View {

@@ -150,13 +150,21 @@ Status values: **Open**, **In progress**, **Blocked**, **Done**, **Deferred**.
 - **Acceptance:** Opening Review alone never reads the project or prompts for folder access; the pane names the exact project before inspection; choosing inspection reads only that checkout and explains why macOS may show a protected-folder prompt.
 - **Verification:** Automated review-model coverage confirms project preparation performs no filesystem read until the explicit action. Canonical-preview verification in a Documents-hosted checkout is still pending.
 
+### UI-017 — Project files need an immediate global quick open
+
+- **Status:** In progress
+- **Problem:** Opening a known project file requires navigating to the Files inspector and manually searching there, which interrupts keyboard-driven work.
+- **Decision:** Command-P opens a restrained, window-local file palette immediately and focuses its search field before any project indexing begins. The palette and Files inspector share one bounded source navigator; indexing and ranked search stay off the main actor, superseded work is cancelled, and no more than 40 matches are published.
+- **Acceptance:** Command-P works from an active task or new-task workspace; arrow keys move the selection; Return reveals the Files inspector and previews the selected file; Escape closes without changing the previously visible panes, inspector tab, or file preview; a missing project has a clear state; an existing task without a provider workspace never inherits the new-task draft project; typing remains responsive with 4,000 indexed files.
+- **Verification:** Hosted coverage confirms the palette and its immediately focusable native search field paint while a delayed 4,000-file index is still running; after the XCTest host installs that field editor, native arrow/Return opens the selected result and Escape dismisses without opening a file or losing the Files inspector's prior query. Typing only schedules off-main ranking, results stay capped at 40, stale rows are removed before a replacement query finishes, superseded project indexes are cancelled, and command routing remains window-local. Search-model coverage also protects stale-query rejection and shared indexing for an unchanged project. Multiwindow coverage confirms a cwd-less existing task cannot reuse a staged new-task project in Files, Review, Terminal, Summary, or Command-P. Automatic focus and the complete flow still require canonical-preview verification.
+
 ### PERF-002 — New Task can beachball the app
 
 - **Status:** In progress
 - **Problem:** Clicking New Task with a large history can block the window instead of immediately presenting a fresh composer.
 - **Decision:** Publish the welcome/composer state synchronously from bounded cached state, keep draft persistence off the interaction path, and reuse rather than restart an in-flight task refresh.
 - **Acceptance:** The first click visibly switches to a usable blank task within one frame where practical; repeated clicks are harmless; the previous draft is preserved; large catalogs do not get synchronously reprojected.
-- **Verification:** Model coverage stays below 50 ms and a hosted 4,824-task click-to-paint check stays below 100 ms. A canonical-preview check with Pete’s real task history is still pending.
+- **Verification:** Model coverage stays below 50 ms and a hosted 4,824-task click-to-paint check stays below 100 ms. The hosted benchmark waits only when SwiftUI genuinely defers mounting the welcome prompt or composer, so unrelated executor scheduling on a busy CI host is not charged to an already-complete paint. A canonical-preview check with Pete’s real task history is still pending.
 
 ### RUNTIME-002 — Repeated use still crashes
 
@@ -253,3 +261,10 @@ Status values: **Open**, **In progress**, **Blocked**, **Done**, **Deferred**.
 - **Decision:** A new task can choose any configured provider/model pair. Once created, the task remains owned by that provider; the user may choose another model exposed by the same provider for a later turn and reset to the recorded task default.
 - **Consequence:** Model selection stays convenient without silently converting or duplicating durable conversation history across providers. Cross-provider continuation remains a separate, explicit future feature.
 - **Verification:** Provider/model picker, restored task binding, next-turn override, reset, usage ranking, and deletion-cleanup regressions must pass for each production adapter.
+
+### D-011 — Global navigation paints before it prepares data
+
+- **Status:** Active
+- **Decision:** Global palettes must become visible and keyboard-ready before starting data preparation. Project indexing is shared per window, search results are bounded and published asynchronously, and stale work cannot replace newer input.
+- **Consequence:** Keyboard navigation never waits for a complete filesystem scan or synchronous path ranking, and opening both Command-P and Files cannot start duplicate indexes for the same project.
+- **Verification:** Hosted large-project coverage must prove the palette mounts promptly while indexing is suspended, plus cancellation, stale-result, result-bound, and shared-index regressions.

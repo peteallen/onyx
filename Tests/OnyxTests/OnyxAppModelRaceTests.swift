@@ -116,7 +116,19 @@ final class OnyxAppModelRaceTests: XCTestCase {
             model.isLoadingThreadList
         }
 
+        let taskIDsBeforeNewTask = Set(model.threads.map(\.id))
+        let clock = ContinuousClock()
+        let clickStart = clock.now
         model.newTask()
+        let clickElapsed = clickStart.duration(to: clock.now)
+
+        XCTAssertEqual(
+            Set(model.threads.map(\.id)),
+            taskIDsBeforeNewTask,
+            "New Task must not synchronously tear down the active catalog while its refresh is suspended."
+        )
+        XCTAssertLessThan(clickElapsed, .milliseconds(50))
+
         await fixture.runtime.releaseSuspendedActiveList()
         await waitUntil("The active refresh did not settle") {
             !model.isLoadingThreadList

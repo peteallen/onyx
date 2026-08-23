@@ -50,8 +50,10 @@ approvals, sandboxing, compaction, and streamed events.
 
 Provider identity is threaded through window restoration, task selection,
 draft preferences, local provider conversations, and model usage ranking.
-Existing tasks are immutable with respect to provider/model switching; the
-unified picker is active only while composing a new task.
+Existing tasks remain bound to their original provider. Their original model is
+the task default, while the unified picker can select another model from that
+provider for a later turn or reset to the default. New tasks can select any
+configured provider/model pair.
 
 A versioned conversation catalog exists as a tested foundation but is not yet
 wired into production task discovery. The shared-runtime coordinator is wired
@@ -153,9 +155,9 @@ line count, directory depth, and visited entries are bounded. Heavy dependency
 folders and directory symlinks are skipped, and canonical path validation
 prevents a preview from escaping the selected workspace.
 
-This is an inspector-local navigation surface. It does not provide a global
-Command-P palette, syntax highlighting, symbol search, go-to-definition, or
-other code navigation.
+The Files inspector and window-local Command-P palette share this bounded source
+navigator. The palette does not provide syntax highlighting, symbol search,
+go-to-definition, or other code navigation.
 
 ## UI performance mechanisms and targets
 

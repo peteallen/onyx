@@ -18,8 +18,9 @@ the new-task picker shows frequent and recent models first, then every cached
 model grouped by provider, and switches provider plus model in one action.
 Bearer credentials stay in Keychain, `/models` metadata drives capability-aware
 controls, and provider-owned conversations stream into a local store. Existing
-tasks remain pinned to the provider and model that created them. Claude/
-Anthropic remains a future adapter. See
+tasks stay bound to the provider that created them; their original model remains
+the default, while later turns can use another model from that same provider.
+Claude/Anthropic remains a future adapter. See
 [docs/PROVIDER_EXTENSIBILITY.md](docs/PROVIDER_EXTENSIBILITY.md) for the exact
 boundary.
 
@@ -30,11 +31,12 @@ Codex tasks can open an isolated ephemeral side chat without changing durable
 task history.
 
 Within the Codex path, the Git inspector supports per-file stage, unstage, and
-confirmed recoverable discard; the Files inspector supports project-local
-search and bounded numbered text previews; and explicit HTTP(S) links returned
+confirmed recoverable discard; the Files inspector and global Command-P palette
+share project-local search and bounded numbered text previews; and explicit
+HTTP(S) links returned
 by MCP, dynamic-tool, and web-search results render as native cards. These are
-deliberately scoped slices: there are no inline diff comments, global Command-P
-or syntax navigation, or complete rich-result/approval taxonomy yet.
+deliberately scoped slices: there are no inline diff comments, syntax navigation,
+or complete rich-result/approval taxonomy yet.
 
 ## Build and run the current development preview
 

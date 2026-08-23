@@ -31,7 +31,7 @@ struct TerminalDrawerView: View {
     @FocusState private var isSearchFocused: Bool
 
     private var selectedProjectPath: String? {
-        model.selectedThread?.cwd ?? model.draftWorkspacePath
+        model.selectedProjectPath
     }
 
     private var displayedOutput: String {

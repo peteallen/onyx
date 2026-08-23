@@ -3,6 +3,7 @@ import SwiftUI
 
 struct ContextInspectorView: View {
     @ObservedObject var model: OnyxAppModel
+    @ObservedObject var sourceNavigator: ProjectSourceNavigatorModel
     @State private var summaryContentHeight: CGFloat = 0
 
     private let summaryMaximumHeight: CGFloat = 640
@@ -70,7 +71,7 @@ struct ContextInspectorView: View {
             summarySurface
         case .files:
             inspectorScrollableSurface {
-                FilesInspector(model: model)
+                FilesInspector(model: model, sourceNavigator: sourceNavigator)
             }
         case .review:
             inspectorScrollableSurface {
@@ -211,7 +212,7 @@ private struct SummaryInspector: View {
     }
 
     private var workspacePath: String {
-        model.selectedThread?.cwd ?? model.draftWorkspacePath ?? "No project selected"
+        model.selectedProjectPath ?? "No project selected"
     }
 
     @ViewBuilder
@@ -507,12 +508,12 @@ private struct SummaryInspector: View {
 
 private struct FilesInspector: View {
     @ObservedObject var model: OnyxAppModel
+    @ObservedObject var sourceNavigator: ProjectSourceNavigatorModel
     @Environment(\.onyxWindowPresentationContext) private var windowPresentation
     @StateObject private var fileTree = ProjectFileTreeModel()
-    @StateObject private var sourceNavigator = ProjectSourceNavigatorModel()
 
     private var projectPath: String? {
-        model.selectedThread?.cwd ?? model.draftWorkspacePath
+        model.selectedProjectPath
     }
 
     var body: some View {
@@ -527,7 +528,7 @@ private struct FilesInspector: View {
                         Button("Refresh", systemImage: "arrow.clockwise") {
                             Task {
                                 await fileTree.loadRoot(path: projectPath)
-                                await sourceNavigator.loadRoot(path: projectPath)
+                                await sourceNavigator.reloadRoot(path: projectPath)
                             }
                         }
                         Button("Open in Finder", systemImage: "folder") {
@@ -651,7 +652,13 @@ private struct FilesInspector: View {
             }
         case .loaded:
             let results = sourceNavigator.searchResults
-            if results.isEmpty {
+            if sourceNavigator.isSearching {
+                compactState(
+                    title: "Finding project files",
+                    detail: "Search stays responsive while matches are ranked.",
+                    icon: "magnifyingglass"
+                )
+            } else if results.isEmpty {
                 compactState(
                     title: "No matching files",
                     detail: "Try part of a filename or folder path.",

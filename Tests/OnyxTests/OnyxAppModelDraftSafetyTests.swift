@@ -6,6 +6,38 @@ import XCTest
 
 @MainActor
 final class OnyxAppModelDraftSafetyTests: XCTestCase {
+    func testProjectPathUsesDraftOnlyForNewTask() {
+        let suiteName = "OnyxAppModelDraftSafetyTests.project-path.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set("/previous-project", forKey: "Onyx.lastWorkspacePath")
+        let model = OnyxAppModel(runtime: nil, defaults: defaults)
+
+        XCTAssertEqual(model.selectedProjectPath, "/previous-project")
+
+        model.threads = [
+            RuntimeThread(
+                id: "task-without-project",
+                title: "No project task",
+                preview: "No project task",
+                cwd: nil,
+                updatedAt: Date(),
+                status: .idle,
+                isPinned: false,
+                runtime: .codex,
+                model: "test-model",
+                branch: nil
+            ),
+        ]
+        model.selectedThreadID = "task-without-project"
+
+        XCTAssertNil(
+            model.selectedProjectPath,
+            "A task without a project must not inherit the last new-task project."
+        )
+    }
+
     func testComposerDraftWriterOrdersBackgroundWritesAndRejectsStaleRevisions() throws {
         let suiteName = "OnyxAppModelDraftSafetyTests.writer-order.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -212,18 +244,34 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
         let start = clock.now
 
         try click(at: newTaskButtonPoint, in: window)
+        let welcomePrompt = "What are we building? I can work in this project, inspect its history, run tools, and keep the result grounded in the current checkout."
+        func isWelcomeComposerMounted() -> Bool {
+            hostingView.firstDescendantTextField(withString: welcomePrompt) != nil
+                && hostingView.firstDescendant(ofType: NSTextView.self) != nil
+        }
+
+        // `sendEvent` invokes the SwiftUI action synchronously. In the normal
+        // path one layout pass publishes the welcome surface, so record that
+        // paint immediately. Only pump the main run loop for another render
+        // pass when SwiftUI has genuinely deferred mounting; an unconditional
+        // `Task.yield()` makes the benchmark include unrelated executor
+        // scheduling on busy CI hosts.
         hostingView.needsLayout = true
         hostingView.layoutSubtreeIfNeeded()
-        await Task.yield()
-        hostingView.layoutSubtreeIfNeeded()
+        let deadline = start.advanced(by: .milliseconds(100))
+        while !isWelcomeComposerMounted(), clock.now < deadline {
+            // Pump only the main run loop. This gives SwiftUI/AppKit a chance
+            // to deliver a deferred mount without yielding the cooperative
+            // executor to unrelated background projection work.
+            pumpMainRunLoop(for: 0.001)
+            hostingView.layoutSubtreeIfNeeded()
+        }
         let elapsed = start.duration(to: clock.now)
 
         XCTAssertEqual(model.selectedThreadID, DraftSafetyFixture.welcomeThreadID)
         XCTAssertEqual(model.threadListRevision, taskListRevision)
         XCTAssertNotNil(
-            hostingView.firstDescendantTextField(
-                withString: "What are we building? I can work in this project, inspect its history, run tools, and keep the result grounded in the current checkout."
-            ),
+            hostingView.firstDescendantTextField(withString: welcomePrompt),
             "The hosted transcript did not publish the welcome surface after pressing New task"
         )
         let composer = try XCTUnwrap(hostingView.firstDescendant(ofType: NSTextView.self))
@@ -234,6 +282,13 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
             .milliseconds(100),
             "The hosted New task interaction missed the paint budget: \(elapsed)"
         )
+    }
+
+    /// Foundation marks direct run-loop pumping unavailable from an async
+    /// context. Keep this tiny synchronous bridge local to the hosted test so
+    /// the timing loop can service AppKit without yielding the task executor.
+    private func pumpMainRunLoop(for seconds: TimeInterval) {
+        RunLoop.main.run(mode: .default, before: Date(timeIntervalSinceNow: seconds))
     }
 
     func testRepeatedNewTaskClicksAreIdempotent() async {

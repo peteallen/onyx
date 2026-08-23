@@ -902,10 +902,13 @@ final class OnyxAppModel: ObservableObject {
     }
 
     var projectName: String {
-        let path = selectedThreadID == Self.welcomeThread.id
+        selectedProjectPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "Choose project"
+    }
+
+    var selectedProjectPath: String? {
+        selectedThreadID == Self.welcomeThread.id
             ? draftWorkspacePath
             : selectedThread?.cwd
-        return path.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "Choose project"
     }
 
     var selectedModelName: String {
@@ -1857,7 +1860,13 @@ final class OnyxAppModel: ObservableObject {
         // Mark the list as loading first; the workspace's catalog synchronizer
         // will wait for the active fetch instead of recording a transient
         // archived snapshot under the active scope.
-        let shouldClearCurrentList = threadListScope != .active || isLoadingThreadList
+        // Keep an active catalog mounted while its refresh is in flight. Replacing
+        // a multi-thousand-row `threads` array here makes SwiftUI synchronously
+        // tear down and diff the whole sidebar—the beachball users see when they
+        // click New Task during startup/reconnect. The synthetic welcome row is
+        // projected separately, so the composer can become usable immediately;
+        // the pending refresh will reconcile the durable rows when it completes.
+        let shouldClearCurrentList = threadListScope != .active
         let shouldRefreshActiveList = threadListScope != .active
             || (isLoadingThreadList && !canReuseConnectionRefresh)
         if shouldClearCurrentList {
@@ -4806,6 +4815,14 @@ final class OnyxAppModel: ObservableObject {
     }
 
     private func updateDraftCache(_ text: String, for key: String) {
+        // Navigation often re-saves an unchanged empty draft. Avoid touching a
+        // potentially large dictionary in that case; mutating a shared
+        // UserDefaults snapshot would otherwise trigger a full copy on the
+        // main actor during the New Task click.
+        if composerDrafts[key] == text,
+           pendingComposerDraftMutations[key] == nil {
+            return
+        }
         let mutation = OnyxComposerDraftMutation.replacingDraft(text, for: key)
         pendingComposerDraftMutations[key] = mutation
         if case .remove = mutation {

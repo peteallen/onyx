@@ -36,6 +36,7 @@ struct OnyxApp: App {
 struct OnyxWindowCommandContext {
     let newTask: () -> Void
     let openProject: () -> Void
+    let openQuickOpen: () -> Void
     let focusTaskSearch: () -> Void
     let toggleSidebar: () -> Void
     let toggleInspector: () -> Void
@@ -46,12 +47,14 @@ struct OnyxWindowCommandContext {
         model: OnyxAppModel,
         windowProvider: @escaping @MainActor () -> NSWindow?,
         openProject: (() -> Void)? = nil,
+        openQuickOpen: @escaping () -> Void = {},
         focusTaskSearch: @escaping () -> Void,
         toggleSidebar: (() -> Void)? = nil
     ) -> Self {
         Self(
             newTask: model.newTask,
             openProject: openProject ?? { model.chooseWorkspace(window: windowProvider()) },
+            openQuickOpen: openQuickOpen,
             focusTaskSearch: focusTaskSearch,
             toggleSidebar: toggleSidebar ?? { model.isSidebarVisible.toggle() },
             toggleInspector: { model.isInspectorVisible.toggle() },
@@ -118,6 +121,16 @@ private struct OnyxCommands: Commands {
                 windowCommands?.openProject()
             }
             .keyboardShortcut("o", modifiers: .command)
+            .disabled(windowCommands == nil)
+        }
+
+        // Command-P is Onyx's project quick open. Replacing the standard Print
+        // command avoids two menu items competing for the same key equivalent.
+        CommandGroup(replacing: .printItem) {
+            Button("Quick Open…") {
+                windowCommands?.openQuickOpen()
+            }
+            .keyboardShortcut("p", modifiers: .command)
             .disabled(windowCommands == nil)
         }
 

@@ -173,9 +173,14 @@ struct LocalProjectSourceReader: ProjectSourceReading {
 
     func indexFiles(atRoot rootPath: String) async throws -> ProjectSourceIndexSnapshot {
         let limits = limits
-        return try await Task.detached(priority: .userInitiated) {
+        let task = Task.detached(priority: .userInitiated) {
             try Self.readIndex(atRoot: rootPath, limits: limits)
-        }.value
+        }
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
     }
 
     func previewFile(at path: String, insideRoot rootPath: String) async throws -> ProjectSourcePreview {
@@ -378,16 +383,20 @@ enum ProjectSourceSearch {
     static func matches(
         files: [ProjectSourceFile],
         query: String,
-        limit: Int
+        limit: Int,
+        isCancelled: () -> Bool = { false }
     ) -> [ProjectSourceFile] {
         let foldedQuery = fold(query).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !foldedQuery.isEmpty else { return [] }
         let terms = foldedQuery.split(whereSeparator: \.isWhitespace).map(String.init)
 
-        return files.compactMap { file -> (file: ProjectSourceFile, rank: SearchRank)? in
+        var ranked: [(file: ProjectSourceFile, rank: SearchRank)] = []
+        ranked.reserveCapacity(min(files.count, max(1, limit) * 4))
+        for (offset, file) in files.enumerated() {
+            if offset.isMultiple(of: 64), isCancelled() { return [] }
             let path = fold(file.relativePath)
             let name = fold(file.name)
-            guard terms.allSatisfy({ path.contains($0) }) else { return nil }
+            guard terms.allSatisfy({ path.contains($0) }) else { continue }
 
             let matchClass: Int
             if name == foldedQuery {
@@ -403,9 +412,13 @@ enum ProjectSourceSearch {
             }
             let firstMatch = terms.compactMap { path.range(of: $0)?.lowerBound.utf16Offset(in: path) }.min()
                 ?? Int.max
-            return (file, SearchRank(matchClass: matchClass, firstMatch: firstMatch, length: path.count))
+            ranked.append(
+                (file, SearchRank(matchClass: matchClass, firstMatch: firstMatch, length: path.count))
+            )
         }
-        .sorted { lhs, rhs in
+
+        guard !isCancelled() else { return [] }
+        return ranked.sorted { lhs, rhs in
             if lhs.rank != rhs.rank { return lhs.rank < rhs.rank }
             return lhs.file.relativePath < rhs.file.relativePath
         }
@@ -449,15 +462,28 @@ final class ProjectSourceNavigatorModel: ObservableObject {
         case failed(String)
     }
 
-    @Published var query = ""
+    @Published var query = "" {
+        didSet {
+            guard query != oldValue else { return }
+            scheduleSearch()
+        }
+    }
     @Published private(set) var indexState: IndexState = .noProject
     @Published private(set) var previewState: PreviewState = .none
+    @Published private(set) var searchResults: [ProjectSourceFile] = []
+    @Published private(set) var isSearching = false
 
     private let reader: any ProjectSourceReading
     private let searchResultLimit: Int
     private var rootPath: String?
     private var indexRevision = 0
     private var previewRevision = 0
+    private var searchRevision = 0
+    private var indexTask: Task<ProjectSourceIndexSnapshot, any Error>?
+    private var searchTask: Task<Void, Never>?
+    private var searchCache: [String: [ProjectSourceFile]] = [:]
+    private var searchCacheOrder: [String] = []
+    private let searchCacheLimit = 24
 
     init(
         reader: any ProjectSourceReading = LocalProjectSourceReader(),
@@ -467,31 +493,52 @@ final class ProjectSourceNavigatorModel: ObservableObject {
         self.searchResultLimit = max(1, searchResultLimit)
     }
 
-    var searchResults: [ProjectSourceFile] {
-        guard case let .loaded(snapshot) = indexState else { return [] }
-        return ProjectSourceSearch.matches(
-            files: snapshot.files,
-            query: query,
-            limit: searchResultLimit
-        )
-    }
-
     var indexWasTruncated: Bool {
         guard case let .loaded(snapshot) = indexState else { return false }
         return snapshot.wasTruncated
     }
 
     func loadRoot(path: String?) async {
+        await loadRoot(path: path, force: false, preserveQuery: false)
+    }
+
+    /// Quick Open deliberately accepts typing before an uncached index is
+    /// ready. Preserve that input when the palette starts the first load; the
+    /// completed snapshot will rank the already-entered query.
+    func loadRootPreservingQuery(path: String?) async {
+        await loadRoot(path: path, force: false, preserveQuery: true)
+    }
+
+    func reloadRoot(path: String?) async {
+        await loadRoot(path: path, force: true, preserveQuery: false)
+    }
+
+    private func loadRoot(path: String?, force: Bool, preserveQuery: Bool) async {
+        let normalizedPath = Self.normalizedRootPath(path)
+        if !force, rootPath == normalizedPath {
+            switch indexState {
+            case .loading, .loaded, .noProject:
+                return
+            case .failed:
+                break
+            }
+        }
+
         indexRevision += 1
         previewRevision += 1
+        searchRevision += 1
+        indexTask?.cancel()
+        indexTask = nil
+        searchTask?.cancel()
+        searchTask = nil
+        searchResults = []
+        isSearching = false
+        searchCache.removeAll(keepingCapacity: true)
+        searchCacheOrder.removeAll(keepingCapacity: true)
         let expectedRevision = indexRevision
-        let normalizedPath = path?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .nilIfEmpty
-            .map { URL(fileURLWithPath: $0, isDirectory: true).standardizedFileURL.path }
 
         rootPath = normalizedPath
-        query = ""
+        if !preserveQuery { query = "" }
         previewState = .none
         guard let normalizedPath else {
             indexState = .noProject
@@ -499,14 +546,26 @@ final class ProjectSourceNavigatorModel: ObservableObject {
         }
 
         indexState = .loading
+        let task = Task { try await reader.indexFiles(atRoot: normalizedPath) }
+        indexTask = task
+        // This is a window-owned cache, not a view-owned operation. A SwiftUI
+        // `.task(id:)` caller is routinely cancelled when the Files inspector
+        // disappears; that must not strand the shared navigator in `.loading`.
+        // The next project load/refresh cancels this model-owned task if it is
+        // obsolete, while the current task is allowed to finish and publish.
+        let result = await task.result
         do {
-            let snapshot = try await reader.indexFiles(atRoot: normalizedPath)
+            let snapshot = try result.get()
             guard indexRevision == expectedRevision, rootPath == normalizedPath else { return }
+            indexTask = nil
             indexState = .loaded(snapshot)
+            scheduleSearch()
         } catch is CancellationError {
+            if indexRevision == expectedRevision { indexTask = nil }
             return
         } catch {
             guard indexRevision == expectedRevision, rootPath == normalizedPath else { return }
+            indexTask = nil
             indexState = .failed(error.localizedDescription)
         }
     }
@@ -536,6 +595,94 @@ final class ProjectSourceNavigatorModel: ObservableObject {
     func clearPreview() {
         previewRevision += 1
         previewState = .none
+    }
+
+    private func scheduleSearch() {
+        searchRevision += 1
+        let expectedSearchRevision = searchRevision
+        searchTask?.cancel()
+        searchTask = nil
+        isSearching = false
+
+        guard case let .loaded(snapshot) = indexState else {
+            searchResults = []
+            return
+        }
+
+        let cacheKey = Self.searchCacheKey(query)
+        guard !cacheKey.isEmpty else {
+            searchResults = []
+            return
+        }
+        if let cached = searchCache[cacheKey] {
+            searchResults = cached
+            touchCacheKey(cacheKey)
+            return
+        }
+
+        let files = snapshot.files
+        let requestedQuery = query
+        let expectedIndexRevision = indexRevision
+        let resultLimit = min(40, searchResultLimit)
+        // Never leave the previous query's selectable rows live while a new
+        // query is being ranked. Return during this brief interval must be a
+        // no-op, not an accidental open of a stale file.
+        searchResults = []
+        isSearching = true
+        searchTask = Task.detached(priority: .userInitiated) { [weak self] in
+            let matches = ProjectSourceSearch.matches(
+                files: files,
+                query: requestedQuery,
+                limit: resultLimit,
+                isCancelled: { Task.isCancelled }
+            )
+            guard !Task.isCancelled else { return }
+            await self?.publishSearchResults(
+                matches,
+                cacheKey: cacheKey,
+                searchRevision: expectedSearchRevision,
+                indexRevision: expectedIndexRevision
+            )
+        }
+    }
+
+    private func publishSearchResults(
+        _ results: [ProjectSourceFile],
+        cacheKey: String,
+        searchRevision expectedSearchRevision: Int,
+        indexRevision expectedIndexRevision: Int
+    ) {
+        guard searchRevision == expectedSearchRevision,
+              indexRevision == expectedIndexRevision,
+              Self.searchCacheKey(query) == cacheKey else { return }
+        isSearching = false
+        searchResults = Array(results.prefix(min(40, searchResultLimit)))
+        searchCache[cacheKey] = searchResults
+        touchCacheKey(cacheKey)
+        while searchCacheOrder.count > searchCacheLimit {
+            searchCache.removeValue(forKey: searchCacheOrder.removeFirst())
+        }
+    }
+
+    private func touchCacheKey(_ key: String) {
+        searchCacheOrder.removeAll { $0 == key }
+        searchCacheOrder.append(key)
+    }
+
+    private static func normalizedRootPath(_ path: String?) -> String? {
+        path?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+            .map { URL(fileURLWithPath: $0, isDirectory: true).standardizedFileURL.path }
+    }
+
+    private static func searchCacheKey(_ query: String) -> String {
+        query
+            .folding(
+                options: [.caseInsensitive, .diacriticInsensitive],
+                locale: Locale(identifier: "en_US_POSIX")
+            )
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
