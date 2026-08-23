@@ -115,7 +115,10 @@ enum OnyxHitTarget {
 /// use (for example, a selected task may become medium), while size comes from
 /// one of these five roles.
 enum OnyxTypography {
-    static let reading: CGFloat = 15
+    /// Conversation prose, routine activity, and composer input intentionally
+    /// share one compact size. Hierarchy comes from weight and color instead
+    /// of making assistant text look like a different application.
+    static let reading: CGFloat = 13.5
     static let paneTitle: CGFloat = 14
     static let navigation: CGFloat = 12.5
     static let secondary: CGFloat = 12
@@ -129,10 +132,26 @@ enum OnyxWorkspaceMetrics {
     static let paneEdgeInset: CGFloat = 12
     static let fieldHeight: CGFloat = 32
     static let regularGap: CGFloat = 8
-    static let maximumReadingWidth: CGFloat = 760
-    static let transcriptOuterLeadingInset: CGFloat = 18
+    static let minimumConversationSideInset: CGFloat = 14
+    static let preferredConversationSideInset: CGFloat = 20
     static let conversationTextInset: CGFloat = 18
+    /// The transcript row and composer shell can span a wide pane, but prose
+    /// should not turn into an edge-to-edge line that is difficult to scan.
+    /// This cap is deliberately generous so ordinary workspace sizes still
+    /// use all available room; only very wide panes retain quiet trailing
+    /// space for assistant prose and entered text.
+    static let maximumConversationTextWidth: CGFloat = 880
     static let composerInnerInset: CGFloat = 12
+
+    static func conversationSideInset(availableWidth: CGFloat) -> CGFloat {
+        guard availableWidth.isFinite, availableWidth > 0 else {
+            return preferredConversationSideInset
+        }
+        return min(
+            preferredConversationSideInset,
+            max(minimumConversationSideInset, availableWidth * 0.03)
+        )
+    }
 }
 
 struct OnyxMark: View {

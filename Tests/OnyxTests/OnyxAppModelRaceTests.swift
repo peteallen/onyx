@@ -174,6 +174,66 @@ final class OnyxAppModelRaceTests: XCTestCase {
         )
     }
 
+    func testTaskSelectedBeforeStartupWinsOverRestoredSelectionAndOmittingList() async {
+        let fixture = makeFixture { defaults in
+            defaults.set(Fixture.threadAID, forKey: "Onyx.selectedThreadID")
+        }
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        await fixture.runtime.setNextActiveListOverride([Fixture.threadA])
+        await fixture.runtime.prepareSuspendedActiveList()
+        await fixture.runtime.prepareSuspendedRead(for: Fixture.threadBID)
+
+        // A replacement provider model can receive a newer sidebar click
+        // before SwiftUI runs its startup task. That click must supersede the
+        // older selection restored from preferences.
+        model.selectThread(Fixture.threadBID)
+        model.start()
+        await fixture.runtime.waitUntilReadIsSuspended(for: Fixture.threadBID)
+        await fixture.runtime.waitUntilActiveListIsSuspended()
+
+        await fixture.runtime.releaseSuspendedActiveList()
+        await waitUntil("The startup list did not settle") {
+            !model.isLoadingThreadList
+        }
+
+        XCTAssertEqual(
+            model.selectedThreadID,
+            Fixture.threadBID,
+            "Startup must not reopen the older restored task after a newer click."
+        )
+        XCTAssertTrue(model.isLoadingThread)
+        XCTAssertTrue(
+            model.hasUnlistedSelectedTask,
+            "The sidebar must recognize that its cached selected row is not in the incomplete live list."
+        )
+        XCTAssertFalse(
+            TaskSidebarLiveSnapshotPolicy.shouldUseLiveSnapshot(
+                hasAuthoritativeThreadList: model.hasAuthoritativeThreadListForCurrentScope,
+                hasUnlistedSelectedTask: model.hasUnlistedSelectedTask
+            ),
+            "An omitting startup page must not replace the cached sidebar projection while the selected task loads."
+        )
+        XCTAssertFalse(
+            ProviderTaskCatalogSynchronizationPolicy.shouldReplaceCachedTasks(
+                connectionState: model.connectionState,
+                isLoadingThreadList: model.isLoadingThreadList,
+                hasAuthoritativeThreadList: model.hasAuthoritativeThreadListForCurrentScope,
+                hasUnlistedSelectedTask: model.hasUnlistedSelectedTask
+            ),
+            "An omitting startup page must not delete the selected row from the shared sidebar cache."
+        )
+
+        await fixture.runtime.releaseSuspendedRead(for: Fixture.threadBID)
+        await waitUntil("The pre-start selection did not finish loading") {
+            model.selectedThreadID == Fixture.threadBID
+                && !model.isLoadingThread
+                && model.timeline == [Fixture.itemB]
+        }
+        XCTAssertFalse(model.hasUnlistedSelectedTask)
+    }
+
     func testNavigationAbortedInitialListCannotReplaceCompleteSidebarCache() async {
         let fixture = makeFixture()
         defer { fixture.cleanUp() }
@@ -286,6 +346,53 @@ final class OnyxAppModelRaceTests: XCTestCase {
                 && !model.isLoadingThread
         }
         XCTAssertEqual(model.threads.map(\.id), [Fixture.threadAID, Fixture.threadBID])
+    }
+
+    func testScopeListCompletionCannotStealNewerUnlistedSelection() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        model.start()
+        await waitUntil("The runtime did not finish its initial load") {
+            model.selectedThreadID == Fixture.threadAID
+                && !model.isLoadingThreadList
+        }
+        model.setThreadListScope(.archived)
+        await waitUntil("The archived task did not load") {
+            model.threadListScope == .archived
+                && model.selectedThreadID == Fixture.archivedThreadID
+                && !model.isLoadingThreadList
+        }
+
+        // The active-scope transition represents the older click. Its
+        // eventual list intentionally omits B, as partial provider catalogs
+        // can omit child or legacy tasks that are still directly readable.
+        await fixture.runtime.setNextActiveListOverride([Fixture.threadA])
+        await fixture.runtime.prepareSuspendedActiveList()
+        await fixture.runtime.prepareSuspendedRead(for: Fixture.threadBID)
+        model.setThreadListScope(.active)
+        await fixture.runtime.waitUntilActiveListIsSuspended()
+
+        // The newer click must own navigation immediately, even while both
+        // its direct read and the older scope list remain in flight.
+        model.selectThread(Fixture.threadBID)
+        await fixture.runtime.waitUntilReadIsSuspended(for: Fixture.threadBID)
+        await fixture.runtime.releaseSuspendedActiveList()
+        await waitUntil("The older active-scope list did not settle") {
+            !model.isLoadingThreadList
+        }
+
+        XCTAssertEqual(model.selectedThreadID, Fixture.threadBID)
+        XCTAssertTrue(model.isLoadingThread)
+
+        await fixture.runtime.releaseSuspendedRead(for: Fixture.threadBID)
+        await waitUntil("The newer direct selection did not finish loading") {
+            model.selectedThreadID == Fixture.threadBID
+                && !model.isLoadingThread
+                && model.timeline == [Fixture.itemB]
+        }
+        XCTAssertEqual(model.selectedThreadID, Fixture.threadBID)
     }
 
     func testNewTaskWinsOverActiveRefreshWhileTaskListIsLoading() async {
@@ -610,6 +717,18 @@ final class OnyxAppModelRaceTests: XCTestCase {
         await waitUntilAsync("The new-thread request never reached the runtime") {
             await fixture.runtime.recordedStartThreadRequestCount() == 1
         }
+        XCTAssertTrue(
+            model.isTurnRunning,
+            "Send must expose waiting state before slow new-task creation returns"
+        )
+        XCTAssertTrue(
+            TranscriptPendingResponse.resolve(
+                items: model.timeline,
+                isAwaitingResponse: model.isTurnRunning,
+                label: "Working on a response…"
+            ).isVisible,
+            "A slow provider must produce immediate in-chat feedback"
+        )
 
         model.composerText = Fixture.createdThreadFollowUp
         model.setThreadListScope(.archived)
@@ -646,6 +765,73 @@ final class OnyxAppModelRaceTests: XCTestCase {
             let drafts = fixture.defaults.dictionary(forKey: "Onyx.composerDrafts") as? [String: String]
             return drafts?[Fixture.archivedThreadID] == Fixture.unrelatedArchivedDraft
         }
+    }
+
+    func testDelayedForkCompletionAddsTaskWithoutStealingNewerSelection() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        model.start()
+        await waitUntil("The runtime did not finish its initial load") {
+            model.selectedThreadID == Fixture.threadAID
+                && !model.isLoadingThread
+        }
+
+        await fixture.runtime.prepareSuspendedFork()
+        model.fork(Fixture.threadAID)
+        await fixture.runtime.waitUntilForkIsSuspended()
+
+        model.selectThread(Fixture.threadBID)
+        await waitUntil("The newer task selection did not finish") {
+            model.selectedThreadID == Fixture.threadBID
+                && !model.isLoadingThread
+                && model.timeline == [Fixture.itemB]
+        }
+
+        await fixture.runtime.releaseSuspendedFork()
+        await waitUntil("The completed fork was not added to the task list") {
+            model.threads.contains { $0.id == Fixture.childThreadID }
+        }
+
+        XCTAssertEqual(model.selectedThreadID, Fixture.threadBID)
+        XCTAssertEqual(model.timeline, [Fixture.itemB])
+    }
+
+    func testDelayedForkCompletionCannotReplaceNewerArchivedScope() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        model.start()
+        await waitUntil("The runtime did not finish its initial load") {
+            model.selectedThreadID == Fixture.threadAID
+                && !model.isLoadingThread
+        }
+
+        await fixture.runtime.prepareSuspendedFork()
+        model.fork(Fixture.threadAID)
+        await fixture.runtime.waitUntilForkIsSuspended()
+
+        model.setThreadListScope(.archived)
+        await waitUntil("The newer archived navigation did not finish") {
+            model.threadListScope == .archived
+                && model.selectedThreadID == Fixture.archivedThreadID
+                && !model.isLoadingThreadList
+        }
+        let archivedThreadIDs = model.threads.map(\.id)
+
+        await fixture.runtime.releaseSuspendedFork()
+        // The fork completion intentionally has no visible mutation in the
+        // archived projection, so give its main-actor continuation a chance
+        // to run before asserting that every visible value stayed put.
+        try? await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertEqual(model.threadListScope, .archived)
+        XCTAssertEqual(model.selectedThreadID, Fixture.archivedThreadID)
+        XCTAssertEqual(model.threads.map(\.id), archivedThreadIDs)
+        XCTAssertEqual(model.timeline, [Fixture.archivedItem])
+        XCTAssertFalse(model.threads.contains { $0.id == Fixture.childThreadID })
     }
 
     func testBlockingInteractionTakesPriorityOverEarlierNonblockingQuestion() async {
@@ -1139,9 +1325,7 @@ final class OnyxAppModelRaceTests: XCTestCase {
         OnyxWorkspaceView.routeProviderTaskSelection(
             vLLMConnection,
             threadID: unlistedChildID,
-            scope: .active,
-            selectedProviderConnectionID: .codexDefault,
-            model: model
+            scope: .active
         ) { connectionID, threadID, _ in
             routedDestination = RuntimeCollaborationAgentDestination(
                 connectionID: connectionID,
@@ -1158,6 +1342,37 @@ final class OnyxAppModelRaceTests: XCTestCase {
         )
         XCTAssertEqual(model.selectedThreadID, Fixture.threadAID)
         XCTAssertTrue(model.threads.contains { $0.id == Fixture.threadAID })
+    }
+
+    func testSameProviderTaskSelectionRoutesThroughWorkspaceNavigationOwner() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        model.start()
+        await waitUntil("The runtime did not finish its initial load") {
+            model.connectionState == .connected("Race test runtime")
+                && model.selectedThreadID == Fixture.threadAID
+                && !model.isLoadingThread
+        }
+
+        var routedDestination: (ProviderConnectionID, String, ThreadListScope)?
+        OnyxWorkspaceView.routeProviderTaskSelection(
+            .codexDefault,
+            threadID: Fixture.threadBID,
+            scope: .active
+        ) { connectionID, threadID, scope in
+            routedDestination = (connectionID, threadID, scope)
+        }
+
+        XCTAssertEqual(routedDestination?.0, .codexDefault)
+        XCTAssertEqual(routedDestination?.1, Fixture.threadBID)
+        XCTAssertEqual(routedDestination?.2, .active)
+        XCTAssertEqual(
+            model.selectedThreadID,
+            Fixture.threadAID,
+            "The workspace navigation owner must clear any older pending destination before selecting the newer task."
+        )
     }
 
     func testCollaborationRowsKeepSameChildThreadIDsDistinctAcrossProviders() async {
@@ -1668,6 +1883,10 @@ private actor RaceTestRuntime: AgentRuntime {
     private var unarchiveIsSuspended = false
     private var unarchiveContinuation: CheckedContinuation<Void, Never>?
     private var unarchiveWaiters: [CheckedContinuation<Void, Never>] = []
+    private var suspendNextFork = false
+    private var forkIsSuspended = false
+    private var forkContinuation: CheckedContinuation<Void, Never>?
+    private var forkWaiters: [CheckedContinuation<Void, Never>] = []
 
     init() {
         let stream = AsyncStream.makeStream(of: AgentRuntimeEvent.self)
@@ -1690,7 +1909,7 @@ private actor RaceTestRuntime: AgentRuntime {
             ),
             availableLoginMethods: [],
             availableModels: [],
-            capabilities: [.streaming, .approvals]
+            capabilities: [.streaming, .approvals, .threadForking]
         )
     }
 
@@ -1751,6 +1970,20 @@ private actor RaceTestRuntime: AgentRuntime {
 
     func resumeThread(id: String) async throws -> RuntimeConversation {
         try await readThread(id: id)
+    }
+
+    func forkThread(id _: String) async throws -> RuntimeThread {
+        if suspendNextFork {
+            suspendNextFork = false
+            await withCheckedContinuation { continuation in
+                forkContinuation = continuation
+                forkIsSuspended = true
+                let waiters = forkWaiters
+                forkWaiters.removeAll()
+                for waiter in waiters { waiter.resume() }
+            }
+        }
+        return Fixture.childThread
     }
 
     func setReadThreadOverride(_ thread: RuntimeThread) {
@@ -1863,6 +2096,24 @@ private actor RaceTestRuntime: AgentRuntime {
         unarchiveContinuation?.resume()
         unarchiveContinuation = nil
         unarchiveIsSuspended = false
+    }
+
+    func prepareSuspendedFork() {
+        suspendNextFork = true
+        forkIsSuspended = false
+    }
+
+    func waitUntilForkIsSuspended() async {
+        guard !forkIsSuspended else { return }
+        await withCheckedContinuation { continuation in
+            forkWaiters.append(continuation)
+        }
+    }
+
+    func releaseSuspendedFork() {
+        forkContinuation?.resume()
+        forkContinuation = nil
+        forkIsSuspended = false
     }
 
     func recordedStartTurns() -> [StartTurnRequest] {

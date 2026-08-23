@@ -33,6 +33,55 @@ final class ProjectCatalogModelTests: XCTestCase {
                 hasAuthoritativeThreadList: true
             )
         )
+        XCTAssertFalse(
+            ProviderTaskCatalogSynchronizationPolicy.shouldReplaceCachedTasks(
+                connectionState: .connected("Provider"),
+                isLoadingThreadList: false,
+                hasAuthoritativeThreadList: true,
+                hasUnlistedSelectedTask: true
+            ),
+            "An incomplete live page must not evict the selected cached task."
+        )
+    }
+
+    func testHostCatalogRefreshPreservesSelectedCachedTaskUntilDirectReadCompletes() {
+        let model = ProjectCatalogModel()
+        let selected = thread(id: "selected", title: "Selected cached task", cwd: "/work/onyx")
+        let listed = thread(id: "listed", title: "Listed task", cwd: "/work/onyx")
+        model.replaceTasks(
+            for: .codexDefault,
+            providerDisplayName: "Codex",
+            scope: .active,
+            threads: [selected, listed]
+        )
+
+        let refreshed = ProjectProviderTaskList(
+            providerConnectionID: .codexDefault,
+            providerDisplayName: "Codex",
+            scope: .active,
+            threads: [listed]
+        )
+        let protection = ProjectProviderTaskProtection(
+            id: ProjectTaskReference.ID(
+                providerConnectionID: .codexDefault,
+                threadID: selected.id
+            ),
+            scope: .active
+        )
+
+        model.replaceTasks(from: [refreshed], preserving: protection)
+        XCTAssertEqual(
+            model.providerTaskLists.first?.threads.map(\.id),
+            [selected.id, listed.id],
+            "A host refresh must not remove the selected cached row while its direct read is pending."
+        )
+
+        model.replaceTasks(from: [refreshed])
+        XCTAssertEqual(
+            model.providerTaskLists.first?.threads.map(\.id),
+            [listed.id],
+            "Once the direct read settles, an authoritative refresh may remove an absent row."
+        )
     }
 
     func testDefaultCatalogLivesInApplicationSupportInsteadOfAProjectFolder() {
@@ -425,55 +474,29 @@ final class ProjectCatalogModelTests: XCTestCase {
         XCTAssertNotEqual(request.key, nextRequest.key)
     }
 
-    func testTaskProjectBootstrapRequiresCompleteSourcesAndHonorsRemovalMarker() async throws {
+    func testStartupPreservesLegacyMarkerCatalogWithoutGuessingProjectProvenance() async throws {
         let location = temporaryCatalogLocation()
         defer { try? FileManager.default.removeItem(at: location.directory) }
         let store = ProjectCatalogStore(fileURL: location.file)
+        try writeCatalog(
+            ProjectCatalogSnapshot(
+                projects: [project(
+                    id: "legacy-project",
+                    path: "/work/legacy-project",
+                    name: "legacy-project",
+                    order: 0
+                )],
+                didBootstrapConversationProjects: true
+            ),
+            to: location.file
+        )
+
         let model = ProjectCatalogModel(store: store)
-        let task = thread(
-            id: "legacy-task",
-            title: "Legacy task",
-            cwd: "/work/legacy-project"
-        )
+        await model.reload()
 
-        let partial = ProjectProviderTaskCatalog(
-            lists: [ProjectProviderTaskList(
-                providerConnectionID: .codexDefault,
-                providerDisplayName: "Codex",
-                scope: .active,
-                threads: [task]
-            )],
-            sourceComplete: false
-        )
-        let partialImported = await model.importTaskProjectsIfSourceComplete(from: partial)
-        let projectsAfterPartial = try await store.projects()
-        let snapshotAfterPartial = try await store.snapshot()
-        XCTAssertFalse(partialImported)
-        XCTAssertTrue(projectsAfterPartial.isEmpty)
-        XCTAssertFalse(snapshotAfterPartial.didBootstrapConversationProjects)
-
-        let complete = ProjectProviderTaskCatalog(
-            lists: partial.lists,
-            sourceComplete: true
-        )
-        let completeImported = await model.importTaskProjectsIfSourceComplete(from: complete)
-        XCTAssertTrue(completeImported)
-        let imported = try XCTUnwrap(model.projects.first)
-        XCTAssertEqual(imported.folderPath, "/work/legacy-project")
-        let snapshotAfterComplete = try await store.snapshot()
-        XCTAssertTrue(snapshotAfterComplete.didBootstrapConversationProjects)
-
-        let removed = await model.removeProject(id: imported.id)
-        XCTAssertTrue(removed)
-        XCTAssertTrue(model.projects.isEmpty)
-
-        // A later complete source must not resurrect a project explicitly
-        // removed from Onyx after the one-time migration committed.
-        let repeatedImport = await model.importTaskProjectsIfSourceComplete(from: complete)
-        let finalProjects = try await store.projects()
-        XCTAssertTrue(repeatedImport)
-        XCTAssertTrue(model.projects.isEmpty)
-        XCTAssertTrue(finalProjects.isEmpty)
+        XCTAssertEqual(model.projects.map(\.folderPath), ["/work/legacy-project"])
+        let snapshot = try await store.snapshot()
+        XCTAssertTrue(snapshot.didBootstrapConversationProjects)
     }
 
     func testOperationFailureCanBeRoutedToInitiatingWindowWithoutSharedNotice() async {
@@ -550,5 +573,15 @@ private extension ProjectCatalogModelTests {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("onyx-project-model-tests-\(UUID().uuidString)", isDirectory: true)
         return (directory, directory.appendingPathComponent("projects.json"))
+    }
+
+    func writeCatalog(_ snapshot: ProjectCatalogSnapshot, to fileURL: URL) throws {
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        try encoder.encode(snapshot).write(to: fileURL, options: .atomic)
     }
 }

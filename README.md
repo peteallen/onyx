@@ -12,7 +12,7 @@ path and a distinct polished-stone visual language.
 Onyx is an independent, unofficial project. It is not affiliated with,
 endorsed by, or sponsored by OpenAI.
 
-OpenAI Codex through `codex app-server` remains the default runtime. Saved
+OpenAI Codex through the bundled `codex app-server` remains the default runtime. Saved
 OpenAI-compatible connections are also available in the production workspace:
 the new-task picker shows frequent and recent models first, then every cached
 model grouped by provider, and switches provider plus model in one action.
@@ -41,6 +41,14 @@ or complete rich-result/approval taxonomy yet.
 ## Build and run the current development preview
 
 Requirements: macOS 15 or newer and Xcode 26 or newer.
+
+The first time you build from a fresh checkout, restore the pinned official
+Codex app-server packages (one per architecture). The archives are cached
+under `.artifacts/` and are hash-checked before every package:
+
+```bash
+scripts/fetch-codex-runtime.sh --architectures universal
+```
 
 ```bash
 swift build
@@ -136,24 +144,27 @@ credentials are configured.
 
 GitHub Actions runs the full test and packaging path for every pull request. The
 manual Release workflow can make an artifact-only development build at any
-selected commit. Publishing a tag or GitHub Release fails closed until
-Developer ID signing and notarization are configured. See
-[docs/RELEASING.md](docs/RELEASING.md) for the exact commands, safeguards, and
-required publication secrets.
+selected commit. Public GitHub Release publication is intentionally disabled
+until the clean-machine OAuth and cross-app isolation checklist is complete.
+See [docs/RELEASING.md](docs/RELEASING.md) for the exact commands, safeguards,
+and remaining release gates.
 
-Onyx resolves Codex in this order:
-
-1. `ONYX_CODEX_PATH`
-2. The binary bundled with `/Applications/ChatGPT.app`
-3. Homebrew paths on Apple Silicon and Intel
+Production resolves only the pinned Codex package inside the Onyx app bundle.
+An explicit development/live-test API may use `ONYX_CODEX_PATH`, an installed
+ChatGPT/Codex app, or Homebrew; none of those paths can become a production
+fallback.
 
 The live runtime is deliberately read through the documented app-server
-JSON-RPC surface. This keeps Codex's durable threads, approvals, tools,
-sandbox, and ChatGPT OAuth behavior intact, and no authentication token is
-copied into Onyx. The installed binary is suitable for development, but it is
-still a versioned subprocess dependency: a production release must pin and
-bundle a known-compatible Codex build rather than assuming every installed
-version is compatible.
+JSON-RPC surface. Release and preview bundles carry a pinned helper at
+`Onyx.app/Contents/Helpers/CodexRuntime/<platform>/bin/codex-app-server`;
+production does not search for or depend on an installed ChatGPT/Codex app.
+Onyx launches it with
+`CODEX_HOME=~/Library/Application Support/Onyx/Codex`, so tasks, auth files,
+SQLite state, rollouts, skills, memories, and MCP configuration are owned by
+Onyx and never mixed with `~/.codex`. Onyx does not copy existing Codex
+credentials or history. The installed runtime remains available only to the
+explicit development/live-test path (`CodexRuntime.makeDevelopmentInstalled`)
+and `ONYX_CODEX_PATH`; those are not production fallbacks.
 
 ## Verify
 
@@ -164,9 +175,9 @@ scripts/check-package-app.sh
 ```
 
 The unit suite includes simulated app-server exit, malformed-transport,
-reconnect, and future-field compatibility fixtures. Two opt-in tests exercise
-the installed Codex runtime and existing Codex-managed login; they need normal
-access to that existing state:
+reconnect, and future-field compatibility fixtures. The opt-in tests exercise
+the development-installed Codex runtime and its separate Onyx-owned home; they
+need normal access to that opt-in test state:
 
 ```bash
 ONYX_LIVE_CODEX_TEST=1 swift test --disable-sandbox --filter CodexRuntimeLiveTests

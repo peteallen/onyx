@@ -125,10 +125,10 @@ struct TerminalDrawerView: View {
             Image(systemName: "terminal")
                 .accessibilityHidden(true)
             Text("TERMINAL")
-                .font(.system(size: 10, weight: .bold))
+                .font(.system(size: OnyxTypography.metadata, weight: .bold))
                 .tracking(0.8)
             Text(session.workingDirectory.map { URL(fileURLWithPath: $0).lastPathComponent } ?? model.projectName)
-                .font(.system(size: 10.5))
+                .font(.system(size: OnyxTypography.metadata))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
 
@@ -138,7 +138,7 @@ struct TerminalDrawerView: View {
                         .font(.system(size: 10))
                     TextField("Filter output", text: $searchText)
                         .textFieldStyle(.plain)
-                        .font(.system(size: 10.5))
+                        .font(.system(size: OnyxTypography.metadata))
                         .frame(width: 150)
                         .focused($isSearchFocused)
                         .accessibilityLabel("Filter terminal output")
@@ -149,7 +149,7 @@ struct TerminalDrawerView: View {
                         }
                     if !searchText.isEmpty {
                         Text("\(matchCount)")
-                            .font(.system(size: 9.5, design: .monospaced))
+                            .font(.system(size: OnyxTypography.metadata, design: .monospaced))
                             .foregroundStyle(.tertiary)
                             .accessibilityLabel("\(matchCount) matching \(matchCount == 1 ? "line" : "lines")")
                     }
@@ -248,7 +248,7 @@ struct TerminalDrawerView: View {
                     }
                     Color.clear.frame(height: 1).id("terminal-bottom")
                 }
-                .font(.system(size: 11.5, design: .monospaced))
+                .font(.system(size: OnyxTypography.secondary, design: .monospaced))
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 12)
@@ -269,12 +269,12 @@ struct TerminalDrawerView: View {
     private var inputBar: some View {
         HStack(spacing: 8) {
             Text("❯")
-                .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
+                .font(.system(size: OnyxTypography.secondary, weight: .semibold, design: .monospaced))
                 .foregroundStyle(OnyxTheme.electric)
                 .accessibilityHidden(true)
             TextField(session.isRunning ? "Enter a shell command" : "Start a shell to enter commands", text: $session.input)
                 .textFieldStyle(.plain)
-                .font(.system(size: 11.5, design: .monospaced))
+                .font(.system(size: OnyxTypography.secondary, design: .monospaced))
                 .focused($isInputFocused)
                 .disabled(!session.isRunning)
                 .onSubmit(session.sendInputLine)
@@ -284,7 +284,7 @@ struct TerminalDrawerView: View {
             if session.isRunning {
                 Button(action: session.interrupt) {
                     Text("⌃C")
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(.system(size: OnyxTypography.metadata, design: .monospaced))
                         .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
                         .contentShape(Rectangle())
                 }

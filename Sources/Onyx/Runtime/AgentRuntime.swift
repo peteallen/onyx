@@ -137,6 +137,10 @@ extension AgentRuntime {
 
 enum AgentRuntimeError: LocalizedError, Sendable {
     case executableNotFound
+    case bundledRuntimeUnavailable
+    case invalidCodexExecutable(String)
+    case developmentExecutableNotFound
+    case runtimeStateUnavailable(String)
     case processExited(Int32)
     case protocolFailure(String)
     case requestFailed(code: Int, message: String)
@@ -147,6 +151,14 @@ enum AgentRuntimeError: LocalizedError, Sendable {
         switch self {
         case .executableNotFound:
             "Onyx could not find a Codex runtime. Install ChatGPT/Codex or set ONYX_CODEX_PATH."
+        case .bundledRuntimeUnavailable:
+            "Onyx's built-in Codex runtime is missing or damaged. Reinstall Onyx to repair it."
+        case let .invalidCodexExecutable(path):
+            "The selected Codex runtime is missing, unsafe, or not executable: \(path)"
+        case .developmentExecutableNotFound:
+            "Onyx could not find an installed Codex runtime for this development test."
+        case let .runtimeStateUnavailable(message):
+            message
         case let .processExited(code):
             "Codex app-server stopped unexpectedly (exit \(code))."
         case let .protocolFailure(message):

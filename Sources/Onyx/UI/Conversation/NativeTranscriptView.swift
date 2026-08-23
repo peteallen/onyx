@@ -41,11 +41,18 @@ struct TranscriptPendingResponse: Equatable {
         label: String
     ) -> Self {
         guard isAwaitingResponse else { return Self(isVisible: false, label: label) }
-        let hasVisibleAssistant = items.reversed()
-            .prefix(while: { $0.kind != .userMessage })
-            .contains {
+        // A new task can still be showing the welcome assistant while its
+        // provider-side thread is being created. With no sent user item in the
+        // transcript yet, that old welcome copy must not suppress feedback for
+        // the newly accepted send.
+        let hasVisibleAssistant: Bool
+        if let lastUserIndex = items.lastIndex(where: { $0.kind == .userMessage }) {
+            hasVisibleAssistant = items[items.index(after: lastUserIndex)...].contains {
                 $0.kind == .assistantMessage && !$0.body.isEmpty
             }
+        } else {
+            hasVisibleAssistant = false
+        }
         return Self(isVisible: !hasVisibleAssistant, label: label)
     }
 }
@@ -731,16 +738,11 @@ struct TranscriptLayoutState {
 /// the collection width after insets; an exact fit enters undefined layout
 /// behavior and can crash while a hosting view is being resized.
 struct TranscriptFlowMetrics: Equatable {
-    /// The transcript is prose first. Keeping its outer row to 760 points
-    /// leaves roughly a 700-point text measure after message insets, which is
-    /// comfortable at the app's 15-point reading size and aligns with the
-    /// composer below it.
-    static let maximumReadableWidth = OnyxWorkspaceMetrics.maximumReadingWidth
-    // Keep the reading column closer to the project edge and let spare width
-    // collect on the trailing side. Very narrow transition frames scale both
-    // preferred gutters down before allowing a row to overflow.
-    static let preferredLeadingInset = OnyxWorkspaceMetrics.transcriptOuterLeadingInset
-    static let preferredTrailingInset: CGFloat = 24
+    /// Transcript rows use the whole pane between the same modest side gutters
+    /// as the composer. Very narrow transition frames scale both gutters down
+    /// before allowing a row to overflow.
+    static let preferredLeadingInset = OnyxWorkspaceMetrics.preferredConversationSideInset
+    static let preferredTrailingInset = OnyxWorkspaceMetrics.preferredConversationSideInset
     static let layoutSafetyWidth: CGFloat = 1
 
     let itemWidth: CGFloat
@@ -758,27 +760,25 @@ struct TranscriptFlowMetrics: Equatable {
             return
         }
 
-        let preferredInsetWidth = Self.preferredLeadingInset
-            + Self.preferredTrailingInset
-        itemWidth = min(
-            Self.maximumReadableWidth,
-            max(
-                1,
-                collectionWidth
-                    - preferredInsetWidth
-                    - Self.layoutSafetyWidth
-            )
+        let preferredSideInset = OnyxWorkspaceMetrics.conversationSideInset(
+            availableWidth: collectionWidth
+        )
+        let preferredInsetWidth = preferredSideInset * 2
+        itemWidth = max(
+            1,
+            collectionWidth
+                - preferredInsetWidth
+                - Self.layoutSafetyWidth
         )
         let availableInsetWidth = max(
             0,
             collectionWidth - itemWidth - Self.layoutSafetyWidth
         )
         if availableInsetWidth >= preferredInsetWidth {
-            leadingInset = Self.preferredLeadingInset
+            leadingInset = preferredSideInset
             trailingInset = availableInsetWidth - leadingInset
         } else {
-            leadingInset = availableInsetWidth
-                * Self.preferredLeadingInset / preferredInsetWidth
+            leadingInset = availableInsetWidth / 2
             trailingInset = availableInsetWidth - leadingInset
         }
     }
@@ -2195,7 +2195,7 @@ private final class TranscriptPendingResponseView: NSView {
 
         spinner.style = .spinning
         spinner.controlSize = .small
-        label.font = .systemFont(ofSize: OnyxTypography.navigation, weight: .regular)
+        label.font = .systemFont(ofSize: OnyxTypography.reading, weight: .regular)
         label.textColor = .secondaryLabelColor
         label.lineBreakMode = .byTruncatingTail
         label.maximumNumberOfLines = 1
@@ -2277,7 +2277,7 @@ final class TranscriptActivityGroupView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
 
-        titleLabel.font = .systemFont(ofSize: OnyxTypography.navigation, weight: .regular)
+        titleLabel.font = .systemFont(ofSize: OnyxTypography.reading, weight: .regular)
         titleLabel.textColor = NSColor.secondaryLabelColor.withAlphaComponent(0.86)
         titleLabel.lineBreakMode = .byTruncatingTail
         titleLabel.maximumNumberOfLines = 1
@@ -2407,7 +2407,7 @@ final class TranscriptActivityGroupView: NSView {
             NSAttributedString(
                 string: fullTitle,
                 attributes: [
-                    .font: titleLabel.font ?? NSFont.systemFont(ofSize: 12),
+                    .font: titleLabel.font ?? NSFont.systemFont(ofSize: OnyxTypography.reading),
                     .foregroundColor: titleLabel.textColor ?? NSColor.secondaryLabelColor,
                 ]
             ),
@@ -2699,7 +2699,10 @@ enum TranscriptMarkdownRenderer {
             font = NSFontManager.shared.convert(baseFont, toHaveTrait: .italicFontMask)
             color = .secondaryLabelColor
         case .code:
-            font = .monospacedSystemFont(ofSize: max(12.5, baseFont.pointSize - 1), weight: .regular)
+            font = .monospacedSystemFont(
+                ofSize: max(OnyxTypography.reading, baseFont.pointSize - 1),
+                weight: .regular
+            )
             color = textColor
         case .thematicBreak:
             font = baseFont
@@ -2761,7 +2764,10 @@ enum TranscriptMarkdownRenderer {
             let intent = InlinePresentationIntent(rawValue: rawValue)
             var renderedFont = font
             if intent.contains(.code) {
-                renderedFont = .monospacedSystemFont(ofSize: max(12.5, font.pointSize - 0.5), weight: .regular)
+                renderedFont = .monospacedSystemFont(
+                    ofSize: max(OnyxTypography.reading, font.pointSize - 0.5),
+                    weight: .regular
+                )
                 result.addAttribute(
                     .backgroundColor,
                     value: NSColor.quaternaryLabelColor.withAlphaComponent(0.12),
@@ -2836,9 +2842,15 @@ final class TranscriptCellView: NSView {
     static let maximumVisibleLinks = TranscriptLayoutState.maximumVisibleLinks
     private static let messageFontSize = OnyxTypography.reading
     private static let userBubbleHorizontalPadding: CGFloat = 14
-    /// Moving the content axis left should not make prose lines longer. Keep
-    /// the recovered space on the quiet trailing side of the reading column.
-    private static let conversationTrailingInset: CGFloat = 38
+    /// `NSTextFieldCell` wraps a line that only barely clears the raw glyph
+    /// measurement. Keep a small fit allowance inside compact user bubbles so
+    /// display rounding cannot turn a one-line message into clipped two-line
+    /// text.
+    private static let userBubbleTextFitAllowance: CGFloat = 6
+    /// Activity can use the available pane width between balanced inner
+    /// gutters; assistant prose keeps a generous readable measure below.
+    /// The outer flow layout still supplies the pane-wide row and edge gutter.
+    private static let conversationTrailingInset = OnyxWorkspaceMetrics.conversationTextInset
 
     private let bubbleBackground = NSView()
     private let avatar = NSTextField(labelWithString: "◆")
@@ -2892,11 +2904,11 @@ final class TranscriptCellView: NSView {
 
         avatar.font = .systemFont(ofSize: OnyxTypography.secondary, weight: .semibold)
         avatar.textColor = NSColor.systemIndigo
-        titleLabel.font = .systemFont(ofSize: OnyxTypography.navigation, weight: .medium)
+        titleLabel.font = .systemFont(ofSize: OnyxTypography.reading, weight: .medium)
         titleLabel.lineBreakMode = .byTruncatingTail
         titleLabel.maximumNumberOfLines = 1
         titleLabel.usesSingleLineMode = true
-        summaryLabel.font = .systemFont(ofSize: OnyxTypography.navigation, weight: .regular)
+        summaryLabel.font = .systemFont(ofSize: OnyxTypography.reading, weight: .regular)
         summaryLabel.textColor = .secondaryLabelColor
         summaryLabel.lineBreakMode = .byTruncatingTail
         summaryLabel.maximumNumberOfLines = 1
@@ -2907,10 +2919,10 @@ final class TranscriptCellView: NSView {
         bodyLabel.allowsEditingTextAttributes = true
         bodyLabel.maximumNumberOfLines = 0
         bodyLabel.lineBreakMode = .byWordWrapping
-        detailLabel.font = .systemFont(ofSize: 11.5, weight: .regular)
+        detailLabel.font = .systemFont(ofSize: OnyxTypography.secondary, weight: .regular)
         detailLabel.textColor = .secondaryLabelColor
         detailLabel.lineBreakMode = .byTruncatingMiddle
-        statusLabel.font = .systemFont(ofSize: 10, weight: .medium)
+        statusLabel.font = .systemFont(ofSize: OnyxTypography.metadata, weight: .medium)
         statusLabel.alignment = .right
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.wantsLayer = true
@@ -3410,6 +3422,7 @@ final class TranscriptCellView: NSView {
         let userBubbleMaximum = min(560, width * 0.78)
         let preferredUserBubbleWidth = item.attachments.isEmpty && item.links.isEmpty
             ? item.body.preferredBubbleWidth(fontSize: messageFontSize)
+                + userBubbleTextFitAllowance
             : max(360, width * 0.56)
         let userBubbleWidth = min(userBubbleMaximum, max(52, preferredUserBubbleWidth))
         let contentX: CGFloat = isUser
@@ -3418,7 +3431,10 @@ final class TranscriptCellView: NSView {
         let trailing: CGFloat = isUser
             ? horizontalInset
             : Self.conversationTrailingInset
-        let contentWidth = max(isUser ? 22 : 100, width - contentX - trailing)
+        let availableContentWidth = max(isUser ? 22 : 100, width - contentX - trailing)
+        let contentWidth = item.kind == .assistantMessage
+            ? min(OnyxWorkspaceMetrics.maximumConversationTextWidth, availableContentWidth)
+            : availableContentWidth
         let title = displayTitle(for: item)
         let titleHeight: CGFloat = title.isEmpty ? 0 : 18
         let detailString = isCollapsed ? "" : visibleDetail(for: item)
@@ -3679,7 +3695,7 @@ final class TranscriptCellView: NSView {
 
     private static func bodyFont(for item: TimelineItem) -> NSFont {
         item.kind == .command
-            ? .monospacedSystemFont(ofSize: 12.5, weight: .regular)
+            ? .monospacedSystemFont(ofSize: OnyxTypography.reading, weight: .regular)
             : .systemFont(ofSize: messageFontSize, weight: .regular)
     }
 
@@ -3734,7 +3750,7 @@ final class TranscriptCellView: NSView {
             return NSAttributedString(
                 string: title,
                 attributes: [
-                    .font: NSFont.systemFont(ofSize: OnyxTypography.navigation, weight: .semibold),
+                    .font: NSFont.systemFont(ofSize: OnyxTypography.reading, weight: .semibold),
                     .foregroundColor: NSColor.labelColor,
                 ]
             )
@@ -3744,7 +3760,7 @@ final class TranscriptCellView: NSView {
             return NSAttributedString(
                 string: title,
                 attributes: [
-                    .font: NSFont.systemFont(ofSize: 11.5, weight: .medium),
+                    .font: NSFont.systemFont(ofSize: OnyxTypography.reading, weight: .medium),
                     .foregroundColor: NSColor.secondaryLabelColor,
                 ]
             )
@@ -3757,7 +3773,7 @@ final class TranscriptCellView: NSView {
             return NSAttributedString(
                 string: title.isEmpty ? summary : title,
                 attributes: [
-                    .font: NSFont.systemFont(ofSize: OnyxTypography.navigation, weight: .regular),
+                    .font: NSFont.systemFont(ofSize: OnyxTypography.reading, weight: .regular),
                     .foregroundColor: NSColor.secondaryLabelColor.withAlphaComponent(0.86),
                 ]
             )
@@ -3766,7 +3782,7 @@ final class TranscriptCellView: NSView {
         let headline = NSMutableAttributedString(
             string: title,
             attributes: [
-                .font: NSFont.systemFont(ofSize: OnyxTypography.navigation, weight: .regular),
+                .font: NSFont.systemFont(ofSize: OnyxTypography.reading, weight: .regular),
                 .foregroundColor: NSColor.secondaryLabelColor.withAlphaComponent(0.86),
             ]
         )
@@ -3774,7 +3790,7 @@ final class TranscriptCellView: NSView {
             NSAttributedString(
                 string: "  ·  \(summary)",
                 attributes: [
-                    .font: NSFont.systemFont(ofSize: OnyxTypography.navigation, weight: .regular),
+                    .font: NSFont.systemFont(ofSize: OnyxTypography.reading, weight: .regular),
                     // Failure output is the useful part of this compact row.
                     // Keep it readable while the small red disclosure conveys
                     // severity; ordinary implementation output stays quieter.
@@ -3949,13 +3965,13 @@ final class TranscriptResourceLinkView: NSView {
         layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.42).cgColor
 
         titleLabel.stringValue = "↗  " + link.title
-        titleLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        titleLabel.font = .systemFont(ofSize: OnyxTypography.secondary, weight: .medium)
         titleLabel.textColor = .linkColor
         titleLabel.lineBreakMode = .byTruncatingTail
         addSubview(titleLabel)
 
         detailLabel.stringValue = link.detail ?? link.url.host ?? link.url.absoluteString
-        detailLabel.font = .systemFont(ofSize: 10.5)
+        detailLabel.font = .systemFont(ofSize: OnyxTypography.metadata)
         detailLabel.textColor = .secondaryLabelColor
         detailLabel.lineBreakMode = .byTruncatingTail
         addSubview(detailLabel)
@@ -4055,7 +4071,7 @@ final class TranscriptAttachmentView: NSView {
         addSubview(imageView)
 
         statusLabel.alignment = .center
-        statusLabel.font = .systemFont(ofSize: 12)
+        statusLabel.font = .systemFont(ofSize: OnyxTypography.secondary)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.maximumNumberOfLines = 2
         statusLabel.lineBreakMode = .byWordWrapping

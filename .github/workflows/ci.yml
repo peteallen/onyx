@@ -58,6 +58,16 @@ jobs:
         shell: zsh -euo pipefail {0}
         run: /usr/bin/swift test --disable-sandbox
 
+      - name: Restore pinned Codex runtime archives
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
+        with:
+          path: .artifacts/codex-runtime
+          key: codex-runtime-${{ runner.os }}-${{ hashFiles('support/codex-runtime-manifest.json') }}
+
+      - name: Fetch and verify pinned Codex runtime archives
+        shell: zsh -euo pipefail {0}
+        run: scripts/fetch-codex-runtime.sh --architectures universal
+
       - name: Verify app packaging safeguards
         shell: zsh -euo pipefail {0}
         run: |

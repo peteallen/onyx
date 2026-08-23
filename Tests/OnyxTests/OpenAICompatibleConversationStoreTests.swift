@@ -268,6 +268,119 @@ final class OpenAICompatibleConversationStoreTests: XCTestCase {
         )
     }
 
+    func testScopedRecoveryRepairsCompletedEmptyAssistantWithoutGuessingUnscopedHistory() async throws {
+        let location = temporaryLocation()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        let connection = ProviderConnectionID("provider.empty-repair")
+        let scope = "scope.provider-empty-repair"
+        let otherScope = "scope.other-provider"
+        let store = OpenAICompatibleConversationStore(fileURL: location.file)
+
+        var scoped = try await store.create(
+            connectionID: connection,
+            title: "Empty response",
+            cwd: "/tmp/project",
+            modelID: "Qwen/Qwen3.8-27B-FP8",
+            scopeID: scope
+        )
+        scoped.messages = [
+            OpenAICompatibleStoredMessage(role: .user, text: "Build the page"),
+            OpenAICompatibleStoredMessage(
+                role: .assistant,
+                text: " \n",
+                status: .completed,
+                detail: "Token usage: prompt 66, response 2048, total 2114"
+            ),
+        ]
+        try await store.upsert(scoped)
+
+        var other = try await store.create(
+            connectionID: connection,
+            title: "Other endpoint",
+            cwd: "/tmp/other",
+            modelID: "same-model",
+            scopeID: otherScope
+        )
+        other.messages = [
+            OpenAICompatibleStoredMessage(role: .user, text: "Keep this history"),
+            OpenAICompatibleStoredMessage(role: .assistant, text: "", status: .completed),
+        ]
+        try await store.upsert(other)
+
+        let repaired = try await store.recoverInterruptedTurns(
+            connectionID: connection,
+            scopeID: scope,
+            now: Date(timeIntervalSince1970: 999)
+        )
+        XCTAssertEqual(repaired.map(\.id), [scoped.id])
+        XCTAssertEqual(repaired[0].status, .failed)
+        XCTAssertEqual(repaired[0].updatedAt, Date(timeIntervalSince1970: 999))
+        let repairedMessage = try XCTUnwrap(repaired[0].messages.last)
+        XCTAssertEqual(repairedMessage.status, .failed)
+        XCTAssertTrue(repairedMessage.detail?.contains("without returning an answer") == true)
+        XCTAssertTrue(repairedMessage.detail?.contains("lower reasoning level") == true)
+        XCTAssertFalse(repairedMessage.detail?.contains("Token usage") == true)
+
+        let reloadedRecord = try await store.conversation(
+            connectionID: connection,
+            id: scoped.id,
+            scopeID: scope
+        )
+        let reloaded = try XCTUnwrap(reloadedRecord)
+        XCTAssertEqual(reloaded.runtimeConversation(kind: .local).items.map(\.kind), [
+            .userMessage,
+            .error,
+        ])
+        XCTAssertEqual(
+            reloaded.runtimeConversation(kind: .local).items.last?.body,
+            repairedMessage.detail
+        )
+
+        // The repair is idempotent and does not rewrite an unrelated scope.
+        let secondRepair = try await store.recoverInterruptedTurns(
+            connectionID: connection,
+            scopeID: scope,
+            now: Date(timeIntervalSince1970: 1000)
+        )
+        XCTAssertTrue(secondRepair.isEmpty)
+        let untouchedRecord = try await store.conversation(
+            connectionID: connection,
+            id: other.id,
+            scopeID: otherScope
+        )
+        let untouched = try XCTUnwrap(untouchedRecord)
+        XCTAssertEqual(untouched.status, .idle)
+        XCTAssertEqual(untouched.messages.last?.status, .completed)
+        XCTAssertNil(untouched.messages.last?.detail)
+    }
+
+    func testEmptyAssistantRepairRequiresExplicitScope() async throws {
+        let location = temporaryLocation()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        let connection = ProviderConnectionID("provider.empty-repair-unscoped")
+        let store = OpenAICompatibleConversationStore(fileURL: location.file)
+        var conversation = try await store.create(
+            connectionID: connection,
+            title: "Legacy empty response",
+            cwd: nil,
+            modelID: "fixture-model"
+        )
+        conversation.messages = [
+            OpenAICompatibleStoredMessage(role: .assistant, text: "", status: .completed),
+        ]
+        try await store.upsert(conversation)
+
+        let unscopedRepair = try await store.recoverInterruptedTurns(connectionID: connection)
+        XCTAssertTrue(unscopedRepair.isEmpty)
+        let unchangedRecord = try await store.conversation(
+            connectionID: connection,
+            id: conversation.id
+        )
+        let unchanged = try XCTUnwrap(unchangedRecord)
+        XCTAssertEqual(unchanged.status, .idle)
+        XCTAssertEqual(unchanged.messages[0].status, .completed)
+    }
+
     func testValidationRejectsFutureSchemaAndDuplicateScopedIDs() async throws {
         let location = temporaryLocation()
         defer { try? FileManager.default.removeItem(at: location.directory) }

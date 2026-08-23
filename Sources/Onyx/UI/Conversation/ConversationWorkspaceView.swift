@@ -59,7 +59,7 @@ struct ConversationWorkspaceView: View {
                             VStack(spacing: 10) {
                                 ProgressView().controlSize(.small)
                                 Text("Loading task history…")
-                                    .font(.system(size: 12.5))
+                                    .font(.system(size: OnyxTypography.reading))
                                     .foregroundStyle(.secondary)
                             }
                             .padding(18)
@@ -82,6 +82,7 @@ struct ConversationWorkspaceView: View {
                         }
 
                         RuntimeStatusStrip(model: model)
+                        ProviderExecutionScopeStrip(model: model)
                         if model.isShowingArchivedThreads {
                             ArchivedThreadStrip(model: model)
                         } else {
@@ -112,6 +113,36 @@ struct ConversationWorkspaceView: View {
         }
         .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: model.isSideChatPresented)
         .background(OnyxTheme.canvas)
+    }
+}
+
+/// Generic OpenAI-compatible connections are useful chat and reasoning
+/// backends, but the current adapter cannot execute Onyx's local workspace
+/// tools. Keep that boundary beside the composer so a project folder and a
+/// permissive-looking model catalog cannot imply that a request will edit
+/// files behind the scenes.
+struct ProviderExecutionScopeStrip: View {
+    @ObservedObject var model: OnyxAppModel
+
+    var body: some View {
+        if ProviderExecutionScopePresentation.isChatOnly(session: model.session) {
+            Label(
+                "Chat only — this provider can reply here, but cannot inspect or edit project files or run commands yet.",
+                systemImage: "text.bubble"
+            )
+            .font(.system(size: OnyxTypography.metadata))
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityLabel("Chat-only provider")
+            .accessibilityHint("This provider cannot inspect or edit project files or run Onyx tools")
+        }
+    }
+}
+
+enum ProviderExecutionScopePresentation {
+    static func isChatOnly(session: RuntimeSession?) -> Bool {
+        guard let session else { return false }
+        return !session.capabilities.contains(.tools)
     }
 }
 
@@ -150,7 +181,7 @@ struct ConversationHistoryViewport<Transcript: View>: View {
                                     ? "Loading earlier messages…"
                                     : "Load earlier messages")
                             }
-                            .font(.system(size: 11.5, weight: .medium))
+                            .font(.system(size: OnyxTypography.secondary, weight: .medium))
                             .foregroundStyle(.secondary)
                             .frame(minHeight: OnyxHitTarget.compact)
                             .padding(.horizontal, 10)
@@ -181,26 +212,20 @@ struct ConversationHistoryViewport<Transcript: View>: View {
     }
 }
 
-/// Keeps the primary conversation controls aligned with the transcript's
-/// readable measure. Insets ease down on compact windows instead of stealing
-/// a fixed 64 points from an already narrow center pane.
+/// Keeps the primary conversation controls aligned with the transcript's pane
+/// gutters. Insets ease down on compact windows rather than taking a fixed
+/// chunk from an already narrow center pane.
 enum ConversationContentLayout {
-    /// Keep the composer on the same calm reading axis as the transcript.
-    /// A much wider input surface makes the center pane feel like a form and
-    /// encourages long, hard-to-scan lines even when the window has room.
-    static let maximumComposerWidth = OnyxWorkspaceMetrics.maximumReadingWidth
+    /// The composer belongs to the pane rather than a narrow card within it.
+    /// Its modest outer gutters match the transcript while the inner inset
+    /// keeps entered text comfortably away from the border.
+    static let maximumComposerWidth: CGFloat = .infinity
     static let bottomInset: CGFloat = 20
-    static let minimumHorizontalInset: CGFloat = 14
-    static let maximumHorizontalInset: CGFloat = 20
+    static let minimumHorizontalInset = OnyxWorkspaceMetrics.minimumConversationSideInset
+    static let maximumHorizontalInset = OnyxWorkspaceMetrics.preferredConversationSideInset
 
     static func horizontalInset(availableWidth: CGFloat) -> CGFloat {
-        guard availableWidth.isFinite, availableWidth > 0 else {
-            return maximumHorizontalInset
-        }
-        return min(
-            maximumHorizontalInset,
-            max(minimumHorizontalInset, availableWidth * 0.03)
-        )
+        OnyxWorkspaceMetrics.conversationSideInset(availableWidth: availableWidth)
     }
 }
 
@@ -290,7 +315,7 @@ private struct ConversationHeaderView: View {
 
             if model.isShowingArchivedThreads {
                 Label("Archived", systemImage: "archivebox")
-                    .font(.system(size: 11.5, weight: .medium))
+                    .font(.system(size: OnyxTypography.secondary, weight: .medium))
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 9)
                     .frame(height: 26)
@@ -412,11 +437,11 @@ private struct EmptyTranscriptView: View {
                 OnyxMark(size: 38)
             }
             Text(isArchive ? "No archived tasks" : "Start with an outcome")
-                .font(.system(size: 17, weight: .semibold))
+                .font(.system(size: OnyxTypography.paneTitle, weight: .semibold))
             Text(isArchive
                 ? "Tasks you archive will remain available here and can be restored at any time."
                 : "Onyx will inspect the workspace, work through the task, and keep the live result here.")
-                .font(.system(size: 12.5))
+                .font(.system(size: OnyxTypography.navigation))
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 360)
@@ -440,11 +465,11 @@ private struct ArchivedThreadStrip: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(model.selectedThread == nil ? "Archived tasks" : "This task is archived")
-                    .font(.system(size: 12.5, weight: .semibold))
+                    .font(.system(size: OnyxTypography.navigation, weight: .semibold))
                 Text(model.selectedThread == nil
                     ? "Select a task to review its history."
                     : "Restore it to continue the conversation or run more work.")
-                    .font(.system(size: 11.5))
+                    .font(.system(size: OnyxTypography.secondary))
                     .foregroundStyle(.secondary)
             }
             Spacer()
@@ -477,7 +502,7 @@ private struct RuntimeStatusStrip: View {
                     : "Reconnecting to \(model.runtimeDisplayName)…")
             }
                 .foregroundStyle(.secondary)
-                .font(.system(size: 10.5))
+                .font(.system(size: OnyxTypography.metadata))
         case let .failed(message):
             reconnectRow(
                 message: message,
@@ -499,7 +524,7 @@ private struct RuntimeStatusStrip: View {
         HStack(spacing: 8) {
             Label(message, systemImage: systemImage)
                 .foregroundStyle(color)
-                .font(.system(size: 10.5))
+                .font(.system(size: OnyxTypography.metadata))
                 .lineLimit(1)
 
             Spacer(minLength: 8)
@@ -507,7 +532,7 @@ private struct RuntimeStatusStrip: View {
             if model.canReconnect {
                 Button("Reconnect", action: model.reconnect)
                     .buttonStyle(.borderless)
-                    .font(.system(size: 10.5, weight: .semibold))
+                    .font(.system(size: OnyxTypography.metadata, weight: .semibold))
                     .accessibilityHint("Restarts \(model.runtimeDisplayName) and refreshes the open task")
             }
         }
@@ -529,14 +554,14 @@ private struct AccountAccessStrip: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
-                    .font(.system(size: 12.5, weight: .semibold))
+                    .font(.system(size: OnyxTypography.navigation, weight: .semibold))
                 if let code = model.loginAttempt?.userCode {
                     Text(code)
-                        .font(.system(size: 13, weight: .bold, design: .monospaced))
+                        .font(.system(size: OnyxTypography.reading, weight: .bold, design: .monospaced))
                         .textSelection(.enabled)
                 } else {
                     Text(detail)
-                        .font(.system(size: 11.5))
+                        .font(.system(size: OnyxTypography.secondary))
                         .foregroundStyle(.secondary)
                 }
             }
@@ -673,6 +698,27 @@ private struct ComposerView: View {
         model.activeUserInteraction?.isBlocking == true
     }
 
+    private var isChatOnlyProvider: Bool {
+        ProviderExecutionScopePresentation.isChatOnly(session: model.session)
+    }
+
+    private var taskOptionsHelp: String {
+        isChatOnlyProvider
+            ? "Choose reasoning effort; this provider is chat only"
+            : "Choose reasoning effort and task permissions"
+    }
+
+    private var taskOptionsAccessibilityValue: String {
+        if isChatOnlyProvider {
+            return model.availableReasoningEfforts.isEmpty
+                ? "Chat only"
+                : "\(model.selectedReasoningEffortName), chat only"
+        }
+        return model.availableReasoningEfforts.isEmpty
+            ? model.permissionLabel
+            : "\(model.selectedReasoningEffortName), \(model.permissionLabel)"
+    }
+
     private var canSend: Bool {
         model.canRunAgent
             && !model.isPreparingLatestMessageEditForSelectedThread
@@ -778,7 +824,7 @@ private struct ComposerView: View {
                         .accessibilityHidden(true)
 
                     Text(BusyComposerPresentation.compactActionLabel)
-                        .font(.system(size: 12, weight: .medium))
+                        .font(.system(size: OnyxTypography.navigation, weight: .medium))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
 
@@ -793,7 +839,7 @@ private struct ComposerView: View {
 
             Button(action: model.interrupt) {
                 Label("Stop", systemImage: "stop.fill")
-                    .font(.system(size: 11.5, weight: .semibold))
+                    .font(.system(size: OnyxTypography.navigation, weight: .semibold))
                     .padding(.horizontal, 9)
                     .frame(height: 26)
                     .background(Color.primary.opacity(0.065))
@@ -1006,7 +1052,7 @@ private struct ComposerView: View {
                     .font(.system(size: 8, weight: .bold))
                     .foregroundStyle(.tertiary)
             }
-            .font(.system(size: 11.5, weight: .medium))
+            .font(.system(size: OnyxTypography.navigation, weight: .medium))
             .frame(minHeight: OnyxHitTarget.compact)
             .contentShape(Rectangle())
         }
@@ -1032,7 +1078,7 @@ private struct ComposerView: View {
                     .font(.system(size: 8, weight: .bold))
                     .foregroundStyle(.tertiary)
             }
-            .font(.system(size: 11.5, weight: .medium))
+            .font(.system(size: OnyxTypography.navigation, weight: .medium))
             .frame(maxWidth: .infinity, alignment: .leading)
             .frame(minHeight: OnyxHitTarget.compact)
             .contentShape(Rectangle())
@@ -1088,8 +1134,10 @@ private struct ComposerView: View {
                 reasoningMenuContent
             }
         }
-        Section("Permissions") {
-            permissionMenuContent
+        if !isChatOnlyProvider {
+            Section("Permissions") {
+                permissionMenuContent
+            }
         }
     }
 
@@ -1103,13 +1151,9 @@ private struct ComposerView: View {
         }
         .menuStyle(.borderlessButton)
         .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
-        .onyxHelp("Choose reasoning effort and task permissions")
+        .onyxHelp(taskOptionsHelp)
         .accessibilityLabel("Task options")
-        .accessibilityValue(
-            model.availableReasoningEfforts.isEmpty
-                ? model.permissionLabel
-                : "\(model.selectedReasoningEffortName), \(model.permissionLabel)"
-        )
+        .accessibilityValue(taskOptionsAccessibilityValue)
     }
 
     /// Reasoning is a first-class model control, so keep the current choice
@@ -1121,30 +1165,26 @@ private struct ComposerView: View {
         } label: {
             HStack(spacing: 5) {
                 Image(systemName: model.availableReasoningEfforts.isEmpty
-                    ? "slider.horizontal.3"
+                    ? (isChatOnlyProvider ? "text.bubble" : "slider.horizontal.3")
                     : "brain")
                     .foregroundStyle(.secondary)
                 Text(model.availableReasoningEfforts.isEmpty
-                    ? model.permissionLabel
+                    ? (isChatOnlyProvider ? "Chat only" : model.permissionLabel)
                     : model.selectedReasoningEffortName)
                     .lineLimit(1)
                 Image(systemName: "chevron.down")
                     .font(.system(size: 8, weight: .bold))
                     .foregroundStyle(.tertiary)
             }
-            .font(.system(size: 11.5, weight: .medium))
+            .font(.system(size: OnyxTypography.navigation, weight: .medium))
             .frame(minHeight: OnyxHitTarget.compact)
             .contentShape(Rectangle())
         }
         .menuStyle(.borderlessButton)
         .fixedSize(horizontal: true, vertical: false)
-        .onyxHelp("Choose reasoning effort and task permissions")
+        .onyxHelp(taskOptionsHelp)
         .accessibilityLabel("Task options")
-        .accessibilityValue(
-            model.availableReasoningEfforts.isEmpty
-                ? model.permissionLabel
-                : "\(model.selectedReasoningEffortName), \(model.permissionLabel)"
-        )
+        .accessibilityValue(taskOptionsAccessibilityValue)
     }
 
     private var compactOptionsMenu: some View {
@@ -1153,7 +1193,7 @@ private struct ComposerView: View {
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: model.availableReasoningEfforts.isEmpty
-                    ? "slider.horizontal.3"
+                    ? (isChatOnlyProvider ? "text.bubble" : "slider.horizontal.3")
                     : "brain")
                     .foregroundStyle(.secondary)
                 if !model.availableReasoningEfforts.isEmpty {
@@ -1161,7 +1201,7 @@ private struct ComposerView: View {
                         .lineLimit(1)
                 }
             }
-            .font(.system(size: 11.5, weight: .medium))
+            .font(.system(size: OnyxTypography.navigation, weight: .medium))
             .frame(
                 minWidth: OnyxHitTarget.compact,
                 minHeight: OnyxHitTarget.compact
@@ -1170,13 +1210,9 @@ private struct ComposerView: View {
         }
         .menuStyle(.borderlessButton)
         .fixedSize(horizontal: true, vertical: false)
-        .onyxHelp("Choose reasoning effort and task permissions")
+        .onyxHelp(taskOptionsHelp)
         .accessibilityLabel("Task options")
-        .accessibilityValue(
-            model.availableReasoningEfforts.isEmpty
-                ? model.permissionLabel
-                : "\(model.selectedReasoningEffortName), \(model.permissionLabel)"
-        )
+        .accessibilityValue(taskOptionsAccessibilityValue)
     }
 
     @ViewBuilder

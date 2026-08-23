@@ -75,9 +75,9 @@ struct ProjectCatalogSnapshot: Codable, Equatable, Sendable {
 
     let schemaVersion: Int
     var projects: [ProjectCatalogRecord]
-    /// Durable migration marker. Once legacy conversation-attached projects
-    /// have been considered, they must never be treated as a source of truth
-    /// again or a user-removed project could reappear on the next launch.
+    /// Compatibility marker written by a rejected pre-release importer.
+    /// Current builds preserve it while treating every existing row as
+    /// potentially user-curated because the old schema had no provenance.
     let didBootstrapConversationProjects: Bool
 
     init(
@@ -99,8 +99,8 @@ struct ProjectCatalogSnapshot: Codable, Equatable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
         projects = try container.decode([ProjectCatalogRecord].self, forKey: .projects)
-        // Catalogs written before the bootstrap marker existed have not yet
-        // recorded the one-time migration and therefore remain eligible.
+        // The marker remains decodable for older development catalogs, but is
+        // never evidence that any individual project is safe to remove.
         didBootstrapConversationProjects = try container.decodeIfPresent(
             Bool.self,
             forKey: .didBootstrapConversationProjects

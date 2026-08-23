@@ -19,6 +19,7 @@ actor CodexRuntime: AgentRuntime {
 
     private let eventContinuation: AsyncStream<AgentRuntimeEvent>.Continuation
     private let client: any CodexAppServerTransport
+    private let expectedCodexHomeURL: URL?
     private let dynamicToolHandler: (any CodexDynamicToolHandler)?
     private var appServerTask: Task<Void, Never>?
     private var connectionAttempt: Task<RuntimeSession, any Error>?
@@ -70,20 +71,30 @@ actor CodexRuntime: AgentRuntime {
     private var connected = false
 
     init(
-        executableURL: URL,
+        launchConfiguration: CodexRuntimeLaunchConfiguration,
         dynamicToolHandler: (any CodexDynamicToolHandler)? = nil
     ) {
         self.init(
-            client: CodexAppServerClient(executableURL: executableURL),
+            client: CodexAppServerClient(
+                executableURL: launchConfiguration.executableURL,
+                processArguments: launchConfiguration.processArguments,
+                processEnvironment: launchConfiguration.processEnvironment,
+                stateDirectoryPreparation: {
+                    try launchConfiguration.prepareStateDirectory()
+                }
+            ),
+            expectedCodexHomeURL: launchConfiguration.codexHomeURL,
             dynamicToolHandler: dynamicToolHandler
         )
     }
 
     init(
         client: any CodexAppServerTransport,
+        expectedCodexHomeURL: URL? = nil,
         dynamicToolHandler: (any CodexDynamicToolHandler)? = nil
     ) {
         self.client = client
+        self.expectedCodexHomeURL = expectedCodexHomeURL
         self.dynamicToolHandler = dynamicToolHandler
         let stream = AsyncStream.makeStream(of: AgentRuntimeEvent.self)
         events = stream.stream
@@ -101,11 +112,24 @@ actor CodexRuntime: AgentRuntime {
     static func makeDefault(
         dynamicToolHandler: (any CodexDynamicToolHandler)? = nil
     ) throws -> CodexRuntime {
-        guard let url = resolveExecutable() else {
-            throw AgentRuntimeError.executableNotFound
-        }
+        let configuration = try CodexRuntimeLaunchConfiguration.production()
         return CodexRuntime(
-            executableURL: url,
+            launchConfiguration: configuration,
+            dynamicToolHandler: dynamicToolHandler
+        )
+    }
+
+    static func makeDevelopmentInstalled(
+        explicitExecutableURL: URL? = nil,
+        codexHomeURL: URL? = nil,
+        dynamicToolHandler: (any CodexDynamicToolHandler)? = nil
+    ) throws -> CodexRuntime {
+        let configuration = try CodexRuntimeLaunchConfiguration.developmentInstalled(
+            explicitExecutableURL: explicitExecutableURL,
+            codexHomeURL: codexHomeURL
+        )
+        return CodexRuntime(
+            launchConfiguration: configuration,
             dynamicToolHandler: dynamicToolHandler
         )
     }
@@ -135,6 +159,7 @@ actor CodexRuntime: AgentRuntime {
     private func establishConnection(generation: UInt64) async throws -> RuntimeSession {
         do {
             let connection = try await client.start()
+            try validateCodexHome(connection.initializeResponse)
             guard connectionGeneration == generation, !Task.isCancelled else {
                 throw CancellationError()
             }
@@ -160,6 +185,20 @@ actor CodexRuntime: AgentRuntime {
             guard connectionGeneration == generation else { throw error }
             eventContinuation.yield(.connectionChanged(.failed(error.localizedDescription)))
             throw error
+        }
+    }
+
+    private func validateCodexHome(_ initializeResponse: JSONValue) throws {
+        guard let expectedCodexHomeURL else { return }
+        guard let reportedCodexHome = initializeResponse["codexHome"]?.stringValue else {
+            throw AgentRuntimeError.protocolFailure(
+                "Codex app-server did not confirm Onyx's private data folder."
+            )
+        }
+        guard reportedCodexHome == expectedCodexHomeURL.path else {
+            throw AgentRuntimeError.protocolFailure(
+                "Codex app-server refused Onyx's private data folder."
+            )
         }
     }
 
@@ -1402,20 +1441,6 @@ actor CodexRuntime: AgentRuntime {
             modelID: thread.model,
             workingDirectory: thread.cwd
         )
-    }
-
-    private static func resolveExecutable() -> URL? {
-        var candidates: [String] = []
-        if let override = ProcessInfo.processInfo.environment["ONYX_CODEX_PATH"], !override.isEmpty {
-            candidates.append(override)
-        }
-        candidates.append(contentsOf: [
-            "/Applications/ChatGPT.app/Contents/Resources/codex",
-            "/Applications/Codex.app/Contents/Resources/codex",
-            "/opt/homebrew/bin/codex",
-            "/usr/local/bin/codex",
-        ])
-        return candidates.first(where: FileManager.default.isExecutableFile(atPath:)).map(URL.init(fileURLWithPath:))
     }
 
     private func runtimeRequestID(from value: JSONValue?) -> RuntimeRequestID? {

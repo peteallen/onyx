@@ -4,6 +4,15 @@ import XCTest
 
 final class TranscriptAttachmentTests: XCTestCase {
     func testPendingResponseStaysInTranscriptUntilAssistantTextBeginsStreaming() {
+        let welcome = TimelineItem(
+            id: "onyx-welcome",
+            kind: .assistantMessage,
+            title: nil,
+            body: "Choose a project to begin.",
+            status: .completed,
+            timestamp: .now,
+            detail: nil
+        )
         let user = TimelineItem(
             id: "pending-user",
             kind: .userMessage,
@@ -23,6 +32,14 @@ final class TranscriptAttachmentTests: XCTestCase {
             detail: nil
         )
 
+        XCTAssertTrue(
+            TranscriptPendingResponse.resolve(
+                items: [welcome],
+                isAwaitingResponse: true,
+                label: "Working on a response…"
+            ).isVisible,
+            "Welcome copy must not hide a newly accepted task while thread creation is pending"
+        )
         XCTAssertTrue(
             TranscriptPendingResponse.resolve(
                 items: [user],
@@ -68,7 +85,7 @@ final class TranscriptAttachmentTests: XCTestCase {
     }
 
     @MainActor
-    func testShortUserMessageUsesACompactNeutralBubbleAndAssistantKeepsReadableMeasure() {
+    func testShortUserMessageUsesACompactNeutralBubbleAndAssistantFillsAvailableRowWidth() {
         let user = TimelineItem(
             id: "compact-user",
             kind: .userMessage,
@@ -92,7 +109,11 @@ final class TranscriptAttachmentTests: XCTestCase {
 
         XCTAssertLessThan(userMetrics.contentWidth, assistantMetrics.contentWidth / 2)
         XCTAssertGreaterThan(userMetrics.contentX, assistantMetrics.contentX)
-        XCTAssertLessThanOrEqual(assistantMetrics.contentWidth, 680)
+        XCTAssertEqual(
+            assistantMetrics.contentWidth,
+            720 - OnyxWorkspaceMetrics.conversationTextInset * 2,
+            accuracy: 0.1
+        )
 
         let height = TranscriptCellView.height(for: user, width: 720, isExpanded: true)
         let cell = TranscriptCellView(frame: NSRect(x: 0, y: 0, width: 720, height: height))
@@ -101,6 +122,52 @@ final class TranscriptAttachmentTests: XCTestCase {
         XCTAssertLessThan(cell.messageBubbleFrame.width, 180)
         XCTAssertGreaterThan(cell.messageBubbleFrame.minX, 500)
         XCTAssertEqual(cell.layer?.backgroundColor, NSColor.clear.cgColor)
+    }
+
+    @MainActor
+    func testWideTranscriptCapsAssistantProseButLeavesActivityPaneWide() {
+        let assistant = TimelineItem(
+            id: "wide-readable-assistant",
+            kind: .assistantMessage,
+            title: nil,
+            body: String(repeating: "Readable prose ", count: 80),
+            status: .completed,
+            timestamp: .now,
+            detail: nil
+        )
+        let activity = TimelineItem(
+            id: "wide-activity",
+            kind: .tool,
+            title: "Inspect output",
+            body: String(repeating: "tool output ", count: 80),
+            status: .completed,
+            timestamp: .now,
+            detail: nil
+        )
+        let width: CGFloat = 1_120
+        let assistantMetrics = TranscriptCellView.metrics(
+            for: assistant,
+            width: width,
+            isExpanded: true
+        )
+        let activityMetrics = TranscriptCellView.metrics(
+            for: activity,
+            width: width,
+            isExpanded: true
+        )
+
+        XCTAssertEqual(
+            assistantMetrics.contentWidth,
+            OnyxWorkspaceMetrics.maximumConversationTextWidth,
+            accuracy: 0.1
+        )
+        XCTAssertEqual(
+            activityMetrics.contentWidth,
+            width - OnyxWorkspaceMetrics.conversationTextInset * 2,
+            accuracy: 0.1
+        )
+        XCTAssertGreaterThan(activityMetrics.contentWidth, assistantMetrics.contentWidth)
+        XCTAssertEqual(activityMetrics.contentX, assistantMetrics.contentX, accuracy: 0.1)
     }
 
     @MainActor
@@ -310,7 +377,7 @@ final class TranscriptAttachmentTests: XCTestCase {
                 effectiveRange: nil
             ) as? NSFont
         )
-        XCTAssertEqual(compactTitleFont.pointSize, OnyxTypography.navigation, accuracy: 0.1)
+        XCTAssertEqual(compactTitleFont.pointSize, OnyxTypography.reading, accuracy: 0.1)
         XCTAssertLessThanOrEqual(cell.expansionControl.frame.maxX, compactTitle.frame.minX)
         XCTAssertLessThan(
             cell.expansionControl.frame.maxX,
@@ -694,6 +761,29 @@ final class TranscriptAttachmentTests: XCTestCase {
                 detail: nil
             )
             XCTAssertEqual(TranscriptCellView.bodyAttributedText(for: item).string, body)
+        }
+    }
+
+    @MainActor
+    func testConversationProseAndExpandedActivityShareOneTypeSize() throws {
+        for kind in [TimelineItemKind.assistantMessage, .tool, .command] {
+            let item = TimelineItem(
+                id: "conversation-font-\(kind.rawValue)",
+                kind: kind,
+                title: kind.isActivity ? "Activity" : nil,
+                body: "Readable conversation text",
+                status: .completed,
+                timestamp: .now,
+                detail: nil
+            )
+            let rendered = TranscriptCellView.bodyAttributedText(for: item)
+            let font = try XCTUnwrap(
+                rendered.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+            )
+            XCTAssertEqual(font.pointSize, OnyxTypography.reading, accuracy: 0.1)
+            if kind == .command {
+                XCTAssertTrue(font.fontDescriptor.symbolicTraits.contains(.monoSpace))
+            }
         }
     }
 

@@ -135,7 +135,12 @@ struct OpenAICompatibleStoredMessage: Identifiable, Codable, Equatable, Sendable
     }
 
     var chatMessage: OpenAICompatibleChatMessage? {
-        guard status != .failed || !text.isEmpty else { return nil }
+        // A legacy provider turn may contain only whitespace after an empty
+        // streamed answer. Once recovery marks it failed, do not replay that
+        // placeholder as an assistant history message on the next request.
+        guard status != .failed
+            || !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return nil }
         let chatRole: OpenAICompatibleChatMessage.Role = switch role {
         case .user: .user
         case .assistant: .assistant
@@ -148,6 +153,22 @@ struct OpenAICompatibleStoredMessage: Identifiable, Codable, Equatable, Sendable
     }
 
     var timelineItem: TimelineItem {
+        if role == .assistant,
+           status == .failed,
+           text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           let detail = detail?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !detail.isEmpty
+        {
+            return TimelineItem(
+                id: id,
+                kind: .error,
+                title: "Provider response failed",
+                body: detail,
+                status: .failed,
+                timestamp: createdAt,
+                detail: nil
+            )
+        }
         let kind: TimelineItemKind = switch role {
         case .user: .userMessage
         case .assistant: .assistantMessage

@@ -136,12 +136,47 @@ fi
 
 staging_root="$(/usr/bin/mktemp -d "$output_dir/.onyx-release.XXXXXX")"
 app_path="$staging_root/Onyx.app"
+staged_artifact_dir="$staging_root/artifacts"
+staged_dmg_path="$staged_artifact_dir/$dmg_basename"
+staged_checksum_path="$staged_artifact_dir/$dmg_basename.sha256"
+previous_dmg="$staging_root/previous.dmg"
+previous_checksum="$staging_root/previous.dmg.sha256"
+publish_in_progress=0
+had_previous_dmg=0
+had_previous_checksum=0
+published_dmg=0
+published_checksum=0
+
+rollback_release_pair() {
+  local rollback_failed=0
+
+  if (( published_dmg == 1 )); then
+    /bin/rm -f -- "$dmg_path" || rollback_failed=1
+  fi
+  if (( published_checksum == 1 )); then
+    /bin/rm -f -- "$checksum_path" || rollback_failed=1
+  fi
+  if (( had_previous_dmg == 1 )); then
+    /bin/mv -- "$previous_dmg" "$dmg_path" || rollback_failed=1
+  fi
+  if (( had_previous_checksum == 1 )); then
+    /bin/mv -- "$previous_checksum" "$checksum_path" || rollback_failed=1
+  fi
+
+  return $rollback_failed
+}
+
 cleanup() {
   local exit_code=$?
+  if (( publish_in_progress == 1 )); then
+    rollback_release_pair ||
+      print -u2 -- "release: warning: could not fully restore the previous artifact pair"
+  fi
   /bin/rm -rf -- "$staging_root"
   return $exit_code
 }
 trap cleanup EXIT
+/bin/mkdir -p "$staged_artifact_dir"
 
 package_arguments=(
   release
@@ -159,29 +194,22 @@ fi
 
 dmg_arguments=(
   "$app_path"
-  "$dmg_path"
+  "$staged_dmg_path"
   --volume-name "$volume_name"
 )
 if [[ -n "$signing_identity" ]]; then
   dmg_arguments+=(--signing-identity "$signing_identity")
 fi
-if (( overwrite == 1 )); then
-  dmg_arguments+=(--overwrite)
-fi
 "$repo_root/scripts/create-dmg.sh" "${dmg_arguments[@]}"
 
-checksum_staging="$staging_root/$dmg_basename.sha256"
 (
-  cd "$output_dir"
-  /usr/bin/shasum -a 256 "$dmg_basename" > "$checksum_staging"
+  cd "$staged_artifact_dir"
+  /usr/bin/shasum -a 256 "$dmg_basename" > "$staged_checksum_path"
+  /usr/bin/shasum -a 256 -c "${staged_checksum_path:t}"
 )
-if [[ -e "$checksum_path" ]]; then
-  /bin/rm -f -- "$checksum_path"
-fi
-/bin/mv -- "$checksum_staging" "$checksum_path"
 
 verification_arguments=(
-  "$dmg_path"
+  "$staged_dmg_path"
   --app-name "Onyx.app"
   --bundle-id "$bundle_identifier"
   --version "$version"
@@ -194,6 +222,43 @@ if [[ "$architectures" == "universal" ]]; then
   verification_arguments+=(--require-universal)
 fi
 "$repo_root/scripts/verify-dmg.sh" "${verification_arguments[@]}"
+
+if (( overwrite == 0 )) && [[ -e "$dmg_path" || -e "$checksum_path" ]]; then
+  die "release artifact appeared while building; rerun with --overwrite to replace it: $dmg_path"
+fi
+if [[ -L "$dmg_path" || -L "$checksum_path" ]]; then
+  die "refusing to replace a symbolic-link release artifact"
+fi
+if [[ -e "$dmg_path" && ! -f "$dmg_path" ]] || \
+   [[ -e "$checksum_path" && ! -f "$checksum_path" ]]; then
+  die "existing release artifact is not a regular file"
+fi
+
+# Publish the verified DMG and its matching checksum as one recoverable pair.
+# Two files cannot be renamed atomically as one POSIX object, so keep rollback
+# armed from the first backup move through verification of the published pair.
+publish_in_progress=1
+if [[ -e "$dmg_path" ]]; then
+  /bin/mv -- "$dmg_path" "$previous_dmg" ||
+    die "could not preserve the existing disk image"
+  had_previous_dmg=1
+fi
+if [[ -e "$checksum_path" ]]; then
+  /bin/mv -- "$checksum_path" "$previous_checksum" ||
+    die "could not preserve the existing checksum"
+  had_previous_checksum=1
+fi
+
+/bin/mv -- "$staged_dmg_path" "$dmg_path" ||
+  die "could not publish the verified disk image"
+published_dmg=1
+/bin/mv -- "$staged_checksum_path" "$checksum_path" ||
+  die "could not publish the verified checksum"
+published_checksum=1
+
+(cd "$output_dir" && /usr/bin/shasum -a 256 -c "${checksum_path:t}") ||
+  die "published release artifact checksum verification failed"
+publish_in_progress=0
 
 print -- "Release artifacts are ready:"
 print -- "  $dmg_path"

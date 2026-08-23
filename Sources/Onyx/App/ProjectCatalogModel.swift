@@ -337,10 +337,17 @@ struct ProjectProviderTaskList: Sendable {
     var threads: [RuntimeThread]
 }
 
+/// A cached sidebar row that must survive a provider catalog refresh while
+/// its direct task read is still in flight. Provider task IDs are scoped by
+/// both connection and active/archived list.
+struct ProjectProviderTaskProtection: Equatable, Sendable {
+    let id: ProjectTaskReference.ID
+    let scope: ThreadListScope
+}
+
 /// A provider task snapshot together with the completeness of the sources
-/// used to produce it.  The sidebar can render a partial snapshot when one
-/// provider is unavailable, but legacy project migration must only consume a
-/// snapshot after every provider/scope source has loaded successfully.
+/// used to produce it. The sidebar can render a partial snapshot when one
+/// provider is unavailable while still reporting that the catalog is partial.
 struct ProjectProviderTaskCatalog: Sendable {
     var lists: [ProjectProviderTaskList]
     let sourceComplete: Bool
@@ -357,10 +364,13 @@ enum ProviderTaskCatalogSynchronizationPolicy {
     static func shouldReplaceCachedTasks(
         connectionState: RuntimeConnectionState,
         isLoadingThreadList: Bool,
-        hasAuthoritativeThreadList: Bool
+        hasAuthoritativeThreadList: Bool,
+        hasUnlistedSelectedTask: Bool = false
     ) -> Bool {
         guard case .connected = connectionState else { return false }
-        return !isLoadingThreadList && hasAuthoritativeThreadList
+        return !isLoadingThreadList
+            && hasAuthoritativeThreadList
+            && !hasUnlistedSelectedTask
     }
 }
 
@@ -466,38 +476,6 @@ final class ProjectCatalogModel: ObservableObject {
         } catch {
             guard revision == persistenceRevision else { return }
             report(title: "Could not load projects", error: error, onFailure: onFailure)
-        }
-    }
-
-    /// Imports the project paths carried by the complete provider task
-    /// snapshot exactly once.  A failed or partial source is deliberately a
-    /// no-op: persisting the migration marker in that case would make a later
-    /// successful launch unable to discover the missing projects.  The store
-    /// itself persists the marker atomically, so a user-removed project cannot
-    /// be resurrected by a concurrent/repeated bootstrap.
-    @discardableResult
-    func importTaskProjectsIfSourceComplete(
-        from catalog: ProjectProviderTaskCatalog,
-        onFailure: ProjectCatalogFailureHandler? = nil
-    ) async -> Bool {
-        guard catalog.sourceComplete, let store else { return false }
-
-        persistenceRevision &+= 1
-        let revision = persistenceRevision
-        do {
-            _ = try await store.importTaskProjects(from: catalog.allThreads)
-            let loaded = try await store.projects()
-            if revision == persistenceRevision { assignProjectsIfChanged(loaded) }
-            return true
-        } catch {
-            if revision == persistenceRevision {
-                report(
-                    title: "Could not import task projects",
-                    error: error,
-                    onFailure: onFailure
-                )
-            }
-            return false
         }
     }
 
@@ -624,6 +602,34 @@ final class ProjectCatalogModel: ObservableObject {
         } else {
             providerTaskLists.append(incoming)
             bumpSidebarProjectionRevision()
+        }
+    }
+
+    /// Applies a host-level provider catalog without evicting the one cached
+    /// row currently being opened directly. Once that read resolves, the live
+    /// workspace snapshot replaces this list normally.
+    func replaceTasks(
+        from lists: [ProjectProviderTaskList],
+        preserving protection: ProjectProviderTaskProtection? = nil
+    ) {
+        for list in lists {
+            if let protection,
+               protection.id.providerConnectionID == list.providerConnectionID,
+               protection.scope.rawValue == list.scope.rawValue,
+               !list.threads.contains(where: { $0.id == protection.id.threadID }),
+               providerTaskLists.contains(where: { cached in
+                   cached.providerConnectionID == list.providerConnectionID
+                       && cached.scope.rawValue == list.scope.rawValue
+                       && cached.threads.contains(where: { $0.id == protection.id.threadID })
+               }) {
+                continue
+            }
+            replaceTasks(
+                for: list.providerConnectionID,
+                providerDisplayName: list.providerDisplayName,
+                scope: list.scope,
+                threads: list.threads
+            )
         }
     }
 

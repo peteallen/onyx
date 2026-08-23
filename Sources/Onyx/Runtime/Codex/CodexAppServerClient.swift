@@ -149,6 +149,8 @@ actor CodexAppServerClient: CodexAppServerTransport {
     private let eventContinuation: AsyncStream<AppServerEvent>.Continuation
     private let executableURL: URL
     private let processArguments: [String]
+    private let processEnvironment: [String: String]?
+    private let stateDirectoryPreparation: (@Sendable () throws -> Void)?
     private var process: Process?
     private var input: FileHandle?
     private var outputHandle: FileHandle?
@@ -186,10 +188,14 @@ actor CodexAppServerClient: CodexAppServerTransport {
 
     init(
         executableURL: URL,
-        processArguments: [String] = ["app-server", "--listen", "stdio://"]
+        processArguments: [String] = ["app-server", "--listen", "stdio://"],
+        processEnvironment: [String: String]? = nil,
+        stateDirectoryPreparation: (@Sendable () throws -> Void)? = nil
     ) {
         self.executableURL = executableURL
         self.processArguments = processArguments
+        self.processEnvironment = processEnvironment
+        self.stateDirectoryPreparation = stateDirectoryPreparation
         let stream = AsyncStream.makeStream(of: AppServerEvent.self)
         events = stream.stream
         eventContinuation = stream.continuation
@@ -219,6 +225,8 @@ actor CodexAppServerClient: CodexAppServerTransport {
             )
         }
 
+        try stateDirectoryPreparation?()
+
         nextConnectionGeneration &+= 1
         let generation = nextConnectionGeneration
         activeConnectionGeneration = generation
@@ -232,6 +240,7 @@ actor CodexAppServerClient: CodexAppServerTransport {
         let terminationObserver = ProcessTerminationObserver()
         process.executableURL = executableURL
         process.arguments = processArguments
+        process.environment = processEnvironment
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe

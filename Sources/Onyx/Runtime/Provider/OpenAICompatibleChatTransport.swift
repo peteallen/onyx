@@ -19,6 +19,10 @@ struct OpenAICompatibleChatResponse: Sendable, Equatable {
         let index: Int
         let role: String?
         let content: String?
+        /// Reasoning is progress evidence, not answer text. Keep only its
+        /// presence so hidden provider thinking cannot leak through this
+        /// transport abstraction or be retained by the runtime.
+        let hasReasoning: Bool
         let finishReason: String?
     }
 
@@ -36,6 +40,7 @@ struct OpenAICompatibleChatStreamChunk: Sendable, Equatable {
         struct Delta: Sendable, Equatable {
             let role: String?
             let content: String?
+            let hasReasoning: Bool
         }
 
         let index: Int
@@ -343,6 +348,7 @@ struct OpenAICompatibleChatTransport: Sendable {
                 index: index,
                 role: message["role"]?.stringValue,
                 content: Self.optionalString(message["content"]),
+                hasReasoning: Self.containsReasoning(in: message),
                 finishReason: Self.optionalString(value["finish_reason"])
             )
         }
@@ -391,7 +397,8 @@ struct OpenAICompatibleChatTransport: Sendable {
                 index: index,
                 delta: .init(
                     role: delta["role"]?.stringValue,
-                    content: optionalString(delta["content"])
+                    content: optionalString(delta["content"]),
+                    hasReasoning: containsReasoning(in: delta)
                 ),
                 finishReason: optionalString(value["finish_reason"])
             )
@@ -419,6 +426,25 @@ struct OpenAICompatibleChatTransport: Sendable {
         guard let value else { return nil }
         if case .null = value { return nil }
         return value.stringValue
+    }
+
+    private static func containsReasoning(in object: [String: JSONValue]) -> Bool {
+        for key in ["reasoning_content", "reasoning", "reasoning_details", "analysis"] {
+            guard let value = object[key] else { continue }
+            switch value {
+            case let .string(text):
+                if !text.isEmpty { return true }
+            case let .array(values):
+                if !values.isEmpty { return true }
+            case let .object(fields):
+                if !fields.isEmpty { return true }
+            case let .bool(value):
+                if value { return true }
+            case .integer, .number, .null:
+                continue
+            }
+        }
+        return false
     }
 
     private static func providerError(

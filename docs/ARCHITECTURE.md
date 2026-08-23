@@ -46,7 +46,20 @@ In the current implementation, the application owns:
 
 Each runtime owns only its provider-specific execution behavior. For Codex,
 that includes ChatGPT authentication, persisted Codex threads, tools,
-approvals, sandboxing, compaction, and streamed events.
+approvals, sandboxing, compaction, and streamed events. The production Codex
+runtime is an Onyx-owned app-server binary at
+`Contents/Helpers/CodexRuntime/<platform>/bin/codex-app-server`; it is not
+resolved from a separately installed ChatGPT/Codex app.
+
+Onyx gives that child process an explicit private home at
+`~/Library/Application Support/Onyx/Codex` through `CODEX_HOME`. It prepares
+the directory with private permissions, removes inherited Codex state-routing
+variables, and never imports or filters `~/.codex`. This keeps Onyx's tasks,
+SQLite databases, rollout files, memories, skills, MCP configuration, and
+ChatGPT OAuth credential files separate from the official Codex application.
+The app-server initialization response is checked against the expected home
+before the runtime is considered usable. Signing out, renaming, archiving, or
+deleting in either app therefore cannot mutate the other's history.
 
 Provider identity is threaded through window restoration, task selection,
 draft preferences, local provider conversations, and model usage ranking.
@@ -146,9 +159,18 @@ tokens. There is no direct-key credential path today. Any such implementation
 must use an app-owned Keychain credential handle rather than UserDefaults,
 process arguments, logs, or transcript state.
 
-Development currently uses the installed Codex binary. Distribution will pin
-and bundle a known-compatible version, archive its generated schema, and run
-recorded protocol fixtures before upgrades.
+Production always uses the pinned helper packaged inside Onyx. The explicit
+`ONYX_CODEX_PATH` override and installed ChatGPT/Codex search are available
+only through `CodexRuntime.makeDevelopmentInstalled` for opt-in development
+and live tests; they are not a production fallback. Release packaging must
+include the helper, preserve its executable bit, verify its checksum, and
+exercise startup against a clean Onyx state directory before publication.
+
+The bundled helper is launched with file-backed ChatGPT OAuth credentials in
+the isolated home. Onyx does not copy credentials from `~/.codex`, and a clean
+Mac with no official Codex harness installed can complete its own OAuth flow.
+The generated app-server schema is archived with the pinned runtime and
+protocol fixtures run before upgrades.
 
 Fixture tests currently prove that an unexpected process exit fails in-flight
 requests, a malformed JSONL record closes the affected transport, and a new

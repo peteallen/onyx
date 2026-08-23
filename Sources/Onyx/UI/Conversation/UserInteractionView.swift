@@ -39,9 +39,9 @@ private struct InteractionHeader: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(interaction.title)
-                    .font(.system(size: 12.5, weight: .semibold))
+                    .font(.system(size: OnyxTypography.navigation, weight: .semibold))
                 Text(interaction.detail)
-                    .font(.system(size: 11.5))
+                    .font(.system(size: OnyxTypography.secondary))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -66,7 +66,7 @@ private struct ApprovalInteractionView: View {
                 )
                 if let command = prompt.command, !command.isEmpty {
                     Text(command)
-                        .font(.system(size: 11, design: .monospaced))
+                        .font(.system(size: OnyxTypography.secondary, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                         .lineLimit(3)
@@ -182,7 +182,7 @@ private struct QuestionInteractionView: View {
 
             if prompt.questions.count > 1 {
                 Label("Scroll to review all \(prompt.questions.count) questions", systemImage: "arrow.up.and.down")
-                    .font(.system(size: 9.5, weight: .medium))
+                    .font(.system(size: OnyxTypography.metadata, weight: .medium))
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .trailing)
             }
@@ -222,11 +222,11 @@ private struct QuestionInteractionView: View {
     private func questionView(_ question: RuntimeQuestion) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(question.header.uppercased())
-                .font(.system(size: 9.5, weight: .bold))
+                .font(.system(size: OnyxTypography.metadata, weight: .bold))
                 .tracking(0.8)
                 .foregroundStyle(.secondary)
             Text(question.prompt)
-                .font(.system(size: 12.5, weight: .medium))
+                .font(.system(size: OnyxTypography.navigation, weight: .medium))
 
             ForEach(question.options, id: \.self) { option in
                 Button {
@@ -238,9 +238,9 @@ private struct QuestionInteractionView: View {
                             ? "largecircle.fill.circle" : "circle")
                             .foregroundStyle(OnyxTheme.iris)
                         VStack(alignment: .leading, spacing: 1) {
-                            Text(option.label).font(.system(size: 12, weight: .medium))
+                            Text(option.label).font(.system(size: OnyxTypography.secondary, weight: .medium))
                             if !option.detail.isEmpty {
-                                Text(option.detail).font(.system(size: 11)).foregroundStyle(.secondary)
+                                Text(option.detail).font(.system(size: OnyxTypography.secondary)).foregroundStyle(.secondary)
                             }
                         }
                         Spacer()
@@ -395,9 +395,9 @@ private struct FormInteractionView: View {
     private func formField(_ field: RuntimeFormField) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(field.label + (field.isRequired ? " *" : ""))
-                .font(.system(size: 11.5, weight: .semibold))
+                .font(.system(size: OnyxTypography.secondary, weight: .semibold))
             if let detail = field.detail, !detail.isEmpty {
-                Text(detail).font(.system(size: 10.5)).foregroundStyle(.secondary)
+                Text(detail).font(.system(size: OnyxTypography.metadata)).foregroundStyle(.secondary)
             }
 
             switch field.kind {

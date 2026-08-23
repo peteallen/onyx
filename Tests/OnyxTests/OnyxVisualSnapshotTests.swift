@@ -16,7 +16,7 @@ final class OnyxVisualSnapshotTests: XCTestCase {
                 id: "visual-user-one",
                 kind: .userMessage,
                 title: nil,
-                body: "hi",
+                body: "sup fam",
                 status: .completed,
                 timestamp: .now,
                 detail: nil

@@ -8,12 +8,19 @@ not have a separate packaging implementation that can drift from local builds.
 
 Requirements are macOS 15 or newer and Xcode 26 or newer.
 
+Restore the pinned Codex packages before a local build or release. This is a
+one-time download per checkout; later runs verify and reuse the cached bytes:
+
+```bash
+scripts/fetch-codex-runtime.sh --architectures universal
+```
+
 ```bash
 scripts/release.sh 0.2.0
 ```
 
 This builds a universal Apple Silicon + Intel release in an isolated staging
-directory and creates:
+directory, embeds the pinned Codex app-server helper, and creates:
 
 - `dist-release/Onyx-0.2.0-macOS.dmg`
 - `dist-release/Onyx-0.2.0-macOS.dmg.sha256`
@@ -22,11 +29,20 @@ The app is ad-hoc signed and the DMG is unsigned when no Developer ID identity
 is configured. That is useful for local testing, but users will see the normal
 Gatekeeper warning for an unidentified developer.
 
-The release command checks the app signature, creates a compressed image with
-an Applications shortcut, mounts it read-only, validates its bundle identity
-and version, and verifies it again after the final move. It refuses to replace
-an existing artifact unless `--overwrite` is explicit. Neither the release nor
-verification scripts launch, install, or stop Onyx.
+The release command checks the app signature, verifies each bundled Codex
+runtime package against its pinned archive hash and package manifest, creates a
+compressed image with an Applications shortcut, mounts it read-only, validates
+its exact top-level payload, bundle identity, and version, initializes the
+mounted native Codex helper against a fresh private data folder, and verifies
+the artifact again before publishing its matching DMG/checksum pair. If pair
+publication fails, the previous pair is restored.
+It refuses to replace an existing artifact unless `--overwrite` is explicit.
+Neither the release nor verification scripts launch, install, or stop Onyx.
+The packaged app must not depend on ChatGPT/Codex being installed separately.
+
+At first launch the app creates only
+`~/Library/Application Support/Onyx/Codex` and passes that path as
+`CODEX_HOME`; it must never read or migrate `~/.codex`.
 
 For a faster host-architecture-only local smoke test, pass
 `--architectures native`. GitHub release artifacts always use the default
@@ -72,7 +88,8 @@ scripts/release.sh 0.2.0
 `create-dmg.sh` also supports App Store Connect API-key credentials and direct
 Apple ID environment variables. See `scripts/create-dmg.sh --help` for their
 names. A notarized build is not moved into place until `notarytool`, stapling,
-Gatekeeper assessment, and the normal mounted-image checks all pass.
+Gatekeeper assessment of both the image and its mounted app, and the normal
+mounted-image checks all pass.
 
 ## GitHub Actions
 
@@ -80,29 +97,20 @@ The `CI` workflow runs on pushes to `main`, pull requests, and manual requests.
 It runs the unit suite, exercises app-packaging failure safeguards, then builds
 and mounts an unsigned release DMG as an end-to-end packaging check.
 
-The `Release` workflow supports two ways to cut a release:
+The `Release` workflow is currently artifact-only. Run **Actions → Release →
+Run workflow**, enter `0.2.0`, and it uploads the verified DMG and checksum as a
+downloadable workflow artifact. It has read-only repository permissions, no
+tag trigger, and no GitHub Release publication step.
 
-1. Push a numeric version tag such as `v0.2.0`. A successful workflow creates
-   or updates the matching GitHub Release and attaches the DMG and checksum,
-   but only when Developer ID signing and notarization are fully configured.
-2. Run **Actions → Release → Run workflow**. Enter `0.2.0`; leave **Publish
-   release** off for an artifact-only dry run, or turn it on to create the tag
-   and GitHub Release at the selected commit.
-
-The tag route is two commands after the release commit is on `main`:
-
-```bash
-git tag -a v0.2.0 -m "Onyx 0.2.0"
-git push origin v0.2.0
-```
-
-Each run also uploads the DMG and checksum as a downloadable workflow artifact.
 Release versions must use three numeric components because macOS stores them in
 `CFBundleShortVersionString`. GitHub's run number becomes `CFBundleVersion`.
 Without Apple secrets, artifact-only workflow runs remain useful development
-distributions. Publishing a GitHub Release fails closed until both signing and
-notarization are configured; a pushed release tag is therefore not a shortcut
-around the distribution trust requirements.
+distributions.
+
+Do not add tag-triggered or manual GitHub Release publication until the runtime
+verification checklist below has passed on the release candidate, including
+clean-machine OAuth and cross-app mutation isolation. Re-enabling publication
+is a separate reviewed change, not a workflow input.
 
 ### Optional repository secrets
 
@@ -132,3 +140,36 @@ To copy a `.p12` as base64 on macOS without creating another file:
 ```
 
 Paste the clipboard contents into `APPLE_DEVELOPER_ID_P12_BASE64`.
+
+## Bundled Codex runtime contract
+
+The helper is part of a pinned, release-owned Codex package rather than a
+machine-local dependency. Packaging accepts one architecture-specific package
+per target, validates its archive hash and manifest, and preserves the complete
+runtime tree under `Contents/Helpers/CodexRuntime/<platform>/`, including the
+app-server, code-mode host, packaged `rg`, shell resources, and package
+metadata. It fails closed when any required file, executable bit, hash, or
+manifest entry does not match. The same packages must be present in preview and
+release bundles.
+
+Run `scripts/fetch-codex-runtime.sh --architectures universal` to populate the
+default ignored cache at `.artifacts/codex-runtime`. Packaging never downloads.
+For a different local cache set `ONYX_CODEX_RUNTIME_CACHE_DIR`; automation may
+instead pass exact archive paths through `ONYX_CODEX_RUNTIME_ARCHIVE_ARM64` and
+`ONYX_CODEX_RUNTIME_ARCHIVE_X86_64`. Every input is still checked against the
+checked-in v0.149.0 size, SHA-256, layout, metadata, and architecture.
+
+Runtime verification must prove all of the following before publication:
+
+- the app-server reports the exact Onyx `CODEX_HOME` during initialization;
+- a clean Onyx home starts signed out even when official Codex is signed in;
+- Onyx-created tasks do not appear in official Codex, and official tasks do
+  not appear in Onyx;
+- rename, archive, delete, sign-out, and relaunch operations stay within the
+  owning app; and
+- a clean Mac with no ChatGPT/Codex installation can authenticate and run the
+  bundled helper.
+
+`ONYX_CODEX_PATH` and installed-runtime discovery are test/development-only
+escape hatches. They must never be used by a production composition or
+silently replace a missing bundled helper.

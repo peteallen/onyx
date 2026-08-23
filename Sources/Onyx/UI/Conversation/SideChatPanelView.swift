@@ -33,7 +33,7 @@ struct SideChatPanelView: View {
                     VStack(spacing: 9) {
                         ProgressView().controlSize(.small)
                         Text("Forking this task's context…")
-                            .font(.system(size: 12))
+                            .font(.system(size: OnyxTypography.reading))
                             .foregroundStyle(.secondary)
                     }
                     .padding(16)
@@ -44,9 +44,9 @@ struct SideChatPanelView: View {
                             .font(.system(size: 24, weight: .medium))
                             .foregroundStyle(OnyxTheme.iris)
                         Text("Ask a quick follow-up")
-                            .font(.system(size: 14, weight: .semibold))
+                            .font(.system(size: OnyxTypography.paneTitle, weight: .semibold))
                         Text("This private branch disappears when you close it.")
-                            .font(.system(size: 11.5))
+                            .font(.system(size: OnyxTypography.secondary))
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)
                     }
@@ -66,14 +66,14 @@ struct SideChatPanelView: View {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundStyle(OnyxTheme.destructive)
                     Text(error)
-                        .font(.system(size: 11.5))
+                        .font(.system(size: OnyxTypography.secondary))
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                     Spacer(minLength: 0)
 
                     if model.canRetrySideChatFork {
                         Button("Retry", action: model.retrySideChatFork)
-                            .font(.system(size: 11.5, weight: .semibold))
+                            .font(.system(size: OnyxTypography.secondary, weight: .semibold))
                             .foregroundStyle(OnyxTheme.iris)
                             .frame(minWidth: 44, minHeight: OnyxHitTarget.compact)
                             .contentShape(Rectangle())
@@ -113,9 +113,9 @@ struct SideChatPanelView: View {
 
             VStack(alignment: .leading, spacing: 1) {
                 Text("Side chat")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: OnyxTypography.paneTitle, weight: .semibold))
                 Text(parentTitle)
-                    .font(.system(size: 10.5))
+                    .font(.system(size: OnyxTypography.metadata))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
@@ -181,7 +181,7 @@ struct SideChatPanelView: View {
                 .accessibilityLabel("Attach images to side chat")
 
                 Text("\(model.sideChatModelName) · \(model.sideChatReasoningEffortName)")
-                    .font(.system(size: 10, weight: .medium))
+                    .font(.system(size: OnyxTypography.metadata, weight: .medium))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
 

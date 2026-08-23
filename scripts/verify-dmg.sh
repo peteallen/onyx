@@ -1,6 +1,9 @@
 #!/bin/zsh
 set -euo pipefail
 
+repo_root="${0:A:h:h}"
+source "$repo_root/scripts/codex-runtime-common.sh"
+
 dmg_path=""
 expected_app_name=""
 expected_bundle_identifier=""
@@ -142,6 +145,13 @@ applications_link="$mount_point/Applications"
 [[ "$(/usr/bin/readlink "$applications_link")" == "/Applications" ]] || \
   die "Applications shortcut does not target /Applications"
 
+top_level_entries=("$mount_point"/*(DN:t))
+expected_top_level_entries=("${app_path:t}" "Applications")
+top_level_entries=("${(@on)top_level_entries}")
+expected_top_level_entries=("${(@on)expected_top_level_entries}")
+[[ "${(j:\n:)top_level_entries}" == "${(j:\n:)expected_top_level_entries}" ]] ||
+  die "disk image contains an unexpected top-level payload: ${(j:, :)top_level_entries}"
+
 info_plist="$app_path/Contents/Info.plist"
 executable_name="$(/usr/bin/plutil -extract CFBundleExecutable raw -o - "$info_plist" \
   2>/dev/null || true)"
@@ -150,12 +160,52 @@ executable_path="$app_path/Contents/MacOS/$executable_name"
 [[ -x "$executable_path" ]] || \
   die "app executable is missing or not executable"
 /usr/bin/plutil -lint "$info_plist" >/dev/null
-/usr/bin/codesign --verify --deep --strict --verbose=2 "$app_path"
 executable_architectures="$(/usr/bin/lipo -archs "$executable_path")"
 if (( require_universal == 1 )); then
   [[ " $executable_architectures " == *" arm64 "* && \
      " $executable_architectures " == *" x86_64 "* ]] || \
     die "app is not universal arm64 + x86_64: $executable_architectures"
+fi
+
+codex_runtime_require_manifest
+runtime_root="$app_path/Contents/Helpers/CodexRuntime"
+[[ -d "$runtime_root" && ! -L "$runtime_root" ]] ||
+  die "app is missing the pinned Codex runtime"
+expected_runtime_architectures=()
+if (( require_universal == 1 )); then
+  expected_runtime_architectures=(arm64 x86_64)
+else
+  [[ " $executable_architectures " == *" arm64 "* ]] &&
+    expected_runtime_architectures+=(arm64)
+  [[ " $executable_architectures " == *" x86_64 "* ]] &&
+    expected_runtime_architectures+=(x86_64)
+fi
+(( ${#expected_runtime_architectures[@]} > 0 )) ||
+  die "app has no supported Codex runtime architecture: $executable_architectures"
+
+expected_runtime_targets=()
+for runtime_architecture in "${expected_runtime_architectures[@]}"; do
+  runtime_target="$(codex_runtime_target_for_architecture "$runtime_architecture")"
+  expected_runtime_targets+=("$runtime_target")
+  codex_runtime_verify_installed_package \
+    "$runtime_root/$runtime_target" "$runtime_architecture"
+done
+installed_runtime_targets=("$runtime_root"/*(N:t))
+[[ "${(j:\n:)installed_runtime_targets}" == "${(j:\n:)expected_runtime_targets}" ]] ||
+  die "Codex runtime targets do not match app architectures"
+
+# Verify the outer signature only after reporting any nested helper problem.
+/usr/bin/codesign --verify --deep --strict --verbose=2 "$app_path"
+if (( require_notarized == 1 )); then
+  /usr/sbin/spctl --assess --type execute --verbose=2 "$app_path"
+fi
+
+# Only execute the mounted helper after its complete package, the outer app,
+# and (for public releases) Gatekeeper acceptance have all been established.
+native_architecture="$(/usr/bin/uname -m)"
+if (( ${expected_runtime_architectures[(Ie)$native_architecture]} )); then
+  native_runtime_target="$(codex_runtime_target_for_architecture "$native_architecture")"
+  codex_runtime_probe_installed_package "$runtime_root/$native_runtime_target"
 fi
 
 verify_plist_value() {

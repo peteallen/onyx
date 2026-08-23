@@ -508,7 +508,7 @@ final class TranscriptLayoutPerformanceTests: XCTestCase {
         )
         XCTAssertEqual(
             try XCTUnwrap(waitingLabel.font).pointSize,
-            OnyxTypography.navigation,
+            OnyxTypography.reading,
             accuracy: 0.1
         )
         XCTAssertEqual(
@@ -816,24 +816,93 @@ final class TranscriptLayoutPerformanceTests: XCTestCase {
         }
     }
 
-    func testWideTranscriptKeepsTheLeadingGutterTight() {
+    func testWideTranscriptFillsThePaneBetweenBalancedSideGutters() {
         let metrics = TranscriptFlowMetrics(collectionWidth: 1_200)
 
         XCTAssertEqual(
-            TranscriptFlowMetrics.maximumReadableWidth,
-            OnyxWorkspaceMetrics.maximumReadingWidth
-        )
-        XCTAssertEqual(
             TranscriptFlowMetrics.preferredLeadingInset,
-            OnyxWorkspaceMetrics.transcriptOuterLeadingInset
+            OnyxWorkspaceMetrics.preferredConversationSideInset
         )
         XCTAssertEqual(
             metrics.leadingInset,
             TranscriptFlowMetrics.preferredLeadingInset,
             accuracy: 0.001
         )
-        XCTAssertGreaterThan(metrics.trailingInset, metrics.leadingInset)
-        XCTAssertEqual(metrics.itemWidth, TranscriptFlowMetrics.maximumReadableWidth)
+        XCTAssertEqual(metrics.trailingInset, metrics.leadingInset, accuracy: 0.001)
+        XCTAssertEqual(
+            metrics.itemWidth,
+            1_200 - metrics.leadingInset - metrics.trailingInset
+                - TranscriptFlowMetrics.layoutSafetyWidth,
+            accuracy: 0.001
+        )
+        XCTAssertGreaterThan(metrics.itemWidth, 1_100)
+    }
+
+    @MainActor
+    func testShortUserMessageFitsOneLineInsideItsBubble() throws {
+        let body = "sup fam"
+        let item = TimelineItem(
+            id: "short-user-message",
+            kind: .userMessage,
+            title: nil,
+            body: body,
+            status: .completed,
+            timestamp: .now,
+            detail: nil
+        )
+        let width: CGFloat = 1_120
+        let hostingView = NSHostingView(
+            rootView: NativeTranscriptView(items: [item])
+        )
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: width, height: 180),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = hostingView
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        hostingView.layoutSubtreeIfNeeded()
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
+        hostingView.layoutSubtreeIfNeeded()
+
+        let collectionView = try XCTUnwrap(
+            hostingView.firstDescendant(ofType: NSCollectionView.self)
+        )
+        let indexPath = IndexPath(item: 0, section: 0)
+        collectionView.scrollToItems(at: [indexPath], scrollPosition: .top)
+        hostingView.layoutSubtreeIfNeeded()
+        let cell = try XCTUnwrap(
+            collectionView.item(at: indexPath)?.view as? TranscriptCellView
+        )
+
+        let bodyLabel = try XCTUnwrap(
+            cell.subviews
+                .compactMap { $0 as? NSTextField }
+                .first { $0.attributedStringValue.string == body && !$0.isHidden }
+        )
+        let requiredBodySize = try XCTUnwrap(bodyLabel.cell?.cellSize(forBounds: NSRect(
+            x: 0,
+            y: 0,
+            width: bodyLabel.bounds.width,
+            height: .greatestFiniteMagnitude
+        )))
+        XCTAssertGreaterThanOrEqual(
+            bodyLabel.bounds.width,
+            bodyLabel.intrinsicContentSize.width,
+            "A short outgoing message should not wrap because its text field is narrower than its intrinsic single-line width"
+        )
+        XCTAssertLessThanOrEqual(
+            requiredBodySize.height,
+            bodyLabel.bounds.height + 0.5,
+            "The native text cell should lay the outgoing message out on the same single line reserved by the row"
+        )
+        XCTAssertLessThanOrEqual(bodyLabel.frame.maxY, cell.messageBubbleFrame.maxY)
+        XCTAssertGreaterThanOrEqual(bodyLabel.frame.minY, cell.messageBubbleFrame.minY)
     }
 
     @MainActor

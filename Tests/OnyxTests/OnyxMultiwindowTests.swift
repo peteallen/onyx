@@ -70,6 +70,32 @@ final class OnyxMultiwindowTests: XCTestCase {
         )
     }
 
+    func testNewerSameProviderSelectionCancelsOlderPendingDestination() {
+        let qwen = ProviderConnectionID("local.qwen.primary")
+        let first = ProviderTaskNavigationPlan.resolve(
+            selectingConnectionID: qwen,
+            threadID: "slow-first-task",
+            scope: .active,
+            currentConnectionID: .codexDefault,
+            currentScope: .active
+        )
+        XCTAssertEqual(first.action, .replaceProvider)
+        XCTAssertEqual(first.pendingThreadID, "slow-first-task")
+
+        // This models the second click after the provider shell has changed
+        // but before the first destination's task list has finished loading.
+        let second = ProviderTaskNavigationPlan.resolve(
+            selectingConnectionID: qwen,
+            threadID: "newer-second-task",
+            scope: .active,
+            currentConnectionID: qwen,
+            currentScope: .active
+        )
+        XCTAssertEqual(second.action, .selectCurrentThread)
+        XCTAssertNil(second.pendingThreadID)
+        XCTAssertNil(second.pendingThreadScope)
+    }
+
     func testProviderModelUsageRanksFrequencyThenRecency() throws {
         let suite = makeDefaults()
         defer { suite.cleanUp() }

@@ -372,7 +372,7 @@ struct GitDiffViewerView: View {
             reviewHeader
             if !model.supports(.codeReview), model.session != nil {
                 Label("This runtime does not support structured code review.", systemImage: "info.circle")
-                    .font(.system(size: 10.5))
+                    .font(.system(size: OnyxTypography.metadata))
                     .foregroundStyle(.secondary)
             }
             stateContent
@@ -411,9 +411,9 @@ struct GitDiffViewerView: View {
             HStack(alignment: .center, spacing: 8) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Working tree review")
-                        .font(.system(size: 12.5, weight: .semibold))
+                        .font(.system(size: OnyxTypography.navigation, weight: .semibold))
                     Text(reviewScopeLabel)
-                        .font(.system(size: 10.5))
+                        .font(.system(size: OnyxTypography.metadata))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
@@ -421,7 +421,7 @@ struct GitDiffViewerView: View {
                 reviewButton
             }
             Text("Inspect, stage, unstage, or discard individual file changes. Ask \(model.runtimeDisplayName) to review the whole checkout.")
-                .font(.system(size: 10.5))
+                .font(.system(size: OnyxTypography.metadata))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -462,7 +462,7 @@ struct GitDiffViewerView: View {
                 ProgressView().controlSize(.small)
                 Text("Reading repository changes…")
             }
-            .font(.system(size: 11))
+            .font(.system(size: OnyxTypography.secondary))
             .frame(maxWidth: .infinity)
             .padding(.vertical, 34)
             .accessibilityElement(children: .ignore)
@@ -499,7 +499,7 @@ struct GitDiffViewerView: View {
                     .foregroundStyle(OnyxTheme.iris)
                     .accessibilityHidden(true)
                 Text(branchName(snapshot.status.branch))
-                    .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
+                    .font(.system(size: OnyxTypography.secondary, weight: .semibold, design: .monospaced))
                     .lineLimit(1)
                 Spacer(minLength: 4)
                 if diffModel.isRefreshing {
@@ -509,7 +509,7 @@ struct GitDiffViewerView: View {
                 }
             }
             Text(trackingLabel(snapshot.status.branch))
-                .font(.system(size: 10))
+                .font(.system(size: OnyxTypography.metadata))
                 .foregroundStyle(.secondary)
             HStack(spacing: 6) {
                 countBadge("Staged", count: snapshot.status.stagedChanges.count, color: OnyxTheme.iris)
@@ -597,7 +597,7 @@ struct GitDiffViewerView: View {
             .padding(.top, 5)
         } label: {
             Text("Changed files")
-                .font(.system(size: 11.5, weight: .semibold))
+                .font(.system(size: OnyxTypography.secondary, weight: .semibold))
         }
         .padding(9)
         .onyxPanel(radius: 9)
@@ -608,22 +608,22 @@ struct GitDiffViewerView: View {
             VStack(alignment: .leading, spacing: 5) {
                 HStack(alignment: .firstTextBaseline) {
                     Text(file.path)
-                        .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
+                        .font(.system(size: OnyxTypography.secondary, weight: .semibold, design: .monospaced))
                         .textSelection(.enabled)
                     Spacer(minLength: 5)
                     Text(file.kind.title)
-                        .font(.system(size: 9.5, weight: .semibold))
+                        .font(.system(size: OnyxTypography.metadata, weight: .semibold))
                         .foregroundStyle(file.kind.color)
                 }
                 if let oldPath = file.oldPath {
                     Text("from \(oldPath)")
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(.system(size: OnyxTypography.metadata, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                 }
                 if !file.isBinary {
                     Text("\(file.additions) additions · \(file.deletions) deletions")
-                        .font(.system(size: 10))
+                        .font(.system(size: OnyxTypography.metadata))
                         .foregroundStyle(.secondary)
                 }
             }
@@ -644,14 +644,14 @@ struct GitDiffViewerView: View {
             HStack(spacing: 6) {
                 ProgressView().controlSize(.mini)
                 Text(operation.action.progressTitle)
-                    .font(.system(size: 10.5, weight: .medium))
+                    .font(.system(size: OnyxTypography.metadata, weight: .medium))
             }
             .frame(height: 24)
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("\(operation.action.progressTitle) \(file.path)")
         } else if diffModel.requiresConflictResolution(on: file.id) {
             Label("Resolve this conflict before changing its Git state.", systemImage: "exclamationmark.triangle")
-                .font(.system(size: 10.5))
+                .font(.system(size: OnyxTypography.metadata))
                 .foregroundStyle(OnyxTheme.warning)
                 .onyxHelp("Resolve the conflict before staging, unstaging, or discarding this file")
                 .accessibilityLabel("Resolve the conflict in \(file.path) before using Git actions")
@@ -700,7 +700,7 @@ struct GitDiffViewerView: View {
                     .foregroundStyle(OnyxTheme.destructive)
                     .accessibilityHidden(true)
                 Text(message)
-                    .font(.system(size: 10.5))
+                    .font(.system(size: OnyxTypography.metadata))
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 4)
                 Button {
@@ -728,11 +728,11 @@ struct GitDiffViewerView: View {
                     file.isBinary ? "Binary or preview unavailable" : "No textual changes",
                     systemImage: file.isBinary ? "doc.badge.ellipsis" : "doc"
                 )
-                .font(.system(size: 11.5, weight: .semibold))
+                .font(.system(size: OnyxTypography.secondary, weight: .semibold))
                 Text(file.isBinary
                     ? "Onyx does not load this file into the text diff viewer."
                     : "Git reported metadata changes without a text hunk.")
-                    .font(.system(size: 10.5))
+                    .font(.system(size: OnyxTypography.metadata))
                     .foregroundStyle(.secondary)
                 metadata(plan)
             }
@@ -775,7 +775,7 @@ struct GitDiffViewerView: View {
                 }
                 if plan.hiddenMetadataCount > 0 {
                     Text("\(plan.hiddenMetadataCount) more metadata lines hidden")
-                        .font(.system(size: 9.5, weight: .medium))
+                        .font(.system(size: OnyxTypography.metadata, weight: .medium))
                         .foregroundStyle(.tertiary)
                 }
             }
@@ -824,9 +824,9 @@ struct GitDiffViewerView: View {
                 .font(.system(size: 20))
                 .foregroundStyle(.tertiary)
                 .accessibilityHidden(true)
-            Text(title).font(.system(size: 11.5, weight: .semibold))
+            Text(title).font(.system(size: OnyxTypography.secondary, weight: .semibold))
             Text(detail)
-                .font(.system(size: 10.5))
+                .font(.system(size: OnyxTypography.metadata))
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
             actions()
@@ -841,7 +841,7 @@ struct GitDiffViewerView: View {
             Circle().fill(color).frame(width: 5, height: 5).accessibilityHidden(true)
             Text("\(title) \(count)")
         }
-        .font(.system(size: 9.5, weight: .medium))
+        .font(.system(size: OnyxTypography.metadata, weight: .medium))
         .padding(.horizontal, 7)
         .frame(height: 21)
         .background(color.opacity(0.11))
@@ -851,7 +851,7 @@ struct GitDiffViewerView: View {
 
     private func truncationNotice(_ message: String) -> some View {
         Label(message, systemImage: "ellipsis.circle")
-            .font(.system(size: 9.5))
+            .font(.system(size: OnyxTypography.metadata))
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
     }
@@ -913,7 +913,7 @@ struct GitDiffViewerView: View {
             ProgressView().controlSize(.mini)
             Text("\(title)…")
         }
-        .font(.system(size: 10.5, weight: .medium))
+        .font(.system(size: OnyxTypography.metadata, weight: .medium))
         .frame(height: 24)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Review status")

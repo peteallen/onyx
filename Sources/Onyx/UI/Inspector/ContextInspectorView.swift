@@ -194,7 +194,7 @@ private struct SummaryInspector: View {
                         accessibilityHint: "Shows the latest plan update"
                     ) {
                         Text(lastPlan.body)
-                            .font(.system(size: 11.5))
+                            .font(.system(size: OnyxTypography.secondary))
                             .foregroundStyle(OnyxTheme.quietText)
                             .fixedSize(horizontal: false, vertical: true)
                             .accessibilityLabel("Latest plan update: \(lastPlan.body)")
@@ -241,7 +241,7 @@ private struct SummaryInspector: View {
             if let explanation = plan.explanation?.trimmingCharacters(in: .whitespacesAndNewlines),
                !explanation.isEmpty {
                 Text(explanation)
-                    .font(.system(size: 11))
+                    .font(.system(size: OnyxTypography.secondary))
                     .foregroundStyle(OnyxTheme.quietText)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -255,7 +255,7 @@ private struct SummaryInspector: View {
                             .foregroundStyle(planColor(for: step.status))
                             .accessibilityHidden(true)
                         Text(step.text)
-                            .font(.system(size: 11.5))
+                            .font(.system(size: OnyxTypography.secondary))
                             .foregroundStyle(step.status == .completed ? OnyxTheme.quietText : Color.primary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -299,7 +299,7 @@ private struct SummaryInspector: View {
                             if let message = agent.message?.trimmingCharacters(in: .whitespacesAndNewlines),
                                !message.isEmpty {
                                 Text(message)
-                                    .font(.system(size: 10.5))
+                                    .font(.system(size: OnyxTypography.metadata))
                                     .foregroundStyle(OnyxTheme.quietText)
                                     .lineLimit(2)
                             }
@@ -307,7 +307,7 @@ private struct SummaryInspector: View {
                         Spacer(minLength: 4)
                         if isNavigable {
                             Text(agent.status.label)
-                                .font(.system(size: 10, weight: .medium))
+                                .font(.system(size: OnyxTypography.metadata, weight: .medium))
                                 .foregroundStyle(agentColor(for: agent.status))
                             Image(systemName: "chevron.forward")
                                 .font(.system(size: 9, weight: .semibold))
@@ -315,7 +315,7 @@ private struct SummaryInspector: View {
                                 .accessibilityHidden(true)
                         } else {
                             Text("Unavailable")
-                                .font(.system(size: 10, weight: .medium))
+                                .font(.system(size: OnyxTypography.metadata, weight: .medium))
                                 .foregroundStyle(OnyxTheme.quietText)
                         }
                     }
@@ -378,14 +378,14 @@ private struct SummaryInspector: View {
             )
             if changes.isEmpty {
                 Text("No file changes recorded in this task")
-                    .font(.system(size: 11))
+                    .font(.system(size: OnyxTypography.secondary))
                     .foregroundStyle(OnyxTheme.quietText)
             } else {
                 VStack(alignment: .leading, spacing: 4) {
                     ForEach(changes.prefix(4)) { change in
                         HStack(spacing: 7) {
                             Image(systemName: "doc.badge.ellipsis")
-                                .font(.system(size: 10.5))
+                                .font(.system(size: OnyxTypography.metadata))
                                 .foregroundStyle(OnyxTheme.quietText)
                                 .accessibilityHidden(true)
                             Text(change.title ?? "Changed file")
@@ -398,7 +398,7 @@ private struct SummaryInspector: View {
                 }
                 if changes.count > 4 {
                     Text("More changes are available in Files and Review")
-                        .font(.system(size: 10.5))
+                        .font(.system(size: OnyxTypography.metadata))
                         .foregroundStyle(OnyxTheme.quietText)
                 }
                 Button {
@@ -407,7 +407,7 @@ private struct SummaryInspector: View {
                     Label("Open Files", systemImage: "doc.on.doc")
                 }
                 .buttonStyle(.link)
-                .font(.system(size: 10.5, weight: .medium))
+                .font(.system(size: OnyxTypography.metadata, weight: .medium))
                 .accessibilityHint("Shows the project's files and task changes")
             }
         }
@@ -575,7 +575,7 @@ private struct FilesInspector: View {
                     .accessibilityLabel("Project actions")
                 }
             }
-            .font(.system(size: 13))
+            .font(.system(size: OnyxTypography.navigation))
             .padding(.bottom, 5)
 
             if isPreviewPresented {
@@ -592,7 +592,7 @@ private struct FilesInspector: View {
                     if !touched.isEmpty {
                         Divider().padding(.vertical, 7)
                         Text("Touched this task")
-                            .font(.system(size: 10.5, weight: .medium))
+                            .font(.system(size: OnyxTypography.metadata, weight: .medium))
                             .foregroundStyle(OnyxTheme.quietText)
                         ForEach(touched) { item in
                             FileTreeRow(icon: "doc.badge.ellipsis", name: item.title ?? "Changed file", depth: 0)
@@ -625,7 +625,7 @@ private struct FilesInspector: View {
                 .accessibilityHidden(true)
             TextField("Quick Open", text: $sourceNavigator.query)
                 .textFieldStyle(.plain)
-                .font(.system(size: 11.5))
+                .font(.system(size: OnyxTypography.secondary))
                 .onSubmit {
                     guard let firstMatch = sourceNavigator.searchResults.first else { return }
                     Task { await sourceNavigator.preview(firstMatch) }
@@ -710,7 +710,7 @@ private struct FilesInspector: View {
                                         .lineLimit(1)
                                     if file.relativePath != file.name {
                                         Text(file.relativePath)
-                                            .font(.system(size: 9.5, design: .monospaced))
+                                            .font(.system(size: OnyxTypography.metadata, design: .monospaced))
                                             .foregroundStyle(.tertiary)
                                             .lineLimit(1)
                                             .truncationMode(.middle)
@@ -730,12 +730,12 @@ private struct FilesInspector: View {
 
                     if sourceNavigator.indexWasTruncated {
                         Text("Results are limited to keep search responsive.")
-                            .font(.system(size: 9.5))
+                            .font(.system(size: OnyxTypography.metadata))
                             .foregroundStyle(.tertiary)
                             .padding(.top, 4)
                     }
                 }
-                .font(.system(size: 11.5))
+                .font(.system(size: OnyxTypography.secondary))
             }
         }
     }
@@ -752,7 +752,7 @@ private struct FilesInspector: View {
                 Text("Loading preview…")
                     .foregroundStyle(.secondary)
             }
-            .font(.system(size: 11))
+            .font(.system(size: OnyxTypography.secondary))
             .frame(maxWidth: .infinity)
             .padding(.vertical, 24)
             .accessibilityElement(children: .ignore)
@@ -763,7 +763,7 @@ private struct FilesInspector: View {
         case let .loaded(preview):
             sourcePreviewHeader(title: preview.file.name, preview: preview)
             Text(preview.file.relativePath)
-                .font(.system(size: 9.5, design: .monospaced))
+                .font(.system(size: OnyxTypography.metadata, design: .monospaced))
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
                 .truncationMode(.middle)
@@ -787,7 +787,7 @@ private struct FilesInspector: View {
 
             if preview.wasTruncated {
                 Label("Preview shortened to keep the inspector responsive.", systemImage: "ellipsis")
-                    .font(.system(size: 9.5))
+                    .font(.system(size: OnyxTypography.metadata))
                     .foregroundStyle(.tertiary)
                     .padding(.top, 4)
             }
@@ -811,7 +811,7 @@ private struct FilesInspector: View {
             .accessibilityLabel("Back to project files")
 
             Text(title)
-                .font(.system(size: 11.5, weight: .semibold))
+                .font(.system(size: OnyxTypography.secondary, weight: .semibold))
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer(minLength: 4)
@@ -863,7 +863,7 @@ private struct FilesInspector: View {
                 Text("Loading project files…")
                     .foregroundStyle(.secondary)
             }
-            .font(.system(size: 11))
+            .font(.system(size: OnyxTypography.secondary))
             .padding(.vertical, 12)
             .frame(maxWidth: .infinity, alignment: .center)
             .accessibilityElement(children: .ignore)
@@ -905,7 +905,7 @@ private struct FilesInspector: View {
                         ProgressView().controlSize(.mini)
                         Text("Loading…")
                     }
-                    .font(.system(size: 10.5))
+                    .font(.system(size: OnyxTypography.metadata))
                     .foregroundStyle(.secondary)
                     .padding(.leading, CGFloat(depth) * 13 + 19)
                     .frame(height: OnyxHitTarget.compact)
@@ -919,13 +919,13 @@ private struct FilesInspector: View {
                         }
                         .buttonStyle(.link)
                     }
-                    .font(.system(size: 10.5))
+                    .font(.system(size: OnyxTypography.metadata))
                     .foregroundStyle(.secondary)
                     .padding(.leading, CGFloat(depth) * 13)
                     .padding(.vertical, 3)
                 case let .truncated(_, depth):
                     Text("More items are hidden to keep the file browser responsive.")
-                        .font(.system(size: 10.5))
+                        .font(.system(size: OnyxTypography.metadata))
                         .foregroundStyle(.tertiary)
                         .padding(.leading, CGFloat(depth) * 13 + 19)
                         .padding(.vertical, 4)
@@ -945,9 +945,9 @@ private struct FilesInspector: View {
                 .font(.system(size: 18))
                 .foregroundStyle(.tertiary)
             Text(title)
-                .font(.system(size: 11.5, weight: .semibold))
+                .font(.system(size: OnyxTypography.secondary, weight: .semibold))
             Text(detail)
-                .font(.system(size: 10.5))
+                .font(.system(size: OnyxTypography.metadata))
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
             actions()
@@ -1084,7 +1084,7 @@ struct ProjectFileRow: View {
             .onyxHelp("File actions")
             .accessibilityLabel("Actions for \(entry.name)")
         }
-        .font(.system(size: 11.5))
+        .font(.system(size: OnyxTypography.secondary))
         .padding(.leading, CGFloat(depth) * 13)
         .frame(minHeight: OnyxHitTarget.compact)
         .contextMenu {
@@ -1124,7 +1124,7 @@ private struct SourcePreviewLineView: View {
                 .textSelection(.enabled)
                 .fixedSize(horizontal: true, vertical: false)
         }
-        .font(.system(size: 10.5, design: .monospaced))
+        .font(.system(size: OnyxTypography.metadata, design: .monospaced))
         .frame(minHeight: 18)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Line \(line.number): \(line.text)")
@@ -1151,7 +1151,7 @@ private struct InspectorValueRow: View {
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
         }
-        .font(.system(size: 11.5))
+        .font(.system(size: OnyxTypography.secondary))
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .combine)
     }
@@ -1164,10 +1164,10 @@ private struct InspectorPathRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(label)
-                .font(.system(size: 10.5, weight: .medium))
+                .font(.system(size: OnyxTypography.metadata, weight: .medium))
                 .foregroundStyle(OnyxTheme.quietText)
             Text(path)
-                .font(.system(size: 11, design: .monospaced))
+                .font(.system(size: OnyxTypography.secondary, design: .monospaced))
                 .foregroundStyle(Color.primary)
                 .textSelection(.enabled)
                 .lineLimit(2)
@@ -1236,7 +1236,7 @@ struct InspectorDisclosureSection<Content: View>: View {
                 VStack(alignment: .leading, spacing: 9) {
                     content
                 }
-                .font(.system(size: 11.5))
+                .font(.system(size: OnyxTypography.secondary))
                 .foregroundStyle(OnyxTheme.quietText)
                 .transition(.opacity)
             }
@@ -1260,7 +1260,7 @@ private struct FileTreeRow: View {
                 .accessibilityHidden(true)
             Text(name).lineLimit(1)
         }
-        .font(.system(size: 11.5))
+        .font(.system(size: OnyxTypography.secondary))
         .padding(.leading, CGFloat(depth) * 13)
         .frame(height: 23)
         .accessibilityElement(children: .ignore)

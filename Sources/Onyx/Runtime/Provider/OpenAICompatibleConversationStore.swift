@@ -240,6 +240,12 @@ actor OpenAICompatibleConversationStore {
     /// A process exit can leave the last atomic snapshot marked as running.
     /// On reconnect that state is made truthful before it reaches the task
     /// list; completed text is retained and only the unfinished item changes.
+    ///
+    /// This also repairs one narrow legacy shape: an older provider turn could
+    /// persist an assistant message as `completed` with no answer text after
+    /// the upstream had exhausted its response budget. That shape is repaired
+    /// only when a concrete scope is supplied; without one, the endpoint that
+    /// produced an old unscoped record is unknown.
     @discardableResult
     func recoverInterruptedTurns(
         connectionID: ProviderConnectionID,
@@ -253,20 +259,56 @@ actor OpenAICompatibleConversationStore {
             for index in candidate.indices
             where candidate[index].connectionID == connectionID
                 && (scopeID == nil || candidate[index].belongs(to: scopeID!))
-                && candidate[index].status == .running
             {
+                let legacyEmptyAssistantIndices: [Int] = if scopeID != nil {
+                    candidate[index].messages.indices.filter { messageIndex in
+                        let message = candidate[index].messages[messageIndex]
+                        return message.role == .assistant
+                            && message.status == .completed
+                            && message.text
+                                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    }
+                } else {
+                    []
+                }
+                guard candidate[index].status == .running
+                    || !legacyEmptyAssistantIndices.isEmpty
+                else {
+                    continue
+                }
+
+                var changed = false
                 if let scopeID, candidate[index].conversationScopeID == nil {
                     candidate[index].conversationScopeID = scopeID
+                    changed = true
                 }
-                candidate[index].status = .failed
-                candidate[index].updatedAt = now
-                for messageIndex in candidate[index].messages.indices
-                where candidate[index].messages[messageIndex].status == .running
-                {
+
+                if candidate[index].status == .running {
+                    candidate[index].status = .failed
+                    changed = true
+                    for messageIndex in candidate[index].messages.indices
+                    where candidate[index].messages[messageIndex].status == .running
+                    {
+                        candidate[index].messages[messageIndex].status = .failed
+                        candidate[index].messages[messageIndex].detail =
+                            "The app closed before this response finished."
+                    }
+                }
+
+                // Do not infer a finish reason from a sparse legacy record.
+                // Preserve useful usage/error detail when it exists, but make
+                // the result actionable and explicit in the transcript.
+                for messageIndex in legacyEmptyAssistantIndices {
+                    let existingDetail = candidate[index].messages[messageIndex].detail
                     candidate[index].messages[messageIndex].status = .failed
                     candidate[index].messages[messageIndex].detail =
-                        "The app closed before this response finished."
+                        Self.repairedEmptyAssistantDetail(existingDetail)
+                    changed = true
                 }
+
+                guard changed else { continue }
+                candidate[index].status = .failed
+                candidate[index].updatedAt = now
                 recovered.append(candidate[index])
             }
             guard !recovered.isEmpty else { return [] }
@@ -378,6 +420,30 @@ actor OpenAICompatibleConversationStore {
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
         return "openai.\(scoped).\(UUID().uuidString.lowercased())"
+    }
+
+    /// Builds a user-facing repair detail without claiming a finish reason
+    /// that was not persisted. Usage-only metadata from the old runtime is not
+    /// conversation content and stays hidden; an explicit provider limit/error
+    /// detail is retained and receives a retry hint when needed.
+    private static func repairedEmptyAssistantDetail(_ existing: String?) -> String {
+        let detail = existing?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let lowercased = detail.lowercased()
+        let hasKnownFailureSignal = lowercased.contains("response limit")
+            || lowercased.contains("output limit")
+            || lowercased.contains("max_tokens")
+            || lowercased.contains("max completion")
+            || lowercased.contains("no final answer")
+        if hasKnownFailureSignal {
+            if lowercased.contains("retry") { return detail }
+            return "\(detail) Retry with a lower reasoning level or a larger output limit."
+        }
+
+        let generic = "The provider completed without returning an answer. Retry this request; if it repeats, try a lower reasoning level or a larger output limit."
+        guard !detail.isEmpty,
+              !lowercased.hasPrefix("token usage:")
+        else { return generic }
+        return "\(generic) \(detail)"
     }
 
     private static var encoder: JSONEncoder {

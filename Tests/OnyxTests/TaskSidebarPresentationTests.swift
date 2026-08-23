@@ -11,7 +11,6 @@ final class TaskSidebarPresentationTests: XCTestCase {
         let visibleStates: [RuntimeTaskAttention] = [
             .needsInput,
             .needsApproval,
-            .failed,
             .unknown,
         ]
         for state in visibleStates {
@@ -20,6 +19,10 @@ final class TaskSidebarPresentationTests: XCTestCase {
                 "\(state.label) should remain visually distinguishable in the sidebar"
             )
         }
+        XCTAssertFalse(
+            RuntimeTaskAttention.failed.showsSidebarAttentionLabel,
+            "Failed should remain icon-only so the sidebar does not grow a debug-style badge"
+        )
     }
 
     func testCompactTimestampUsesOneShortUnit() {
@@ -142,6 +145,54 @@ final class TaskSidebarPresentationTests: XCTestCase {
             TaskSidebarLiveSnapshotPolicy.shouldUseLiveSnapshot(
                 hasAuthoritativeThreadList: true
             )
+        )
+        XCTAssertFalse(
+            TaskSidebarLiveSnapshotPolicy.shouldUseLiveSnapshot(
+                hasAuthoritativeThreadList: true,
+                hasUnlistedSelectedTask: true
+            ),
+            "Keep the cached selected row mounted until its direct provider read resolves."
+        )
+    }
+
+    func testTaskListLoadingIsContextualAndNeverCoversCachedRows() {
+        XCTAssertEqual(
+            TaskSidebarContentState.resolve(
+                isProjectionReady: true,
+                hasVisibleTasks: false,
+                hasVisibleProjects: false,
+                isLoadingThreadList: true
+            ),
+            .loading
+        )
+        XCTAssertEqual(
+            TaskSidebarContentState.resolve(
+                isProjectionReady: true,
+                hasVisibleTasks: true,
+                hasVisibleProjects: true,
+                isLoadingThreadList: true
+            ),
+            .content,
+            "Refreshing a mounted task list must not add a floating spinner over it."
+        )
+        XCTAssertEqual(
+            TaskSidebarContentState.resolve(
+                isProjectionReady: true,
+                hasVisibleTasks: false,
+                hasVisibleProjects: true,
+                isLoadingThreadList: true
+            ),
+            .loading,
+            "Project metadata alone is not task content; do not show 'No tasks yet' while the provider list is loading."
+        )
+        XCTAssertEqual(
+            TaskSidebarContentState.resolve(
+                isProjectionReady: true,
+                hasVisibleTasks: false,
+                hasVisibleProjects: false,
+                isLoadingThreadList: false
+            ),
+            .empty
         )
     }
 

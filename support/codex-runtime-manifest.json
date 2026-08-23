@@ -1,0 +1,66 @@
+{
+  "layoutVersion": 1,
+  "version": "0.149.0",
+  "tag": "rust-v0.149.0",
+  "variant": "codex-app-server",
+  "entrypoint": "bin/codex-app-server",
+  "resourcesDir": "codex-resources",
+  "pathDir": "codex-path",
+  "license": {
+    "path": "support/codex-runtime/LICENSE",
+    "sha256": "dcf2606f0748818840e75135fce8f867ba5e073999fc6b7155f9d28492c2f714",
+    "sourceURL": "https://raw.githubusercontent.com/openai/codex/rust-v0.149.0/LICENSE"
+  },
+  "notice": {
+    "path": "support/codex-runtime/NOTICE",
+    "sha256": "9d71575ecfd9a843fc1677b0efb08053c6ba9fd686a0de1a6f5382fd3c220915",
+    "sourceURL": "https://raw.githubusercontent.com/openai/codex/rust-v0.149.0/NOTICE"
+  },
+  "checksumManifest": {
+    "fileName": "codex-package_SHA256SUMS",
+    "url": "https://github.com/openai/codex/releases/download/rust-v0.149.0/codex-package_SHA256SUMS",
+    "sha256": "27dfdc7cf0bbb17bcefe11eb76751f6d7fffd322d79d7f25c2dfe88067744cc0"
+  },
+  "expectedEntries": [
+    "bin/",
+    "bin/codex-app-server",
+    "bin/codex-code-mode-host",
+    "codex-package.json",
+    "codex-path/",
+    "codex-path/rg",
+    "codex-resources/",
+    "codex-resources/zsh/",
+    "codex-resources/zsh/bin/",
+    "codex-resources/zsh/bin/zsh"
+  ],
+  "executables": [
+    "bin/codex-app-server",
+    "bin/codex-code-mode-host",
+    "codex-path/rg",
+    "codex-resources/zsh/bin/zsh"
+  ],
+  "codeIdentifiers": [
+    "codex-app-server",
+    "codex-code-mode-host",
+    "com.openai.codex.rg",
+    "com.openai.codex.zsh"
+  ],
+  "artifacts": [
+    {
+      "architecture": "arm64",
+      "target": "aarch64-apple-darwin",
+      "fileName": "codex-app-server-package-aarch64-apple-darwin.tar.gz",
+      "url": "https://github.com/openai/codex/releases/download/rust-v0.149.0/codex-app-server-package-aarch64-apple-darwin.tar.gz",
+      "sha256": "aaa3751edfab80b887dbd1ca709c87a16495238e1f1a86cbcbbbb5a34e2b31a2",
+      "size": 93775517
+    },
+    {
+      "architecture": "x86_64",
+      "target": "x86_64-apple-darwin",
+      "fileName": "codex-app-server-package-x86_64-apple-darwin.tar.gz",
+      "url": "https://github.com/openai/codex/releases/download/rust-v0.149.0/codex-app-server-package-x86_64-apple-darwin.tar.gz",
+      "sha256": "e6426142f259f3d1ada6aff6117c0f41ee65533a36b294501f848fe9e5e49f1f",
+      "size": 101559500
+    }
+  ]
+}

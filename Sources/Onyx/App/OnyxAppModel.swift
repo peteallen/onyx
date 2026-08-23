@@ -912,6 +912,16 @@ final class OnyxAppModel: ObservableObject {
         return catalogThreadsCache
     }
 
+    /// A task can be opened directly from the shared sidebar cache before it
+    /// appears in this provider model's first list page. Keep the cached
+    /// projection authoritative until the direct read inserts that task; using
+    /// the incomplete live snapshot would make the selected row disappear.
+    var hasUnlistedSelectedTask: Bool {
+        guard let selectedThreadID,
+              selectedThreadID != Self.welcomeThread.id else { return false }
+        return !threads.contains { $0.id == selectedThreadID }
+    }
+
     var projectName: String {
         selectedProjectPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "Choose project"
     }
@@ -1344,7 +1354,13 @@ final class OnyxAppModel: ObservableObject {
             }
         }
 
-        beginConnection(preferredSelection: pendingRestoredSelectionID, rehydrateVisibleThread: false)
+        beginConnection(
+            preferredSelection: selectedThreadID == nil
+                || selectedThreadID == Self.welcomeThread.id
+                ? pendingRestoredSelectionID
+                : nil,
+            rehydrateVisibleThread: false
+        )
     }
 
     func reconnect() {
@@ -1367,6 +1383,9 @@ final class OnyxAppModel: ObservableObject {
         let revision = connectionRevision
         let epoch = accountEpoch
         let navigationAtStart = navigationRevision
+        let selectedTaskAtStart = selectedThreadID.flatMap { id in
+            id == Self.welcomeThread.id ? nil : id
+        }
         connectionTask?.cancel()
         connectionState = .connecting
         if notice?.title == connectionFailureNoticeTitle {
@@ -1446,7 +1465,8 @@ final class OnyxAppModel: ObservableObject {
                 applyThreadList(
                     liveThreads,
                     scope: scope,
-                    preferredSelection: effectivePreferredSelection
+                    preferredSelection: effectivePreferredSelection,
+                    preserveCurrentSelection: selectedTaskAtStart != nil
                 )
                 pendingRestoredSelectionID = nil
 
@@ -1474,6 +1494,10 @@ final class OnyxAppModel: ObservableObject {
         guard selectedThreadID != id else { return }
         if id != Self.welcomeThread.id {
             hasExplicitNewTaskSelection = false
+            // An explicit task click supersedes any selection restored from
+            // preferences, including when it lands before SwiftUI starts a
+            // newly-created provider model.
+            pendingRestoredSelectionID = nil
         }
         closeSideChat()
         saveCurrentDraftNow()
@@ -2048,12 +2072,17 @@ final class OnyxAppModel: ObservableObject {
         isLoadingThreadList = true
 
         let epoch = accountEpoch
+        let navigationAtStart = navigationRevision
         threadListTask = Task { [weak self] in
             guard let self else { return }
             do {
                 let liveThreads = try await fetchThreads(in: scope)
                 guard accountEpoch == epoch, !Task.isCancelled else { return }
-                applyThreadList(liveThreads, scope: scope)
+                applyThreadList(
+                    liveThreads,
+                    scope: scope,
+                    preserveCurrentSelection: navigationRevision != navigationAtStart
+                )
             } catch {
                 guard accountEpoch == epoch, !Task.isCancelled, threadListScope == scope else { return }
                 isLoadingThreadList = false
@@ -2895,11 +2924,22 @@ final class OnyxAppModel: ObservableObject {
         }
 
         let epoch = accountEpoch
+        let navigationAtStart = navigationRevision
         Task { [weak self] in
             guard let self else { return }
             do {
                 let forked = try await runtime.forkThread(id: id)
                 guard accountEpoch == epoch, !Task.isCancelled else { return }
+                guard navigationRevision == navigationAtStart else {
+                    // A newer task click can accept the completed fork into
+                    // the still-visible active list, but a scope change owns
+                    // the whole projection. Never relabel an archived list as
+                    // active or insert an active fork among archived rows.
+                    if threadListScope == .active {
+                        updateThread(forked)
+                    }
+                    return
+                }
                 threadListScope = .active
                 updateThread(forked)
                 selectedThreadID = nil

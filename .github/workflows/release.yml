@@ -1,28 +1,15 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v[0-9]*.[0-9]*.[0-9]*"
   workflow_dispatch:
     inputs:
       version:
         description: "Release version, with or without a leading v (for example, 0.2.0)"
         required: true
         type: string
-      publish_release:
-        description: "Create or update the GitHub Release after validation"
-        required: true
-        default: false
-        type: boolean
-      prerelease:
-        description: "Mark a manually published GitHub Release as a prerelease"
-        required: true
-        default: false
-        type: boolean
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -75,32 +62,17 @@ jobs:
         shell: zsh -euo pipefail {0}
         env:
           REQUESTED_VERSION: ${{ inputs.version }}
-          REQUESTED_PUBLISH: ${{ inputs.publish_release }}
-          REQUESTED_PRERELEASE: ${{ inputs.prerelease }}
         run: |
-          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
-            version="${GITHUB_REF_NAME#v}"
-            publish="true"
-            prerelease="false"
-          else
-            requested_version="$REQUESTED_VERSION"
-            version="${requested_version#v}"
-            publish="$REQUESTED_PUBLISH"
-            prerelease="$REQUESTED_PRERELEASE"
-          fi
+          version="${REQUESTED_VERSION#v}"
 
           if [[ ! "$version" =~ '^[0-9]+[.][0-9]+[.][0-9]+$' ]]; then
             print -u2 -- "Release version must be numeric x.y.z; got: $version"
             exit 1
           fi
 
-          tag="v$version"
           artifact_name="Onyx-$version-macOS"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
-          echo "publish=$publish" >> "$GITHUB_OUTPUT"
-          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
 
       - name: Configure optional Developer ID certificate
         id: signing
@@ -178,22 +150,19 @@ jobs:
           fi
           echo "enabled=1" >> "$GITHUB_OUTPUT"
 
-      - name: Require notarization before publishing
-        if: steps.metadata.outputs.publish == 'true'
-        shell: zsh -euo pipefail {0}
-        env:
-          SIGNING_ENABLED: ${{ steps.signing.outputs.enabled }}
-          NOTARIZATION_ENABLED: ${{ steps.notarization.outputs.enabled }}
-        run: |
-          if [[ "$SIGNING_ENABLED" != "true" || "$NOTARIZATION_ENABLED" != "1" ]]; then
-            print -u2 -- "Publishing requires Developer ID signing and notarization."
-            print -u2 -- "Run an artifact-only workflow with publish_release=false until both are configured."
-            exit 1
-          fi
-
       - name: Run unit tests
         shell: zsh -euo pipefail {0}
         run: /usr/bin/swift test --disable-sandbox
+
+      - name: Restore pinned Codex runtime archives
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
+        with:
+          path: .artifacts/codex-runtime
+          key: codex-runtime-${{ runner.os }}-${{ hashFiles('support/codex-runtime-manifest.json') }}
+
+      - name: Fetch and verify pinned Codex runtime archives
+        shell: zsh -euo pipefail {0}
+        run: scripts/fetch-codex-runtime.sh --architectures universal
 
       - name: Build, sign, notarize, and verify release artifacts
         shell: zsh -euo pipefail {0}
@@ -222,46 +191,6 @@ jobs:
             ${{ runner.temp }}/onyx-release/${{ steps.metadata.outputs.artifact_name }}.dmg.sha256
           if-no-files-found: error
           retention-days: 30
-
-      - name: Publish GitHub Release
-        if: steps.metadata.outputs.publish == 'true'
-        shell: zsh -euo pipefail {0}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          tag="${{ steps.metadata.outputs.tag }}"
-          version="${{ steps.metadata.outputs.version }}"
-          release_dir="$RUNNER_TEMP/onyx-release"
-          dmg="$release_dir/${{ steps.metadata.outputs.artifact_name }}.dmg"
-          checksum="$dmg.sha256"
-
-          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]] && \
-             /usr/bin/git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
-            existing_tag_commit="$(/usr/bin/git rev-list -n 1 "$tag")"
-            selected_commit="$(/usr/bin/git rev-parse "$GITHUB_SHA^{commit}")"
-            if [[ "$existing_tag_commit" != "$selected_commit" ]]; then
-              print -u2 -- "Tag $tag already points to a different commit; refusing to retarget it."
-              exit 1
-            fi
-          fi
-
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" "$dmg" "$checksum" --clobber
-          else
-            release_arguments=(
-              "$tag"
-              "$dmg"
-              "$checksum"
-              --target "$GITHUB_SHA"
-              --title "Onyx $version"
-              --generate-notes
-            )
-            if [[ "${{ steps.metadata.outputs.prerelease }}" == "true" ]]; then
-              release_arguments+=(--prerelease)
-            fi
-            gh release create "${release_arguments[@]}"
-          fi
 
       - name: Remove temporary signing keychain
         if: always() && steps.signing.outputs.keychain_path != ''

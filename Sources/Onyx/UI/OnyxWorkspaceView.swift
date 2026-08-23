@@ -23,11 +23,11 @@ struct OnyxWorkspaceView: View {
     private let onSelectProviderConnection: @MainActor (ProviderConnectionID) -> Void
     private let rankedModelChoices: [OnyxApplicationHost.ProviderModelChoice]
     private let onSelectProviderModel: @MainActor (OnyxApplicationHost.ProviderModelChoice) -> Void
-    private let onSelectProviderTask: @MainActor (
+    private let onSelectProviderTask: (@MainActor (
         ProviderConnectionID,
         String,
         ThreadListScope
-    ) -> Void
+    ) -> Void)?
 
     init(
         model: OnyxAppModel,
@@ -40,11 +40,11 @@ struct OnyxWorkspaceView: View {
         onSelectProviderConnection: @escaping @MainActor (ProviderConnectionID) -> Void = { _ in },
         rankedModelChoices: [OnyxApplicationHost.ProviderModelChoice] = [],
         onSelectProviderModel: @escaping @MainActor (OnyxApplicationHost.ProviderModelChoice) -> Void = { _ in },
-        onSelectProviderTask: @escaping @MainActor (
+        onSelectProviderTask: (@MainActor (
             ProviderConnectionID,
             String,
             ThreadListScope
-        ) -> Void = { _, _, _ in }
+        ) -> Void)? = nil
     ) {
         self.model = model
         self.projectCatalog = projectCatalog
@@ -213,6 +213,8 @@ struct OnyxWorkspaceView: View {
             synchronizeProviderTasks()
         }
         .onChange(of: model.isLoadingThreadList) { _, _ in synchronizeProviderTasks() }
+        .onChange(of: model.threadListRevision) { _, _ in synchronizeProviderTasks() }
+        .onChange(of: model.selectedThreadID) { _, _ in synchronizeProviderTasks() }
         .onChange(of: model.threadListScope) { _, _ in
             synchronizeProviderTasks()
         }
@@ -241,12 +243,16 @@ struct OnyxWorkspaceView: View {
 
     @MainActor
     private func selectProviderTask(_ connectionID: ProviderConnectionID, threadID: String) {
+        guard let onSelectProviderTask else {
+            if connectionID == selectedProviderConnectionID {
+                model.selectThread(threadID)
+            }
+            return
+        }
         Self.routeProviderTaskSelection(
             connectionID,
             threadID: threadID,
             scope: model.threadListScope,
-            selectedProviderConnectionID: selectedProviderConnectionID,
-            model: model,
             onSelectProviderTask: onSelectProviderTask
         )
     }
@@ -256,12 +262,17 @@ struct OnyxWorkspaceView: View {
         _ connectionID: ProviderConnectionID,
         threadID: String
     ) {
+        guard let onSelectProviderTask else {
+            if connectionID == selectedProviderConnectionID,
+               model.threadListScope.rawValue == ThreadListScope.active.rawValue {
+                model.selectThread(threadID)
+            }
+            return
+        }
         Self.routeProviderTaskSelection(
             connectionID,
             threadID: threadID,
             scope: .active,
-            selectedProviderConnectionID: selectedProviderConnectionID,
-            model: model,
             onSelectProviderTask: onSelectProviderTask
         )
     }
@@ -274,20 +285,19 @@ struct OnyxWorkspaceView: View {
         _ connectionID: ProviderConnectionID,
         threadID: String,
         scope: ThreadListScope,
-        selectedProviderConnectionID: ProviderConnectionID,
-        model: OnyxAppModel,
         onSelectProviderTask: @MainActor (
             ProviderConnectionID,
             String,
             ThreadListScope
         ) -> Void
     ) {
-        if connectionID == selectedProviderConnectionID,
-           scope == model.threadListScope {
-            model.selectThread(threadID)
-        } else {
-            onSelectProviderTask(connectionID, threadID, scope)
-        }
+        // The provider workspace owns pending cross-provider/scope
+        // navigation. Route every click through it, including a same-provider
+        // click, so a newer task can cancel an older destination that is still
+        // waiting for its catalog. Letting this view select directly left the
+        // old pending destination alive, and its late list completion stole
+        // selection back from the user.
+        onSelectProviderTask(connectionID, threadID, scope)
     }
 
     @MainActor
@@ -435,7 +445,8 @@ struct OnyxWorkspaceView: View {
         guard ProviderTaskCatalogSynchronizationPolicy.shouldReplaceCachedTasks(
             connectionState: model.connectionState,
             isLoadingThreadList: model.isLoadingThreadList,
-            hasAuthoritativeThreadList: model.hasAuthoritativeThreadListForCurrentScope
+            hasAuthoritativeThreadList: model.hasAuthoritativeThreadListForCurrentScope,
+            hasUnlistedSelectedTask: model.hasUnlistedSelectedTask
         ) else { return }
         projectCatalog.replaceTasks(
             for: selectedProviderConnectionID,

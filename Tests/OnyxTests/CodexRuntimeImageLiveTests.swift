@@ -20,7 +20,7 @@ final class CodexRuntimeImageLiveTests: XCTestCase {
         try makeCodeImage(expectedCode, at: imageURL)
         let validatedImage = try ComposerImageValidator.localFile(at: imageURL)
 
-        let runtime = try CodexRuntime.makeDefault()
+        let runtime = try CodexRuntime.makeDevelopmentInstalled()
         do {
             _ = try await runtime.connect()
             let thread = try await runtime.startThread(

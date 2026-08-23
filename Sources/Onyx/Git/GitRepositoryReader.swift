@@ -200,12 +200,15 @@ struct LocalGitCommandExecutor: GitCommandExecuting, Sendable {
         stdoutCollector.append(standardOutput.fileHandleForReading.readDataToEndOfFile())
         stderrCollector.append(standardError.fileHandleForReading.readDataToEndOfFile())
 
-        let timedOut = didTimeOut
-        if timedOut {
-            throw GitRepositoryError.timedOut(arguments: arguments, timeout: timeout)
-        }
+        // Output can cross the bound just before the deadline while the pipe
+        // callback is waiting for a busy main test process. If both terminal
+        // conditions are observed, report the concrete safety bound that was
+        // exceeded instead of misclassifying the command as a timeout.
         if stdoutCollector.didExceedLimit || stderrCollector.didExceedLimit {
             throw GitRepositoryError.outputLimitExceeded(arguments: arguments, limit: outputLimit)
+        }
+        if didTimeOut {
+            throw GitRepositoryError.timedOut(arguments: arguments, timeout: timeout)
         }
 
         return GitCommandResult(

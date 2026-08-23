@@ -432,8 +432,8 @@ final class OnyxApplicationHost: ObservableObject {
 
     /// Loads the complete task catalog for every configured connection. The
     /// returned `sourceComplete` bit is intentionally separate from the lists:
-    /// a partial snapshot is still useful to paint the sidebar, but must never
-    /// be used to commit the one-time legacy project migration marker.
+    /// a partial snapshot is still useful to paint the sidebar without
+    /// pretending every provider finished loading successfully.
     func cachedProviderTaskCatalog(
         connections: [WorkspaceConnection]
     ) async -> ProjectProviderTaskCatalog {
@@ -521,18 +521,16 @@ final class OnyxApplicationHost: ObservableObject {
     }
 
     /// Compatibility projection for callers that only need sidebar lists.
-    /// Production startup uses `loadProviderTaskCatalog` below so migration
-    /// can distinguish a complete source from a partial rendering snapshot.
     func cachedProviderTaskLists(
         connections: [WorkspaceConnection]
     ) async -> [ProjectProviderTaskList] {
         await cachedProviderTaskCatalog(connections: connections).lists
     }
 
-    /// Loads provider tasks and, only when every source succeeded, performs
-    /// the one-time migration from task working folders into the durable
-    /// project catalog. Keeping this boundary in the composition host makes
-    /// the behavior identical for every restored workspace window.
+    /// Loads provider tasks without deriving projects from their working
+    /// folders. Projects are app-owned, explicit user choices; a fresh Onyx
+    /// install must remain a blank slate even when a provider has years of
+    /// task history.
     @discardableResult
     func loadProviderTaskCatalog(
         connections: [WorkspaceConnection],
@@ -543,11 +541,6 @@ final class OnyxApplicationHost: ObservableObject {
         let catalog = ProjectProviderTaskCatalog(
             lists: loaded.lists,
             sourceComplete: connectionSourceComplete && loaded.sourceComplete
-        )
-        guard catalog.sourceComplete else { return catalog }
-        _ = await projectCatalogModel.importTaskProjectsIfSourceComplete(
-            from: catalog,
-            onFailure: onFailure
         )
         return catalog
     }
@@ -862,7 +855,8 @@ struct OnyxWindowRootView: View {
             connectionState: selection.model.connectionState,
             isLoadingThreadList: selection.model.isLoadingThreadList,
             hasAuthoritativeThreadList: selection.model
-                .hasAuthoritativeThreadListForCurrentScope
+                .hasAuthoritativeThreadListForCurrentScope,
+            hasUnlistedSelectedTask: selection.model.hasUnlistedSelectedTask
         ),
            let currentConnection = loadedConnections.first(where: {
                $0.id == selection.connectionID
@@ -888,14 +882,21 @@ struct OnyxWindowRootView: View {
         )
         guard !Task.isCancelled,
               catalogRefreshRevision == refreshRevision else { return }
-        for list in cachedTaskCatalog.lists {
-            host.projectCatalogModel.replaceTasks(
-                for: list.providerConnectionID,
-                providerDisplayName: list.providerDisplayName,
-                scope: list.scope,
-                threads: list.threads
-            )
-        }
+        let protectedTask = selection.model.hasUnlistedSelectedTask
+            ? selection.model.selectedThreadID.map { threadID in
+                ProjectProviderTaskProtection(
+                    id: ProjectTaskReference.ID(
+                        providerConnectionID: selection.connectionID,
+                        threadID: threadID
+                    ),
+                    scope: selection.model.threadListScope
+                )
+            }
+            : nil
+        host.projectCatalogModel.replaceTasks(
+            from: cachedTaskCatalog.lists,
+            preserving: protectedTask
+        )
     }
 }
 
@@ -1064,21 +1065,32 @@ private struct ProviderWorkspaceContent: View {
         threadID: String,
         scope: ThreadListScope
     ) {
-        guard connectionID != selection.connectionID else {
-            if scope == model.threadListScope {
-                model.selectThread(threadID)
-            } else {
-                selection.pendingThreadID = threadID
-                selection.pendingThreadScope = scope
-                model.setThreadListScope(scope)
-            }
-            return
-        }
-        replaceSelection(
-            with: connectionID,
-            pendingThreadID: threadID,
-            pendingThreadScope: scope
+        let plan = ProviderTaskNavigationPlan.resolve(
+            selectingConnectionID: connectionID,
+            threadID: threadID,
+            scope: scope,
+            currentConnectionID: selection.connectionID,
+            currentScope: model.threadListScope
         )
+        switch plan.action {
+        case .selectCurrentThread:
+            // Assign the complete plan before selecting. For a direct click
+            // both values are nil, which cancels an older provider/scope
+            // destination before its late task-list completion can reopen it.
+            selection.pendingThreadID = plan.pendingThreadID
+            selection.pendingThreadScope = plan.pendingThreadScope
+            model.selectThread(threadID)
+        case .changeCurrentScope:
+            selection.pendingThreadID = plan.pendingThreadID
+            selection.pendingThreadScope = plan.pendingThreadScope
+            model.setThreadListScope(scope)
+        case .replaceProvider:
+            replaceSelection(
+                with: connectionID,
+                pendingThreadID: plan.pendingThreadID,
+                pendingThreadScope: plan.pendingThreadScope
+            )
+        }
     }
 
     @MainActor
@@ -1139,6 +1151,46 @@ private struct ProviderWorkspaceContent: View {
             pendingModelID: nil,
             pendingThreadID: pendingThreadID,
             pendingThreadScope: pendingThreadScope
+        )
+    }
+}
+
+struct ProviderTaskNavigationPlan: Equatable {
+    enum Action: Equatable {
+        case selectCurrentThread
+        case changeCurrentScope
+        case replaceProvider
+    }
+
+    let action: Action
+    let pendingThreadID: String?
+    let pendingThreadScope: ThreadListScope?
+
+    static func resolve(
+        selectingConnectionID: ProviderConnectionID,
+        threadID: String,
+        scope: ThreadListScope,
+        currentConnectionID: ProviderConnectionID,
+        currentScope: ThreadListScope
+    ) -> Self {
+        guard selectingConnectionID == currentConnectionID else {
+            return Self(
+                action: .replaceProvider,
+                pendingThreadID: threadID,
+                pendingThreadScope: scope
+            )
+        }
+        guard scope.rawValue == currentScope.rawValue else {
+            return Self(
+                action: .changeCurrentScope,
+                pendingThreadID: threadID,
+                pendingThreadScope: scope
+            )
+        }
+        return Self(
+            action: .selectCurrentThread,
+            pendingThreadID: nil,
+            pendingThreadScope: nil
         )
     }
 }

@@ -78,7 +78,7 @@ struct ProjectQuickOpenView: View {
 
             TextField("Quick Open", text: $navigator.query)
                 .textFieldStyle(.plain)
-                .font(.system(size: 14))
+                .font(.system(size: OnyxTypography.paneTitle))
                 .focused($isSearchFocused)
                 .onSubmit(openSelection)
                 .onKeyPress(.downArrow) {
@@ -226,7 +226,7 @@ struct ProjectQuickOpenView: View {
                         .lineLimit(1)
                     if file.relativePath != file.name {
                         Text(file.relativePath)
-                            .font(.system(size: 10.5, design: .monospaced))
+                            .font(.system(size: OnyxTypography.metadata, design: .monospaced))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                             .truncationMode(.middle)
@@ -269,9 +269,9 @@ struct ProjectQuickOpenView: View {
                 .foregroundStyle(.tertiary)
                 .accessibilityHidden(true)
             Text(title)
-                .font(.system(size: 12.5, weight: .medium))
+                .font(.system(size: OnyxTypography.navigation, weight: .medium))
             Text(detail)
-                .font(.system(size: 11.5))
+                .font(.system(size: OnyxTypography.secondary))
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 370)

@@ -45,6 +45,9 @@ enum OpenAICompatibleRuntimeError: LocalizedError, Equatable, Sendable {
 /// App-owned runtime for OpenAI-compatible `/models` and `/chat/completions`
 /// endpoints. Unlike CodexRuntime, this actor does not claim remote tools,
 /// approvals, sandboxing, fork, compact, review, or active-turn steering.
+/// Provider-neutral sandbox and approval fields are therefore inert here and
+/// are ignored without an alert; the persistent chat-only UI communicates the
+/// boundary before submission.
 actor OpenAICompatibleRuntime: AgentRuntime {
     /// `.local` keeps the existing provider-neutral enum source-compatible;
     /// the session's display name remains the configured connection name.
@@ -379,7 +382,6 @@ actor OpenAICompatibleRuntime: AgentRuntime {
         guard record.authMode != .bearer || bearerToken != nil else {
             throw OpenAICompatibleRuntimeError.authenticationRequired
         }
-        reportUnsupportedPolicies(sandbox: request.sandboxMode, approval: request.approvalPolicy)
         guard !request.ephemeral else {
             throw AgentRuntimeError.unsupported("ephemeral conversations")
         }
@@ -560,12 +562,6 @@ actor OpenAICompatibleRuntime: AgentRuntime {
             threadID: request.threadID,
             item: userMessage.timelineItem
         ))
-        eventContinuation.yield(.itemStarted(
-            threadID: request.threadID,
-            item: assistantMessage.timelineItem
-        ))
-        reportUnsupportedPolicies(sandbox: request.sandboxMode, approval: request.approvalPolicy)
-
         // Reserve the slot before creating the child task. If a test endpoint
         // completes synchronously, `finishTurn` can remove this placeholder;
         // the optional task handle then cannot resurrect it.
@@ -702,11 +698,13 @@ actor OpenAICompatibleRuntime: AgentRuntime {
         generation: UInt64
     ) async {
         var assistantText = ""
+        var sawReasoning = false
+        var didStartAssistantItem = false
+        var finishReason: String?
         var lastPersist = Date.distantPast
         var usage: OpenAICompatibleChatUsage?
         var completionStatus = TimelineItemStatus.completed
         var completionDetail: String?
-        var responseFailureDetail: String?
         do {
             for try await event in transport.stream(request) {
                 try Task.checkCancellation()
@@ -715,8 +713,31 @@ actor OpenAICompatibleRuntime: AgentRuntime {
                 switch event {
                 case let .chunk(chunk):
                     usage = chunk.usage ?? usage
+                    if let reportedFinishReason = chunk.choices.compactMap(\.finishReason).last {
+                        finishReason = reportedFinishReason
+                    }
+                    if chunk.choices.contains(where: { $0.delta.hasReasoning }) {
+                        // Hidden reasoning proves the stream is alive, but it
+                        // is neither answer text nor transcript content.
+                        sawReasoning = true
+                    }
                     let delta = chunk.choices.compactMap(\.delta.content).joined()
                     if !delta.isEmpty {
+                        if !didStartAssistantItem {
+                            didStartAssistantItem = true
+                            eventContinuation.yield(.itemStarted(
+                                threadID: threadID,
+                                item: TimelineItem(
+                                    id: assistantMessageID,
+                                    kind: .assistantMessage,
+                                    title: nil,
+                                    body: "",
+                                    status: .running,
+                                    timestamp: .now,
+                                    detail: nil
+                                )
+                            ))
+                        }
                         assistantText += delta
                         eventContinuation.yield(.itemDelta(
                             threadID: threadID,
@@ -747,7 +768,26 @@ actor OpenAICompatibleRuntime: AgentRuntime {
             try Task.checkCancellation()
             guard isCurrentTurn(threadID: threadID, turnID: turnID, generation: generation)
             else { return }
-            completionDetail = usageDetail(usage)
+            let hasAnswer = !assistantText
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .isEmpty
+            if Self.isOutputLimitFinishReason(finishReason) {
+                let detail = Self.outputLimitDetail(
+                    hasAnswer: hasAnswer,
+                    hasReasoning: sawReasoning
+                )
+                completionStatus = .failed
+                completionDetail = detail
+            } else if !hasAnswer {
+                let detail = Self.emptyResponseDetail(
+                    finishReason: finishReason,
+                    hasReasoning: sawReasoning
+                )
+                completionStatus = .failed
+                completionDetail = detail
+            } else {
+                completionDetail = usageDetail(usage)
+            }
         } catch is CancellationError {
             guard isCurrentTurn(threadID: threadID, turnID: turnID, generation: generation)
             else { return }
@@ -763,7 +803,6 @@ actor OpenAICompatibleRuntime: AgentRuntime {
             let detail = Self.safeErrorDetail(error)
             completionStatus = .failed
             completionDetail = detail
-            responseFailureDetail = detail
         }
 
         do {
@@ -784,14 +823,6 @@ actor OpenAICompatibleRuntime: AgentRuntime {
                     title: "Provider response could not be saved",
                     detail: Self.safeErrorDetail(error)
                 )
-            )
-        }
-        if let responseFailureDetail,
-           generation == connectionGeneration,
-           connected
-        {
-            eventContinuation.yield(
-                .runtimeNotice(title: "Provider response failed", detail: responseFailureDetail)
             )
         }
     }
@@ -1417,20 +1448,6 @@ actor OpenAICompatibleRuntime: AgentRuntime {
             : record.transportCapabilities
     }
 
-    private func reportUnsupportedPolicies(
-        sandbox: RuntimeSandboxMode,
-        approval: RuntimeApprovalPolicy
-    ) {
-        if sandbox != .workspaceWrite || approval != .onRequest {
-            eventContinuation.yield(
-                .runtimeNotice(
-                    title: "Provider controls unavailable",
-                    detail: "This chat provider does not execute local tools, sandbox commands, or approvals."
-                )
-            )
-        }
-    }
-
     private func usageDetail(_ usage: OpenAICompatibleChatUsage?) -> String? {
         guard let usage else { return nil }
         let fields = [
@@ -1439,6 +1456,42 @@ actor OpenAICompatibleRuntime: AgentRuntime {
             usage.totalTokens.map { "total \($0)" },
         ].compactMap { $0 }
         return fields.isEmpty ? nil : "Token usage: \(fields.joined(separator: ", "))"
+    }
+
+    private static func emptyResponseDetail(
+        finishReason: String?,
+        hasReasoning: Bool
+    ) -> String {
+        if hasReasoning {
+            return "The provider returned reasoning but no final answer. Retry with a lower reasoning level."
+        }
+        if let finishReason,
+           !finishReason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return "The provider stopped with \(finishReason) before returning an answer."
+        }
+        return "The provider completed without returning an answer."
+    }
+
+    private static func isOutputLimitFinishReason(_ value: String?) -> Bool {
+        guard let value else { return false }
+        return ["length", "max_tokens", "max_output_tokens"].contains(
+            value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        )
+    }
+
+    private static func outputLimitDetail(
+        hasAnswer: Bool,
+        hasReasoning: Bool
+    ) -> String {
+        if !hasAnswer {
+            return hasReasoning
+                ? "The provider used its response limit while reasoning and returned no final answer. Retry with a lower reasoning level or a larger output limit."
+                : "The provider reached its response limit before returning an answer. Retry with a larger output limit."
+        }
+        return hasReasoning
+            ? "The provider reached its response limit after reasoning, so the answer may be incomplete. Retry with a lower reasoning level or a larger output limit."
+            : "The provider reached its response limit, so the answer may be incomplete. Retry with a larger output limit."
     }
 
     private static func title(from text: String) -> String {

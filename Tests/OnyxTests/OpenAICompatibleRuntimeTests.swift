@@ -103,6 +103,219 @@ final class OpenAICompatibleRuntimeTests: XCTestCase {
         XCTAssertNil(payload["chat_template_kwargs"])
     }
 
+    func testConnectRepairsPersistedEmptyAssistantBeforeRead() async throws {
+        let location = try makeTemporaryDirectory(prefix: "OpenAICompatibleRuntimeEmptyRepair")
+        defer { try? FileManager.default.removeItem(at: location) }
+        let connection = try makeFixtureConnection(id: "fixture.empty-repair-read")
+        let connectionStore = ProviderConnectionStore(storage: InMemoryProviderConnectionStorage())
+        try await connectionStore.upsert(connection)
+        let conversationStore = OpenAICompatibleConversationStore(
+            fileURL: location.appendingPathComponent("conversations.json")
+        )
+        var conversation = try await conversationStore.create(
+            connectionID: connection.id,
+            title: "Persisted empty response",
+            cwd: "/tmp/project",
+            modelID: "fixture-model",
+            scopeID: connection.conversationScopeID
+        )
+        conversation.messages = [
+            OpenAICompatibleStoredMessage(role: .user, text: "Build a page"),
+            OpenAICompatibleStoredMessage(
+                role: .assistant,
+                text: "\n",
+                status: .completed,
+                detail: "Token usage: prompt 66, response 2048, total 2114"
+            ),
+        ]
+        try await conversationStore.upsert(conversation)
+
+        RuntimeFixtureURLProtocol.configure { request in
+            guard request.url?.path == "/v1/models" else {
+                return .eventStream(body: "data: [DONE]\n\n")
+            }
+            return .json(body: "{\"data\":[{\"id\":\"fixture-model\"}]}")
+        }
+        let runtime = makeRuntime(
+            connection: connection,
+            connectionStore: connectionStore,
+            conversationStore: conversationStore
+        )
+
+        _ = try await runtime.connect()
+        let read = try await runtime.readThread(id: conversation.id)
+        XCTAssertEqual(read.thread.status, .failed)
+        XCTAssertEqual(read.items.map(\.kind), [.userMessage, .error])
+        XCTAssertTrue(read.items.last?.body.contains("without returning an answer") == true)
+        XCTAssertFalse(read.items.last?.body.contains("Token usage") == true)
+
+        let persistedRecord = try await conversationStore.conversation(
+            connectionID: connection.id,
+            id: conversation.id,
+            scopeID: connection.conversationScopeID
+        )
+        let persisted = try XCTUnwrap(persistedRecord)
+        XCTAssertEqual(persisted.status, .failed)
+        XCTAssertEqual(persisted.messages.last?.status, .failed)
+        XCTAssertNil(persisted.messages.last?.chatMessage)
+    }
+
+    func testReasoningOnlyLengthCompletionFailsPersistentlyWithoutLeakingReasoning() async throws {
+        let location = try makeTemporaryDirectory(
+            prefix: "OpenAICompatibleRuntimeReasoningLimit"
+        )
+        defer { try? FileManager.default.removeItem(at: location) }
+        let modelID = "Qwen/Qwen3.8-27B-FP8"
+        let connection = try ProviderConnectionRecord(
+            id: ProviderConnectionID("fixture.reasoning-limit"),
+            displayName: "Fixture vLLM",
+            baseURL: URL(string: "https://provider.example/v1")!,
+            selectedModelID: modelID,
+            authMode: .none,
+            transportCapabilities: [.streaming, .streamUsage]
+        )
+        let connectionStore = ProviderConnectionStore(
+            storage: InMemoryProviderConnectionStorage()
+        )
+        try await connectionStore.upsert(connection)
+        let conversationStore = OpenAICompatibleConversationStore(
+            fileURL: location.appendingPathComponent("conversations.json")
+        )
+        RuntimeFixtureURLProtocol.configure { request in
+            guard request.url?.path != "/v1/models" else {
+                return .json(body: "{\"data\":[{\"id\":\"\(modelID)\"}]}")
+            }
+            return .eventStream(body: """
+            data: {"choices":[{"index":0,"delta":{"reasoning_content":"Planning the page. "},"finish_reason":null}]}
+
+            data: {"choices":[{"index":0,"delta":{"reasoning_content":"Still reasoning."},"finish_reason":null}]}
+
+            data: {"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}
+
+            data: {"choices":[],"usage":{"prompt_tokens":66,"completion_tokens":2048,"total_tokens":2114}}
+
+            data: [DONE]
+
+            """)
+        }
+        let runtime = OpenAICompatibleRuntime(
+            connectionID: connection.id,
+            connectionStore: connectionStore,
+            credentialStore: InMemoryCredentialStore(),
+            conversationStore: conversationStore,
+            session: makeFixtureSession()
+        )
+        _ = try await runtime.connect()
+        let thread = try await runtime.startThread(
+            StartThreadRequest(cwd: "/tmp/project", model: modelID)
+        )
+
+        let events = await collectThroughPostTurnBarrier(runtime: runtime, threadID: thread.id) {
+            try await runtime.startTurn(StartTurnRequest(
+                threadID: thread.id,
+                text: "Build a polished hello world page",
+                reasoningEffort: "xhigh"
+            ))
+        }
+
+        XCTAssertFalse(events.contains { event in
+            guard case let .itemStarted(id, item) = event else { return false }
+            return id == thread.id && item.kind == .reasoning
+        })
+        XCTAssertFalse(events.contains { event in
+            guard case let .itemDelta(id, _, delta) = event else { return false }
+            return id == thread.id
+                && (delta.contains("Planning the page") || delta.contains("Still reasoning"))
+        })
+        let completedItems = events.compactMap { event -> TimelineItem? in
+            guard case let .itemCompleted(id, item) = event, id == thread.id else { return nil }
+            return item
+        }
+        XCTAssertEqual(completedItems.map(\.kind), [.error])
+        XCTAssertTrue(completedItems[0].body.contains("response limit while reasoning"))
+        XCTAssertTrue(events.contains { event in
+            guard case let .turnCompleted(id, status) = event else { return false }
+            return id == thread.id && status == .failed
+        })
+        XCTAssertFalse(events.contains { event in
+            guard case let .runtimeNotice(title, _) = event else { return false }
+            return title == "Provider response failed"
+        }, "A persistent inline provider failure must not also interrupt the user with a modal")
+
+        let conversation = try await runtime.readThread(id: thread.id)
+        XCTAssertEqual(conversation.thread.status, .failed)
+        XCTAssertEqual(conversation.items.map(\.kind), [.userMessage, .error])
+        XCTAssertTrue(conversation.items.last?.body.contains("lower reasoning level") == true)
+        let stored = try await conversationStore.conversation(
+            connectionID: connection.id,
+            id: thread.id
+        )
+        XCTAssertNil(stored?.messages.last?.chatMessage)
+    }
+
+    func testLengthFinishPreservesPartialAnswerButMarksItIncomplete() async throws {
+        let location = try makeTemporaryDirectory(
+            prefix: "OpenAICompatibleRuntimePartialLimit"
+        )
+        defer { try? FileManager.default.removeItem(at: location) }
+        let connection = try makeFixtureConnection(id: "fixture.partial-limit")
+        let connectionStore = ProviderConnectionStore(
+            storage: InMemoryProviderConnectionStorage()
+        )
+        try await connectionStore.upsert(connection)
+        let conversationStore = OpenAICompatibleConversationStore(
+            fileURL: location.appendingPathComponent("conversations.json")
+        )
+        RuntimeFixtureURLProtocol.configure { request in
+            guard request.url?.path != "/v1/models" else {
+                return .json(body: "{\"data\":[{\"id\":\"fixture-model\"}]}")
+            }
+            return .eventStream(body: """
+            data: {"choices":[{"index":0,"delta":{"reasoning_content":"hidden"},"finish_reason":null}]}
+
+            data: {"choices":[{"index":0,"delta":{"content":"Partial answer"},"finish_reason":"length"}]}
+
+            data: [DONE]
+
+            """)
+        }
+        let runtime = makeRuntime(
+            connection: connection,
+            connectionStore: connectionStore,
+            conversationStore: conversationStore
+        )
+        _ = try await runtime.connect()
+        let thread = try await runtime.startThread(StartThreadRequest(cwd: "/tmp"))
+
+        let events = await collectThroughPostTurnBarrier(runtime: runtime, threadID: thread.id) {
+            try await runtime.startTurn(
+                StartTurnRequest(threadID: thread.id, text: "Return a long answer")
+            )
+        }
+
+        let completed = try XCTUnwrap(events.compactMap { event -> TimelineItem? in
+            guard case let .itemCompleted(id, item) = event, id == thread.id else { return nil }
+            return item
+        }.last)
+        XCTAssertEqual(completed.kind, .assistantMessage)
+        XCTAssertEqual(completed.body, "Partial answer")
+        XCTAssertEqual(completed.status, .failed)
+        XCTAssertTrue(completed.detail?.contains("answer may be incomplete") == true)
+        XCTAssertTrue(events.contains { event in
+            guard case let .turnCompleted(id, status) = event else { return false }
+            return id == thread.id && status == .failed
+        })
+        XCTAssertFalse(events.contains { event in
+            guard case let .runtimeNotice(title, _) = event else { return false }
+            return title == "Provider response failed"
+        }, "An inline incomplete-answer state must not also interrupt the user with a modal")
+
+        let conversation = try await runtime.readThread(id: thread.id)
+        XCTAssertEqual(conversation.items.last?.body, "Partial answer")
+        XCTAssertEqual(conversation.items.last?.status, .failed)
+        XCTAssertFalse(conversation.items.contains { $0.body.contains("hidden") })
+    }
+
     func testLegacyEmptyTransportCapabilitiesRemainUsable() async throws {
         let location = try makeTemporaryDirectory(prefix: "OpenAICompatibleRuntimeLegacyTransport")
         defer { try? FileManager.default.removeItem(at: location) }
@@ -474,7 +687,7 @@ final class OpenAICompatibleRuntimeTests: XCTestCase {
             .contains(imageURL.path))
     }
 
-    func testUnsupportedCodexControlsAreExplicitAndInterruptCompletesAsFailed() async throws {
+    func testChatOnlyRuntimeIgnoresToolPoliciesAndInterruptCompletesAsFailed() async throws {
         let location = try makeTemporaryDirectory(prefix: "OpenAICompatibleRuntimeInterrupt")
         defer { try? FileManager.default.removeItem(at: location) }
         let connection = try ProviderConnectionRecord(
@@ -490,9 +703,7 @@ final class OpenAICompatibleRuntimeTests: XCTestCase {
         let conversationStore = OpenAICompatibleConversationStore(
             fileURL: location.appendingPathComponent("conversations.json")
         )
-        let notices = NoticeCapture()
         RuntimeFixtureURLProtocol.configure { request in
-            notices.record(request)
             guard request.url?.path == "/v1/models" else {
                 return .eventStream(body: "data: [DONE]\n\n", delay: 500)
             }
@@ -506,17 +717,19 @@ final class OpenAICompatibleRuntimeTests: XCTestCase {
             session: makeFixtureSession()
         )
         _ = try await runtime.connect()
-        let thread = try await runtime.startThread(StartThreadRequest(cwd: "/tmp"))
         let eventTask = Task { () -> [AgentRuntimeEvent] in
             var result: [AgentRuntimeEvent] = []
             for await event in runtime.events {
                 result.append(event)
-                if case let .turnCompleted(threadID, _) = event, threadID == thread.id {
-                    break
-                }
+                if case .turnCompleted = event { break }
             }
             return result
         }
+        let thread = try await runtime.startThread(StartThreadRequest(
+            cwd: "/tmp",
+            sandboxMode: .fullAccess,
+            approvalPolicy: .never
+        ))
         try await runtime.startTurn(
             StartTurnRequest(
                 threadID: thread.id,
@@ -528,10 +741,10 @@ final class OpenAICompatibleRuntimeTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(30))
         try await runtime.interrupt(threadID: thread.id)
         let events = await eventTask.value
-        XCTAssertTrue(events.contains {
-            if case let .runtimeNotice(title, _) = $0 { return title == "Provider controls unavailable" }
+        XCTAssertFalse(events.contains {
+            if case .runtimeNotice = $0 { return true }
             return false
-        })
+        }, "The persistent chat-only strip makes stale tool-policy alerts redundant")
         XCTAssertTrue(events.contains {
             if case let .turnCompleted(threadID, status) = $0 {
                 return threadID == thread.id && status == .failed
@@ -797,7 +1010,10 @@ final class OpenAICompatibleRuntimeTests: XCTestCase {
             case 1:
                 return .eventStream(body: "data: [DONE]\n\n", gate: oldStreamGate)
             case 2:
-                return .eventStream(body: "data: [DONE]\n\n", gate: replacementStreamGate)
+                return .eventStream(
+                    body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"replacement\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                    gate: replacementStreamGate
+                )
             default:
                 return .eventStream(body: "data: [DONE]\n\n")
             }
@@ -1405,6 +1621,41 @@ final class OpenAICompatibleRuntimeTests: XCTestCase {
         return await task.value
     }
 
+    /// Continues beyond `turnCompleted` to a runtime-generated ordering
+    /// barrier. Provider response notices used to be emitted immediately after
+    /// completion, so stopping at the completion event could not detect the
+    /// duplicate modal that followed the durable inline failure.
+    private func collectThroughPostTurnBarrier(
+        runtime: OpenAICompatibleRuntime,
+        threadID: String,
+        start: () async throws -> Void
+    ) async -> [AgentRuntimeEvent] {
+        let barrierName = "Post-turn barrier \(UUID().uuidString)"
+        let task = Task { () -> [AgentRuntimeEvent] in
+            var events: [AgentRuntimeEvent] = []
+            for await event in runtime.events {
+                events.append(event)
+                switch event {
+                case let .turnCompleted(id, _) where id == threadID:
+                    try? await runtime.renameThread(id: threadID, name: barrierName)
+                case let .threadNameChanged(id, name)
+                    where id == threadID && name == barrierName:
+                    return events
+                default:
+                    break
+                }
+            }
+            return events
+        }
+        do {
+            try await start()
+        } catch {
+            task.cancel()
+            return await task.value
+        }
+        return await task.value
+    }
+
     private func makeFixtureSession() -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [RuntimeFixtureURLProtocol.self]
@@ -1702,15 +1953,6 @@ private final class RequestPathSequenceCapture: @unchecked Sendable {
                 request.value(forHTTPHeaderField: "Authorization")
             ))
         }
-    }
-}
-
-private final class NoticeCapture: @unchecked Sendable {
-    private let lock = NSLock()
-    private var requests: [URLRequest] = []
-
-    func record(_ request: URLRequest) {
-        lock.withLock { requests.append(request) }
     }
 }
 

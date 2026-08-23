@@ -27,6 +27,10 @@ struct NativeComposerTextView: NSViewRepresentable {
         scrollView.borderType = .noBorder
 
         let textView = ComposerTextView(frame: .zero)
+        context.coordinator.textView = textView
+        textView.onTextContainerWidthChange = { [weak coordinator = context.coordinator] in
+            coordinator?.updateHeight()
+        }
         textView.delegate = context.coordinator
         textView.canSubmit = canSubmit
         textView.onSubmit = onSubmit
@@ -45,11 +49,11 @@ struct NativeComposerTextView: NSViewRepresentable {
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
-        textView.textContainer?.widthTracksTextView = true
-        textView.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
+        // Keep the editor itself pane-wide so its complete visible surface is
+        // easy to click, while capping only the line measure inside it.
+        textView.maximumTextContainerWidth = OnyxWorkspaceMetrics.maximumConversationTextWidth
         textView.isEditable = isEnabled
         scrollView.documentView = textView
-        context.coordinator.textView = textView
         return scrollView
     }
 
@@ -60,12 +64,18 @@ struct NativeComposerTextView: NSViewRepresentable {
         textView.onSubmit = onSubmit
         textView.onPasteImages = onPasteImages
         textView.placeholder = Self.placeholder
+        textView.maximumTextContainerWidth = OnyxWorkspaceMetrics.maximumConversationTextWidth
         textView.isEditable = isEnabled
         if textView.string != text {
             textView.string = text
             textView.needsDisplay = true
             context.coordinator.updateHeight()
         }
+        // A successful Return submission deliberately ends native editing
+        // before it calls into SwiftUI. If this same editor survives the
+        // resulting state update, give it the caret back now that SwiftUI has
+        // confirmed it is still present and enabled.
+        textView.restoreFocusAfterSubmitIfAvailable()
     }
 
     static func dismantleNSView(_ scrollView: NSScrollView, coordinator: Coordinator) {
@@ -77,6 +87,8 @@ struct NativeComposerTextView: NSViewRepresentable {
         textView.canSubmit = { false }
         textView.onSubmit = nil
         textView.onPasteImages = nil
+        textView.onTextContainerWidthChange = nil
+        textView.cancelFocusRestorationAfterSubmit()
         coordinator.textView = nil
         scrollView.documentView = nil
     }
@@ -122,8 +134,44 @@ final class ComposerTextView: NSTextView {
     var placeholder = "" {
         didSet { needsDisplay = true }
     }
+    /// Limits line length without shrinking the NSTextView hit surface. A
+    /// narrow editor continues to use every available point; only unusually
+    /// wide panes leave quiet space after the readable text container.
+    var maximumTextContainerWidth: CGFloat? {
+        didSet { updateTextContainerWidth() }
+    }
+    var onTextContainerWidthChange: (() -> Void)?
     private var consumedSubmitKeyCodes = Set<UInt16>()
     private var hasPendingSubmit = false
+    private var pendingSubmitKeyCode: UInt16?
+    private var submitCallbackCompleted = false
+    private var submitKeyWasReleased = false
+    private var focusRestorationScheduled = false
+    private var submitKeyUpMonitor: Any?
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        updateTextContainerWidth()
+    }
+
+    private func updateTextContainerWidth() {
+        guard let maximumTextContainerWidth,
+              maximumTextContainerWidth.isFinite,
+              maximumTextContainerWidth > 0,
+              let textContainer else { return }
+        let availableWidth = max(1, bounds.width - textContainerInset.width * 2)
+        let resolvedWidth = min(maximumTextContainerWidth, availableWidth)
+        let widthChanged = abs(textContainer.containerSize.width - resolvedWidth) > 0.5
+            || textContainer.widthTracksTextView
+        guard widthChanged else { return }
+
+        textContainer.widthTracksTextView = false
+        textContainer.containerSize = NSSize(
+            width: resolvedWidth,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        onTextContainerWidthChange?()
+    }
 
     /// The placeholder follows TextKit's insertion geometry instead of using
     /// a separately tuned inset. That keeps the empty-field caret just before
@@ -163,26 +211,112 @@ final class ComposerTextView: NSTextView {
             consumedSubmitKeyCodes.insert(event.keyCode)
             guard !hasPendingSubmit else { return }
             hasPendingSubmit = true
+            let submitKeyCode = event.keyCode
+            beginSubmitKeySequence(keyCode: submitKeyCode)
             // Submitting can immediately replace this representable with the
             // compact busy strip. If the text view remains first responder,
             // AppKit sends the matching key-up through a responder chain whose
             // SwiftUI hosting node has already been removed. On current macOS
             // that can crash in NSHostingView/ObservationTracking. End editing
             // while the native view is still mounted, then submit after this
-            // key-down has completely unwound.
+            // key-down has completely unwound. The following SwiftUI update
+            // either dismantles this editor or restores its focus if the
+            // composer remains available.
             let submit = onSubmit
             window?.makeFirstResponder(nil)
             DispatchQueue.main.async { [weak self] in
                 self?.hasPendingSubmit = false
                 submit?()
+                self?.completeSubmitCallback(for: submitKeyCode)
             }
             return
         }
         super.keyDown(with: event)
     }
 
+    private func beginSubmitKeySequence(keyCode: UInt16) {
+        cancelFocusRestorationAfterSubmit()
+        pendingSubmitKeyCode = keyCode
+        submitKeyUpMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyUp) {
+            [weak self] event in
+            self?.observeSubmitKeyUp(keyCode: event.keyCode)
+            return event
+        }
+    }
+
+    private func completeSubmitCallback(for keyCode: UInt16) {
+        guard pendingSubmitKeyCode == keyCode else { return }
+        // If submission explicitly focused another control, that choice wins
+        // even if the control later resigns before the Return key is released.
+        if let window,
+           window.firstResponder != nil,
+           window.firstResponder !== window,
+           window.firstResponder !== self {
+            cancelFocusRestorationAfterSubmit()
+            return
+        }
+        submitCallbackCompleted = true
+        scheduleFocusRestorationIfSafe()
+    }
+
+    private func observeSubmitKeyUp(keyCode: UInt16) {
+        guard pendingSubmitKeyCode == keyCode else { return }
+        submitKeyWasReleased = true
+        consumedSubmitKeyCodes.remove(keyCode)
+        removeSubmitKeyUpMonitor()
+        scheduleFocusRestorationIfSafe()
+    }
+
+    private func scheduleFocusRestorationIfSafe() {
+        guard submitCallbackCompleted,
+              submitKeyWasReleased,
+              !focusRestorationScheduled else { return }
+        focusRestorationScheduled = true
+        // A local event monitor runs before AppKit dispatches key-up. Wait for
+        // that dispatch to unwind before putting the editor back into the
+        // responder chain.
+        DispatchQueue.main.async { [weak self] in
+            self?.restoreFocusAfterSubmitIfAvailable()
+        }
+    }
+
+    /// Restores the caret only when submission left this exact editor mounted
+    /// and available. If another control acquired focus while the submission
+    /// unwound, that explicit focus change wins.
+    func restoreFocusAfterSubmitIfAvailable() {
+        guard pendingSubmitKeyCode != nil,
+              submitCallbackCompleted,
+              submitKeyWasReleased else { return }
+        guard let window, isEditable else {
+            cancelFocusRestorationAfterSubmit()
+            return
+        }
+        guard window.firstResponder == nil || window.firstResponder === window else {
+            cancelFocusRestorationAfterSubmit()
+            return
+        }
+
+        cancelFocusRestorationAfterSubmit()
+        window.makeFirstResponder(self)
+    }
+
+    func cancelFocusRestorationAfterSubmit() {
+        pendingSubmitKeyCode = nil
+        submitCallbackCompleted = false
+        submitKeyWasReleased = false
+        focusRestorationScheduled = false
+        removeSubmitKeyUpMonitor()
+    }
+
+    private func removeSubmitKeyUpMonitor() {
+        guard let submitKeyUpMonitor else { return }
+        NSEvent.removeMonitor(submitKeyUpMonitor)
+        self.submitKeyUpMonitor = nil
+    }
+
     override func keyUp(with event: NSEvent) {
         if consumedSubmitKeyCodes.remove(event.keyCode) != nil {
+            observeSubmitKeyUp(keyCode: event.keyCode)
             return
         }
         super.keyUp(with: event)

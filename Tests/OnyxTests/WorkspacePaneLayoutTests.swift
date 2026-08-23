@@ -5,8 +5,48 @@ import XCTest
 
 @MainActor
 final class WorkspacePaneLayoutTests: XCTestCase {
+    func testChatOnlyProviderScopeIsVisibleAndNeverImpliedBeforeConnection() {
+        XCTAssertFalse(ProviderExecutionScopePresentation.isChatOnly(session: nil))
+
+        let baseSession = RuntimeSession(
+            runtime: .local,
+            displayName: "Fixture vLLM",
+            accountLabel: nil,
+            planLabel: nil,
+            auth: RuntimeAuthState(
+                mode: nil,
+                email: nil,
+                planLabel: nil,
+                requiresAuthentication: false
+            ),
+            availableLoginMethods: [],
+            availableModels: [],
+            capabilities: [.streaming, .reasoning]
+        )
+        XCTAssertTrue(ProviderExecutionScopePresentation.isChatOnly(session: baseSession))
+
+        let codingSession = RuntimeSession(
+            runtime: .codex,
+            displayName: "Codex app-server",
+            accountLabel: nil,
+            planLabel: nil,
+            auth: baseSession.auth,
+            availableLoginMethods: [],
+            availableModels: [],
+            capabilities: [.streaming, .tools]
+        )
+        XCTAssertFalse(ProviderExecutionScopePresentation.isChatOnly(session: codingSession))
+    }
+
     func testConversationControlsStayReadableWithoutCrampingCompactWindows() {
-        XCTAssertEqual(ConversationContentLayout.maximumComposerWidth, 760)
+        XCTAssertEqual(ConversationContentLayout.maximumComposerWidth, .infinity)
+        XCTAssertEqual(OnyxWorkspaceMetrics.maximumConversationTextWidth, 880)
+        XCTAssertEqual(OnyxTypography.reading, 13.5)
+        XCTAssertGreaterThan(
+            OnyxTypography.reading,
+            OnyxTypography.navigation,
+            "Conversation text should be only slightly larger than the prior tool-use baseline"
+        )
         XCTAssertEqual(
             ConversationContentLayout.horizontalInset(availableWidth: 320),
             ConversationContentLayout.minimumHorizontalInset,

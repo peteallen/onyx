@@ -100,7 +100,7 @@ private struct ConnectionStatus: View {
                     .foregroundStyle(color)
             }
             Text(runtimeName)
-                .font(.system(size: 10.5, weight: .medium))
+                .font(.system(size: OnyxTypography.metadata, weight: .medium))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
         }

@@ -54,7 +54,7 @@ struct ProviderSettingsView: View {
                 Section("OpenAI-compatible") {
                     if model.connections.isEmpty {
                         Label("No connections", systemImage: "server.rack")
-                            .font(.callout)
+                            .font(.system(size: OnyxTypography.navigation))
                             .foregroundStyle(.secondary)
                             .listRowBackground(Color.clear)
                             .listRowSeparator(.hidden)
@@ -149,7 +149,7 @@ struct ProviderSettingsView: View {
                         if !model.draft.trimmedBaseURL.isEmpty,
                            let message = model.draft.urlValidationMessage {
                             Label(message, systemImage: "xmark.octagon.fill")
-                                .font(.callout)
+                                .font(.system(size: OnyxTypography.navigation))
                                 .foregroundStyle(OnyxTheme.destructive)
                                 .accessibilityLabel("URL validation error: \(message)")
                         }
@@ -191,7 +191,7 @@ struct ProviderSettingsView: View {
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(model.selectedConnectionID == nil ? "Add provider connection" : "Provider connection")
-                    .font(.title2.weight(.semibold))
+                    .font(.system(size: OnyxTypography.paneTitle, weight: .semibold))
                 Text(
                     model.selectedConnectionID == nil
                         ? "Connect Onyx to any OpenAI-compatible chat endpoint."
@@ -241,11 +241,11 @@ struct ProviderSettingsView: View {
                         "This endpoint uses unencrypted HTTP",
                         systemImage: "exclamationmark.triangle.fill"
                     )
-                    .font(.headline)
+                    .font(.system(size: OnyxTypography.paneTitle, weight: .semibold))
                     .foregroundStyle(OnyxTheme.warning)
 
                     Text("Traffic, including prompts and responses, can be read or changed on the network. Clear-text HTTP is limited to literal loopback, private-network, or link-local IP addresses, and still requires your acknowledgement.")
-                        .font(.callout)
+                        .font(.system(size: OnyxTypography.navigation))
                         .foregroundStyle(.secondary)
 
                     if model.draft.hasAllowedInsecureHTTPHost {
@@ -261,7 +261,7 @@ struct ProviderSettingsView: View {
                             "This HTTP host is not allowed. Use HTTPS or enter a literal loopback, private-network, or link-local IP address.",
                             systemImage: "nosign"
                         )
-                        .font(.callout.weight(.medium))
+                        .font(.system(size: OnyxTypography.navigation, weight: .medium))
                         .foregroundStyle(OnyxTheme.destructive)
                     }
 
@@ -270,7 +270,7 @@ struct ProviderSettingsView: View {
                             "Bearer authentication cannot be used over clear-text HTTP. Switch to HTTPS before saving.",
                             systemImage: "key.slash"
                         )
-                        .font(.callout.weight(.medium))
+                        .font(.system(size: OnyxTypography.navigation, weight: .medium))
                         .foregroundStyle(OnyxTheme.destructive)
                     }
                 }
@@ -322,7 +322,7 @@ struct ProviderSettingsView: View {
                                 ? "The saved key will be removed when you save."
                                 : "A bearer token is saved in Keychain."
                         )
-                        .font(.callout)
+                        .font(.system(size: OnyxTypography.navigation))
                         .foregroundStyle(.secondary)
 
                         Spacer()
@@ -390,7 +390,7 @@ struct ProviderSettingsView: View {
                 Text(
                     "Last successful test \(lastSucceededAt.formatted(date: .abbreviated, time: .shortened))"
                 )
-                .font(.caption)
+                .font(.system(size: OnyxTypography.metadata))
                 .foregroundStyle(.secondary)
             }
         } header: {
@@ -505,7 +505,7 @@ private struct ProviderConnectionRow: View {
                         ?? connection.baseURL.host
                         ?? connection.baseURL.absoluteString
                 )
-                .font(.caption)
+                .font(.system(size: OnyxTypography.metadata))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
             }
@@ -530,7 +530,7 @@ private struct ProviderSettingsBanner: View {
             Image(systemName: systemImage)
                 .foregroundStyle(tint)
             Text(text)
-                .font(.callout)
+                .font(.system(size: OnyxTypography.navigation))
                 .foregroundStyle(.primary)
                 .textSelection(.enabled)
             Spacer(minLength: 0)

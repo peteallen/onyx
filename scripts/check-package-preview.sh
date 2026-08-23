@@ -7,6 +7,8 @@ package_app_script="$repo_root/scripts/package-app.sh"
 run_script="$repo_root/scripts/run-preview.sh"
 repair_script="$repo_root/scripts/repair-preview-registration.sh"
 preview_app="$repo_root/dist-preview/Onyx Preview.app"
+runtime_common_script="$repo_root/scripts/codex-runtime-common.sh"
+runtime_manifest="$repo_root/support/codex-runtime-manifest.json"
 
 script_text="$(<"$preview_script")"
 [[ "$script_text" == *'preview_app="$repo_root/dist-preview/Onyx Preview.app"'* ]]
@@ -14,6 +16,7 @@ script_text="$(<"$preview_script")"
 [[ "$script_text" == *'preview_display_name="Onyx Preview"'* ]]
 [[ "$script_text" == *'preview_build_number="$(/bin/date -u +%Y%m%d%H%M%S)"'* ]]
 [[ "$script_text" == *'stable_signing_identity="71E83D4C74C2320E54ABA79ABA79B2D75B8A1B8A"'* ]]
+[[ "$script_text" == *'"$repo_root/scripts/package-app.sh" "${package_arguments[@]}"'* ]]
 [[ "$script_text" != *'security find-identity -v -p codesigning'* ]]
 [[ "$script_text" == *'the preview signing identity is empty'* ]]
 [[ "$script_text" == *'ONYX_PREVIEW_CODESIGN_IDENTITY to a certificate fingerprint'* ]]
@@ -78,6 +81,10 @@ lock_fixture_dir="$(/usr/bin/mktemp -d \
 run_preview_lock_file="$lock_fixture_dir/run-preview.lock"
 lock_fixture_ready="$lock_fixture_dir/ready"
 lock_fixture_release="$lock_fixture_dir/release"
+# Restricted macOS runners can deny the harmless priority adjustment zsh
+# normally applies to background jobs. The lock contract does not depend on
+# priority, so disable that shell behavior for this fixture.
+unsetopt BG_NICE
 /usr/bin/lockf -s -t 0 "$run_preview_lock_file" /bin/zsh -c '
   /usr/bin/touch "$1"
   for attempt in {1..500}; do
@@ -202,10 +209,24 @@ fi
 [[ "$partial_lsof_failure" == *'lsof exited with status 1'* ]]
 
 package_app_text="$(<"$package_app_script")"
+runtime_common_text="$(<"$runtime_common_script")"
 [[ "$package_app_text" == *'target_running_pids()'* ]]
 [[ "$package_app_text" == *'final_running_pids="$(target_running_pids)"'* ]]
 [[ "$package_app_text" == *'target started running during packaging'* ]]
 [[ "$package_app_text" == *'could not inspect the package target'* ]]
+[[ "$package_app_text" == *'source "$repo_root/scripts/codex-runtime-common.sh"'* ]]
+[[ "$package_app_text" == *'codex_runtime_validate_archive'* ]]
+[[ "$package_app_text" == *'Helpers/CodexRuntime'* ]]
+[[ "$package_app_text" == *'nested_codesign_arguments'* ]]
+[[ "$package_app_text" != *'/usr/bin/codesign --deep'* ]]
+[[ "$runtime_common_text" == *'ONYX_CODEX_RUNTIME_ARCHIVE_ARM64'* ]]
+[[ "$runtime_common_text" == *'ONYX_CODEX_RUNTIME_ARCHIVE_X86_64'* ]]
+[[ "$runtime_common_text" == *'contains a symlink, hard link, or unsupported entry'* ]]
+[[ "$(/usr/bin/plutil -extract version raw -o - "$runtime_manifest")" == "0.149.0" ]]
+[[ "$(/usr/bin/plutil -extract artifacts.0.target raw -o - "$runtime_manifest")" == \
+  "aarch64-apple-darwin" ]]
+[[ "$(/usr/bin/plutil -extract artifacts.1.target raw -o - "$runtime_manifest")" == \
+  "x86_64-apple-darwin" ]]
 
 repair_text="$(<"$repair_script")"
 [[ "$repair_text" == *'app.onyx.preview.b'* ]]

@@ -4,7 +4,7 @@ import XCTest
 
 @MainActor
 final class ProjectCatalogProductionTests: XCTestCase {
-    func testHostDefersMigrationUntilCompleteCodexCatalogAndLoadsBeyondFirstPage() async throws {
+    func testHostLoadsCompleteCodexCatalogWithoutImportingTaskFolders() async throws {
         let defaults = try makeDefaults()
         defer { defaults.cleanUp() }
         let location = temporaryLocation("codex")
@@ -53,7 +53,7 @@ final class ProjectCatalogProductionTests: XCTestCase {
             "A successful Codex page must not be capped at the old 100-row UI limit"
         )
         let incompleteSnapshot = try await ProjectCatalogStore(fileURL: location.file).snapshot()
-        XCTAssertFalse(incompleteSnapshot.didBootstrapConversationProjects)
+        XCTAssertTrue(incompleteSnapshot.projects.isEmpty)
 
         await runtime.setFailArchived(false)
         let complete = await host.loadProviderTaskCatalog(connections: connections)
@@ -62,22 +62,20 @@ final class ProjectCatalogProductionTests: XCTestCase {
             complete.lists.first(where: { $0.scope == .archived })?.threads.count,
             archived.count
         )
-        XCTAssertEqual(host.projectCatalogModel.projects.map(\.folderPath), ["/work/onyx"])
+        XCTAssertTrue(host.projectCatalogModel.projects.isEmpty)
         let calls = await runtime.listAllCalls()
         XCTAssertEqual(calls, [false, true, false, true])
 
-        let imported = try XCTUnwrap(host.projectCatalogModel.projects.first)
-        let removed = await host.projectCatalogModel.removeProject(id: imported.id)
-        XCTAssertTrue(removed)
-        XCTAssertTrue(host.projectCatalogModel.projects.isEmpty)
-
-        // The complete source is still present, but the persisted marker makes
-        // an explicit project removal authoritative across later launches.
+        // Repeated complete history loads still cannot turn task working
+        // directories into app-owned projects.
         _ = await host.loadProviderTaskCatalog(connections: connections)
         XCTAssertTrue(host.projectCatalogModel.projects.isEmpty)
+        let finalSnapshot = try await ProjectCatalogStore(fileURL: location.file).snapshot()
+        XCTAssertTrue(finalSnapshot.projects.isEmpty)
+        XCTAssertFalse(finalSnapshot.didBootstrapConversationProjects)
     }
 
-    func testHostLoadsEveryLocalConversationForSidebarAndMigration() async throws {
+    func testHostLoadsEveryLocalConversationWithoutImportingTaskFolders() async throws {
         let defaults = try makeDefaults()
         defer { defaults.cleanUp() }
         let location = temporaryLocation("local")
@@ -121,7 +119,7 @@ final class ProjectCatalogProductionTests: XCTestCase {
             catalog.lists.first(where: { $0.scope == .active })?.threads.count,
             125
         )
-        XCTAssertEqual(host.projectCatalogModel.projects.map(\.folderPath), ["/work/local"])
+        XCTAssertTrue(host.projectCatalogModel.projects.isEmpty)
     }
 
     func testWorkspaceModelListsAndOpensTaskBeyondFormerHundredRowCap() async throws {

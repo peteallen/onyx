@@ -7,7 +7,7 @@ final class CodexRuntimeLiveTests: XCTestCase {
             throw XCTSkip("Set ONYX_LIVE_CODEX_TEST=1 to exercise the installed Codex runtime")
         }
 
-        let runtime = try CodexRuntime.makeDefault()
+        let runtime = try CodexRuntime.makeDevelopmentInstalled()
         do {
             _ = try await runtime.connect()
             let threads = try await runtime.listThreads(limit: 20, archived: false)
@@ -47,7 +47,7 @@ final class CodexRuntimeLiveTests: XCTestCase {
             throw XCTSkip("Set ONYX_LIVE_CODEX_TEST=1 to exercise the installed Codex runtime")
         }
 
-        let runtime = try CodexRuntime.makeDefault()
+        let runtime = try CodexRuntime.makeDevelopmentInstalled()
         let session = try await runtime.connect()
         let threads = try await runtime.listThreads(limit: 5, archived: false)
         let archivedThreads = try await runtime.listThreads(limit: 5, archived: true)
@@ -83,7 +83,7 @@ final class CodexRuntimeLiveTests: XCTestCase {
             throw XCTSkip("Set ONYX_LIVE_CODEX_TEST=1 to exercise the installed Codex runtime")
         }
 
-        let runtime = try CodexRuntime.makeDefault()
+        let runtime = try CodexRuntime.makeDevelopmentInstalled()
         _ = try await runtime.connect()
         let thread = try await runtime.startThread(
             StartThreadRequest(
@@ -139,7 +139,7 @@ final class CodexRuntimeLiveTests: XCTestCase {
         }
 
         let handler = LiveDynamicToolRecorder()
-        let runtime = try CodexRuntime.makeDefault(dynamicToolHandler: handler)
+        let runtime = try CodexRuntime.makeDevelopmentInstalled(dynamicToolHandler: handler)
         do {
             _ = try await runtime.connect()
             let cwd = FileManager.default.currentDirectoryPath

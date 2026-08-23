@@ -2,6 +2,7 @@
 set -euo pipefail
 
 repo_root="${0:A:h:h}"
+source "$repo_root/scripts/codex-runtime-common.sh"
 configuration="debug"
 app_dir=""
 display_name="${ONYX_APP_DISPLAY_NAME:-}"
@@ -36,10 +37,13 @@ Options:
 Environment equivalents:
   ONYX_APP_DISPLAY_NAME, ONYX_BUNDLE_IDENTIFIER, ONYX_APP_VERSION,
   ONYX_BUILD_NUMBER, ONYX_CODESIGN_IDENTITY, ONYX_ARCHITECTURES,
-  ONYX_CODESIGN_TIMESTAMP, ONYX_CODESIGN_REQUIREMENT
+  ONYX_CODESIGN_TIMESTAMP, ONYX_CODESIGN_REQUIREMENT,
+  ONYX_CODEX_RUNTIME_CACHE_DIR, ONYX_CODEX_RUNTIME_ARCHIVE_ARM64,
+  ONYX_CODEX_RUNTIME_ARCHIVE_X86_64
 
 The positional form `scripts/package-app.sh debug [APP_PATH]` remains supported.
-The script never launches or stops an application.
+Packaging requires the pinned local Codex archive for every requested app
+architecture. It never downloads, launches, or stops an application.
 EOF
 }
 
@@ -141,6 +145,9 @@ info_template="$repo_root/support/Info.plist"
 [[ -f "$info_template" ]] || die "missing Info.plist template: $info_template"
 icon_file="$repo_root/support/Onyx.icns"
 [[ -f "$icon_file" ]] || die "missing app icon: $icon_file"
+codex_runtime_entitlements="$repo_root/support/codex-runtime-entitlements.plist"
+[[ -f "$codex_runtime_entitlements" && ! -L "$codex_runtime_entitlements" ]] || \
+  die "missing Codex runtime entitlements: $codex_runtime_entitlements"
 
 plist_value() {
   /usr/bin/plutil -extract "$1" raw -o - "$info_template"
@@ -172,6 +179,17 @@ plist_value() {
   die "designated requirement cannot contain a newline"
 if [[ -n "$designated_requirement" && "$signing_identity" == "-" ]]; then
   die "an explicit designated requirement requires a persistent signing identity"
+fi
+
+codex_runtime_require_manifest
+runtime_architectures=()
+if [[ "$architectures" == "native" ]]; then
+  native_architecture="$(/usr/bin/uname -m)"
+  [[ "$native_architecture" == "arm64" || "$native_architecture" == "x86_64" ]] ||
+    die "unsupported native architecture for bundled Codex runtime: $native_architecture"
+  runtime_architectures+=("$native_architecture")
+else
+  runtime_architectures+=(arm64 x86_64)
 fi
 
 target_executable="$app_dir/Contents/MacOS/Onyx"
@@ -262,7 +280,8 @@ cleanup() {
 trap cleanup EXIT
 
 contents_dir="$staged_app/Contents"
-/bin/mkdir -p "$contents_dir/MacOS" "$contents_dir/Resources"
+/bin/mkdir -p "$contents_dir/MacOS" "$contents_dir/Resources" \
+  "$contents_dir/Helpers/CodexRuntime"
 if [[ "$architectures" == "native" ]]; then
   /usr/bin/install -m 755 "${binary_paths[1]}" "$contents_dir/MacOS/Onyx"
 else
@@ -279,26 +298,84 @@ fi
 /usr/bin/plutil -replace CFBundleShortVersionString -string "$short_version" "$contents_dir/Info.plist"
 /usr/bin/plutil -replace CFBundleVersion -string "$build_number" "$contents_dir/Info.plist"
 
+runtime_preparation_root="$staging_root/CodexRuntimePreparation"
+/bin/mkdir -p "$runtime_preparation_root"
+for runtime_architecture in "${runtime_architectures[@]}"; do
+  runtime_archive="$(codex_runtime_archive_for_architecture "$runtime_architecture")"
+  [[ -f "$runtime_archive" && ! -L "$runtime_archive" ]] ||
+    die "missing pinned Codex runtime archive for $runtime_architecture; run scripts/fetch-codex-runtime.sh --architectures $architectures"
+  prepared_runtime="$(codex_runtime_validate_archive \
+    "$runtime_architecture" "$runtime_archive" "$runtime_preparation_root")"
+  runtime_target="$(codex_runtime_target_for_architecture "$runtime_architecture")"
+  bundled_runtime="$contents_dir/Helpers/CodexRuntime/$runtime_target"
+  /usr/bin/ditto --noqtn "$prepared_runtime" "$bundled_runtime"
+  codex_runtime_copy_attribution "$bundled_runtime"
+done
+
 print -- "Signing and verifying staged app…"
 /usr/bin/plutil -lint "$contents_dir/Info.plist" >/dev/null
 codesign_arguments=(--force --sign "$signing_identity")
+nested_codesign_arguments=(--force --sign "$signing_identity")
 signature_summary="ad hoc"
 if [[ "$signing_identity" == "-" ]]; then
-  codesign_arguments+=(--timestamp=none)
+  codesign_arguments+=(--options runtime --timestamp=none)
+  nested_codesign_arguments+=(--options runtime --timestamp=none)
 else
   codesign_arguments+=(--options runtime)
+  nested_codesign_arguments+=(--options runtime)
   if [[ -n "$designated_requirement" ]]; then
     codesign_arguments+=(--requirements "=designated => $designated_requirement")
   fi
   if [[ "$signing_timestamp" == "1" ]]; then
     codesign_arguments+=(--timestamp)
+    nested_codesign_arguments+=(--timestamp)
     signature_summary="$signing_identity (hardened runtime, trusted timestamp)"
   else
     codesign_arguments+=(--timestamp=none)
+    nested_codesign_arguments+=(--timestamp=none)
     signature_summary="$signing_identity (hardened runtime, no timestamp)"
   fi
 fi
+
+# The pinned archive hash establishes upstream provenance. Re-sign every
+# nested Mach-O with Onyx's identity before sealing the outer app; the
+# upstream release signatures are not strict-verifiable after distribution.
+for runtime_architecture in "${runtime_architectures[@]}"; do
+  runtime_target="$(codex_runtime_target_for_architecture "$runtime_architecture")"
+  runtime_package="$contents_dir/Helpers/CodexRuntime/$runtime_target"
+  executable_count="$(codex_runtime_manifest_value executables)"
+  for (( executable_index=0; executable_index<executable_count; executable_index++ )); do
+    executable_relative="$(codex_runtime_manifest_value "executables.$executable_index")"
+    code_identifier="$(codex_runtime_manifest_value \
+      "codeIdentifiers.$executable_index")"
+    if [[ "$executable_relative" == "bin/codex-app-server" || \
+          "$executable_relative" == "bin/codex-code-mode-host" ]]; then
+      /usr/bin/codesign "${nested_codesign_arguments[@]}" \
+        --identifier "$code_identifier" \
+        --entitlements "$codex_runtime_entitlements" \
+        "$runtime_package/$executable_relative"
+    else
+      /usr/bin/codesign "${nested_codesign_arguments[@]}" \
+        --identifier "$code_identifier" \
+        "$runtime_package/$executable_relative"
+    fi
+  done
+  # Contents/Helpers is a nested-code location. `codesign` otherwise treats
+  # these readable files as unsigned nested code instead of ordinary sealed
+  # resources, so give each one a deterministic detached resource envelope
+  # before sealing the outer app. Their bytes remain unchanged and are checked
+  # against the pinned upstream hashes below.
+  for nested_resource in codex-package.json LICENSE NOTICE; do
+    /usr/bin/codesign "${nested_codesign_arguments[@]}" "$runtime_package/$nested_resource"
+  done
+done
 /usr/bin/codesign "${codesign_arguments[@]}" "$staged_app"
+
+for runtime_architecture in "${runtime_architectures[@]}"; do
+  runtime_target="$(codex_runtime_target_for_architecture "$runtime_architecture")"
+  codex_runtime_verify_installed_package \
+    "$contents_dir/Helpers/CodexRuntime/$runtime_target" "$runtime_architecture"
+done
 /usr/bin/codesign --verify --deep --strict --verbose=2 "$staged_app"
 if [[ -n "$designated_requirement" ]]; then
   /usr/bin/codesign --verify --deep --strict --verbose=2 \
@@ -317,6 +394,14 @@ if [[ "$architectures" == "universal" ]]; then
      " $packaged_architectures " == *" x86_64 "* ]] || \
     die "universal executable did not contain arm64 and x86_64: $packaged_architectures"
 fi
+
+installed_runtime_targets=("$contents_dir/Helpers/CodexRuntime"/*(N:t))
+expected_runtime_targets=()
+for runtime_architecture in "${runtime_architectures[@]}"; do
+  expected_runtime_targets+=("$(codex_runtime_target_for_architecture "$runtime_architecture")")
+done
+[[ "${(j:\n:)installed_runtime_targets}" == "${(j:\n:)expected_runtime_targets}" ]] ||
+  die "packaged Codex runtime targets do not match app architectures"
 
 # Everything that can fail has operated on a sibling staging directory. Recheck
 # the exact executable after the build and verification, immediately before the

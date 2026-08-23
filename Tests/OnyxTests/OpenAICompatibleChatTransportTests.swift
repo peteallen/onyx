@@ -141,6 +141,39 @@ final class OpenAICompatibleChatTransportTests: XCTestCase {
         XCTAssertEqual(events[4], .completed)
     }
 
+    func testStreamingRecognizesCommonReasoningFieldsWithoutTreatingThemAsAnswerText() async throws {
+        let body = """
+        data: {"choices":[{"index":0,"delta":{"reasoning_content":"First thought. "},"finish_reason":null}]}
+
+        data: {"choices":[{"index":0,"delta":{"reasoning":"Second thought."},"finish_reason":null}]}
+
+        data: {"choices":[{"index":0,"delta":{"reasoning_details":[{"type":"reasoning.text","text":"Third thought."}]},"finish_reason":null}]}
+
+        data: {"choices":[{"index":0,"delta":{"content":"Final answer"},"finish_reason":"stop"}]}
+
+        data: [DONE]
+
+        """
+        MockChatURLProtocol.configure { _ in
+            .eventStream(chunks: [Data(body.utf8)])
+        }
+        let transport = try makeTransport()
+
+        var chunks: [OpenAICompatibleChatStreamChunk] = []
+        for try await event in transport.stream(makeRequest(stream: true)) {
+            if case let .chunk(chunk) = event { chunks.append(chunk) }
+        }
+
+        XCTAssertEqual(chunks.count, 4)
+        XCTAssertTrue(chunks[0].choices[0].delta.hasReasoning)
+        XCTAssertNil(chunks[0].choices[0].delta.content)
+        XCTAssertTrue(chunks[1].choices[0].delta.hasReasoning)
+        XCTAssertTrue(chunks[2].choices[0].delta.hasReasoning)
+        XCTAssertEqual(chunks[3].choices[0].delta.content, "Final answer")
+        XCTAssertFalse(chunks[3].choices[0].delta.hasReasoning)
+        XCTAssertEqual(chunks[3].choices[0].finishReason, "stop")
+    }
+
     func testSSEParserWaitsForCompleteUTF8EventAcrossArbitraryByteBoundaries() throws {
         let event = Data("data: {\"choices\":[],\"label\":\"a🪨b\"}\r\n\r\n".utf8)
         let emoji = try XCTUnwrap(event.range(of: Data("🪨".utf8)))

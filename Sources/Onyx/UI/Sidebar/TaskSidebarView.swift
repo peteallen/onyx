@@ -24,21 +24,22 @@ struct TaskSidebarView: View {
         VStack(spacing: 0) {
             header
             search
-            projectListHeader
-                .padding(.horizontal, 8)
+            projectListHeader(taskCount: grouping.taskCount)
 
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 3) {
+                LazyVStack(alignment: .leading, spacing: 6) {
                     ForEach(displayedGroups) { group in
                         projectHeader(group)
                             .padding(.top, 8)
                         if isProjectExpanded(group.id) {
                             if group.tasks.isEmpty {
-                                Text("No tasks yet")
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(.tertiary)
-                                    .padding(.leading, 28)
-                                    .padding(.vertical, 5)
+                                if !model.isLoadingThreadList {
+                                    Text("No tasks yet")
+                                        .font(.system(size: OnyxTypography.secondary))
+                                        .foregroundStyle(.tertiary)
+                                        .padding(.leading, 28)
+                                        .padding(.vertical, 5)
+                                }
                             } else {
                                 // A small inset makes the project/task relationship
                                 // readable without turning each project into a card.
@@ -51,33 +52,33 @@ struct TaskSidebarView: View {
                     }
 
                     if !grouping.unassigned.isEmpty {
-                        SidebarSectionLabel(
-                            title: projectCatalog.projects.isEmpty
-                                ? (model.isShowingArchivedThreads ? "Archived" : "Tasks")
-                                : "Other Tasks",
-                            count: grouping.unassigned.count
-                        )
-                        .padding(.top, displayedGroups.isEmpty ? 8 : 14)
+                        if !projectCatalog.projects.isEmpty {
+                            SidebarSectionLabel(
+                                title: "Other Tasks",
+                                count: grouping.unassigned.count
+                            )
+                            .padding(.top, displayedGroups.isEmpty ? 4 : 12)
+                        }
                         ForEach(grouping.unassigned) { task in threadRow(task) }
                     }
 
-                    if projectionModel.isReady,
-                       grouping.taskCount == 0,
-                       displayedGroups.isEmpty,
-                       !model.isLoadingThreadList {
+                    switch TaskSidebarContentState.resolve(
+                        isProjectionReady: projectionModel.isReady,
+                        hasVisibleTasks: grouping.taskCount > 0,
+                        hasVisibleProjects: !displayedGroups.isEmpty,
+                        isLoadingThreadList: model.isLoadingThreadList
+                    ) {
+                    case .loading:
+                        sidebarLoadingState
+                    case .empty:
                         sidebarEmptyState
+                    case .content:
+                        EmptyView()
                     }
                 }
                 .padding(.horizontal, 8)
+                .padding(.top, 2)
                 .padding(.bottom, 14)
-            }
-            .overlay(alignment: .top) {
-                if model.isLoadingThreadList {
-                    ProgressView()
-                        .controlSize(.small)
-                        .padding(.top, 20)
-                        .accessibilityLabel("Loading tasks")
-                }
             }
 
             SidebarUtilityFooter(model: model)
@@ -179,7 +180,7 @@ struct TaskSidebarView: View {
                 .stroke(OnyxTheme.border, lineWidth: OnyxTheme.hairline)
         }
         .padding(.horizontal, 10)
-        .padding(.bottom, 7)
+        .padding(.bottom, 11)
         .onExitCommand {
             if model.searchText.isEmpty {
                 isSearchFocused = false
@@ -197,32 +198,43 @@ struct TaskSidebarView: View {
         }
     }
 
-    private var projectListHeader: some View {
-        HStack(spacing: 6) {
-            Text("Projects")
-                .font(.system(size: OnyxTypography.secondary, weight: .semibold))
-                .foregroundStyle(.secondary)
-            Spacer()
-            if projectCatalog.isLoading {
-                ProgressView()
-                    .controlSize(.mini)
-                    .accessibilityLabel("Loading projects")
-            }
-            scopeMenu
-            Button(action: beginImportProject) {
-                Image(systemName: "plus")
-                    .font(.system(size: 10.5, weight: .bold))
-                    .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+    private func projectListHeader(taskCount: Int) -> some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 6) {
+                Text("Projects")
+                    .font(.system(size: OnyxTypography.secondary, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button(action: beginImportProject) {
+                    HStack(spacing: 5) {
+                        Image(systemName: "folder.badge.plus")
+                        Text("Add Project")
+                    }
+                    .font(.system(size: OnyxTypography.secondary, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .frame(minHeight: OnyxHitTarget.compact)
                     .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .onyxHelp("Add a project folder")
+                .accessibilityLabel("Add project")
+                .accessibilityHint("Opens a folder chooser; you can also create a new folder there")
             }
-            .buttonStyle(.plain)
+
+            HStack(spacing: 7) {
+                Text(model.isShowingArchivedThreads ? "Archived Tasks" : "Tasks")
+                    .font(.system(size: OnyxTypography.secondary, weight: .semibold))
+                Text("\(taskCount)")
+                    .font(.system(size: OnyxTypography.metadata, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                Spacer()
+                scopeMenu
+            }
             .foregroundStyle(.secondary)
-            .onyxHelp("Add a project folder")
-            .accessibilityLabel("Add project")
-            .accessibilityHint("Opens a folder chooser; you can also create a new folder there")
+            .accessibilityElement(children: .contain)
         }
-        .padding(.horizontal, 7)
-        .padding(.bottom, 4)
+        .padding(.horizontal, 17)
+        .padding(.bottom, 6)
     }
 
     private var scopeMenu: some View {
@@ -246,7 +258,7 @@ struct TaskSidebarView: View {
                 Image(systemName: "chevron.down")
                     .font(.system(size: 7.5, weight: .semibold))
             }
-            .font(.system(size: 10.5, weight: .medium))
+            .font(.system(size: OnyxTypography.metadata, weight: .medium))
             .foregroundStyle(.secondary)
             .frame(minHeight: OnyxHitTarget.compact)
             .contentShape(Rectangle())
@@ -278,11 +290,25 @@ struct TaskSidebarView: View {
                 .foregroundStyle(.tertiary)
                 .accessibilityHidden(true)
             Text(model.searchText.isEmpty ? "No archived tasks" : "No matching tasks")
-                .font(.system(size: 11.5, weight: .medium))
+                .font(.system(size: OnyxTypography.secondary, weight: .medium))
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
         .padding(.top, 28)
+    }
+
+    private var sidebarLoadingState: some View {
+        HStack(spacing: 8) {
+            ProgressView()
+                .controlSize(.small)
+            Text("Loading tasks…")
+                .font(.system(size: OnyxTypography.secondary, weight: .medium))
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 28)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Loading tasks")
     }
 
     private var isConnected: Bool {
@@ -297,7 +323,8 @@ struct TaskSidebarView: View {
 
     private var sidebarProjectionRequest: ProjectTaskSidebarProjectionRequest {
         let useLiveSnapshot = TaskSidebarLiveSnapshotPolicy.shouldUseLiveSnapshot(
-            hasAuthoritativeThreadList: model.hasAuthoritativeThreadListForCurrentScope
+            hasAuthoritativeThreadList: model.hasAuthoritativeThreadListForCurrentScope,
+            hasUnlistedSelectedTask: model.hasUnlistedSelectedTask
         )
         return projectCatalog.sidebarProjectionRequest(
             scope: model.threadListScope,
@@ -437,8 +464,14 @@ struct TaskSidebarView: View {
                 isArchived: model.isShowingArchivedThreads,
                 providerName: providerConnections.count > 1 ? task.providerDisplayName : nil
             )
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .buttonStyle(.plain)
+        // Keep the whole visible row clickable, including the quiet trailing
+        // whitespace. The label's intrinsic text width should never become
+        // the hit-target width in a wide sidebar.
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(thread.title)
         .accessibilityValue(threadAccessibilityValue(
@@ -576,7 +609,7 @@ private struct SidebarSectionLabel: View {
                 .font(.system(size: OnyxTypography.secondary, weight: .semibold))
             Spacer()
             Text("\(count)")
-                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .font(.system(size: OnyxTypography.metadata, weight: .medium, design: .monospaced))
                 .foregroundStyle(.tertiary)
         }
         .foregroundStyle(.secondary)
@@ -617,7 +650,7 @@ struct ProjectSidebarHeader: View {
                         .lineLimit(1)
                     Spacer(minLength: 4)
                     Text("\(taskCount)")
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .font(.system(size: OnyxTypography.metadata, weight: .medium, design: .monospaced))
                         .foregroundStyle(.tertiary)
                 }
                 .frame(minHeight: OnyxHitTarget.compact)
@@ -669,12 +702,12 @@ private struct TaskSidebarRow: View {
     let providerName: String?
 
     var body: some View {
-        HStack(alignment: .top, spacing: 8) {
+        HStack(alignment: .top, spacing: 9) {
             statusIndicator
-                .frame(width: 11, height: 12)
-                .padding(.top, 4)
+                .frame(width: 12, height: 14)
+                .padding(.top, 3)
 
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
                     Text(thread.title)
                         .font(.system(size: OnyxTypography.navigation, weight: isSelected ? .medium : .regular))
@@ -683,9 +716,14 @@ private struct TaskSidebarRow: View {
                     Spacer(minLength: 4)
                     if !isArchived, attention.showsSidebarAttentionLabel {
                         Text(attention.label)
-                            .font(.system(size: 9.5, weight: .semibold))
+                            .font(.system(size: OnyxTypography.metadata, weight: .semibold))
                             .foregroundStyle(attention.sidebarColor)
                             .lineLimit(1)
+                    } else {
+                        Text(TaskSidebarTimestamp.compact(thread.updatedAt))
+                            .font(.system(size: OnyxTypography.metadata))
+                            .monospacedDigit()
+                            .foregroundStyle(.tertiary)
                     }
                 }
                 HStack(spacing: 5) {
@@ -694,6 +732,15 @@ private struct TaskSidebarRow: View {
                             .font(.system(size: 8))
                             .foregroundStyle(OnyxTheme.iris.opacity(0.78))
                             .accessibilityHidden(true)
+                    }
+                    if let providerName {
+                        Text(providerName)
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                        if previewText != nil {
+                            Text("·")
+                                .foregroundStyle(.tertiary)
+                        }
                     }
                     if let previewText {
                         Text(previewText)
@@ -705,22 +752,15 @@ private struct TaskSidebarRow: View {
                             .lineLimit(1)
                             .truncationMode(.tail)
                     }
-                    Spacer(minLength: 4)
-                    if let providerName {
-                        Text(providerName)
-                            .lineLimit(1)
-                    }
-                    Text(TaskSidebarTimestamp.compact(thread.updatedAt))
-                        .monospacedDigit()
-                        .foregroundStyle(.tertiary)
+                    Spacer(minLength: 0)
                 }
                 .font(.system(size: OnyxTypography.metadata))
                 .foregroundStyle(.secondary)
             }
         }
-        .padding(.horizontal, 9)
-        .padding(.vertical, 6.5)
-        .frame(minHeight: OnyxHitTarget.row)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .frame(minHeight: 44)
         .background {
             if isSelected {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -809,19 +849,42 @@ extension RuntimeThreadStatus {
 extension RuntimeTaskAttention {
     var showsSidebarAttentionLabel: Bool {
         switch self {
-        // A progress indicator already communicates routine work. Keep text
-        // for states that require the user's attention or explain an error.
-        case .working, .ready: false
-        case .needsInput, .needsApproval, .failed, .unknown: true
+        // The leading indicator already communicates routine work and failure.
+        // Keep words only for states where the user needs to take an action or
+        // where the indicator alone could be mistaken for a ready task;
+        // repeating "Failed" beside a red failure icon crowds narrow rows and
+        // recreates the detached debug-label problem from the transcript.
+        case .needsInput, .needsApproval: true
+        case .unknown: true
+        case .working, .ready, .failed: false
         }
     }
 }
 
 enum TaskSidebarLiveSnapshotPolicy {
     static func shouldUseLiveSnapshot(
-        hasAuthoritativeThreadList: Bool
+        hasAuthoritativeThreadList: Bool,
+        hasUnlistedSelectedTask: Bool = false
     ) -> Bool {
-        hasAuthoritativeThreadList
+        hasAuthoritativeThreadList && !hasUnlistedSelectedTask
+    }
+}
+
+enum TaskSidebarContentState: Equatable {
+    case loading
+    case empty
+    case content
+
+    static func resolve(
+        isProjectionReady: Bool,
+        hasVisibleTasks: Bool,
+        hasVisibleProjects: Bool,
+        isLoadingThreadList: Bool
+    ) -> Self {
+        if hasVisibleTasks { return .content }
+        if isLoadingThreadList { return .loading }
+        if hasVisibleProjects { return .content }
+        return isProjectionReady ? .empty : .content
     }
 }
 

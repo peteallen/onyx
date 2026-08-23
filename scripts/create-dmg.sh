@@ -232,6 +232,12 @@ verification_arguments=(
   --version "$short_version"
   --build-number "$build_number"
 )
+app_architectures="$(/usr/bin/lipo -archs \
+  "$app_path/Contents/MacOS/$(/usr/bin/plutil -extract CFBundleExecutable raw -o - "$info_plist")")"
+if [[ " $app_architectures " == *" arm64 "* && \
+      " $app_architectures " == *" x86_64 "* ]]; then
+  verification_arguments+=(--require-universal)
+fi
 if (( notarize == 1 )); then
   verification_arguments+=(--require-notarized)
 fi
