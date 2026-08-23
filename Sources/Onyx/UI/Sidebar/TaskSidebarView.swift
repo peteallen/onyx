@@ -114,16 +114,20 @@ struct TaskSidebarView: View {
             }
             Spacer()
             Button(action: model.newTask) {
-                Image(systemName: "square.and.pencil")
-                    .font(.system(size: 13, weight: .semibold))
-                    .frame(width: 27, height: 27)
-                    .background(Color.primary.opacity(0.055))
-                    .foregroundStyle(.primary)
-                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .stroke(OnyxTheme.border, lineWidth: OnyxTheme.hairline)
-                    }
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.primary.opacity(0.055))
+                        .frame(width: 27, height: 27)
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .stroke(OnyxTheme.border, lineWidth: OnyxTheme.hairline)
+                        }
+                    Image(systemName: "square.and.pencil")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.primary)
+                }
+                .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .onyxHelp("New task (⌘N)")
@@ -151,6 +155,8 @@ struct TaskSidebarView: View {
                     model.searchText = ""
                 } label: {
                     Image(systemName: "xmark.circle.fill")
+                        .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.tertiary)
@@ -158,7 +164,7 @@ struct TaskSidebarView: View {
             }
         }
         .padding(.horizontal, 9)
-        .frame(height: 30)
+        .frame(height: OnyxHitTarget.compact)
         .background(OnyxTheme.surface)
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay {
@@ -199,7 +205,8 @@ struct TaskSidebarView: View {
             Button(action: beginImportProject) {
                 Image(systemName: "plus")
                     .font(.system(size: 10.5, weight: .bold))
-                    .frame(width: 24, height: 22)
+                    .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
@@ -234,7 +241,7 @@ struct TaskSidebarView: View {
             }
             .font(.system(size: 10.5, weight: .medium))
             .foregroundStyle(.secondary)
-            .frame(height: 22)
+            .frame(minHeight: OnyxHitTarget.compact)
             .contentShape(Rectangle())
         }
         .menuStyle(.borderlessButton)
@@ -562,7 +569,7 @@ private struct SidebarSectionLabel: View {
     }
 }
 
-private struct ProjectSidebarHeader: View {
+struct ProjectSidebarHeader: View {
     let project: ProjectCatalogRecord
     let taskCount: Int
     let isExpanded: Bool
@@ -595,6 +602,7 @@ private struct ProjectSidebarHeader: View {
                         .font(.system(size: 10, weight: .medium, design: .monospaced))
                         .foregroundStyle(.tertiary)
                 }
+                .frame(minHeight: OnyxHitTarget.compact)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -619,7 +627,7 @@ private struct ProjectSidebarHeader: View {
             } label: {
                 Image(systemName: "ellipsis")
                     .font(.system(size: 10.5, weight: .bold))
-                    .frame(width: 24, height: 22)
+                    .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
                     .contentShape(Rectangle())
             }
             .menuStyle(.borderlessButton)
@@ -694,6 +702,7 @@ private struct TaskSidebarRow: View {
         }
         .padding(.horizontal, 9)
         .padding(.vertical, 6.5)
+        .frame(minHeight: OnyxHitTarget.row)
         .background {
             if isSelected {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)

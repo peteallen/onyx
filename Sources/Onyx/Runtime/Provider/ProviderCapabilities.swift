@@ -57,6 +57,45 @@ enum ProviderRequestParameter: String, Codable, Hashable, Sendable, CaseIterable
     }
 }
 
+/// Narrow model-family knowledge used only when a generic OpenAI-compatible
+/// catalog omits a capability that Onyx has verified for that exact family.
+/// Keep this list deliberately small: an arbitrary model name must never gain
+/// request controls merely because it is served by vLLM.
+enum KnownOpenAICompatibleModelProfile: Equatable, Sendable {
+    case qwen38
+
+    static func profile(for modelID: String) -> Self? {
+        let normalized = modelID
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let name = normalized.split(separator: "/").last.map(String.init) ?? normalized
+        let qwen38Prefixes = ["qwen3.8", "qwen3-8", "qwen3_8"]
+        if qwen38Prefixes.contains(where: { prefix in
+            name == prefix
+                || name.hasPrefix("\(prefix)-")
+                || name.hasPrefix("\(prefix)_")
+        }) {
+            return .qwen38
+        }
+        return nil
+    }
+
+    /// Qwen 3.8's vLLM chat contract accepts `none` as the explicit direct
+    /// mode plus three thinking levels. Do not expose the generic vLLM schema's
+    /// `high` or `max` values: this model rejects both at request time.
+    var reasoningEfforts: [String] {
+        switch self {
+        case .qwen38: ["none", "low", "medium", "xhigh"]
+        }
+    }
+
+    var defaultReasoningEffort: String {
+        switch self {
+        case .qwen38: "xhigh"
+        }
+    }
+}
+
 /// Endpoint-level behavior that is not reported in a model catalog. For
 /// example, OpenRouter's chat endpoint supports SSE streaming even though
 /// model `supported_parameters` usually does not contain `stream`.
@@ -172,7 +211,15 @@ struct ProviderCapabilitySet: Codable, Equatable, Hashable, Sendable {
     /// actually use. Tool parameters remain server metadata until Onyx has a
     /// decoder, approval surface, and execution lifecycle for tool calls.
     var clientUsableParameters: Set<ProviderRequestParameter> {
-        supportedParameters.subtracting([.tools, .toolChoice])
+        var parameters = supportedParameters.subtracting([.tools, .toolChoice])
+        // Exact effort values are sufficient client-side evidence for the
+        // typed field. They may come from the provider catalog or from one of
+        // the deliberately narrow, live-verified family profiles below; do
+        // not force the latter into the server-advertised parameter set.
+        if !reasoningEfforts.isEmpty {
+            parameters.insert(.reasoningEffort)
+        }
+        return parameters
     }
 
     private static func normalizedServerCapabilities(_ values: [String]) -> [String] {
@@ -191,8 +238,7 @@ struct ProviderCapabilitySet: Codable, Equatable, Hashable, Sendable {
         case let .parameter(parameter): supportedParameters.contains(parameter)
         case .transport: false
         case let .reasoningEffort(effort):
-            supportedParameters.contains(.reasoningEffort)
-                && reasoningEfforts.contains(effort)
+            reasoningEfforts.contains(effort)
         }
     }
 
@@ -203,6 +249,8 @@ struct ProviderCapabilitySet: Codable, Equatable, Hashable, Sendable {
         switch requirement {
         case .parameter(.tools), .parameter(.toolChoice):
             false
+        case .parameter(.reasoningEffort):
+            !reasoningEfforts.isEmpty
         default:
             supports(requirement)
         }
@@ -216,26 +264,78 @@ struct ProviderCapabilitySet: Codable, Equatable, Hashable, Sendable {
 
 }
 
-/// Records which capability dimensions were actually present in provider
-/// metadata. A generic OpenAI-compatible `/models` row often contains only an
-/// ID; the adapter still uses text as its safe chat baseline, but the UI must
-/// not present that baseline as a provider-verified text-only declaration.
+/// Records which capability dimensions have usable evidence. Most evidence is
+/// provider-advertised metadata; a deliberately allow-listed exact model
+/// family can also supply evidence when a sparse `/models` row contains only
+/// its ID. The adapter still uses text as its safe baseline for every other
+/// unknown model.
 struct ProviderCapabilityEvidence: Codable, Equatable, Hashable, Sendable {
     let inputModalitiesAdvertised: Bool
     let outputModalitiesAdvertised: Bool
     let supportedParametersAdvertised: Bool
     let reasoningEffortsAdvertised: Bool
+    /// The provider omitted effort metadata, but Onyx has live-verified an
+    /// exact allow-listed model profile. Keep this distinct from advertised
+    /// evidence so persisted catalogs and picker copy remain honest.
+    let reasoningEffortsVerifiedByClient: Bool
 
     init(
         inputModalitiesAdvertised: Bool,
         outputModalitiesAdvertised: Bool,
         supportedParametersAdvertised: Bool,
-        reasoningEffortsAdvertised: Bool
+        reasoningEffortsAdvertised: Bool,
+        reasoningEffortsVerifiedByClient: Bool = false
     ) {
         self.inputModalitiesAdvertised = inputModalitiesAdvertised
         self.outputModalitiesAdvertised = outputModalitiesAdvertised
         self.supportedParametersAdvertised = supportedParametersAdvertised
         self.reasoningEffortsAdvertised = reasoningEffortsAdvertised
+        self.reasoningEffortsVerifiedByClient = reasoningEffortsVerifiedByClient
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case inputModalitiesAdvertised
+        case outputModalitiesAdvertised
+        case supportedParametersAdvertised
+        case reasoningEffortsAdvertised
+        case reasoningEffortsVerifiedByClient
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            inputModalitiesAdvertised: try container.decodeIfPresent(
+                Bool.self,
+                forKey: .inputModalitiesAdvertised
+            ) ?? false,
+            outputModalitiesAdvertised: try container.decodeIfPresent(
+                Bool.self,
+                forKey: .outputModalitiesAdvertised
+            ) ?? false,
+            supportedParametersAdvertised: try container.decodeIfPresent(
+                Bool.self,
+                forKey: .supportedParametersAdvertised
+            ) ?? false,
+            reasoningEffortsAdvertised: try container.decodeIfPresent(
+                Bool.self,
+                forKey: .reasoningEffortsAdvertised
+            ) ?? false,
+            reasoningEffortsVerifiedByClient: try container.decodeIfPresent(
+                Bool.self,
+                forKey: .reasoningEffortsVerifiedByClient
+            ) ?? false
+        )
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(inputModalitiesAdvertised, forKey: .inputModalitiesAdvertised)
+        try container.encode(outputModalitiesAdvertised, forKey: .outputModalitiesAdvertised)
+        try container.encode(supportedParametersAdvertised, forKey: .supportedParametersAdvertised)
+        try container.encode(reasoningEffortsAdvertised, forKey: .reasoningEffortsAdvertised)
+        if reasoningEffortsVerifiedByClient {
+            try container.encode(true, forKey: .reasoningEffortsVerifiedByClient)
+        }
     }
 
     var isUnknown: Bool {
@@ -243,6 +343,7 @@ struct ProviderCapabilityEvidence: Codable, Equatable, Hashable, Sendable {
             && !outputModalitiesAdvertised
             && !supportedParametersAdvertised
             && !reasoningEffortsAdvertised
+            && !reasoningEffortsVerifiedByClient
     }
 
     var isPartial: Bool {
@@ -282,7 +383,8 @@ struct ProviderCapabilityEvidence: Codable, Equatable, Hashable, Sendable {
         if inputModalitiesAdvertised {
             values.append(inputModalities.contains(.image) ? "Images" : "Text")
         }
-        if reasoningEffortsAdvertised, !reasoningEfforts.isEmpty {
+        if reasoningEffortsAdvertised || reasoningEffortsVerifiedByClient,
+           !reasoningEfforts.isEmpty {
             values.append("Reasoning")
         }
         let serverAdvertisesToolUse = serverAdvertisedParameters.contains(.tools)
@@ -375,7 +477,7 @@ struct ProviderModelDescriptor: Identifiable, Codable, Equatable, Hashable, Send
     init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let capabilities = try container.decode(ProviderCapabilitySet.self, forKey: .capabilities)
-        try self.init(
+        let descriptor = try Self(
             id: container.decode(String.self, forKey: .id),
             displayName: container.decodeIfPresent(String.self, forKey: .displayName),
             description: container.decodeIfPresent(String.self, forKey: .description),
@@ -388,6 +490,7 @@ struct ProviderModelDescriptor: Identifiable, Codable, Equatable, Hashable, Send
             contextLength: container.decodeIfPresent(Int.self, forKey: .contextLength),
             maxCompletionTokens: container.decodeIfPresent(Int.self, forKey: .maxCompletionTokens)
         )
+        self = descriptor.applyingKnownModelProfile()
     }
 
     /// Decodes the stable subset of OpenRouter's `/models` response that an
@@ -418,13 +521,19 @@ struct ProviderModelDescriptor: Identifiable, Codable, Equatable, Hashable, Send
                 guard let raw = value.stringValue else { return nil }
                 return ProviderRequestParameter.fromOpenRouterCatalog(raw)
             } ?? []
-        let supportedParameters = Set(catalogParameters)
+        var supportedParameters = Set(catalogParameters)
         let reasoningEfforts = value["reasoning"]?["supported_efforts"]?.arrayValue?
             .compactMap(\.stringValue) ?? []
+        // A provider that names exact effort values has already supplied
+        // enough evidence for the typed effort field, even if its flat
+        // `supported_parameters` list is absent or incomplete.
+        if !reasoningEfforts.isEmpty {
+            supportedParameters.insert(.reasoningEffort)
+        }
         let serverAdvertisedCapabilities = value["capabilities"]?.arrayValue?
             .compactMap(\.stringValue) ?? []
 
-        return try Self(
+        let descriptor = try Self(
             id: id,
             displayName: value["name"]?.stringValue,
             description: value["description"]?.stringValue,
@@ -450,6 +559,7 @@ struct ProviderModelDescriptor: Identifiable, Codable, Equatable, Hashable, Send
                 ?? value["max_model_len"]?.intValue,
             maxCompletionTokens: value["top_provider"]?["max_completion_tokens"]?.intValue
         )
+        return descriptor.applyingKnownModelProfile()
     }
 
     /// Decodes every usable model from an OpenRouter `/models` envelope while
@@ -485,6 +595,56 @@ struct ProviderModelDescriptor: Identifiable, Codable, Equatable, Hashable, Send
             supportedParametersAdvertised: !capabilities.supportedParameters.isEmpty,
             reasoningEffortsAdvertised: !capabilities.reasoningEfforts.isEmpty
         )
+    }
+
+    /// Adds only exact, verified family knowledge when both the parameter and
+    /// effort matrix is absent. An explicit provider parameter list that
+    /// omits reasoning wins over this fallback; a list that positively names
+    /// `reasoning_effort` may use the verified profile to fill only its missing
+    /// values.
+    func applyingKnownModelProfile() -> Self {
+        guard wireProtocol == .openAIChatCompletions,
+              !capabilityEvidence.reasoningEffortsAdvertised,
+              !capabilityEvidence.supportedParametersAdvertised
+                || capabilities.supportedParameters.contains(.reasoningEffort),
+              let profile = KnownOpenAICompatibleModelProfile.profile(for: id)
+        else { return self }
+
+        return (try? Self(
+            id: id,
+            displayName: displayName,
+            description: description,
+            wireProtocol: wireProtocol,
+            capabilities: ProviderCapabilitySet(
+                inputModalities: capabilities.inputModalities,
+                outputModalities: capabilities.outputModalities,
+                // Preserve the literal `/models` response here. The verified
+                // family profile makes this field client-usable through its
+                // exact effort list without pretending the server advertised
+                // `reasoning_effort` in a sparse catalog row.
+                supportedParameters: capabilities.supportedParameters,
+                reasoningEfforts: profile.reasoningEfforts,
+                serverAdvertisedCapabilities: capabilities.serverAdvertisedCapabilities
+            ),
+            capabilityEvidence: ProviderCapabilityEvidence(
+                inputModalitiesAdvertised: capabilityEvidence.inputModalitiesAdvertised,
+                outputModalitiesAdvertised: capabilityEvidence.outputModalitiesAdvertised,
+                supportedParametersAdvertised: capabilityEvidence.supportedParametersAdvertised,
+                reasoningEffortsAdvertised: capabilityEvidence.reasoningEffortsAdvertised,
+                reasoningEffortsVerifiedByClient: true
+            ),
+            contextLength: contextLength,
+            maxCompletionTokens: maxCompletionTokens
+        )) ?? self
+    }
+
+    var preferredDefaultReasoningEffort: String? {
+        if let profile = KnownOpenAICompatibleModelProfile.profile(for: id),
+           capabilities.reasoningEfforts.contains(profile.defaultReasoningEffort)
+        {
+            return profile.defaultReasoningEffort
+        }
+        return capabilities.reasoningEfforts.first
     }
 }
 

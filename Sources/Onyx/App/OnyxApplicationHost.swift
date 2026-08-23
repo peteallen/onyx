@@ -366,7 +366,7 @@ final class OnyxApplicationHost: ObservableObject {
             // older records are retained as a second fallback as well.
             let discovered = record.discovery.discoveredModels.isEmpty
                 ? record.discovery.discoveredModelIDs.compactMap(Self.fallbackModelDescriptor)
-                : record.discovery.discoveredModels
+                : record.discovery.discoveredModels.map { $0.applyingKnownModelProfile() }
             var descriptors = discovered
             if let selectedModelID = record.selectedModelID,
                !descriptors.contains(where: { $0.id == selectedModelID }),
@@ -374,13 +374,17 @@ final class OnyxApplicationHost: ObservableObject {
                 descriptors.append(fallback)
             }
             let models = descriptors.enumerated().map { index, descriptor in
-                RuntimeModel(
+                let defaultReasoningEffort = record.requestBehavior.enableThinking == false
+                    && descriptor.capabilities.reasoningEfforts.contains("none")
+                    ? "none"
+                    : descriptor.preferredDefaultReasoningEffort
+                return RuntimeModel(
                     id: descriptor.id,
                     displayName: descriptor.displayName,
                     description: descriptor.description,
                     isDefault: descriptor.id == record.selectedModelID
                         || (record.selectedModelID == nil && index == 0),
-                    defaultReasoningEffort: descriptor.capabilities.reasoningEfforts.first,
+                    defaultReasoningEffort: defaultReasoningEffort,
                     reasoningEfforts: descriptor.capabilities.reasoningEfforts,
                     inputModalities: descriptor.capabilities.inputModalities,
                     serverAdvertisedRequestParameters: descriptor.capabilities.supportedParameters,
@@ -618,12 +622,13 @@ final class OnyxApplicationHost: ObservableObject {
     }
 
     private static func fallbackModelDescriptor(_ id: String) -> ProviderModelDescriptor? {
-        try? ProviderModelDescriptor(
+        let descriptor = try? ProviderModelDescriptor(
             id: id,
             wireProtocol: .openAIChatCompletions,
             capabilities: ProviderCapabilitySet(),
             capabilityEvidence: .unknown
         )
+        return descriptor?.applyingKnownModelProfile()
     }
 
     /// Resolves configured OpenAI-compatible connections in the same

@@ -48,7 +48,10 @@ final class ProviderSettingsDiscoveryTests: XCTestCase {
         )
 
         XCTAssertEqual(models.map(\.id), ["Qwen/Qwen3.8-27B-FP8"])
-        XCTAssertTrue(try XCTUnwrap(models.first).capabilityEvidence.isUnknown)
+        let qwen = try XCTUnwrap(models.first)
+        XCTAssertEqual(qwen.capabilities.reasoningEfforts, ["none", "low", "medium", "xhigh"])
+        XCTAssertTrue(qwen.capabilities.supports(.reasoningEffort("medium")))
+        XCTAssertTrue(qwen.capabilityEvidence.isPartial)
         let request = try XCTUnwrap(probe.request)
         XCTAssertEqual(request.url?.absoluteString, "https://provider.example.test/v1/models")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer fixture-key")

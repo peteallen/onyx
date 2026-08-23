@@ -114,14 +114,16 @@ struct SideChatPanelView: View {
             Button(action: model.closeSideChat) {
                 Image(systemName: "xmark")
                     .font(.system(size: 11, weight: .semibold))
-                    .frame(width: 24, height: 24)
+                    .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.borderless)
             .onyxHelp("Close side chat")
             .accessibilityLabel("Close side chat")
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 9)
+        // The close target grows without making the entire header taller.
+        .padding(.vertical, 5)
         .background(OnyxTheme.chrome)
     }
 
@@ -140,6 +142,7 @@ struct SideChatPanelView: View {
                 text: $model.sideChatComposerText,
                 measuredHeight: $textHeight,
                 isEnabled: model.canRunAgent && !model.isSideChatLoading,
+                canSubmit: { canSend },
                 onSubmit: {
                     if canSend { model.sendSideChat() }
                 },
@@ -154,7 +157,8 @@ struct SideChatPanelView: View {
                     model.chooseSideChatImages(window: windowPresentation.window)
                 } label: {
                     Image(systemName: "plus")
-                        .frame(width: 24, height: 24)
+                        .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.borderless)
                 .disabled(!model.canAttachSideChatImages)
@@ -174,28 +178,36 @@ struct SideChatPanelView: View {
 
                 if model.isSideChatTurnRunning {
                     Button(action: model.interruptSideChat) {
-                        Image(systemName: "stop.fill")
-                            .font(.system(size: 9, weight: .bold))
-                            .frame(width: 26, height: 26)
-                            .background(Color.primary)
-                            .foregroundStyle(OnyxTheme.canvas)
-                            .clipShape(Circle())
+                        ZStack {
+                            Circle()
+                                .fill(Color.primary)
+                                .frame(width: 26, height: 26)
+                            Image(systemName: "stop.fill")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundStyle(OnyxTheme.canvas)
+                        }
+                        .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                        .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .onyxHelp("Stop side chat")
                     .accessibilityLabel("Stop side chat")
                 } else {
                     Button(action: model.sendSideChat) {
-                        Image(systemName: "arrow.up")
-                            .font(.system(size: 11, weight: .bold))
-                            .frame(width: 27, height: 27)
-                            .background(
-                                canSend
-                                    ? AnyShapeStyle(OnyxTheme.accentGradient)
-                                    : AnyShapeStyle(Color.secondary.opacity(0.16))
-                            )
-                            .foregroundStyle(canSend ? Color.white : Color.secondary.opacity(0.58))
-                            .clipShape(Circle())
+                        ZStack {
+                            Circle()
+                                .fill(
+                                    canSend
+                                        ? AnyShapeStyle(OnyxTheme.accentGradient)
+                                        : AnyShapeStyle(Color.secondary.opacity(0.16))
+                                )
+                                .frame(width: 27, height: 27)
+                            Image(systemName: "arrow.up")
+                                .font(.system(size: 11, weight: .bold))
+                                .foregroundStyle(canSend ? Color.white : Color.secondary.opacity(0.58))
+                        }
+                        .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                        .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .disabled(!canSend)

@@ -7,7 +7,9 @@ import SwiftUI
 /// type intentionally contains no view or persistence state so the rules can
 /// be exercised without constructing an AppKit window.
 enum WorkspacePaneLayout {
-    static let dividerWidth: CGFloat = 7
+    /// A splitter is narrower than a normal button, but should still be broad
+    /// enough to acquire without pixel hunting on a trackpad.
+    static let dividerWidth: CGFloat = OnyxHitTarget.splitter
     /// Protect enough room for the transcript and composer to remain the
     /// primary workspace, even when both supporting panes are open.
     static let minimumConversationWidth: CGFloat = 640

@@ -13,7 +13,7 @@ final class ProjectFileTreeTests: XCTestCase {
             kind: .directory
         )
         var toggleCount = 0
-        let size = NSSize(width: 280, height: 23)
+        let size = NSSize(width: 280, height: OnyxHitTarget.compact)
         let hostingView = NSHostingView(
             rootView: ProjectFileRow(
                 entry: entry,
@@ -42,10 +42,11 @@ final class ProjectFileTreeTests: XCTestCase {
         }
         hostingView.layoutSubtreeIfNeeded()
 
-        // The label begins after the chevron and folder icon. This point sits
-        // squarely over "Sources" and outside the old 12-point chevron-only
-        // target, so the test regresses the interaction the user encountered.
-        try click(at: NSPoint(x: 55, y: size.height / 2), in: window)
+        // The label begins after the chevron and folder icon. This point is
+        // horizontally outside the old chevron-only target and vertically in
+        // the extra area beyond the old 23-point row, so a normal imprecise
+        // click still toggles the folder.
+        try click(at: NSPoint(x: 55, y: 3), in: window)
         RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
 
         XCTAssertEqual(toggleCount, 1)

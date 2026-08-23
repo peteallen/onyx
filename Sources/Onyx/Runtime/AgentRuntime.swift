@@ -16,7 +16,20 @@ protocol AgentRuntime: Sendable {
     /// override this instead of guessing a very large page size.
     func listAllThreads(archived: Bool) async throws -> [RuntimeThread]
     func readThread(id: String) async throws -> RuntimeConversation
+    func readThread(
+        id: String,
+        initialHistoryPage: RuntimeThreadHistoryPageRequest
+    ) async throws -> RuntimeThreadResumeResult
     func resumeThread(id: String) async throws -> RuntimeConversation
+    func resumeThread(
+        id: String,
+        initialHistoryPage: RuntimeInitialThreadHistoryPageRequest
+    ) async throws -> RuntimeThreadResumeResult
+    func listThreadHistory(
+        id: String,
+        page: RuntimeThreadHistoryPageRequest
+    ) async throws -> RuntimeThreadHistoryPage
+    func revertThread(id: String, beforeTurnID: String) async throws -> RuntimeThreadRevertResult
     func startThread(_ request: StartThreadRequest) async throws -> RuntimeThread
     func forkThread(id: String) async throws -> RuntimeThread
     /// Creates an isolated, non-durable branch of an existing conversation.
@@ -78,6 +91,31 @@ extension AgentRuntime {
 
     func resumeThread(id: String) async throws -> RuntimeConversation {
         try await readThread(id: id)
+    }
+
+    func readThread(
+        id _: String,
+        initialHistoryPage _: RuntimeThreadHistoryPageRequest
+    ) async throws -> RuntimeThreadResumeResult {
+        throw AgentRuntimeError.unsupported("paginated thread history")
+    }
+
+    func resumeThread(
+        id _: String,
+        initialHistoryPage _: RuntimeInitialThreadHistoryPageRequest
+    ) async throws -> RuntimeThreadResumeResult {
+        throw AgentRuntimeError.unsupported("paginated thread history")
+    }
+
+    func listThreadHistory(
+        id _: String,
+        page _: RuntimeThreadHistoryPageRequest
+    ) async throws -> RuntimeThreadHistoryPage {
+        throw AgentRuntimeError.unsupported("paginated thread history")
+    }
+
+    func revertThread(id _: String, beforeTurnID _: String) async throws -> RuntimeThreadRevertResult {
+        throw AgentRuntimeError.unsupported("thread history editing")
     }
 
     func forkThread(id _: String) async throws -> RuntimeThread {

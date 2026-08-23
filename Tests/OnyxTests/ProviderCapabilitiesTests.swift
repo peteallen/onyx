@@ -77,7 +77,7 @@ final class ProviderCapabilitiesTests: XCTestCase {
 
     func testGenericVLLMCatalogKeepsTextBaselineButMarksCapabilitiesUnknown() throws {
         let model = try ProviderModelDescriptor.openRouter(from: .object([
-            "id": .string("Qwen/Qwen3.8-27B-FP8"),
+            "id": .string("acme/unknown-text-model"),
             "object": .string("model"),
             "owned_by": .string("vllm"),
         ]))
@@ -87,6 +87,53 @@ final class ProviderCapabilitiesTests: XCTestCase {
         XCTAssertTrue(model.capabilities.supportedParameters.isEmpty)
         XCTAssertTrue(model.capabilityEvidence.isUnknown)
         XCTAssertEqual(model.pickerCapabilitySummary, "Capabilities unknown")
+
+        let nearMatch = try ProviderModelDescriptor.openRouter(from: .object([
+            "id": .string("acme/qwen3.80-lookalike"),
+            "owned_by": .string("vllm"),
+        ]))
+        XCTAssertTrue(nearMatch.capabilities.reasoningEfforts.isEmpty)
+        XCTAssertTrue(nearMatch.capabilityEvidence.isUnknown)
+    }
+
+    func testSparseQwen38CatalogUsesVerifiedFamilyReasoningProfile() throws {
+        let model = try ProviderModelDescriptor.openRouter(from: .object([
+            "id": .string("Qwen/Qwen3.8-27B-FP8"),
+            "object": .string("model"),
+            "owned_by": .string("vllm"),
+        ]))
+
+        XCTAssertEqual(model.capabilities.inputModalities, [.text])
+        XCTAssertEqual(model.capabilities.reasoningEfforts, ["none", "low", "medium", "xhigh"])
+        XCTAssertTrue(model.capabilities.supports(.reasoningEffort("medium")))
+        XCTAssertFalse(model.capabilities.supports(.reasoningEffort("high")))
+        XCTAssertTrue(model.capabilities.supportedParameters.isEmpty)
+        XCTAssertEqual(model.capabilities.clientUsableParameters, [.reasoningEffort])
+        XCTAssertEqual(model.preferredDefaultReasoningEffort, "xhigh")
+        XCTAssertEqual(model.pickerCapabilitySummary, "Reasoning · Partial metadata")
+        XCTAssertTrue(model.capabilityEvidence.isPartial)
+        XCTAssertFalse(model.capabilityEvidence.reasoningEffortsAdvertised)
+        XCTAssertTrue(model.capabilityEvidence.reasoningEffortsVerifiedByClient)
+    }
+
+    func testQwen38CatalogWithReasoningParameterUsesVerifiedMissingEffortMatrix() throws {
+        let model = try ProviderModelDescriptor.openRouter(from: .object([
+            "id": .string("Qwen/Qwen3.8-27B-FP8"),
+            "supported_parameters": .array([.string("reasoning_effort")]),
+        ]))
+
+        XCTAssertEqual(model.capabilities.supportedParameters, [.reasoningEffort])
+        XCTAssertEqual(model.capabilities.reasoningEfforts, ["none", "low", "medium", "xhigh"])
+        XCTAssertTrue(model.capabilityEvidence.supportedParametersAdvertised)
+        XCTAssertFalse(model.capabilityEvidence.reasoningEffortsAdvertised)
+        XCTAssertTrue(model.capabilityEvidence.reasoningEffortsVerifiedByClient)
+
+        let explicitOmission = try ProviderModelDescriptor.openRouter(from: .object([
+            "id": .string("Qwen/Qwen3.8-27B-FP8"),
+            "supported_parameters": .array([.string("tools")]),
+        ]))
+        XCTAssertTrue(explicitOmission.capabilities.reasoningEfforts.isEmpty)
+        XCTAssertFalse(explicitOmission.capabilityEvidence.reasoningEffortsVerifiedByClient)
     }
 
     func testExactVLLMModelsResponsePreservesServerCapabilitiesAndContextLength() throws {
@@ -141,15 +188,16 @@ final class ProviderCapabilitiesTests: XCTestCase {
             ["completion", "tool_use"]
         )
         XCTAssertTrue(model.capabilities.serverAdvertisesToolUse)
+        XCTAssertEqual(model.capabilities.reasoningEfforts, ["none", "low", "medium", "xhigh"])
         XCTAssertTrue(model.capabilities.supportedParameters.isEmpty)
-        XCTAssertTrue(model.capabilities.clientUsableParameters.isEmpty)
+        XCTAssertEqual(model.capabilities.clientUsableParameters, [.reasoningEffort])
         XCTAssertFalse(
             model.capabilities.supportsClient(.parameter(.tools)),
             "Server tool metadata must not imply an Onyx-executable tool runtime"
         )
         XCTAssertEqual(
             model.pickerCapabilitySummary,
-            "Server tools · Onyx tools unavailable · Partial metadata"
+            "Reasoning · Server tools · Onyx tools unavailable · Partial metadata"
         )
 
         let runtimeModel = RuntimeModel(
@@ -157,8 +205,8 @@ final class ProviderCapabilitiesTests: XCTestCase {
             displayName: model.displayName,
             description: model.description,
             isDefault: true,
-            defaultReasoningEffort: nil,
-            reasoningEfforts: [],
+            defaultReasoningEffort: model.preferredDefaultReasoningEffort,
+            reasoningEfforts: model.capabilities.reasoningEfforts,
             inputModalities: model.capabilities.inputModalities,
             serverAdvertisedRequestParameters: model.capabilities.supportedParameters,
             supportedRequestParameters: model.capabilities.clientUsableParameters,
@@ -167,6 +215,10 @@ final class ProviderCapabilitiesTests: XCTestCase {
         )
         XCTAssertFalse(runtimeModel.capabilityMetadataIsUnknown)
         XCTAssertTrue(runtimeModel.capabilityMetadataIsPartial)
+        XCTAssertEqual(runtimeModel.defaultReasoningEffort, "xhigh")
+        XCTAssertEqual(runtimeModel.reasoningEfforts, ["none", "low", "medium", "xhigh"])
+        XCTAssertTrue(runtimeModel.serverAdvertisedRequestParameters.isEmpty)
+        XCTAssertEqual(runtimeModel.supportedRequestParameters, [.reasoningEffort])
 
         let roundTripped = try JSONDecoder().decode(
             ProviderModelDescriptor.self,
@@ -254,6 +306,69 @@ final class ProviderCapabilitiesTests: XCTestCase {
             .object(["url": .string("data:image/png;base64,AA==")])
         )
         XCTAssertFalse(try request.encodedData().isEmpty)
+    }
+
+    func testQwenReasoningSelectionUsesVerifiedVLLMFieldsAndPreservesLegacyDisable() throws {
+        let connection = try ProviderConnectionDescriptor.openRouter()
+        let qwen = try ProviderModelDescriptor.openRouter(from: .object([
+            "id": .string("Qwen/Qwen3.8-27B-FP8"),
+            "owned_by": .string("vllm"),
+        ]))
+
+        let medium = try OpenAICompatibleChatRequestBuilder.make(
+            connection: connection,
+            model: qwen,
+            inputs: [.text("Think carefully")],
+            reasoningEffort: "medium",
+            requestBehavior: .init(enableThinking: false)
+        )
+        XCTAssertEqual(medium.payload["reasoning_effort"], .string("medium"))
+        XCTAssertNil(
+            medium.payload["chat_template_kwargs"],
+            "The task-level reasoning choice must override a legacy provider-wide disable"
+        )
+
+        let none = try OpenAICompatibleChatRequestBuilder.make(
+            connection: connection,
+            model: qwen,
+            inputs: [.text("Answer directly")],
+            reasoningEffort: "none"
+        )
+        XCTAssertEqual(none.payload["reasoning_effort"], .string("none"))
+        XCTAssertEqual(
+            none.payload["chat_template_kwargs"]?["enable_thinking"],
+            .bool(false)
+        )
+
+        let legacyDisable = try OpenAICompatibleChatRequestBuilder.make(
+            connection: connection,
+            model: qwen,
+            inputs: [.text("Answer directly")],
+            requestBehavior: .init(enableThinking: false)
+        )
+        XCTAssertNil(legacyDisable.payload["reasoning_effort"])
+        XCTAssertEqual(
+            legacyDisable.payload["chat_template_kwargs"]?["enable_thinking"],
+            .bool(false)
+        )
+
+        let unknown = try ProviderModelDescriptor.openRouter(from: .object([
+            "id": .string("acme/unknown-text-model"),
+            "owned_by": .string("vllm"),
+        ]))
+        XCTAssertThrowsError(
+            try OpenAICompatibleChatRequestBuilder.make(
+                connection: connection,
+                model: unknown,
+                inputs: [.text("Do work")],
+                reasoningEffort: "medium"
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? ProviderCapabilityError,
+                .missingCapabilities([.reasoningEffort("medium")])
+            )
+        }
     }
 
     func testConnectionAndModelMustNegotiateTheSameWireProtocol() throws {

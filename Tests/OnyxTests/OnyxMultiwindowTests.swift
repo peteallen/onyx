@@ -277,8 +277,14 @@ final class OnyxMultiwindowTests: XCTestCase {
         XCTAssertEqual(cached.id, modelID)
         XCTAssertEqual(cached.displayName, modelID)
         XCTAssertTrue(cached.isDefault)
-        XCTAssertTrue(cached.capabilityEvidence.isUnknown)
-        XCTAssertEqual(cached.pickerCapabilitySummary, "Capabilities unknown")
+        XCTAssertTrue(cached.capabilityEvidence.isPartial)
+        XCTAssertEqual(cached.reasoningEfforts, ["none", "low", "medium", "xhigh"])
+        XCTAssertEqual(cached.defaultReasoningEffort, "xhigh")
+        XCTAssertEqual(cached.supportedRequestParameters, [.reasoningEffort])
+        XCTAssertTrue(cached.serverAdvertisedRequestParameters.isEmpty)
+        XCTAssertFalse(cached.capabilityEvidence.reasoningEffortsAdvertised)
+        XCTAssertTrue(cached.capabilityEvidence.reasoningEffortsVerifiedByClient)
+        XCTAssertEqual(cached.pickerCapabilitySummary, "Reasoning · Partial metadata")
     }
 
     func testDisconnectedEmptyLiveCatalogDoesNotEraseCachedModels() throws {

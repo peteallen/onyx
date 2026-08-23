@@ -82,7 +82,7 @@ struct TerminalDrawerView: View {
     private var resizeHandle: some View {
         Rectangle()
             .fill(Color.clear)
-            .frame(height: 6)
+            .frame(height: OnyxHitTarget.splitter)
             .overlay {
                 Capsule()
                     .fill(Color.white.opacity(0.14))
@@ -172,6 +172,8 @@ struct TerminalDrawerView: View {
                 }
             } label: {
                 Image(systemName: isSearchVisible ? "magnifyingglass.circle.fill" : "magnifyingglass")
+                    .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.borderless)
             .onyxHelp("Search terminal output")
@@ -182,6 +184,8 @@ struct TerminalDrawerView: View {
                 followsOutput.toggle()
             } label: {
                 Image(systemName: followsOutput ? "arrow.down.to.line.compact" : "pause")
+                    .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.borderless)
             .onyxHelp(followsOutput ? "Following new output" : "Resume following new output")
@@ -202,6 +206,8 @@ struct TerminalDrawerView: View {
                 }
             } label: {
                 Image(systemName: "ellipsis")
+                    .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                    .contentShape(Rectangle())
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
@@ -212,6 +218,8 @@ struct TerminalDrawerView: View {
                 model.isBottomPanelVisible = false
             } label: {
                 Image(systemName: "xmark")
+                    .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.borderless)
             .onyxHelp("Hide terminal")
@@ -219,7 +227,7 @@ struct TerminalDrawerView: View {
             .accessibilityHint("Closes the terminal panel")
         }
         .padding(.horizontal, 12)
-        .frame(height: 30)
+        .frame(height: 32)
     }
 
     private var outputView: some View {
@@ -274,16 +282,24 @@ struct TerminalDrawerView: View {
                 .accessibilityHint(session.isRunning ? "Press Return to run the command" : "Start the shell before entering a command")
 
             if session.isRunning {
-                Button("⌃C", action: session.interrupt)
-                    .buttonStyle(.borderless)
-                    .font(.system(size: 10, design: .monospaced))
-                    .onyxHelp("Interrupt the current command")
-                    .accessibilityLabel("Interrupt command")
-                    .accessibilityHint("Sends Control-C to the shell")
+                Button(action: session.interrupt) {
+                    Text("⌃C")
+                        .font(.system(size: 10, design: .monospaced))
+                        .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.borderless)
+                .onyxHelp("Interrupt the current command")
+                .accessibilityLabel("Interrupt command")
+                .accessibilityHint("Sends Control-C to the shell")
             } else {
-                Button("Start") {
+                Button {
                     session.start(in: selectedProjectPath)
                     isInputFocused = true
+                } label: {
+                    Text("Start")
+                        .frame(minWidth: OnyxHitTarget.compact, minHeight: OnyxHitTarget.compact)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.borderless)
                 .accessibilityLabel("Start shell")

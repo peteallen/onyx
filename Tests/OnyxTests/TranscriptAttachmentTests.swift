@@ -48,6 +48,16 @@ final class TranscriptAttachmentTests: XCTestCase {
             ).isVisible,
             "The inline indicator should yield to the streaming assistant message"
         )
+
+        assistant.status = .completed
+        XCTAssertFalse(
+            TranscriptPendingResponse.resolve(
+                items: [user, assistant],
+                isAwaitingResponse: true,
+                label: "Working on a response…"
+            ).isVisible,
+            "A completed assistant body must not coexist with a stale waiting row"
+        )
         XCTAssertFalse(
             TranscriptPendingResponse.resolve(
                 items: [user],
@@ -94,6 +104,51 @@ final class TranscriptAttachmentTests: XCTestCase {
     }
 
     @MainActor
+    func testLatestUserMessageEditControlIsQuietButGenerousAndInvokesHandler() {
+        let message = TimelineItem(
+            id: "editable-user",
+            kind: .userMessage,
+            title: nil,
+            body: "Please correct this request",
+            status: .completed,
+            timestamp: .now,
+            detail: nil
+        )
+        let height = TranscriptCellView.height(for: message, width: 720, isExpanded: true)
+        let cell = TranscriptCellView(frame: NSRect(x: 0, y: 0, width: 720, height: height))
+        var editCount = 0
+        cell.configure(
+            with: message,
+            isExpanded: true,
+            isEditable: true,
+            onEdit: { editCount += 1 }
+        )
+        cell.layout()
+
+        XCTAssertFalse(cell.editControl.isHidden)
+        XCTAssertEqual(cell.editControl.frame.size, NSSize(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact))
+        XCTAssertEqual(cell.editControl.accessibilityLabel(), "Edit last message")
+        cell.editControl.performClick(nil)
+        XCTAssertEqual(editCount, 1)
+    }
+
+    @MainActor
+    func testOlderUserMessageDoesNotExposeEditControl() {
+        let message = TimelineItem(
+            id: "read-only-user",
+            kind: .userMessage,
+            title: nil,
+            body: "An earlier request",
+            status: .completed,
+            timestamp: .now,
+            detail: nil
+        )
+        let cell = TranscriptCellView(frame: NSRect(x: 0, y: 0, width: 640, height: 90))
+        cell.configure(with: message, isExpanded: true)
+        XCTAssertTrue(cell.editControl.isHidden)
+    }
+
+    @MainActor
     func testAssistantProtocolPhaseIsNotRenderedAsConversationMetadata() {
         var assistant = TimelineItem(
             id: "assistant-phase",
@@ -110,7 +165,27 @@ final class TranscriptAttachmentTests: XCTestCase {
         XCTAssertEqual(TranscriptCellView.visibleDetail(for: assistant), "")
 
         assistant.detail = "1,024 input tokens"
-        XCTAssertEqual(TranscriptCellView.visibleDetail(for: assistant), "1,024 input tokens")
+        XCTAssertEqual(
+            TranscriptCellView.visibleDetail(for: assistant),
+            "",
+            "Usage metadata remains available on the item but is not rendered below the response"
+        )
+        XCTAssertEqual(assistant.detail, "1,024 input tokens")
+        XCTAssertEqual(
+            TranscriptCellView.metrics(for: assistant, width: 640, isExpanded: true).detailHeight,
+            0,
+            "Hiding usage must not leave an empty metadata gap"
+        )
+
+        assistant.detail = "Token usage: prompt 512, response 128, total 640"
+        XCTAssertEqual(TranscriptCellView.visibleDetail(for: assistant), "")
+
+        assistant.detail = "Finished in 0.2s"
+        XCTAssertEqual(
+            TranscriptCellView.visibleDetail(for: assistant),
+            "Finished in 0.2s",
+            "Non-usage assistant metadata remains user-meaningful"
+        )
     }
 
     @MainActor
@@ -225,7 +300,7 @@ final class TranscriptAttachmentTests: XCTestCase {
     }
 
     @MainActor
-    func testRoutineActivityKeepsLiveStatusQuietWhileExceptionalRowsStayProminent() {
+    func testRoutineActivityKeepsStatusQuietAndMakesFailureDetailReadable() throws {
         let running = TimelineItem(
             id: "running-command",
             kind: .command,
@@ -282,15 +357,44 @@ final class TranscriptAttachmentTests: XCTestCase {
         )
         failedCommandCell.configure(with: failedCommand, isExpanded: false)
         failedCommandCell.layoutSubtreeIfNeeded()
-        XCTAssertGreaterThan(failedCommandCell.layer?.borderWidth ?? 0, 0)
-        XCTAssertNotEqual(failedCommandCell.layer?.backgroundColor, NSColor.clear.cgColor)
+        let failedMetrics = TranscriptCellView.metrics(
+            for: failedCommand,
+            width: 640,
+            isExpanded: false
+        )
+        XCTAssertEqual(failedMetrics.statusWidth, 0)
+        XCTAssertEqual(failedCommandCell.layer?.borderWidth, 0)
+        XCTAssertEqual(failedCommandCell.layer?.backgroundColor, NSColor.clear.cgColor)
+        XCTAssertLessThanOrEqual(
+            TranscriptCellView.height(for: failedCommand, width: 640, isExpanded: false),
+            36,
+            "A failed routine action stays a compact transcript row, not a debug card"
+        )
         XCTAssertEqual(failedCommandCell.accessibilityValue() as? String, "Failed, Collapsed")
         XCTAssertTrue(
             failedCommandCell.subviews
                 .compactMap { $0 as? NSTextField }
                 .first(where: { $0.stringValue == "Failed" })?
-                .isHidden == false,
-            "Exceptional outcomes must remain visibly prominent"
+                .isHidden == true,
+            "The readable error summary and red disclosure replace the detached Failed badge"
+        )
+        let failedHeadline = try XCTUnwrap(
+            failedCommandCell.subviews
+                .compactMap { $0 as? NSTextField }
+                .first(where: { $0.stringValue.contains("Run tests") })
+        )
+        XCTAssertTrue(failedHeadline.stringValue.contains("The build exited with status 1."))
+        let failureSummaryRange = (failedHeadline.stringValue as NSString).range(
+            of: "The build exited with status 1."
+        )
+        XCTAssertEqual(
+            failedHeadline.attributedStringValue.attribute(
+                .foregroundColor,
+                at: failureSummaryRange.location,
+                effectiveRange: nil
+            ) as? NSColor,
+            NSColor.secondaryLabelColor,
+            "Failure detail should be readable in the collapsed row"
         )
 
         let failure = TimelineItem(
@@ -306,6 +410,14 @@ final class TranscriptAttachmentTests: XCTestCase {
         failureCell.configure(with: failure, isExpanded: true)
         XCTAssertGreaterThan(failureCell.layer?.borderWidth ?? 0, 0)
         XCTAssertNotEqual(failureCell.layer?.backgroundColor, NSColor.clear.cgColor)
+        failureCell.layoutSubtreeIfNeeded()
+        XCTAssertTrue(
+            failureCell.subviews
+                .compactMap { $0 as? NSTextField }
+                .first(where: { $0.stringValue == "Failed" })?
+                .isHidden == true,
+            "An explicit error card does not need a second Failed badge"
+        )
     }
 
     @MainActor

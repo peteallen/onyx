@@ -62,7 +62,19 @@ struct OpenAICompatibleChatRequest: Sendable, Equatable {
         if includeStreamingUsage && stream {
             object["stream_options"] = .object(["include_usage": .bool(true)])
         }
-        if let enableThinking = requestBehavior.enableThinking {
+        let enableThinking: Bool?
+        if KnownOpenAICompatibleModelProfile.profile(for: model) == .qwen38,
+           let reasoningEffort
+        {
+            // A per-task selection is more specific than the legacy
+            // provider-wide "disable thinking" option. `none` preserves that
+            // native Qwen behavior; a selected thinking level relies on the
+            // typed `reasoning_effort` field and must not also send `false`.
+            enableThinking = reasoningEffort == "none" ? false : nil
+        } else {
+            enableThinking = requestBehavior.enableThinking
+        }
+        if let enableThinking {
             object["chat_template_kwargs"] = .object([
                 "enable_thinking": .bool(enableThinking),
             ])

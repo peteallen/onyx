@@ -36,30 +36,38 @@ by MCP, dynamic-tool, and web-search results render as native cards. These are
 deliberately scoped slices: there are no inline diff comments, global Command-P
 or syntax navigation, or complete rich-result/approval taxonomy yet.
 
-## Run the current development build
+## Build and run the current development preview
 
 Requirements: macOS 15 or newer and Xcode 26 or newer.
 
 ```bash
-swift run Onyx
+swift build
 ```
 
-To build, package, ad-hoc sign, and verify the native development application:
+That command builds without launching a second unbundled copy of Onyx. Do not
+use `swift run Onyx` for UI development: it bypasses the stable preview identity
+and can run beside the packaged app with different macOS permissions and saved
+window state.
 
-```bash
-scripts/package-app.sh debug
-```
-
-That creates `dist/Onyx.app` and includes the custom Onyx app icon. The packaging
-command does not launch or stop the app. For previews, always reuse the stable
-path, display name, and bundle identifier:
+To package without launching, always reuse the stable path, display name, and
+bundle identifier:
 
 ```bash
 scripts/package-preview.sh
 ```
 
-To package, replace, and launch that same preview identity in one step, use
-`scripts/run-preview.sh`.
+To package, replace, and launch that same preview identity in one step, use:
+
+```bash
+scripts/run-preview.sh
+```
+
+This is the only supported development launch path.
+
+Before opening the rebuilt bundle, the launcher unregisters repo-local legacy
+Onyx identities and force-registers the canonical preview. This keeps Finder,
+automation targeting, and macOS privacy grants from drifting back to an older
+renamed build; it does not delete those bundles or reset LaunchServices.
 
 This always replaces `dist-preview/Onyx Preview.app` with bundle ID
 `app.onyx.preview`; it never invents a timestamped app identity. If that exact
@@ -77,9 +85,10 @@ the general package command refuses to overwrite it. Its explicit
 relaunches a process.
 
 Ad-hoc signatures have a code-hash identity that changes on every build. To keep
-privacy and automation approvals stable, the preview helper automatically uses
-the first valid Code Signing identity in the default user Keychain. Override that
-choice with a SHA-1 fingerprint when necessary:
+privacy and automation approvals stable, this checkout pins the certificate
+already associated with the canonical preview. Override that SHA-1 fingerprint
+only when moving the checkout to another machine or deliberately rotating the
+preview certificate:
 
 ```bash
 ONYX_PREVIEW_CODESIGN_IDENTITY='CERTIFICATE_SHA1' \

@@ -153,6 +153,38 @@ final class OnyxSideChatTests: XCTestCase {
         )
     }
 
+    func testSideChatSendFailureRemovesOptimisticRowAndShowsOneErrorSurface() async {
+        let fixture = makeFixture(
+            capabilities: [.streaming, .interruption, .ephemeralThreadForking],
+            failTurn: true
+        )
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        model.start()
+        await waitUntil("Parent task did not load") {
+            model.selectedThreadID == SideChatFixture.parent.id
+        }
+        model.openSideChat()
+        await waitUntil("Fork did not open") { model.sideChatThreadID == SideChatFixture.fork.id }
+
+        model.sideChatComposerText = "This should be restored"
+        model.sendSideChat()
+        await waitUntil("Side-chat failure did not surface") {
+            model.sideChatError != nil && !model.isSideChatTurnRunning
+        }
+
+        XCTAssertTrue(
+            model.sideChatTimeline.allSatisfy { !$0.id.hasPrefix("side-optimistic:") },
+            "A rejected send must not leave a fake sent row in the transcript"
+        )
+        XCTAssertFalse(
+            model.sideChatTimeline.contains(where: { $0.kind == .error }),
+            "The panel error strip is the single failure surface"
+        )
+        XCTAssertEqual(model.sideChatComposerText, "This should be restored")
+    }
+
     func testSideChatKeepsDeltaThatArrivesBeforeMatchingItemStart() async {
         let fixture = makeFixture(capabilities: [.streaming, .interruption, .ephemeralThreadForking])
         defer { fixture.cleanUp() }
@@ -366,7 +398,8 @@ final class OnyxSideChatTests: XCTestCase {
 
     private func makeFixture(
         capabilities: RuntimeCapabilities,
-        delayedFork: Bool = false
+        delayedFork: Bool = false,
+        failTurn: Bool = false
     ) -> SideChatTestFixture {
         let suiteName = "OnyxSideChatTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -374,7 +407,11 @@ final class OnyxSideChatTests: XCTestCase {
         defaults.set(SideChatFixture.parent.id, forKey: "Onyx.selectedThreadID")
         defaults.set("codex-window-model", forKey: "Onyx.selectedModelID")
         defaults.set("high", forKey: "Onyx.reasoningEffort")
-        let runtime = SideChatTestRuntime(capabilities: capabilities, delayedFork: delayedFork)
+        let runtime = SideChatTestRuntime(
+            capabilities: capabilities,
+            delayedFork: delayedFork,
+            failTurn: failTurn
+        )
         return SideChatTestFixture(
             model: OnyxAppModel(runtime: runtime, defaults: defaults),
             runtime: runtime,
@@ -485,6 +522,7 @@ private actor SideChatTestRuntime: AgentRuntime {
     private let continuation: AsyncStream<AgentRuntimeEvent>.Continuation
     private let capabilities: RuntimeCapabilities
     private let delayedFork: Bool
+    private let failTurn: Bool
     private var forkedParents: [String] = []
     private var turns: [StartTurnRequest] = []
     private var steeredThreads: [String] = []
@@ -492,9 +530,10 @@ private actor SideChatTestRuntime: AgentRuntime {
     private var responses: [RecordedResponse] = []
     private var delayedForkContinuation: CheckedContinuation<RuntimeConversation, any Error>?
 
-    init(capabilities: RuntimeCapabilities, delayedFork: Bool) {
+    init(capabilities: RuntimeCapabilities, delayedFork: Bool, failTurn: Bool) {
         self.capabilities = capabilities
         self.delayedFork = delayedFork
+        self.failTurn = failTurn
         let stream = AsyncStream.makeStream(of: AgentRuntimeEvent.self)
         events = stream.stream
         continuation = stream.continuation
@@ -566,6 +605,9 @@ private actor SideChatTestRuntime: AgentRuntime {
     }
 
     func startTurn(_ request: StartTurnRequest) async throws {
+        if failTurn {
+            throw AgentRuntimeError.requestFailed(code: -1, message: "Side-chat test failure")
+        }
         turns.append(request)
         continuation.yield(.turnStarted(threadID: request.threadID, turnID: "side-turn"))
     }

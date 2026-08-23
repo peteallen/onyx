@@ -14,7 +14,7 @@ final class WorkspacePaneLayoutTests: XCTestCase {
         )
         XCTAssertEqual(
             ConversationContentLayout.horizontalInset(availableWidth: 600),
-            24,
+            18,
             accuracy: 0.001
         )
         XCTAssertEqual(
@@ -69,6 +69,11 @@ final class WorkspacePaneLayoutTests: XCTestCase {
             inspectorVisible: true,
             isCompact: WorkspacePaneLayout.isCompact(totalWidth: expectedBoundary - 1)
         ))
+    }
+
+    func testPaneSplittersAreWideEnoughToAcquireWithoutPixelHunting() {
+        XCTAssertGreaterThanOrEqual(WorkspacePaneLayout.dividerWidth, 10)
+        XCTAssertEqual(WorkspacePaneLayout.dividerWidth, OnyxHitTarget.splitter)
     }
 
     func testCompactSidebarToggleUsesDisplayedVisibilityAndDismissesInspector() {

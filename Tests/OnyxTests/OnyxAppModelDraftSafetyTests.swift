@@ -756,6 +756,72 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
         XCTAssertEqual(turn.reasoningEffort, "low")
     }
 
+    func testQwenReasoningLevelsAppearAndSelectedEffortSurvivesValidation() async {
+        let suiteName = "OnyxAppModelDraftSafetyTests.qwen-reasoning.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let qwenID = "Qwen/Qwen3.8-27B-FP8"
+        let thread = RuntimeThread(
+            id: "qwen-reasoning-task",
+            title: "Qwen reasoning task",
+            preview: "Qwen reasoning task",
+            cwd: DraftSafetyFixture.workspacePath,
+            updatedAt: Date(timeIntervalSince1970: 3),
+            status: .idle,
+            isPinned: false,
+            runtime: .local,
+            model: qwenID,
+            branch: nil
+        )
+        let runtime = DraftSafetyRuntime(
+            initialThreads: [thread],
+            failurePoint: .none,
+            capabilities: [.streaming, .reasoning],
+            availableModels: [
+                RuntimeModel(
+                    id: qwenID,
+                    displayName: "Qwen 3.8 27B",
+                    description: nil,
+                    isDefault: true,
+                    defaultReasoningEffort: "xhigh",
+                    reasoningEfforts: ["none", "low", "medium", "xhigh"],
+                    inputModalities: [.text],
+                    serverAdvertisedRequestParameters: [.reasoningEffort],
+                    supportedRequestParameters: [.reasoningEffort],
+                    capabilityEvidence: ProviderCapabilityEvidence(
+                        inputModalitiesAdvertised: false,
+                        outputModalitiesAdvertised: false,
+                        supportedParametersAdvertised: false,
+                        reasoningEffortsAdvertised: true
+                    )
+                ),
+            ],
+            kind: .local
+        )
+        let model = OnyxAppModel(runtime: runtime, defaults: defaults)
+
+        model.start()
+        await waitUntil("Qwen task did not load") {
+            model.canRunAgent && model.selectedThreadID == thread.id && !model.isLoadingThread
+        }
+        XCTAssertEqual(model.availableReasoningEfforts, ["none", "low", "medium", "xhigh"])
+        XCTAssertEqual(model.selectedReasoningEffort, "xhigh")
+
+        model.selectReasoningEffort("medium")
+        XCTAssertEqual(model.selectedReasoningEffort, "medium")
+        XCTAssertEqual(model.availableReasoningEfforts, ["none", "low", "medium", "xhigh"])
+
+        model.composerText = "Use medium reasoning"
+        model.sendComposer()
+        await waitUntilAsync("The Qwen turn did not reach the runtime") {
+            await runtime.recordedStartTurns().count == 1
+        }
+        let recordedTurn = await runtime.recordedStartTurns().first
+        XCTAssertEqual(recordedTurn?.reasoningEffort, "medium")
+    }
+
     func testNewTaskContextTransfersBetweenProviderModelsWithoutCountingUsage() async throws {
         let sourceSuiteName = "OnyxAppModelDraftSafetyTests.transfer.source.\(UUID().uuidString)"
         let targetSuiteName = "OnyxAppModelDraftSafetyTests.transfer.target.\(UUID().uuidString)"

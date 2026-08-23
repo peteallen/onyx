@@ -28,7 +28,7 @@ struct SidebarUtilityFooter: View {
             SettingsLink {
                 Image(systemName: "gearshape")
                     .font(.system(size: 12.5, weight: .medium))
-                    .frame(width: 27, height: 27)
+                    .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -38,7 +38,7 @@ struct SidebarUtilityFooter: View {
             .accessibilityHint("Opens Onyx settings")
         }
         .padding(.horizontal, 10)
-        .frame(height: 38)
+        .frame(height: 40)
         .overlay(alignment: .top) {
             Rectangle()
                 .fill(OnyxTheme.border)
@@ -56,12 +56,16 @@ private struct UtilityButton: View {
 
     var body: some View {
         Button(action: action) {
-            Image(systemName: icon)
-                .font(.system(size: 12.5, weight: .medium))
-                .symbolRenderingMode(.hierarchical)
-                .frame(width: 27, height: 27)
-                .background(isSelected ? Color.primary.opacity(0.065) : Color.clear)
-                .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+            ZStack {
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(isSelected ? Color.primary.opacity(0.065) : Color.clear)
+                    .frame(width: 27, height: 27)
+                Image(systemName: icon)
+                    .font(.system(size: 12.5, weight: .medium))
+                    .symbolRenderingMode(.hierarchical)
+            }
+            .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .foregroundStyle(isSelected ? OnyxTheme.iris : Color.secondary)

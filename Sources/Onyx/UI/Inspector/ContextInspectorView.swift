@@ -39,6 +39,7 @@ struct ContextInspectorView: View {
                             )
                             .frame(maxWidth: .infinity)
                             .frame(height: 31)
+                            .contentShape(Rectangle())
                             .background {
                                 if model.inspectorTab == tab {
                                     RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -291,8 +292,8 @@ private struct SummaryInspector: View {
                             .foregroundStyle(.quaternary)
                             .accessibilityHidden(true)
                     }
+                    .frame(minHeight: OnyxHitTarget.row)
                     .contentShape(Rectangle())
-                    .frame(minHeight: 30)
                 }
                 .buttonStyle(.plain)
                 .disabled(agent.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -318,8 +319,8 @@ private struct SummaryInspector: View {
                             .accessibilityHidden(true)
                     }
                     .foregroundStyle(OnyxTheme.quietText)
+                    .frame(minHeight: OnyxHitTarget.compact)
                     .contentShape(Rectangle())
-                    .frame(minHeight: 26)
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(showsAllAgents ? "Show fewer agents" : "Show all agents")
@@ -534,7 +535,8 @@ private struct FilesInspector: View {
                         }
                     } label: {
                         Image(systemName: "ellipsis")
-                            .frame(width: 22, height: 22)
+                            .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                            .contentShape(Rectangle())
                     }
                     .menuStyle(.borderlessButton)
                     .fixedSize()
@@ -608,6 +610,8 @@ private struct FilesInspector: View {
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundStyle(.tertiary)
+                        .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .onyxHelp("Clear file search")
@@ -615,7 +619,7 @@ private struct FilesInspector: View {
             }
         }
         .padding(.horizontal, 8)
-        .frame(height: 29)
+        .frame(height: OnyxHitTarget.compact)
         .background(OnyxTheme.raisedSurface)
         .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
         .overlay {
@@ -680,10 +684,10 @@ private struct FilesInspector: View {
                                     .font(.system(size: 8.5, weight: .semibold))
                                     .foregroundStyle(.tertiary)
                             }
+                            .frame(minHeight: OnyxHitTarget.row)
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
-                        .frame(minHeight: 30)
                         .accessibilityLabel("Preview \(file.relativePath)")
                     }
 
@@ -762,7 +766,8 @@ private struct FilesInspector: View {
                 sourceNavigator.clearPreview()
             } label: {
                 Image(systemName: "chevron.left")
-                    .frame(width: 20, height: 20)
+                    .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .onyxHelp("Back to project files")
@@ -779,7 +784,8 @@ private struct FilesInspector: View {
                     openSourceFile(preview.file.path)
                 } label: {
                     Image(systemName: "arrow.up.forward.app")
-                        .frame(width: 20, height: 20)
+                        .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .onyxHelp("Open in default app")
@@ -789,7 +795,8 @@ private struct FilesInspector: View {
                     revealSourceFile(preview.file.path)
                 } label: {
                     Image(systemName: "folder")
-                        .frame(width: 20, height: 20)
+                        .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .onyxHelp("Reveal in Finder")
@@ -864,7 +871,7 @@ private struct FilesInspector: View {
                     .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)
                     .padding(.leading, CGFloat(depth) * 13 + 19)
-                    .frame(height: 23)
+                    .frame(height: OnyxHitTarget.compact)
                 case let .failure(parentPath, message, depth):
                     HStack(spacing: 6) {
                         Image(systemName: "exclamationmark.triangle")
@@ -985,8 +992,9 @@ struct ProjectFileRow: View {
                             .lineLimit(1)
                             .truncationMode(.middle)
                     }
-                    .contentShape(Rectangle())
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(minHeight: OnyxHitTarget.compact)
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .onyxHelp(isExpanded ? "Collapse folder" : "Expand folder")
@@ -1005,6 +1013,8 @@ struct ProjectFileRow: View {
                                 .lineLimit(1)
                                 .truncationMode(.middle)
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .frame(minHeight: OnyxHitTarget.compact)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
@@ -1029,7 +1039,8 @@ struct ProjectFileRow: View {
                 Button("Reveal in Finder", systemImage: "folder", action: onReveal)
             } label: {
                 Image(systemName: "ellipsis")
-                    .frame(width: 20, height: 20)
+                    .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                    .contentShape(Rectangle())
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
@@ -1038,7 +1049,7 @@ struct ProjectFileRow: View {
         }
         .font(.system(size: 11.5))
         .padding(.leading, CGFloat(depth) * 13)
-        .frame(height: 23)
+        .frame(minHeight: OnyxHitTarget.compact)
         .contextMenu {
             if entry.kind == .file {
                 Button("Preview", action: onPreview)
@@ -1131,7 +1142,7 @@ private struct InspectorPathRow: View {
     }
 }
 
-private struct InspectorDisclosureSection<Content: View>: View {
+struct InspectorDisclosureSection<Content: View>: View {
     let title: String
     let icon: String
     let summary: String
@@ -1177,6 +1188,7 @@ private struct InspectorDisclosureSection<Content: View>: View {
                         .font(.system(size: 8.5, weight: .semibold))
                         .foregroundStyle(.quaternary)
                 }
+                .frame(minHeight: OnyxHitTarget.compact)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -1194,7 +1206,7 @@ private struct InspectorDisclosureSection<Content: View>: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 2)
-        .padding(.vertical, 11)
+        .padding(.vertical, 4)
     }
 }
 

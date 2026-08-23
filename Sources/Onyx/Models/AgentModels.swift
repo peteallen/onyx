@@ -41,6 +41,12 @@ struct RuntimeCapabilities: OptionSet, Sendable {
     /// retaining the parent's context. This is intentionally separate from
     /// ordinary durable task forking.
     static let ephemeralThreadForking = Self(rawValue: 1 << 15)
+    /// The runtime can resume a task with only a bounded page of recent turns
+    /// and hydrate the remaining history through cursor-based pages.
+    static let threadHistoryPagination = Self(rawValue: 1 << 16)
+    /// The runtime can replace durable task history with the prefix before a
+    /// specific turn. This does not imply that workspace file changes revert.
+    static let threadHistoryRevert = Self(rawValue: 1 << 17)
 }
 
 struct RuntimeSession: Sendable, Equatable {
@@ -585,6 +591,119 @@ struct RuntimeConversation: Sendable, Equatable {
     var items: [TimelineItem]
 }
 
+/// Provider-neutral direction for cursor-based history APIs. A descending
+/// page starts at the newest available turn and walks toward older history.
+enum RuntimeHistoryDirection: Sendable, Equatable, Hashable {
+    case ascending
+    case descending
+}
+
+/// How much transcript detail a provider should return for each turn.
+enum RuntimeTurnItemDetail: Sendable, Equatable, Hashable {
+    case notLoaded
+    case summary
+    case full
+    case unknown(String)
+}
+
+enum RuntimeConversationTurnStatus: Sendable, Equatable, Hashable {
+    case completed
+    case interrupted
+    case failed
+    case inProgress
+    case unknown(String)
+}
+
+/// A turn retains the provider's stable turn identity so callers can offer
+/// operations such as editing and resending the last user message without
+/// inferring a turn boundary from timeline item IDs.
+struct RuntimeConversationTurn: Identifiable, Sendable, Equatable, Hashable {
+    let id: String
+    var items: [TimelineItem]
+    var status: RuntimeConversationTurnStatus
+    var itemDetail: RuntimeTurnItemDetail
+    var startedAt: Date?
+    var completedAt: Date?
+    var durationMilliseconds: Int?
+}
+
+/// Parameters accepted while resuming a task with a bounded initial page.
+/// Resume pages have no cursor because the provider chooses the live history
+/// head; subsequent pages use `RuntimeThreadHistoryPageRequest`.
+struct RuntimeInitialThreadHistoryPageRequest: Sendable, Equatable, Hashable {
+    var limit: Int
+    var direction: RuntimeHistoryDirection
+    var itemDetail: RuntimeTurnItemDetail
+
+    init(
+        limit: Int,
+        direction: RuntimeHistoryDirection = .descending,
+        itemDetail: RuntimeTurnItemDetail = .full
+    ) {
+        self.limit = limit
+        self.direction = direction
+        self.itemDetail = itemDetail
+    }
+}
+
+struct RuntimeThreadHistoryPageRequest: Sendable, Equatable, Hashable {
+    var cursor: String?
+    var limit: Int
+    var direction: RuntimeHistoryDirection
+    var itemDetail: RuntimeTurnItemDetail
+
+    init(
+        cursor: String? = nil,
+        limit: Int,
+        direction: RuntimeHistoryDirection = .descending,
+        itemDetail: RuntimeTurnItemDetail = .full
+    ) {
+        self.cursor = cursor
+        self.limit = limit
+        self.direction = direction
+        self.itemDetail = itemDetail
+    }
+}
+
+struct RuntimeThreadHistoryPage: Sendable, Equatable, Hashable {
+    /// Turns remain in the provider-requested order. For descending requests,
+    /// `nextCursor` therefore continues toward older turns.
+    var turns: [RuntimeConversationTurn]
+    var nextCursor: String?
+    var backwardsCursor: String?
+    var direction: RuntimeHistoryDirection
+
+    /// Timeline order expected by the transcript, regardless of the direction
+    /// used to fetch the page. An older descending page can be prepended as-is.
+    var chronologicalItems: [TimelineItem] {
+        switch direction {
+        case .ascending:
+            turns.flatMap(\.items)
+        case .descending:
+            turns.reversed().flatMap(\.items)
+        }
+    }
+}
+
+/// Result of the bounded resume path. Providers keep page cursors separate
+/// from the conversation so an empty page is distinguishable from a complete
+/// unpaginated transcript.
+struct RuntimeThreadResumeResult: Sendable, Equatable {
+    var conversation: RuntimeConversation
+    var initialHistoryPage: RuntimeThreadHistoryPage?
+    var turnsBackwardsCursor: String?
+    var itemsBackwardsCursor: String?
+}
+
+/// Revert responses intentionally contain metadata and hydration cursors, not
+/// a complete conversation: native Codex leaves `thread.turns` empty after the
+/// durable prefix is replaced.
+struct RuntimeThreadRevertResult: Sendable, Equatable {
+    var thread: RuntimeThread
+    var turnsBackwardsCursor: String?
+    var itemsBackwardsCursor: String?
+}
+
 enum RuntimeRequestID: Sendable, Equatable, Hashable, CustomStringConvertible {
     case integer(Int)
     case string(String)
@@ -758,6 +877,11 @@ enum RuntimeUserInteractionResponse: Sendable, Equatable {
 
 enum AgentRuntimeEvent: Sendable, Equatable {
     case connectionChanged(RuntimeConnectionState)
+    /// A runtime can discover after connecting that an advertised protocol
+    /// surface is unavailable (for example, an older Codex app-server that
+    /// rejects history pagination). The downgrade is monotonic for the life of
+    /// that shared runtime and must reach every attached window.
+    case runtimeCapabilitiesDowngraded(RuntimeCapabilities)
     case accountUpdated(RuntimeAuthState)
     case loginCompleted(RuntimeLoginCompletion)
     case threadUpdated(RuntimeThread)

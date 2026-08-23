@@ -3,6 +3,7 @@ import SwiftUI
 struct ConversationWorkspaceView: View {
     @ObservedObject var model: OnyxAppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.onyxWindowPresentationContext) private var windowPresentation
     /// The parent owns compact pane arbitration, so the header can describe
     /// what is actually visible rather than only the persisted preference.
     var sidebarDisplayed: Bool?
@@ -29,17 +30,30 @@ struct ConversationWorkspaceView: View {
                     )
 
                     ZStack {
-                        NativeTranscriptView(
-                            items: model.transcriptSnapshot.items,
-                            isAwaitingResponse: (model.isTurnRunning || model.isSelectedReviewStarting)
-                                && model.activeUserInteraction == nil,
-                            workingLabel: model.isReviewRunning || model.isSelectedReviewStarting
-                                ? "Reviewing changes…"
-                                : "Working on a response…",
-                            revision: model.transcriptSnapshot.revision,
-                            changeHint: model.transcriptSnapshot.changeHint
-                        )
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        ConversationHistoryViewport(
+                            canLoadEarlierHistory: model.canLoadEarlierHistory,
+                            isLoadingEarlierHistory: model.isLoadingEarlierHistory,
+                            onLoadEarlierHistory: model.loadEarlierHistory
+                        ) {
+                            NativeTranscriptView(
+                                items: model.transcriptSnapshot.items,
+                                isAwaitingResponse: (model.isTurnRunning || model.isSelectedReviewStarting)
+                                    && model.activeUserInteraction == nil,
+                                workingLabel: model.isReviewRunning || model.isSelectedReviewStarting
+                                    ? "Reviewing changes…"
+                                    : "Working on a response…",
+                                revision: model.transcriptSnapshot.revision,
+                                changeHint: model.transcriptSnapshot.changeHint,
+                                editableUserMessageID: model.latestEditableUserMessageID,
+                                onEditUserMessage: { messageID in
+                                    model.beginEditLatestUserMessage(
+                                        messageID: messageID,
+                                        window: windowPresentation.window
+                                    )
+                                }
+                            )
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        }
 
                         if model.isLoadingThread {
                             VStack(spacing: 10) {
@@ -82,7 +96,9 @@ struct ConversationWorkspaceView: View {
                         }
                     }
                     .frame(maxWidth: ConversationContentLayout.maximumComposerWidth)
-                    .padding(.horizontal, composerInset)
+                    .padding(.leading, composerInset)
+                    .padding(.trailing, composerInset)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.bottom, ConversationContentLayout.bottomInset)
                 }
 
@@ -99,6 +115,72 @@ struct ConversationWorkspaceView: View {
     }
 }
 
+/// Reserves one compact row above the transcript for bounded history paging.
+/// The row intentionally remains in the layout after the final page loads so
+/// the transcript viewport never changes height while AppKit is preserving the
+/// reader's anchor across a prepend.
+enum ConversationHistoryViewportLayout {
+    static let affordanceHeight = OnyxHitTarget.compact + 4
+}
+
+struct ConversationHistoryViewport<Transcript: View>: View {
+    let canLoadEarlierHistory: Bool
+    let isLoadingEarlierHistory: Bool
+    let onLoadEarlierHistory: () -> Void
+    @ViewBuilder let transcript: Transcript
+    @State private var hasPresentedHistoryAffordance = false
+
+    private var reservesHistoryAffordance: Bool {
+        canLoadEarlierHistory || isLoadingEarlierHistory || hasPresentedHistoryAffordance
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if reservesHistoryAffordance {
+                ZStack {
+                    if canLoadEarlierHistory || isLoadingEarlierHistory {
+                        Button(action: onLoadEarlierHistory) {
+                            HStack(spacing: 7) {
+                                if isLoadingEarlierHistory {
+                                    ProgressView().controlSize(.small)
+                                } else {
+                                    Image(systemName: "arrow.up")
+                                }
+                                Text(isLoadingEarlierHistory
+                                    ? "Loading earlier messages…"
+                                    : "Load earlier messages")
+                            }
+                            .font(.system(size: 11.5, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .frame(minHeight: OnyxHitTarget.compact)
+                            .padding(.horizontal, 10)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(isLoadingEarlierHistory)
+                        .accessibilityHint("Adds the preceding page without moving the visible conversation")
+                    }
+                }
+                .frame(height: ConversationHistoryViewportLayout.affordanceHeight, alignment: .bottom)
+            }
+
+            transcript
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .onAppear {
+            if canLoadEarlierHistory || isLoadingEarlierHistory {
+                hasPresentedHistoryAffordance = true
+            }
+        }
+        .onChange(of: canLoadEarlierHistory) { _, canLoad in
+            if canLoad { hasPresentedHistoryAffordance = true }
+        }
+        .onChange(of: isLoadingEarlierHistory) { _, isLoading in
+            if isLoading { hasPresentedHistoryAffordance = true }
+        }
+    }
+}
+
 /// Keeps the primary conversation controls aligned with the transcript's
 /// readable measure. Insets ease down on compact windows instead of stealing
 /// a fixed 64 points from an already narrow center pane.
@@ -108,8 +190,8 @@ enum ConversationContentLayout {
     /// encourages long, hard-to-scan lines even when the window has room.
     static let maximumComposerWidth: CGFloat = 760
     static let bottomInset: CGFloat = 20
-    static let minimumHorizontalInset: CGFloat = 16
-    static let maximumHorizontalInset: CGFloat = 30
+    static let minimumHorizontalInset: CGFloat = 14
+    static let maximumHorizontalInset: CGFloat = 20
 
     static func horizontalInset(availableWidth: CGFloat) -> CGFloat {
         guard availableWidth.isFinite, availableWidth > 0 else {
@@ -117,7 +199,7 @@ enum ConversationContentLayout {
         }
         return min(
             maximumHorizontalInset,
-            max(minimumHorizontalInset, availableWidth * 0.04)
+            max(minimumHorizontalInset, availableWidth * 0.03)
         )
     }
 }
@@ -154,6 +236,8 @@ private struct ConversationHeaderView: View {
                     onShowSidebar()
                 } label: {
                     Image(systemName: "sidebar.leading")
+                        .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.borderless)
                 .onyxHelp("Show sidebar")
@@ -222,7 +306,7 @@ private struct ConversationHeaderView: View {
             } label: {
                 Image(systemName: "sidebar.right")
                     .foregroundStyle(model.isInspectorVisible ? OnyxTheme.iris : Color.secondary)
-                    .frame(width: 26, height: 26)
+                    .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.borderless)
@@ -268,7 +352,8 @@ private struct ConversationHeaderView: View {
                 }
             } label: {
                 Image(systemName: "ellipsis")
-                    .frame(width: 26, height: 26)
+                    .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                    .contentShape(Rectangle())
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
@@ -309,6 +394,7 @@ private struct ConversationHeaderView: View {
         .frame(height: 28)
         .background(isSelected ? OnyxTheme.iris.opacity(0.10) : Color.clear)
         .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .frame(height: OnyxHitTarget.compact)
         .contentShape(Rectangle())
     }
 }
@@ -540,6 +626,7 @@ enum ComposerToolbarLayout {
 /// accidentally hide controls the user still needs.
 enum BusyComposerPresentation {
     static let compactHeight: CGFloat = 40
+    static let compactActionLabel = "Write a follow-up"
 
     static func usesCompactStrip(
         isTurnRunning: Bool,
@@ -581,7 +668,6 @@ private struct ComposerView: View {
     @Environment(\.onyxWindowPresentationContext) private var windowPresentation
     @State private var textHeight: CGFloat = 46
     @State private var userExpandedBusyComposer = false
-    @FocusState private var compactBusyStripFocused: Bool
 
     private var interactionBlocksComposer: Bool {
         model.activeUserInteraction?.isBlocking == true
@@ -589,6 +675,7 @@ private struct ComposerView: View {
 
     private var canSend: Bool {
         model.canRunAgent
+            && !model.isPreparingLatestMessageEditForSelectedThread
             && !interactionBlocksComposer
             && !model.isReviewBlockingComposer
             && (!model.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -648,6 +735,7 @@ private struct ComposerView: View {
                 isEnabled: model.canRunAgent
                     && !interactionBlocksComposer
                     && !model.isReviewBlockingComposer,
+                canSubmit: { canSend },
                 onSubmit: submitComposer,
                 onPasteImages: { images in
                     model.addPastedComposerImages(images)
@@ -684,11 +772,12 @@ private struct ComposerView: View {
         HStack(spacing: 8) {
             Button(action: expandBusyComposer) {
                 HStack(spacing: 8) {
-                    ProgressView()
-                        .controlSize(.mini)
+                    Image(systemName: "square.and.pencil")
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(.tertiary)
                         .accessibilityHidden(true)
 
-                    Text(busyLabel)
+                    Text(BusyComposerPresentation.compactActionLabel)
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -699,13 +788,7 @@ private struct ComposerView: View {
             }
             .buttonStyle(.plain)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-            .focused($compactBusyStripFocused)
-            .onChange(of: compactBusyStripFocused) { _, isFocused in
-                if isFocused {
-                    expandBusyComposer()
-                }
-            }
-            .accessibilityLabel(busyLabel)
+            .accessibilityLabel(BusyComposerPresentation.compactActionLabel)
             .accessibilityHint("Expands the message composer so you can write a follow-up")
 
             Button(action: model.interrupt) {
@@ -715,6 +798,8 @@ private struct ComposerView: View {
                     .frame(height: 26)
                     .background(Color.primary.opacity(0.065))
                     .clipShape(Capsule())
+                .frame(height: OnyxHitTarget.compact)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .onyxHelp("Stop task")
@@ -732,15 +817,7 @@ private struct ComposerView: View {
         }
     }
 
-    private var busyLabel: String {
-        BusyComposerPresentation.label(
-            isReviewRunning: model.isReviewRunning,
-            isReviewStarting: model.isSelectedReviewStarting
-        )
-    }
-
     private func expandBusyComposer() {
-        compactBusyStripFocused = false
         userExpandedBusyComposer = true
     }
 
@@ -850,7 +927,8 @@ private struct ComposerView: View {
     private var attachImagesButton: some View {
         Button(action: { model.chooseComposerImages(window: windowPresentation.window) }) {
             Image(systemName: "plus")
-                .frame(width: 24, height: 24)
+                .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.borderless)
         .disabled(!model.canAttachImages)
@@ -929,6 +1007,8 @@ private struct ComposerView: View {
                     .foregroundStyle(.tertiary)
             }
             .font(.system(size: 11.5, weight: .medium))
+            .frame(minHeight: OnyxHitTarget.compact)
+            .contentShape(Rectangle())
         }
         .menuStyle(.borderlessButton)
         .fixedSize(horizontal: true, vertical: false)
@@ -954,6 +1034,8 @@ private struct ComposerView: View {
             }
             .font(.system(size: 11.5, weight: .medium))
             .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(minHeight: OnyxHitTarget.compact)
+            .contentShape(Rectangle())
         }
         .menuStyle(.borderlessButton)
         .frame(width: 164, alignment: .leading)
@@ -968,7 +1050,8 @@ private struct ComposerView: View {
             providerModelMenuContent
         } label: {
             Image(systemName: "point.3.connected.trianglepath.dotted")
-                .frame(width: 28, height: 28)
+                .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                .contentShape(Rectangle())
         }
         .menuStyle(.borderlessButton)
         .onyxHelp(isComposingNewTask ? "Choose a provider and model for this new task" : "Choose the model for the next turn")
@@ -983,9 +1066,9 @@ private struct ComposerView: View {
                 model.selectReasoningEffort(effort)
             } label: {
                 if effort == model.selectedReasoningEffort {
-                    Label(effort.capitalized, systemImage: "checkmark")
+                    Label(model.reasoningEffortName(effort), systemImage: "checkmark")
                 } else {
-                    Text(effort.capitalized)
+                    Text(model.reasoningEffortName(effort))
                 }
             }
         }
@@ -1015,11 +1098,11 @@ private struct ComposerView: View {
             minimalOptionsMenuContent
         } label: {
             Image(systemName: "slider.horizontal.3")
-                .frame(width: 28, height: 28)
+                .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
                 .foregroundStyle(.secondary)
         }
         .menuStyle(.borderlessButton)
-        .frame(width: 28, height: 28)
+        .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
         .onyxHelp("Choose reasoning effort and task permissions")
         .accessibilityLabel("Task options")
         .accessibilityValue(
@@ -1044,24 +1127,34 @@ private struct ComposerView: View {
                 .accessibilityLabel("Starting task")
         } else if model.isTurnRunning {
             Button(action: model.interrupt) {
-                Image(systemName: "stop.fill")
-                    .font(.system(size: 9, weight: .bold))
-                    .frame(width: 28, height: 28)
-                    .background(Color.primary)
-                    .foregroundStyle(OnyxTheme.canvas)
-                    .clipShape(Circle())
+                ZStack {
+                    Circle()
+                        .fill(Color.primary)
+                        .frame(width: 28, height: 28)
+
+                    Image(systemName: "stop.fill")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(OnyxTheme.canvas)
+                }
+                .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .onyxHelp("Stop")
             .accessibilityLabel("Stop task")
         } else {
             Button(action: model.sendComposer) {
-                Image(systemName: "arrow.up")
-                    .font(.system(size: 12, weight: .bold))
-                    .frame(width: 29, height: 29)
-                    .background(canSend ? AnyShapeStyle(OnyxTheme.accentGradient) : AnyShapeStyle(Color.secondary.opacity(0.16)))
-                    .foregroundStyle(canSend ? Color.white : Color.secondary.opacity(0.58))
-                    .clipShape(Circle())
+                ZStack {
+                    Circle()
+                        .fill(canSend ? AnyShapeStyle(OnyxTheme.accentGradient) : AnyShapeStyle(Color.secondary.opacity(0.16)))
+                        .frame(width: 29, height: 29)
+
+                    Image(systemName: "arrow.up")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(canSend ? Color.white : Color.secondary.opacity(0.58))
+                }
+                .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .disabled(!canSend)
@@ -1095,7 +1188,8 @@ private struct ComposerView: View {
                    choice.model.inputModalities.contains(.image) {
                     Image(systemName: "photo")
                 }
-                if choice.model.capabilityEvidence.reasoningEffortsAdvertised,
+                if (choice.model.capabilityEvidence.reasoningEffortsAdvertised
+                        || choice.model.capabilityEvidence.reasoningEffortsVerifiedByClient),
                    !choice.model.reasoningEfforts.isEmpty {
                     Image(systemName: "brain")
                 }
@@ -1143,10 +1237,18 @@ struct ComposerImagePreviewRow: View {
                         Button {
                             onRemove(draft.id)
                         } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .symbolRenderingMode(.palette)
-                                .foregroundStyle(Color.white, Color.black.opacity(0.72))
-                                .font(.system(size: 17, weight: .semibold))
+                            ZStack {
+                                // Keep the painted glyph compact while giving
+                                // the dismissal action the same forgiving
+                                // acquisition area as the other composer
+                                // controls.
+                                Image(systemName: "xmark.circle.fill")
+                                    .symbolRenderingMode(.palette)
+                                    .foregroundStyle(Color.white, Color.black.opacity(0.72))
+                                    .font(.system(size: 17, weight: .semibold))
+                            }
+                            .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                            .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                         .offset(x: 5, y: -5)
@@ -1166,6 +1268,9 @@ struct ComposerImagePreviewRow: View {
 private struct ComposerDraftThumbnail: View {
     let draft: ComposerImageDraft
 
+    @State private var thumbnail: NSImage?
+    @State private var didFail = false
+
     var body: some View {
         Group {
             if let image = thumbnail {
@@ -1180,21 +1285,26 @@ private struct ComposerDraftThumbnail: View {
                 }
             }
         }
-    }
-
-    private var thumbnail: NSImage? {
-        switch draft.input {
-        case let .localImagePath(path):
-            return NSImage(contentsOfFile: path)
-        case let .imageURL(raw):
-            guard raw.lowercased().hasPrefix("data:"),
-                  let comma = raw.firstIndex(of: ","),
-                  let data = Data(base64Encoded: String(raw[raw.index(after: comma)...])) else {
-                return nil
+        // Image decoding (especially for pasted data URLs) is deliberately
+        // outside `body`. SwiftUI reevaluates this view for every transcript
+        // or draft mutation; doing a synchronous file read/base64 decode here
+        // made typing and streaming contend with image work on the main actor.
+        .task(id: draft.id) {
+            guard thumbnail == nil, !didFail else { return }
+            do {
+                let image = try await TranscriptImageLoader.shared.loadThumbnail(
+                    from: draft.timelineAttachment.source,
+                    cacheIdentity: "composer-preview:\(draft.id.uuidString)",
+                    maximumPixelSize: 160
+                )
+                guard !Task.isCancelled else { return }
+                thumbnail = image
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled else { return }
+                didFail = true
             }
-            return NSImage(data: data)
-        case .text:
-            return nil
         }
     }
 }

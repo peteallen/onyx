@@ -184,8 +184,30 @@ if [[ -f "$app_dir/Contents/Info.plist" ]]; then
 fi
 
 target_running_pids() {
-  [[ -f "$target_executable" && -x /usr/sbin/lsof ]] || return 0
-  /usr/sbin/lsof -a -d txt -t -- "$target_executable" 2>/dev/null || true
+  [[ -f "$target_executable" ]] || return 0
+  [[ -x /usr/sbin/lsof ]] || die "cannot inspect the package target because /usr/sbin/lsof is unavailable"
+  local temp_dir
+  temp_dir="$(/usr/bin/mktemp -d \
+    "${TMPDIR:-/tmp}/onyx-package-app-lsof.XXXXXX")" || \
+    die "could not create a private directory for package-target inspection"
+  local output_file="$temp_dir/output"
+  local error_file="$temp_dir/error"
+  local lsof_exit=0
+  /usr/sbin/lsof -a -d txt -t -- "$target_executable" \
+    >| "$output_file" 2>| "$error_file" || lsof_exit=$?
+  # Status 1 with no diagnostic means no process matched. Reject diagnostics
+  # and higher or partial-output failures so an incomplete inspection cannot
+  # authorize a package replacement.
+  if [[ -s "$error_file" ]] || (( lsof_exit > 1 )) || \
+     (( lsof_exit == 1 && $(/usr/bin/wc -c < "$output_file") > 0 )); then
+    local diagnostic="$(<"$error_file")"
+    [[ -n "$diagnostic" ]] || diagnostic="lsof exited with status $lsof_exit"
+    /bin/rm -rf -- "$temp_dir"
+    die "could not inspect the package target: $diagnostic"
+  fi
+  [[ -f "$output_file" ]] && local output="$(<"$output_file")" || local output=""
+  /bin/rm -rf -- "$temp_dir"
+  print -r -- "$output"
 }
 
 running_pids="$(target_running_pids)"

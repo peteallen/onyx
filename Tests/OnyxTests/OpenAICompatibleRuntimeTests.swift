@@ -26,8 +26,10 @@ final class OpenAICompatibleRuntimeTests: XCTestCase {
             fileURL: location.appendingPathComponent("conversations.json")
         )
         let session = makeFixtureSession()
+        let captured = RequestBodySequenceCapture()
         RuntimeFixtureURLProtocol.configure { request in
             guard request.url?.path == "/v1/models" else {
+                captured.record(request)
                 return .eventStream(body: """
                 data: {"id":"chatcmpl-fixture","model":"Qwen/Qwen3.8-27B-FP8","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
 
@@ -54,6 +56,14 @@ final class OpenAICompatibleRuntimeTests: XCTestCase {
         let sessionSnapshot = try await runtime.connect()
         XCTAssertTrue(sessionSnapshot.auth.canRun)
         XCTAssertEqual(sessionSnapshot.availableModels.map(\.id), ["Qwen/Qwen3.8-27B-FP8"])
+        XCTAssertTrue(sessionSnapshot.capabilities.contains(.reasoning))
+        let qwen = try XCTUnwrap(sessionSnapshot.availableModels.first)
+        XCTAssertEqual(qwen.reasoningEfforts, ["none", "low", "medium", "xhigh"])
+        XCTAssertEqual(qwen.defaultReasoningEffort, "none")
+        XCTAssertEqual(qwen.supportedRequestParameters, [.reasoningEffort])
+        XCTAssertTrue(qwen.serverAdvertisedRequestParameters.isEmpty)
+        XCTAssertFalse(qwen.capabilityEvidence.reasoningEffortsAdvertised)
+        XCTAssertTrue(qwen.capabilityEvidence.reasoningEffortsVerifiedByClient)
 
         let thread = try await runtime.startThread(
             StartThreadRequest(cwd: "/tmp/project", model: "Qwen/Qwen3.8-27B-FP8")
@@ -62,7 +72,8 @@ final class OpenAICompatibleRuntimeTests: XCTestCase {
             try await runtime.startTurn(
                 StartTurnRequest(
                     threadID: thread.id,
-                    inputs: [.text("Reply exactly with a fixture response")]
+                    inputs: [.text("Reply exactly with a fixture response")],
+                    reasoningEffort: "medium"
                 )
             )
         }
@@ -84,6 +95,12 @@ final class OpenAICompatibleRuntimeTests: XCTestCase {
         ])
         let listed = try await runtime.listThreads(limit: 10, archived: false)
         XCTAssertEqual(listed.first?.id, thread.id)
+        let body = try XCTUnwrap(captured.bodies.last)
+        let payload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: body) as? [String: Any]
+        )
+        XCTAssertEqual(payload["reasoning_effort"] as? String, "medium")
+        XCTAssertNil(payload["chat_template_kwargs"])
     }
 
     func testLegacyEmptyTransportCapabilitiesRemainUsable() async throws {
@@ -117,6 +134,20 @@ final class OpenAICompatibleRuntimeTests: XCTestCase {
         XCTAssertTrue(snapshot.capabilities.contains(.streaming))
         XCTAssertTrue(snapshot.capabilities.contains(.interruption))
         XCTAssertTrue(snapshot.capabilities.contains(.usage))
+        XCTAssertFalse(snapshot.capabilities.contains(.threadHistoryPagination))
+        XCTAssertFalse(snapshot.capabilities.contains(.threadHistoryRevert))
+
+        do {
+            _ = try await runtime.resumeThread(
+                id: "unsupported-history",
+                initialHistoryPage: RuntimeInitialThreadHistoryPageRequest(limit: 12)
+            )
+            XCTFail("OpenAI-compatible runtimes must not imply native history pagination")
+        } catch let AgentRuntimeError.unsupported(feature) {
+            XCTAssertEqual(feature, "paginated thread history")
+        } catch {
+            XCTFail("Unexpected history fallback error: \(error)")
+        }
     }
 
     func testConnectUsesManuallySavedModelWhenDiscoveryReturnsNoModels() async throws {
@@ -155,6 +186,10 @@ final class OpenAICompatibleRuntimeTests: XCTestCase {
         let snapshot = try await runtime.connect()
         XCTAssertEqual(snapshot.availableModels.map(\.id), ["Qwen/Qwen3.8-27B-FP8"])
         XCTAssertEqual(snapshot.availableModels.first?.displayName, "Qwen/Qwen3.8-27B-FP8")
+        XCTAssertEqual(
+            snapshot.availableModels.first?.reasoningEfforts,
+            ["none", "low", "medium", "xhigh"]
+        )
     }
 
     func testManuallySavedModelRemainsExecutableWhenDiscoveryOmitsIt() async throws {
@@ -205,10 +240,11 @@ final class OpenAICompatibleRuntimeTests: XCTestCase {
             snapshot.availableModels.first(where: { $0.id == manualModelID })
         )
         XCTAssertTrue(manualModel.isDefault)
-        XCTAssertEqual(manualModel.capabilityEvidence, .unknown)
+        XCTAssertTrue(manualModel.capabilityEvidence.isPartial)
         XCTAssertEqual(manualModel.inputModalities, [.text])
-        XCTAssertTrue(manualModel.reasoningEfforts.isEmpty)
-        XCTAssertTrue(manualModel.supportedRequestParameters.isEmpty)
+        XCTAssertEqual(manualModel.reasoningEfforts, ["none", "low", "medium", "xhigh"])
+        XCTAssertEqual(manualModel.supportedRequestParameters, [.reasoningEffort])
+        XCTAssertTrue(manualModel.serverAdvertisedRequestParameters.isEmpty)
 
         let storedConnection = try await connectionStore.connection(id: connection.id)
         let stored = try XCTUnwrap(storedConnection)
@@ -1311,7 +1347,13 @@ final class OpenAICompatibleRuntimeTests: XCTestCase {
             conversationStore: OpenAICompatibleConversationStore(fileURL: location)
         )
         let snapshot = try await runtime.connect()
-        XCTAssertTrue(snapshot.availableModels.contains { $0.id == connection.selectedModelID })
+        let liveModel = try XCTUnwrap(
+            snapshot.availableModels.first { $0.id == connection.selectedModelID }
+        )
+        if KnownOpenAICompatibleModelProfile.profile(for: modelID) == .qwen38 {
+            XCTAssertEqual(liveModel.reasoningEfforts, ["none", "low", "medium", "xhigh"])
+            XCTAssertEqual(liveModel.defaultReasoningEffort, "none")
+        }
         let thread = try await runtime.startThread(StartThreadRequest(cwd: FileManager.default.currentDirectoryPath))
         let eventTask = Task { () -> String in
             var answer = ""
@@ -1330,7 +1372,8 @@ final class OpenAICompatibleRuntimeTests: XCTestCase {
         try await runtime.startTurn(
             StartTurnRequest(
                 threadID: thread.id,
-                inputs: [.text("Reply with the exact token ONYX_QWEN_LIVE_OK")]
+                inputs: [.text("Reply with the exact token ONYX_QWEN_LIVE_OK")],
+                reasoningEffort: liveModel.reasoningEfforts.contains("medium") ? "medium" : nil
             )
         )
         let answer = await eventTask.value

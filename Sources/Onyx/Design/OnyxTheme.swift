@@ -96,6 +96,18 @@ enum OnyxTheme {
     }
 }
 
+/// Shared interaction geometry for Onyx's dense desktop chrome.
+///
+/// Glyphs and labels can remain visually compact, but controls should not make
+/// people aim at the glyph itself. Use `compact` for icon buttons and `row` for
+/// clickable labels/list rows. Splitters are the one deliberately narrower
+/// exception because they sit between two live panes.
+enum OnyxHitTarget {
+    static let compact: CGFloat = 32
+    static let row: CGFloat = 34
+    static let splitter: CGFloat = 11
+}
+
 struct OnyxMark: View {
     var size: CGFloat = 28
 

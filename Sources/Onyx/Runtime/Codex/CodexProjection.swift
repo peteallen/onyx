@@ -35,21 +35,94 @@ enum CodexProjection {
 
     static func conversation(from result: JSONValue) throws -> RuntimeConversation {
         let threadValue = result["thread"] ?? result
-        guard var thread = thread(from: threadValue) else {
+        guard let thread = thread(from: threadValue) else {
             throw AgentRuntimeError.missingField("thread.id")
         }
 
         let turns = threadValue["turns"]?.arrayValue ?? []
         var items: [TimelineItem] = []
         for turn in turns {
+            let fallbackTimestamp = date(from: turn["startedAt"])
+                ?? date(from: turn["completedAt"])
             for item in turn["items"]?.arrayValue ?? [] {
-                items.append(timelineItem(from: item))
+                items.append(
+                    timelineItem(
+                        from: item,
+                        fallbackTimestamp: fallbackTimestamp
+                    )
+                )
             }
         }
-        if let last = items.last {
-            thread.updatedAt = max(thread.updatedAt, last.timestamp)
-        }
         return RuntimeConversation(thread: thread, items: items)
+    }
+
+    static func historyPage(
+        from result: JSONValue,
+        direction: RuntimeHistoryDirection
+    ) throws -> RuntimeThreadHistoryPage {
+        guard let values = result["data"]?.arrayValue ?? result.arrayValue else {
+            throw AgentRuntimeError.missingField("thread/turns/list.data")
+        }
+        let turns = try values.map { value in
+            guard let turn = conversationTurn(from: value) else {
+                throw AgentRuntimeError.missingField("thread/turns/list.data[].id")
+            }
+            return turn
+        }
+        return RuntimeThreadHistoryPage(
+            turns: turns,
+            nextCursor: result["nextCursor"]?.stringValue,
+            backwardsCursor: result["backwardsCursor"]?.stringValue,
+            direction: direction
+        )
+    }
+
+    static func conversationTurn(from value: JSONValue) -> RuntimeConversationTurn? {
+        guard let id = value["id"]?.stringValue else { return nil }
+        let status = conversationTurnStatus(from: value["status"]?.stringValue)
+        let startedAt = date(from: value["startedAt"])
+        let completedAt = date(from: value["completedAt"])
+        let fallbackTimestamp = startedAt ?? completedAt
+        let defaultItemStatus: TimelineItemStatus = switch status {
+        case .inProgress: .running
+        case .failed: .failed
+        case .completed, .interrupted, .unknown: .completed
+        }
+        return RuntimeConversationTurn(
+            id: id,
+            items: (value["items"]?.arrayValue ?? []).map {
+                timelineItem(
+                    from: $0,
+                    defaultStatus: defaultItemStatus,
+                    fallbackTimestamp: fallbackTimestamp
+                )
+            },
+            status: status,
+            itemDetail: turnItemDetail(from: value["itemsView"]?.stringValue),
+            startedAt: startedAt,
+            completedAt: completedAt,
+            durationMilliseconds: value["durationMs"]?.intValue
+        )
+    }
+
+    private static func conversationTurnStatus(from rawValue: String?) -> RuntimeConversationTurnStatus {
+        switch rawValue {
+        case "completed": .completed
+        case "interrupted": .interrupted
+        case "failed": .failed
+        case "inProgress": .inProgress
+        case let value?: .unknown(value)
+        case nil: .unknown("unknown")
+        }
+    }
+
+    private static func turnItemDetail(from rawValue: String?) -> RuntimeTurnItemDetail {
+        switch rawValue {
+        case "notLoaded": .notLoaded
+        case "summary": .summary
+        case "full", nil: .full
+        case let value?: .unknown(value)
+        }
     }
 
     static func threadLifecycleEvent(from notification: AppServerNotification) -> AgentRuntimeEvent? {
@@ -76,12 +149,15 @@ enum CodexProjection {
 
     static func timelineItem(
         from value: JSONValue,
-        defaultStatus: TimelineItemStatus = .completed
+        defaultStatus: TimelineItemStatus = .completed,
+        fallbackTimestamp: Date? = nil
     ) -> TimelineItem {
         let type = value["type"]?.stringValue ?? "unknown"
         let id = value["id"]?.stringValue ?? UUID().uuidString
         let status = itemStatus(from: value["status"]?.stringValue, default: defaultStatus)
-        let timestamp = date(from: value["createdAt"] ?? value["timestamp"]) ?? .now
+        let timestamp = date(from: value["createdAt"] ?? value["timestamp"])
+            ?? fallbackTimestamp
+            ?? .now
 
         switch type {
         case "userMessage":

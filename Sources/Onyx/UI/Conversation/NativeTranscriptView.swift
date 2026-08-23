@@ -8,6 +8,8 @@ struct NativeTranscriptView: NSViewControllerRepresentable {
     var workingLabel = "Working"
     var revision: UInt64? = nil
     var changeHint: TranscriptCollectionUpdate.Hint? = nil
+    var editableUserMessageID: String? = nil
+    var onEditUserMessage: (String) -> Void = { _ in }
 
     func makeNSViewController(context: Context) -> TranscriptViewController {
         TranscriptViewController()
@@ -19,7 +21,9 @@ struct NativeTranscriptView: NSViewControllerRepresentable {
             isAwaitingResponse: isAwaitingResponse,
             workingLabel: workingLabel,
             revision: revision,
-            changeHint: changeHint
+            changeHint: changeHint,
+            editableUserMessageID: editableUserMessageID,
+            onEditUserMessage: onEditUserMessage
         )
     }
 }
@@ -37,12 +41,12 @@ struct TranscriptPendingResponse: Equatable {
         label: String
     ) -> Self {
         guard isAwaitingResponse else { return Self(isVisible: false, label: label) }
-        let hasStreamingAssistant = items.reversed()
+        let hasVisibleAssistant = items.reversed()
             .prefix(while: { $0.kind != .userMessage })
             .contains {
-                $0.kind == .assistantMessage && $0.status == .running && !$0.body.isEmpty
+                $0.kind == .assistantMessage && !$0.body.isEmpty
             }
-        return Self(isVisible: !hasStreamingAssistant, label: label)
+        return Self(isVisible: !hasVisibleAssistant, label: label)
     }
 }
 
@@ -83,6 +87,11 @@ enum TranscriptActivityGrouping {
         let groupStart: Int
     }
 
+    fileprivate struct TailMutation {
+        let result: AppendResult
+        let replacementGroups: [TranscriptActivityGroup]
+    }
+
     static func groups(for items: [TimelineItem]) -> [TranscriptActivityGroup] {
         var instrumentation = AppendInstrumentation()
         return groups(
@@ -103,6 +112,30 @@ enum TranscriptActivityGrouping {
         appendedRange: Range<Int>,
         instrumentation: inout AppendInstrumentation
     ) -> AppendResult? {
+        guard let mutation = appendMutation(
+            for: groups,
+            oldItems: oldItems,
+            newItems: newItems,
+            appendedRange: appendedRange,
+            instrumentation: &instrumentation
+        ) else { return nil }
+        groups.replaceSubrange(
+            mutation.result.groupStart..<groups.endIndex,
+            with: mutation.replacementGroups
+        )
+        return mutation.result
+    }
+
+    /// Plans a bounded suffix replacement without requiring the caller's
+    /// group storage to be one contiguous array. This keeps prepended group
+    /// pages offset-backed while preserving the array API used by model tests.
+    fileprivate static func appendMutation<Groups: RandomAccessCollection>(
+        for groups: Groups,
+        oldItems: [TimelineItem],
+        newItems: [TimelineItem],
+        appendedRange: Range<Int>,
+        instrumentation: inout AppendInstrumentation
+    ) -> TailMutation? where Groups.Index == Int, Groups.Element == TranscriptActivityGroup {
         guard appendedRange.lowerBound == oldItems.count,
               appendedRange.upperBound == newItems.count,
               !appendedRange.isEmpty else { return nil }
@@ -120,18 +153,21 @@ enum TranscriptActivityGrouping {
             }
         }
 
-        while let tailGroup = groups.last, tailGroup.range.upperBound > itemStart {
-            groups.removeLast()
+        var groupStart = groups.endIndex
+        while groupStart > groups.startIndex {
+            let candidateIndex = groups.index(before: groupStart)
+            guard groups[candidateIndex].range.upperBound > itemStart else { break }
+            groupStart = candidateIndex
         }
-        let groupStart = groups.count
-        groups.append(
-            contentsOf: self.groups(
-                for: newItems,
-                startingAt: itemStart,
-                instrumentation: &instrumentation
-            )
+        let replacements = self.groups(
+            for: newItems,
+            startingAt: itemStart,
+            instrumentation: &instrumentation
         )
-        return AppendResult(itemStart: itemStart, groupStart: groupStart)
+        return TailMutation(
+            result: AppendResult(itemStart: itemStart, groupStart: groupStart),
+            replacementGroups: replacements
+        )
     }
 
     static func append(
@@ -162,6 +198,27 @@ enum TranscriptActivityGrouping {
         changedIndex: Int,
         instrumentation: inout AppendInstrumentation
     ) -> AppendResult? {
+        guard let mutation = replaceChangedTailMutation(
+            in: groups,
+            oldItems: oldItems,
+            newItems: newItems,
+            changedIndex: changedIndex,
+            instrumentation: &instrumentation
+        ) else { return nil }
+        groups.replaceSubrange(
+            mutation.result.groupStart..<groups.endIndex,
+            with: mutation.replacementGroups
+        )
+        return mutation.result
+    }
+
+    fileprivate static func replaceChangedTailMutation<Groups: RandomAccessCollection>(
+        in groups: Groups,
+        oldItems: [TimelineItem],
+        newItems: [TimelineItem],
+        changedIndex: Int,
+        instrumentation: inout AppendInstrumentation
+    ) -> TailMutation? where Groups.Index == Int, Groups.Element == TranscriptActivityGroup {
         guard oldItems.count == newItems.count,
               changedIndex == oldItems.count - 1,
               oldItems.indices.contains(changedIndex),
@@ -179,18 +236,21 @@ enum TranscriptActivityGrouping {
             itemStart = changedIndex - 1
         }
 
-        while let tailGroup = groups.last, tailGroup.range.upperBound > itemStart {
-            groups.removeLast()
+        var groupStart = groups.endIndex
+        while groupStart > groups.startIndex {
+            let candidateIndex = groups.index(before: groupStart)
+            guard groups[candidateIndex].range.upperBound > itemStart else { break }
+            groupStart = candidateIndex
         }
-        let groupStart = groups.count
-        groups.append(
-            contentsOf: self.groups(
-                for: newItems,
-                startingAt: itemStart,
-                instrumentation: &instrumentation
-            )
+        let replacements = self.groups(
+            for: newItems,
+            startingAt: itemStart,
+            instrumentation: &instrumentation
         )
-        return AppendResult(itemStart: itemStart, groupStart: groupStart)
+        return TailMutation(
+            result: AppendResult(itemStart: itemStart, groupStart: groupStart),
+            replacementGroups: replacements
+        )
     }
 
     static func replaceChangedTail(
@@ -279,7 +339,7 @@ enum TranscriptActivityGrouping {
             groupingCanChange(at: index, from: oldItems, to: newItems)
         case let .rowChanges(indices):
             indices.contains { groupingCanChange(at: $0, from: oldItems, to: newItems) }
-        case .append, .reloadAll:
+        case .append, .prepend, .reloadAll:
             true
         }
     }
@@ -334,6 +394,7 @@ enum TranscriptCollectionUpdate: Equatable {
     case tailChange(Int)
     case rowChanges(IndexSet)
     case append(Range<Int>)
+    case prepend(Range<Int>)
     case reloadAll
 
     struct PlanningInstrumentation: Equatable {
@@ -341,7 +402,7 @@ enum TranscriptCollectionUpdate: Equatable {
         fileprivate(set) var hintedUpdateCount = 0
     }
 
-    enum Hint: Equatable {
+    enum Hint: Equatable, Sendable {
         /// One or more consecutive `append(_:)` mutations extending the same
         /// immutable prefix. Each revision in this lineage adds exactly one
         /// item, which lets a controller that missed an intermediate SwiftUI
@@ -349,6 +410,14 @@ enum TranscriptCollectionUpdate: Equatable {
         /// historical row.
         case itemsAppended(
             startIndex: Int,
+            fromRevision: UInt64,
+            toRevision: UInt64
+        )
+        /// One bounded page was inserted before an immutable visible suffix.
+        /// Unlike an arbitrary middle insertion, this can be applied without
+        /// recycling mounted transcript rows and while anchoring the viewport.
+        case itemsPrepended(
+            count: Int,
             fromRevision: UInt64,
             toRevision: UInt64
         )
@@ -395,6 +464,15 @@ enum TranscriptCollectionUpdate: Equatable {
            newItems.count == startIndex + newOffset {
             instrumentation.hintedUpdateCount += 1
             return .append(oldItems.count..<newItems.count)
+        }
+
+        if case let .itemsPrepended(count, fromRevision, toRevision) = hint,
+           oldRevision == fromRevision,
+           newRevision == toRevision,
+           count > 0,
+           newItems.count == oldItems.count + count {
+            instrumentation.hintedUpdateCount += 1
+            return .prepend(0..<count)
         }
 
         if case let .rowsChanged(indices, fromRevision, toRevision) = hint,
@@ -542,7 +620,7 @@ struct TranscriptLayoutState {
         newItems: [TimelineItem]
     ) {
         switch update {
-        case .unchanged, .append:
+        case .unchanged, .append, .prepend:
             break
         case let .tailChange(index):
             invalidateRows(IndexSet(integer: index), in: newItems)
@@ -658,13 +736,16 @@ struct TranscriptFlowMetrics: Equatable {
     /// comfortable at the app's 15-point reading size and aligns with the
     /// composer below it.
     static let maximumReadableWidth: CGFloat = 760
-    // Normal panes keep a quiet gutter; very narrow transition frames let
-    // that gutter yield before they let a row overflow.
-    static let preferredHorizontalInset: CGFloat = 24
+    // Keep the reading column closer to the project edge and let spare width
+    // collect on the trailing side. Very narrow transition frames scale both
+    // preferred gutters down before allowing a row to overflow.
+    static let preferredLeadingInset: CGFloat = 18
+    static let preferredTrailingInset: CGFloat = 24
     static let layoutSafetyWidth: CGFloat = 1
 
     let itemWidth: CGFloat
-    let horizontalInset: CGFloat
+    let leadingInset: CGFloat
+    let trailingInset: CGFloat
 
     init(collectionWidth rawCollectionWidth: CGFloat) {
         let collectionWidth = rawCollectionWidth.isFinite
@@ -672,26 +753,34 @@ struct TranscriptFlowMetrics: Equatable {
             : 0
         guard collectionWidth > Self.layoutSafetyWidth else {
             itemWidth = 0
-            horizontalInset = 0
+            leadingInset = 0
+            trailingInset = 0
             return
         }
 
-        // Margins stay at their preferred size for normal panes, but yield
-        // during transient narrow layout passes instead of forcing a 320pt
-        // row into a smaller collection view.
+        let preferredInsetWidth = Self.preferredLeadingInset
+            + Self.preferredTrailingInset
         itemWidth = min(
             Self.maximumReadableWidth,
             max(
                 1,
                 collectionWidth
-                    - Self.preferredHorizontalInset * 2
+                    - preferredInsetWidth
                     - Self.layoutSafetyWidth
             )
         )
-        horizontalInset = max(
+        let availableInsetWidth = max(
             0,
-            (collectionWidth - itemWidth - Self.layoutSafetyWidth) / 2
+            collectionWidth - itemWidth - Self.layoutSafetyWidth
         )
+        if availableInsetWidth >= preferredInsetWidth {
+            leadingInset = Self.preferredLeadingInset
+            trailingInset = availableInsetWidth - leadingInset
+        } else {
+            leadingInset = availableInsetWidth
+                * Self.preferredLeadingInset / preferredInsetWidth
+            trailingInset = availableInsetWidth - leadingInset
+        }
     }
 }
 
@@ -714,7 +803,27 @@ private final class TranscriptCollectionFlowLayout: NSCollectionViewFlowLayout {
     }
 }
 
+struct TranscriptPrependInstrumentation: Equatable {
+    fileprivate(set) var insertedDisplayRowCount = 0
+    fileprivate(set) var projectedPrefixItemCount = 0
+    fileprivate(set) var projectedPrefixGroupCount = 0
+    fileprivate(set) var fullReloadCount = 0
+    fileprivate(set) var projectionFullReloadCount = 0
+    fileprivate(set) var displayIndexRebuildCount = 0
+    fileprivate(set) var anchorFallbackScanCount = 0
+    fileprivate(set) var deferredReloadLookupCount = 0
+    fileprivate(set) var nearTailLookupCount = 0
+    fileprivate(set) var nearTailInspectedRowCount = 0
+    fileprivate(set) var nearTailLookupBudgetExceededCount = 0
+    fileprivate(set) var tailGroupingInspectedItemCount = 0
+    fileprivate(set) var suffixBatchUpdateCount = 0
+}
+
 final class TranscriptViewController: NSViewController, NSCollectionViewDataSource, NSCollectionViewDelegateFlowLayout {
+    /// A mutable rollup contains at most eight children. An expanded rollup,
+    /// its summary, and the adjacent live/lone row therefore fit within this
+    /// hard fallback budget.
+    static let maximumNearTailLookupRows = TranscriptActivityGrouping.maximumItemsPerGroup + 4
     private static let itemIdentifier = NSUserInterfaceItemIdentifier("OnyxTranscriptItem")
     private static let pendingItemIdentifier = NSUserInterfaceItemIdentifier("OnyxTranscriptPendingItem")
     private static let activityGroupIdentifier = NSUserInterfaceItemIdentifier("OnyxTranscriptActivityGroupItem")
@@ -731,16 +840,130 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         }
     }
 
+    /// Stores prepended pages without copying or rewriting the mounted suffix.
+    /// Each page remembers the cumulative item offset at creation; rows are
+    /// shifted lazily when AppKit asks for one visible element.
+    private struct PrependOffsetStorage<Element>: RandomAccessCollection {
+        typealias Index = Int
+
+        private struct Stored {
+            let element: Element
+            let prependOffset: Int
+        }
+
+        private var prependedPages: [[Stored]] = []
+        private var prependedPageEnds: [Int] = []
+        private var tail: [Stored] = []
+        private var currentPrependOffset = 0
+        private let shifted: (Element, Int) -> Element
+        private(set) var fullMaterializationCount = 0
+
+        init(shifted: @escaping (Element, Int) -> Element) {
+            self.shifted = shifted
+        }
+
+        var startIndex: Int { 0 }
+        var endIndex: Int { (prependedPageEnds.last ?? 0) + tail.count }
+
+        subscript(position: Int) -> Element {
+            precondition(indices.contains(position))
+            let prependedCount = prependedPageEnds.last ?? 0
+            let stored: Stored
+            if position < prependedCount {
+                // Pages and their elements are retained in insertion order;
+                // reading that storage backwards yields chronological display
+                // order after successively older pages are added.
+                let reverseOffset = prependedCount - 1 - position
+                var lower = 0
+                var upper = prependedPageEnds.count
+                while lower < upper {
+                    let middle = lower + (upper - lower) / 2
+                    if prependedPageEnds[middle] > reverseOffset {
+                        upper = middle
+                    } else {
+                        lower = middle + 1
+                    }
+                }
+                let pageIndex = lower
+                let priorEnd = pageIndex == 0 ? 0 : prependedPageEnds[pageIndex - 1]
+                stored = prependedPages[pageIndex][reverseOffset - priorEnd]
+            } else {
+                stored = tail[position - prependedCount]
+            }
+            return shifted(stored.element, currentPrependOffset - stored.prependOffset)
+        }
+
+        mutating func replaceAll(with elements: [Element]) {
+            prependedPages.removeAll(keepingCapacity: true)
+            prependedPageEnds.removeAll(keepingCapacity: true)
+            tail = elements.map { Stored(element: $0, prependOffset: currentPrependOffset) }
+        }
+
+        mutating func prepend(_ elements: [Element], itemOffset: Int) {
+            guard itemOffset != 0 else { return }
+            currentPrependOffset += itemOffset
+            guard !elements.isEmpty else { return }
+            prependedPages.append(elements.reversed().map {
+                Stored(element: $0, prependOffset: currentPrependOffset)
+            })
+            prependedPageEnds.append((prependedPageEnds.last ?? 0) + elements.count)
+        }
+
+        mutating func removeSubrange(_ bounds: Range<Int>) {
+            guard !bounds.isEmpty else { return }
+            let prependedCount = prependedPageEnds.last ?? 0
+            if bounds.lowerBound >= prependedCount {
+                tail.removeSubrange(
+                    (bounds.lowerBound - prependedCount)..<(bounds.upperBound - prependedCount)
+                )
+                return
+            }
+
+            fullMaterializationCount += 1
+            var materialized = Array(self)
+            materialized.removeSubrange(bounds)
+            replaceAll(with: materialized)
+        }
+
+        mutating func append(contentsOf elements: [Element]) {
+            tail.append(contentsOf: elements.map {
+                Stored(element: $0, prependOffset: currentPrependOffset)
+            })
+        }
+    }
+
     private struct AppendProjectionChange {
         let displayStart: Int
         let oldDisplayCount: Int
         let oldTailIDs: [String]
         let newTailIDs: [String]
-        let reloadsExistingGroup: Bool
         let requiresReload: Bool
+    }
 
-        var preservesExistingRows: Bool {
-            !requiresReload && newTailIDs.starts(with: oldTailIDs)
+    private struct PrependProjectionChange {
+        let insertedDisplayCount: Int
+        let requiresReload: Bool
+    }
+
+    private struct ViewportAnchor {
+        let rowID: String
+        let displayIndex: Int
+        let offsetFromViewportTop: CGFloat
+    }
+
+    /// The pending-response row is presentation-only, but it still occupies
+    /// a real collection-view index. Keep its old and new topology alongside
+    /// every transcript projection mutation so AppKit sees one coherent
+    /// transaction when a first token arrives at the same time that the row
+    /// disappears.
+    private struct PendingResponseChange {
+        let old: TranscriptPendingResponse
+        let new: TranscriptPendingResponse
+        let oldDisplayCount: Int
+
+        var visibilityChanged: Bool { old.isVisible != new.isVisible }
+        var labelChanged: Bool {
+            old.isVisible && new.isVisible && old.label != new.label
         }
     }
 
@@ -762,16 +985,50 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
     /// Collection rows are presentation-only. A collapsed activity group
     /// replaces its contiguous children with one summary row; expanding it
     /// puts the original children back at their stable positions.
-    private var displayRows: [DisplayRow] = []
-    private var activityGroups: [TranscriptActivityGroup] = []
+    private var displayRows = PrependOffsetStorage<DisplayRow> { row, offset in
+        switch row {
+        case let .item(index): .item(index: index + offset)
+        case let .activityGroup(group): .activityGroup(TranscriptActivityGroup(
+            id: group.id,
+            range: (group.range.lowerBound + offset)..<(group.range.upperBound + offset),
+            itemIDs: group.itemIDs,
+            title: group.title,
+            summary: group.summary
+        ))
+        }
+    }
+    private var activityGroups = PrependOffsetStorage<TranscriptActivityGroup> { group, offset in
+        TranscriptActivityGroup(
+            id: group.id,
+            range: (group.range.lowerBound + offset)..<(group.range.upperBound + offset),
+            itemIDs: group.itemIDs,
+            title: group.title,
+            summary: group.summary
+        )
+    }
     private var displayIndexByItemIndex: [Int: Int] = [:]
     private var groupDisplayIndexByItemIndex: [Int: Int] = [:]
+    /// A prepend shifts every historical row's item index. Defer rebuilding
+    /// these auxiliary lookup maps until an operation that needs them, so
+    /// repeated older-page loads do not rescan the whole transcript.
+    private var displayIndexIsDirty = false
+    /// After a prepend, the existing lookup maps still describe the mounted
+    /// suffix. Keep its item/display offsets separately so a live tail update
+    /// can resolve its row without rebuilding maps for the whole transcript.
+    private var deferredItemIndexOffset = 0
+    private var deferredDisplayIndexOffset = 0
     private var expandedActivityGroupIDs = Set<String>()
     /// Expansion follows provider-stable timeline IDs, never collection
     /// indexes. Streaming and insertion can recycle cells while preserving a
     /// row's identity.
     private var expandedItemIDs = Set<String>()
     private var hasScheduledFollowScroll = false
+    private var editableUserMessageID: String?
+    private var onEditUserMessage: (String) -> Void = { _ in }
+    private(set) var prependInstrumentation = TranscriptPrependInstrumentation()
+    var projectionStorageMaterializationCount: Int {
+        displayRows.fullMaterializationCount + activityGroups.fullMaterializationCount
+    }
 
     override func loadView() {
         view = NSView()
@@ -831,8 +1088,12 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         isAwaitingResponse: Bool = false,
         workingLabel: String = "Working",
         revision newRevision: UInt64? = nil,
-        changeHint: TranscriptCollectionUpdate.Hint? = nil
+        changeHint: TranscriptCollectionUpdate.Hint? = nil,
+        editableUserMessageID newEditableUserMessageID: String? = nil,
+        onEditUserMessage newOnEditUserMessage: @escaping (String) -> Void = { _ in }
     ) {
+        editableUserMessageID = newEditableUserMessageID
+        onEditUserMessage = newOnEditUserMessage
         let shouldFollow = isNearBottom
         let oldItems = items
         var planningInstrumentation = TranscriptCollectionUpdate.PlanningInstrumentation()
@@ -855,7 +1116,11 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         // and the pending-row insert/delete against the correct old item
         // count, without a full reload of a potentially long history.
         let oldPendingResponse = pendingResponse
-        let pendingResponseChanged = newPendingResponse != oldPendingResponse
+        let pendingResponseChange = PendingResponseChange(
+            old: oldPendingResponse,
+            new: newPendingResponse,
+            oldDisplayCount: displayRows.count
+        )
         if update == .reloadAll {
             let validExpandableIDs = Set(
                 newItems.lazy
@@ -867,7 +1132,7 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
             let changedIndices: IndexSet = switch update {
             case let .tailChange(index): IndexSet(integer: index)
             case let .rowChanges(indices): indices
-            case .unchanged, .append, .reloadAll: []
+            case .unchanged, .append, .prepend, .reloadAll: []
             }
             for index in changedIndices where newItems.indices.contains(index) {
                 if !newItems[index].kind.isCollapsibleActivity {
@@ -877,7 +1142,13 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         }
 
         var appendProjectionChange: AppendProjectionChange?
+        var prependProjectionChange: PrependProjectionChange?
         var tailProjectionChange: TailProjectionChange?
+        let viewportAnchor: ViewportAnchor? = if case .prepend = update {
+            captureViewportAnchor()
+        } else {
+            nil
+        }
         let groupingStructureChanged: Bool
         let displayMappingChanged: Bool
         if case let .append(appendedRange) = update {
@@ -888,6 +1159,14 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
             )
             groupingStructureChanged = false
             // The append path updates just the affected index-map suffix.
+            displayMappingChanged = false
+        } else if case let .prepend(prependedRange) = update {
+            prependProjectionChange = prependProjection(
+                oldItems: oldItems,
+                newItems: newItems,
+                prependedRange: prependedRange
+            )
+            groupingStructureChanged = false
             displayMappingChanged = false
         } else if case let .tailChange(index) = update,
                   TranscriptActivityGrouping.requiresProjectionRebuild(
@@ -918,8 +1197,8 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
             let oldDisplayRowIDs = displayRows.map(\.id)
             let newGroups = TranscriptActivityGrouping.groups(for: newItems)
             expandedActivityGroupIDs.formIntersection(Set(newGroups.map(\.id)))
-            activityGroups = newGroups
-            displayRows = makeDisplayRows(items: newItems, groups: newGroups)
+            activityGroups.replaceAll(with: newGroups)
+            displayRows.replaceAll(with: makeDisplayRows(items: newItems, groups: newGroups))
             groupingStructureChanged = oldGroupStructure != newGroups.map(\.structureKey)
             displayMappingChanged = groupingStructureChanged
                 || oldDisplayRowIDs != displayRows.map(\.id)
@@ -932,21 +1211,51 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         items = newItems
         itemsRevision = newRevision
 
+        // Publish the final data-source state before entering the collection
+        // transaction. Every incremental operation below (including a
+        // pending-row insert/delete) is then validated against the same new
+        // row count. The old pending state remains captured in
+        // `pendingResponseChange` for index-path planning.
+        pendingResponse = newPendingResponse
+
         if let appendProjectionChange {
-            applyAppendProjectionChange(appendProjectionChange)
+            applyAppendProjectionChange(
+                appendProjectionChange,
+                pendingResponseChange: pendingResponseChange
+            )
+        } else if let prependProjectionChange {
+            applyPrependProjectionChange(
+                prependProjectionChange,
+                anchor: viewportAnchor,
+                pendingResponseChange: pendingResponseChange
+            )
         } else if let tailProjectionChange {
-            applyTailProjectionChange(tailProjectionChange)
+            applyTailProjectionChange(
+                tailProjectionChange,
+                pendingResponseChange: pendingResponseChange
+            )
         } else if groupingStructureChanged {
             collectionView.reloadData()
         } else {
             switch update {
             case .unchanged:
-                break
+                applySimpleCollectionUpdate(
+                    pendingResponseChange: pendingResponseChange
+                )
             case let .tailChange(index):
-                reloadRows(IndexSet(integer: index))
+                applySimpleCollectionUpdate(
+                    pendingResponseChange: pendingResponseChange,
+                    reloadIndices: IndexSet(integer: index)
+                )
             case let .rowChanges(indices):
-                reloadRows(indices)
+                applySimpleCollectionUpdate(
+                    pendingResponseChange: pendingResponseChange,
+                    reloadIndices: indices
+                )
             case .append:
+                // Handled by the incremental projection branch above.
+                break
+            case .prepend:
                 // Handled by the incremental projection branch above.
                 break
             case .reloadAll:
@@ -954,24 +1263,11 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
             }
         }
 
-        // Update the UI-owned response indicator independently.  Showing or
-        // hiding it should touch one collection item at the tail, not cause
-        // every Markdown-heavy transcript cell to be recreated.  This runs
-        // after transcript mutations while `pendingResponse` still describes
-        // the old data-source count, so insert/delete validation remains
-        // consistent even when a streamed item and the indicator change in
-        // the same SwiftUI update.
-        pendingResponse = newPendingResponse
-        if pendingResponseChanged {
-            applyPendingResponseChange(
-                from: oldPendingResponse,
-                to: newPendingResponse
-            )
-        }
-
-        if shouldFollow || oldItems.isEmpty || pendingResponse.isVisible {
+        let prependedHistory = if case .prepend = update { true } else { false }
+        if !prependedHistory && (shouldFollow || oldItems.isEmpty || pendingResponse.isVisible) {
             scheduleFollowScroll()
         }
+        refreshVisibleMessageEditActions()
     }
 
     private func scheduleFollowScroll() {
@@ -984,29 +1280,82 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         }
     }
 
-    private func applyPendingResponseChange(
-        from oldResponse: TranscriptPendingResponse,
-        to newResponse: TranscriptPendingResponse
+    /// Applies one coherent AppKit transaction for a transcript mutation and
+    /// the presentation-only pending row. In particular, a streamed first
+    /// token may insert transcript rows while removing the old waiting row at
+    /// the same tail index; issuing those as separate collection mutations
+    /// leaves NSCollectionView with an invalid intermediate item count.
+    private func performCollectionBatch(
+        pendingResponseChange change: PendingResponseChange,
+        hasUpdates: Bool,
+        updates: @escaping () -> Void,
+        completion: (() -> Void)? = nil
     ) {
-        let oldVisible = oldResponse.isVisible
-        let newVisible = newResponse.isVisible
-        let pendingIndex = displayRows.count
+        let oldVisible = change.old.isVisible
+        let newVisible = change.new.isVisible
+        let oldDisplayCount = change.oldDisplayCount
+        let newDisplayCount = displayRows.count
+        let pendingVisibilityChanged = oldVisible != newVisible
+        let canReloadLabelInBatch = change.labelChanged
+            && !pendingVisibilityChanged
+            && oldDisplayCount == newDisplayCount
+        let hasPendingOperation = pendingVisibilityChanged || canReloadLabelInBatch
 
-        switch (oldVisible, newVisible) {
-        case (false, true):
-            collectionView.insertItems(
-                at: [IndexPath(item: pendingIndex, section: 0)]
-            )
-        case (true, false):
-            collectionView.deleteItems(
-                at: [IndexPath(item: pendingIndex, section: 0)]
-            )
-        case (true, true) where oldResponse.label != newResponse.label:
-            collectionView.reloadItems(
-                at: [IndexPath(item: pendingIndex, section: 0)]
-            )
-        case (false, false), (true, true):
-            break
+        guard hasPendingOperation || hasUpdates else {
+            completion?()
+            return
+        }
+
+        collectionView.performBatchUpdates({ [weak self] in
+            guard let self else { return }
+            updates()
+            if oldVisible, !newVisible {
+                self.collectionView.deleteItems(at: [
+                    IndexPath(item: oldDisplayCount, section: 0),
+                ])
+            } else if !oldVisible, newVisible {
+                self.collectionView.insertItems(at: [
+                    IndexPath(item: newDisplayCount, section: 0),
+                ])
+            }
+            if canReloadLabelInBatch {
+                self.collectionView.reloadItems(at: [
+                    IndexPath(item: newDisplayCount, section: 0),
+                ])
+            }
+        }, completionHandler: { [weak self] _ in
+            guard let self else {
+                completion?()
+                return
+            }
+            // If transcript rows shifted the pending row, reload its new
+            // position only after the structural batch has settled. This is
+            // a content refresh, not a second topology mutation.
+            if change.labelChanged,
+               !canReloadLabelInBatch,
+               newVisible,
+               self.pendingResponse == change.new {
+                self.collectionView.reloadItems(at: [
+                    IndexPath(item: self.displayRows.count, section: 0),
+                ])
+            }
+            completion?()
+        })
+    }
+
+    private func applySimpleCollectionUpdate(
+        pendingResponseChange change: PendingResponseChange,
+        reloadIndices: IndexSet = []
+    ) {
+        let indexPaths = reloadIndexPaths(for: reloadIndices)
+        performCollectionBatch(
+            pendingResponseChange: change,
+            hasUpdates: !indexPaths.isEmpty
+        ) { [weak self] in
+            guard let self else { return }
+            if !indexPaths.isEmpty {
+                self.collectionView.reloadItems(at: indexPaths)
+            }
         }
     }
 
@@ -1049,6 +1398,10 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
             transcriptItem.configure(
                 with: timelineItem,
                 isExpanded: isExpanded(timelineItem),
+                isEditable: timelineItem.id == editableUserMessageID,
+                onEdit: { [weak self] in
+                    self?.onEditUserMessage(timelineItem.id)
+                },
                 onToggle: { [weak self] expanded in
                     self?.setExpanded(expanded, for: timelineItem.id)
                 }
@@ -1089,9 +1442,9 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         let metrics = flowMetrics
         return NSEdgeInsets(
             top: 18,
-            left: metrics.horizontalInset,
+            left: metrics.leadingInset,
             bottom: 24,
-            right: metrics.horizontalInset
+            right: metrics.trailingInset
         )
     }
 
@@ -1130,18 +1483,19 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         return documentView.bounds.height - visibleMaxY < 48
     }
 
-    private func makeDisplayRows(
+    private func makeDisplayRows<Groups: Collection>(
         items: [TimelineItem],
-        groups: [TranscriptActivityGroup]
-    ) -> [DisplayRow] {
-        makeDisplayRows(items: items, groups: groups[...], startingAt: 0)
+        groups: Groups
+    ) -> [DisplayRow] where Groups.Element == TranscriptActivityGroup {
+        makeDisplayRows(items: items, groups: groups, startingAt: 0)
     }
 
-    private func makeDisplayRows(
+    private func makeDisplayRows<Groups: Collection>(
         items: [TimelineItem],
-        groups: ArraySlice<TranscriptActivityGroup>,
-        startingAt initialIndex: Int
-    ) -> [DisplayRow] {
+        groups: Groups,
+        startingAt initialIndex: Int,
+        endingAt requestedEndIndex: Int? = nil
+    ) -> [DisplayRow] where Groups.Element == TranscriptActivityGroup {
         var groupsByStart: [Int: TranscriptActivityGroup] = [:]
         groupsByStart.reserveCapacity(groups.count)
         for group in groups {
@@ -1149,9 +1503,10 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         }
 
         var rows: [DisplayRow] = []
-        rows.reserveCapacity(max(0, items.count - initialIndex))
+        let endIndex = min(items.count, max(initialIndex, requestedEndIndex ?? items.count))
+        rows.reserveCapacity(max(0, endIndex - initialIndex))
         var index = initialIndex
-        while index < items.count {
+        while index < endIndex {
             if let group = groupsByStart[index] {
                 // Keep the disclosure row mounted while expanded so the user
                 // can collapse the rollup again after inspecting its child
@@ -1170,54 +1525,207 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         return rows
     }
 
+    /// Extends the projection above the current page without touching the
+    /// mounted suffix. Groups intentionally stop at the page boundary: joining
+    /// two routine-activity runs across that boundary would mutate the first
+    /// visible row and defeat stable incremental insertion.
+    private func prependProjection(
+        oldItems: [TimelineItem],
+        newItems: [TimelineItem],
+        prependedRange: Range<Int>
+    ) -> PrependProjectionChange {
+        guard prependedRange.lowerBound == 0,
+              prependedRange.upperBound > 0,
+              newItems.count == oldItems.count + prependedRange.count else {
+            let rebuiltGroups = TranscriptActivityGrouping.groups(for: newItems)
+            activityGroups.replaceAll(with: rebuiltGroups)
+            displayRows.replaceAll(with: makeDisplayRows(items: newItems, groups: rebuiltGroups))
+            rebuildDisplayIndex()
+            return PrependProjectionChange(insertedDisplayCount: 0, requiresReload: true)
+        }
+
+        let offset = prependedRange.count
+        let prefixItems = Array(newItems[prependedRange])
+        let prefixGroups = TranscriptActivityGrouping.groups(for: prefixItems)
+        let prefixRows = makeDisplayRows(
+            items: newItems,
+            groups: prefixGroups[...],
+            startingAt: 0,
+            endingAt: offset
+        )
+
+        activityGroups.prepend(prefixGroups, itemOffset: offset)
+        displayRows.prepend(prefixRows, itemOffset: offset)
+        prependInstrumentation.projectedPrefixItemCount += prefixItems.count
+        prependInstrumentation.projectedPrefixGroupCount += prefixGroups.count
+        displayIndexIsDirty = true
+        deferredItemIndexOffset += offset
+        deferredDisplayIndexOffset += prefixRows.count
+        return PrependProjectionChange(
+            insertedDisplayCount: prefixRows.count,
+            requiresReload: false
+        )
+    }
+
+    private func captureViewportAnchor() -> ViewportAnchor? {
+        let visiblePaths = collectionView.indexPathsForVisibleItems()
+            .filter { displayRows.indices.contains($0.item) }
+            .sorted { $0.item < $1.item }
+        guard let path = visiblePaths.first,
+              let attributes = collectionView.layoutAttributesForItem(at: path),
+              let rowID = stableID(for: displayRows[path.item], in: items) else { return nil }
+        return ViewportAnchor(
+            rowID: rowID,
+            displayIndex: path.item,
+            offsetFromViewportTop: attributes.frame.minY - scrollView.contentView.bounds.minY
+        )
+    }
+
+    private func stableID(for row: DisplayRow, in items: [TimelineItem]) -> String? {
+        switch row {
+        case let .item(index):
+            guard items.indices.contains(index) else { return nil }
+            return "item:\(items[index].id)"
+        case let .activityGroup(group):
+            return "group:\(group.id)"
+        }
+    }
+
+    private func applyPrependProjectionChange(
+        _ change: PrependProjectionChange,
+        anchor: ViewportAnchor?,
+        pendingResponseChange: PendingResponseChange
+    ) {
+        guard !change.requiresReload else {
+            prependInstrumentation.fullReloadCount += 1
+            collectionView.reloadData()
+            restoreViewport(anchor)
+            return
+        }
+        guard change.insertedDisplayCount > 0 else {
+            performCollectionBatch(
+                pendingResponseChange: pendingResponseChange,
+                hasUpdates: false,
+                updates: {},
+                completion: { [weak self] in self?.restoreViewport(anchor) }
+            )
+            return
+        }
+
+        let insertedPaths = Set(
+            (0..<change.insertedDisplayCount).map { IndexPath(item: $0, section: 0) }
+        )
+        prependInstrumentation.insertedDisplayRowCount += change.insertedDisplayCount
+        performCollectionBatch(
+            pendingResponseChange: pendingResponseChange,
+            hasUpdates: true,
+            updates: { [weak self] in
+                self?.collectionView.insertItems(at: insertedPaths)
+            }
+        ) { [weak self] in
+            self?.restoreViewport(
+                anchor,
+                expectedDisplayIndexOffset: change.insertedDisplayCount
+            )
+        }
+    }
+
+    private func restoreViewport(
+        _ anchor: ViewportAnchor?,
+        expectedDisplayIndexOffset: Int = 0
+    ) {
+        guard let anchor else { return }
+        // AppKit may complete a batch before its flow layout has produced the
+        // inserted rows' final attributes. Defer one main-loop turn so the
+        // stable old row can be placed at precisely its previous visual offset.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let expectedDisplayIndex = anchor.displayIndex + expectedDisplayIndexOffset
+            let displayIndex: Int?
+            if self.displayRows.indices.contains(expectedDisplayIndex),
+               self.stableID(
+                   for: self.displayRows[expectedDisplayIndex],
+                   in: self.items
+               ) == anchor.rowID {
+                displayIndex = expectedDisplayIndex
+            } else {
+                // The fallback is reserved for a defensive full reload. A
+                // valid prepend knows exactly how many display rows were
+                // inserted and restores the anchor without scanning history.
+                self.prependInstrumentation.anchorFallbackScanCount += 1
+                displayIndex = self.displayRows.firstIndex(where: {
+                    self.stableID(for: $0, in: self.items) == anchor.rowID
+                })
+            }
+            guard let displayIndex,
+                  let attributes = self.collectionView.layoutAttributesForItem(
+                      at: IndexPath(item: displayIndex, section: 0)
+                  ) else { return }
+
+            let clipView = self.scrollView.contentView
+            var proposedBounds = clipView.bounds
+            proposedBounds.origin.y = attributes.frame.minY - anchor.offsetFromViewportTop
+            let constrained = clipView.constrainBoundsRect(proposedBounds)
+            clipView.scroll(to: constrained.origin)
+            self.scrollView.reflectScrolledClipView(clipView)
+        }
+    }
+
     private func appendProjection(
         oldItems: [TimelineItem],
         newItems: [TimelineItem],
         appendedRange: Range<Int>
     ) -> AppendProjectionChange {
         let oldDisplayCount = displayRows.count
-        guard let result = TranscriptActivityGrouping.append(
-            to: &activityGroups,
+        let hadDeferredDisplayIndex = displayIndexIsDirty
+        var groupingInstrumentation = TranscriptActivityGrouping.AppendInstrumentation()
+        guard let mutation = TranscriptActivityGrouping.appendMutation(
+            for: activityGroups,
             oldItems: oldItems,
             newItems: newItems,
-            appendedRange: appendedRange
+            appendedRange: appendedRange,
+            instrumentation: &groupingInstrumentation
         ) else {
-            activityGroups = TranscriptActivityGrouping.groups(for: newItems)
-            displayRows = makeDisplayRows(items: newItems, groups: activityGroups)
+            let rebuiltGroups = TranscriptActivityGrouping.groups(for: newItems)
+            activityGroups.replaceAll(with: rebuiltGroups)
+            displayRows.replaceAll(with: makeDisplayRows(items: newItems, groups: rebuiltGroups))
             rebuildDisplayIndex()
             return AppendProjectionChange(
                 displayStart: 0,
                 oldDisplayCount: oldDisplayCount,
                 oldTailIDs: [],
                 newTailIDs: [],
-                reloadsExistingGroup: false,
                 requiresReload: true
             )
         }
-
+        prependInstrumentation.tailGroupingInspectedItemCount +=
+            groupingInstrumentation.inspectedItemCount
+        let result = mutation.result
+        activityGroups.removeSubrange(result.groupStart..<activityGroups.endIndex)
+        activityGroups.append(contentsOf: mutation.replacementGroups)
         let displayStart: Int
         if result.itemStart == oldItems.count {
             displayStart = oldDisplayCount
-        } else if let groupIndex = groupDisplayIndexByItemIndex[result.itemStart] {
+        } else if let groupIndex = deferredGroupDisplayIndex(for: result.itemStart) {
             displayStart = groupIndex
-        } else if let itemIndex = displayIndexByItemIndex[result.itemStart] {
+        } else if let itemIndex = deferredDisplayIndex(for: result.itemStart) {
             displayStart = itemIndex
         } else {
-            activityGroups = TranscriptActivityGrouping.groups(for: newItems)
-            displayRows = makeDisplayRows(items: newItems, groups: activityGroups)
+            let rebuiltGroups = TranscriptActivityGrouping.groups(for: newItems)
+            activityGroups.replaceAll(with: rebuiltGroups)
+            displayRows.replaceAll(with: makeDisplayRows(items: newItems, groups: rebuiltGroups))
             rebuildDisplayIndex()
             return AppendProjectionChange(
                 displayStart: 0,
                 oldDisplayCount: oldDisplayCount,
                 oldTailIDs: [],
                 newTailIDs: [],
-                reloadsExistingGroup: false,
                 requiresReload: true
             )
         }
 
         let oldTailIDs = displayRows[displayStart...].map(\.id)
-        displayRows.removeSubrange(displayStart...)
+        displayRows.removeSubrange(displayStart..<displayRows.endIndex)
         let tailRows = makeDisplayRows(
             items: newItems,
             groups: activityGroups[result.groupStart...],
@@ -1225,10 +1733,11 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         )
         displayRows.append(contentsOf: tailRows)
         let newTailIDs = tailRows.map(\.id)
-        rebuildDisplayIndex(
+        updateDisplayIndexSuffix(
             fromDisplayIndex: displayStart,
             itemIndexStart: result.itemStart,
-            oldItemCount: oldItems.count
+            oldItemCount: oldItems.count,
+            preservingDeferredOffsets: hadDeferredDisplayIndex
         )
 
         return AppendProjectionChange(
@@ -1236,54 +1745,157 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
             oldDisplayCount: oldDisplayCount,
             oldTailIDs: oldTailIDs,
             newTailIDs: newTailIDs,
-            reloadsExistingGroup: result.itemStart < oldItems.count
-                && tailRows.first.map { row in
-                    if case .activityGroup = row { return true }
-                    return false
-                } == true,
             requiresReload: false
         )
     }
 
-    private func applyAppendProjectionChange(_ change: AppendProjectionChange) {
-        guard change.preservesExistingRows else {
+    private func applyAppendProjectionChange(
+        _ change: AppendProjectionChange,
+        pendingResponseChange: PendingResponseChange
+    ) {
+        applySuffixProjectionChange(
+            displayStart: change.displayStart,
+            oldDisplayCount: change.oldDisplayCount,
+            oldTailIDs: change.oldTailIDs,
+            newTailIDs: change.newTailIDs,
+            requiresReload: change.requiresReload,
+            pendingResponseChange: pendingResponseChange
+        )
+    }
+
+    /// Reconciles only the mutable display suffix. The common prefix stays
+    /// mounted and is reloaded atomically when its rollup summary changed;
+    /// the remaining old/new rows are deleted and inserted in the same AppKit
+    /// transaction. This covers lone-activity -> rollup, live-tail joining an
+    /// existing rollup, and the bounded eight -> nine activity transition.
+    private func applySuffixProjectionChange(
+        displayStart: Int,
+        oldDisplayCount: Int,
+        oldTailIDs: [String],
+        newTailIDs: [String],
+        requiresReload: Bool,
+        pendingResponseChange: PendingResponseChange
+    ) {
+        guard !requiresReload,
+              oldDisplayCount == displayStart + oldTailIDs.count,
+              displayRows.count == displayStart + newTailIDs.count else {
+            prependInstrumentation.projectionFullReloadCount += 1
             collectionView.reloadData()
             return
         }
 
-        // `appendProjection` has already installed the new display-row
-        // snapshot because the collection view's data source must be able to
-        // render the inserted cells immediately. When an eight-item activity
-        // rollup reaches its bound and the next activity becomes a new row,
-        // the snapshot grows *and* the surviving rollup changes. Issuing the
-        // reload first asks AppKit to reload against the old item count while
-        // the data source reports the new count, which raises
-        // `NSInternalInconsistencyException` during hosted SwiftUI layout.
-        // Apply both topology and content changes as one collection update so
-        // AppKit validates the old/new counts together.
-        let insertedPaths: Set<IndexPath>
-        if displayRows.count > change.oldDisplayCount {
-            insertedPaths = Set(
-                (change.oldDisplayCount..<displayRows.count).map {
+        if oldTailIDs == newTailIDs {
+            let paths = Set(
+                (displayStart..<displayRows.count).map {
                     IndexPath(item: $0, section: 0)
                 }
             )
-        } else {
-            insertedPaths = []
+            performCollectionBatch(
+                pendingResponseChange: pendingResponseChange,
+                hasUpdates: !paths.isEmpty
+            ) { [weak self] in
+                guard let self, !paths.isEmpty else { return }
+                self.collectionView.reloadItems(at: paths)
+            }
+            return
         }
-        let reloadPaths: Set<IndexPath> = change.reloadsExistingGroup
-            ? [IndexPath(item: change.displayStart, section: 0)]
-            : []
-        guard !insertedPaths.isEmpty || !reloadPaths.isEmpty else { return }
 
-        collectionView.performBatchUpdates({
+        var commonPrefixCount = 0
+        while commonPrefixCount < min(oldTailIDs.count, newTailIDs.count),
+              oldTailIDs[commonPrefixCount] == newTailIDs[commonPrefixCount] {
+            commonPrefixCount += 1
+        }
+
+        let replacementStart = displayStart + commonPrefixCount
+        let deletedPaths = Set(
+            (replacementStart..<oldDisplayCount).map {
+                IndexPath(item: $0, section: 0)
+            }
+        )
+        let insertedPaths = Set(
+            (replacementStart..<displayRows.count).map {
+                IndexPath(item: $0, section: 0)
+            }
+        )
+        let reloadPaths = Set(
+            (displayStart..<replacementStart).map {
+                IndexPath(item: $0, section: 0)
+            }
+        )
+        let hasSuffixUpdates = !deletedPaths.isEmpty
+            || !insertedPaths.isEmpty
+            || !reloadPaths.isEmpty
+        if hasSuffixUpdates {
+            prependInstrumentation.suffixBatchUpdateCount += 1
+        }
+        performCollectionBatch(
+            pendingResponseChange: pendingResponseChange,
+            hasUpdates: hasSuffixUpdates
+        ) { [weak self] in
+            guard let self else { return }
+            if !deletedPaths.isEmpty {
+                self.collectionView.deleteItems(at: deletedPaths)
+            }
             if !insertedPaths.isEmpty {
-                collectionView.insertItems(at: insertedPaths)
+                self.collectionView.insertItems(at: insertedPaths)
             }
             if !reloadPaths.isEmpty {
-                collectionView.reloadItems(at: reloadPaths)
+                self.collectionView.reloadItems(at: reloadPaths)
             }
-        }, completionHandler: nil)
+        }
+    }
+
+    private func deferredDisplayIndex(for itemIndex: Int) -> Int? {
+        if let baseIndex = displayIndexByItemIndex[itemIndex - deferredItemIndexOffset] {
+            let candidate = baseIndex + deferredDisplayIndexOffset
+            if displayRow(at: candidate, contains: itemIndex, groupOnly: false) {
+                return candidate
+            }
+        }
+        return displayIndexNearTail(for: itemIndex, groupOnly: false)
+    }
+
+    private func deferredGroupDisplayIndex(for itemIndex: Int) -> Int? {
+        if let baseIndex = groupDisplayIndexByItemIndex[itemIndex - deferredItemIndexOffset] {
+            let candidate = baseIndex + deferredDisplayIndexOffset
+            if displayRow(at: candidate, contains: itemIndex, groupOnly: true) {
+                return candidate
+            }
+        }
+        return displayIndexNearTail(for: itemIndex, groupOnly: true)
+    }
+
+    private func displayRow(at displayIndex: Int, contains itemIndex: Int, groupOnly: Bool) -> Bool {
+        guard displayRows.indices.contains(displayIndex) else { return false }
+        switch displayRows[displayIndex] {
+        case let .item(index):
+            return !groupOnly && index == itemIndex
+        case let .activityGroup(group):
+            return group.range.contains(itemIndex)
+        }
+    }
+
+    private func displayIndexNearTail(for itemIndex: Int, groupOnly: Bool) -> Int? {
+        prependInstrumentation.nearTailLookupCount += 1
+        guard !displayRows.isEmpty else { return nil }
+        var displayIndex = displayRows.index(before: displayRows.endIndex)
+        var inspectedRowCount = 0
+        while inspectedRowCount < Self.maximumNearTailLookupRows {
+            inspectedRowCount += 1
+            prependInstrumentation.nearTailInspectedRowCount += 1
+            switch displayRows[displayIndex] {
+            case let .item(index):
+                if !groupOnly, index == itemIndex { return displayIndex }
+                if index < itemIndex { return nil }
+            case let .activityGroup(group):
+                if group.range.contains(itemIndex) { return displayIndex }
+                if group.range.upperBound <= itemIndex { return nil }
+            }
+            guard displayIndex > displayRows.startIndex else { return nil }
+            displayIndex = displayRows.index(before: displayIndex)
+        }
+        prependInstrumentation.nearTailLookupBudgetExceededCount += 1
+        return nil
     }
 
     private func replaceChangedTailProjection(
@@ -1292,16 +1904,20 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         changedIndex: Int
     ) -> TailProjectionChange {
         let oldDisplayCount = displayRows.count
+        let hadDeferredDisplayIndex = displayIndexIsDirty
         let oldGroupCount = activityGroups.count
         let previousLastGroupID = activityGroups.last?.id
-        guard let result = TranscriptActivityGrouping.replaceChangedTail(
-            in: &activityGroups,
+        var groupingInstrumentation = TranscriptActivityGrouping.AppendInstrumentation()
+        guard let mutation = TranscriptActivityGrouping.replaceChangedTailMutation(
+            in: activityGroups,
             oldItems: oldItems,
             newItems: newItems,
-            changedIndex: changedIndex
+            changedIndex: changedIndex,
+            instrumentation: &groupingInstrumentation
         ) else {
-            activityGroups = TranscriptActivityGrouping.groups(for: newItems)
-            displayRows = makeDisplayRows(items: newItems, groups: activityGroups)
+            let rebuiltGroups = TranscriptActivityGrouping.groups(for: newItems)
+            activityGroups.replaceAll(with: rebuiltGroups)
+            displayRows.replaceAll(with: makeDisplayRows(items: newItems, groups: rebuiltGroups))
             rebuildDisplayIndex()
             return TailProjectionChange(
                 displayStart: 0,
@@ -1311,7 +1927,11 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
                 requiresReload: true
             )
         }
-
+        prependInstrumentation.tailGroupingInspectedItemCount +=
+            groupingInstrumentation.inspectedItemCount
+        let result = mutation.result
+        activityGroups.removeSubrange(result.groupStart..<activityGroups.endIndex)
+        activityGroups.append(contentsOf: mutation.replacementGroups)
         if result.groupStart < oldGroupCount,
            let previousLastGroupID,
            !activityGroups[result.groupStart...].contains(where: { $0.id == previousLastGroupID }) {
@@ -1319,13 +1939,14 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         }
 
         let displayStart: Int
-        if let groupIndex = groupDisplayIndexByItemIndex[result.itemStart] {
+        if let groupIndex = deferredGroupDisplayIndex(for: result.itemStart) {
             displayStart = groupIndex
-        } else if let itemIndex = displayIndexByItemIndex[result.itemStart] {
+        } else if let itemIndex = deferredDisplayIndex(for: result.itemStart) {
             displayStart = itemIndex
         } else {
-            activityGroups = TranscriptActivityGrouping.groups(for: newItems)
-            displayRows = makeDisplayRows(items: newItems, groups: activityGroups)
+            let rebuiltGroups = TranscriptActivityGrouping.groups(for: newItems)
+            activityGroups.replaceAll(with: rebuiltGroups)
+            displayRows.replaceAll(with: makeDisplayRows(items: newItems, groups: rebuiltGroups))
             rebuildDisplayIndex()
             return TailProjectionChange(
                 displayStart: 0,
@@ -1337,17 +1958,18 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         }
 
         let oldTailIDs = displayRows[displayStart...].map(\.id)
-        displayRows.removeSubrange(displayStart...)
+        displayRows.removeSubrange(displayStart..<displayRows.endIndex)
         let tailRows = makeDisplayRows(
             items: newItems,
             groups: activityGroups[result.groupStart...],
             startingAt: result.itemStart
         )
         displayRows.append(contentsOf: tailRows)
-        rebuildDisplayIndex(
+        updateDisplayIndexSuffix(
             fromDisplayIndex: displayStart,
             itemIndexStart: result.itemStart,
-            oldItemCount: oldItems.count
+            oldItemCount: oldItems.count,
+            preservingDeferredOffsets: hadDeferredDisplayIndex
         )
 
         return TailProjectionChange(
@@ -1359,30 +1981,22 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         )
     }
 
-    private func applyTailProjectionChange(_ change: TailProjectionChange) {
-        guard !change.requiresReload else {
-            collectionView.reloadData()
-            return
-        }
-
-        let newRange = change.displayStart..<displayRows.count
-        if change.oldTailIDs == change.newTailIDs {
-            let indexPaths = Set(newRange.map { IndexPath(item: $0, section: 0) })
-            guard !indexPaths.isEmpty else { return }
-            // Reloading is the only mutation; the flow layout now invalidates
-            // its delegate metrics atomically when its width changes.
-            collectionView.reloadItems(at: indexPaths)
-            return
-        }
-
-        // A changed projection replaces collection topology (for example, a
-        // live tool row joining a compact activity group). A single reload is
-        // safer than delete/insert batch mutations while SwiftUI is laying out
-        // the hosted controller, and this path is much rarer than streaming.
-        collectionView.reloadData()
+    private func applyTailProjectionChange(
+        _ change: TailProjectionChange,
+        pendingResponseChange: PendingResponseChange
+    ) {
+        applySuffixProjectionChange(
+            displayStart: change.displayStart,
+            oldDisplayCount: change.oldDisplayCount,
+            oldTailIDs: change.oldTailIDs,
+            newTailIDs: change.newTailIDs,
+            requiresReload: change.requiresReload,
+            pendingResponseChange: pendingResponseChange
+        )
     }
 
     private func rebuildDisplayIndex() {
+        prependInstrumentation.displayIndexRebuildCount += 1
         displayIndexByItemIndex.removeAll(keepingCapacity: true)
         groupDisplayIndexByItemIndex.removeAll(keepingCapacity: true)
         for (displayIndex, row) in displayRows.enumerated() {
@@ -1402,15 +2016,28 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
                 }
             }
         }
+        displayIndexIsDirty = false
+        deferredItemIndexOffset = 0
+        deferredDisplayIndexOffset = 0
     }
 
-    private func rebuildDisplayIndex(
+    private func ensureDisplayIndex() {
+        guard displayIndexIsDirty else { return }
+        rebuildDisplayIndex()
+    }
+
+    private func updateDisplayIndexSuffix(
         fromDisplayIndex displayStart: Int,
         itemIndexStart: Int,
-        oldItemCount: Int
+        oldItemCount: Int,
+        preservingDeferredOffsets: Bool
     ) {
+        let itemOffset = preservingDeferredOffsets ? deferredItemIndexOffset : 0
+        let displayOffset = preservingDeferredOffsets ? deferredDisplayIndexOffset : 0
+        let normalizedItemStart = itemIndexStart - itemOffset
+        let normalizedOldItemCount = oldItemCount - itemOffset
         if itemIndexStart < oldItemCount {
-            for index in itemIndexStart..<oldItemCount {
+            for index in normalizedItemStart..<normalizedOldItemCount {
                 displayIndexByItemIndex.removeValue(forKey: index)
                 groupDisplayIndexByItemIndex.removeValue(forKey: index)
             }
@@ -1418,34 +2045,97 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         for displayIndex in displayStart..<displayRows.count {
             switch displayRows[displayIndex] {
             case let .item(index):
-                displayIndexByItemIndex[index] = displayIndex
+                displayIndexByItemIndex[index - itemOffset] = displayIndex - displayOffset
             case let .activityGroup(group):
                 for index in group.range {
-                    groupDisplayIndexByItemIndex[index] = displayIndex
+                    groupDisplayIndexByItemIndex[index - itemOffset] = displayIndex - displayOffset
                     if !expandedActivityGroupIDs.contains(group.id) {
-                        displayIndexByItemIndex[index] = displayIndex
+                        displayIndexByItemIndex[index - itemOffset] = displayIndex - displayOffset
                     }
                 }
             }
         }
+        if !preservingDeferredOffsets {
+            displayIndexIsDirty = false
+            deferredItemIndexOffset = 0
+            deferredDisplayIndexOffset = 0
+        }
+    }
+
+    private func reloadIndexPaths(for indices: IndexSet) -> Set<IndexPath> {
+        guard !indices.isEmpty else { return [] }
+        if displayIndexIsDirty {
+            prependInstrumentation.deferredReloadLookupCount += indices.count
+        }
+
+        func resolveUsingDeferredOffsets() -> (displayIndices: IndexSet, unresolved: Bool) {
+            var displayIndices = IndexSet()
+            var unresolved = false
+            for index in indices {
+                let itemDisplayIndex = deferredDisplayIndex(for: index)
+                // Only routine activity can be a rollup child. Avoid an
+                // unnecessary bounded tail scan for plans, assistant text,
+                // approvals, and other independently displayed rows.
+                let groupDisplayIndex: Int? = if items.indices.contains(index),
+                                                 items[index].kind.isRoutineActivity {
+                    deferredGroupDisplayIndex(for: index)
+                } else {
+                    nil
+                }
+                if let itemDisplayIndex {
+                    displayIndices.insert(itemDisplayIndex)
+                }
+                // A child's title can contribute to the semantic rollup.
+                // Refresh its header too when the group is expanded.
+                if let groupDisplayIndex {
+                    displayIndices.insert(groupDisplayIndex)
+                }
+                if itemDisplayIndex == nil, groupDisplayIndex == nil {
+                    unresolved = true
+                }
+            }
+            return (displayIndices, unresolved)
+        }
+
+        var resolution = resolveUsingDeferredOffsets()
+        if resolution.unresolved, displayIndexIsDirty {
+            // Arbitrary old-row mutations are uncommon but must remain
+            // correct. Only those fall back to rebuilding the full maps;
+            // streamed tail rows resolve through offsets or the hard-bounded
+            // near-tail lookup above.
+            ensureDisplayIndex()
+            resolution = (
+                IndexSet(indices.flatMap { index in
+                    [displayIndexByItemIndex[index], groupDisplayIndexByItemIndex[index]]
+                        .compactMap { $0 }
+                }),
+                false
+            )
+        }
+        guard !resolution.displayIndices.isEmpty else { return [] }
+        return Set(
+            resolution.displayIndices.map { IndexPath(item: $0, section: 0) }
+        )
     }
 
     private func reloadRows(_ indices: IndexSet) {
-        var displayIndices = IndexSet(indices.compactMap { displayIndexByItemIndex[$0] })
-        // A child's title can contribute to the semantic rollup. Refresh its
-        // header too when the group is expanded; the child row still reloads
-        // through the regular display-index map.
-        for index in indices {
-            if let groupIndex = groupDisplayIndexByItemIndex[index] {
-                displayIndices.insert(groupIndex)
-            }
-        }
-        guard !displayIndices.isEmpty else { return }
-        let indexPaths = Set(displayIndices.map { IndexPath(item: $0, section: 0) })
+        let indexPaths = reloadIndexPaths(for: indices)
+        guard !indexPaths.isEmpty else { return }
         // Reloading the items is the single layout mutation. A separate manual
         // invalidation here is re-entrant when this update is driven by an
         // `NSHostingView` layout pass and has caused production crashes.
         collectionView.reloadItems(at: indexPaths)
+    }
+
+    private func refreshVisibleMessageEditActions() {
+        for case let item as TranscriptCollectionItem in collectionView.visibleItems() {
+            item.updateEditAction(
+                editableUserMessageID: editableUserMessageID,
+                onEdit: { [weak self] messageID in
+                    self?.onEditUserMessage(messageID)
+                }
+            )
+        }
     }
 
     private func isExpanded(_ item: TimelineItem) -> Bool {
@@ -1453,6 +2143,7 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
     }
 
     private func setExpanded(_ expanded: Bool, for itemID: String) {
+        ensureDisplayIndex()
         guard let index = items.firstIndex(where: { $0.id == itemID }),
               items[index].kind.isCollapsibleActivity else { return }
 
@@ -1474,7 +2165,7 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         }
 
         let oldIDs = displayRows.map(\.id)
-        displayRows = makeDisplayRows(items: items, groups: activityGroups)
+        displayRows.replaceAll(with: makeDisplayRows(items: items, groups: activityGroups))
         rebuildDisplayIndex()
         guard oldIDs != displayRows.map(\.id) else { return }
 
@@ -1581,6 +2272,7 @@ final class TranscriptActivityGroupView: NSView {
     private var fullTitle = "Activity"
     private var onToggle: ((Bool) -> Void)?
     private(set) var isExpanded = false
+    var representedItemIDs: [String] { group?.itemIDs ?? [] }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1780,12 +2472,29 @@ private final class TranscriptCollectionItem: NSCollectionViewItem {
     func configure(
         with item: TimelineItem,
         isExpanded: Bool = true,
+        isEditable: Bool = false,
+        onEdit: (() -> Void)? = nil,
         onToggle: ((Bool) -> Void)? = nil
     ) {
         (view as? TranscriptCellView)?.configure(
             with: item,
             isExpanded: isExpanded,
+            isEditable: isEditable,
+            onEdit: onEdit,
             onToggle: onToggle
+        )
+    }
+
+    func updateEditAction(
+        editableUserMessageID: String?,
+        onEdit: @escaping (String) -> Void
+    ) {
+        guard let cell = view as? TranscriptCellView else { return }
+        cell.updateEditAction(
+            isEditable: cell.itemID == editableUserMessageID,
+            onEdit: cell.itemID.map { messageID in
+                { onEdit(messageID) }
+            }
         )
     }
 
@@ -2077,6 +2786,22 @@ enum TranscriptMarkdownRenderer {
     }
 }
 
+final class TranscriptEditControl: NSButton {
+    var onFocusChange: ((Bool) -> Void)?
+
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        if accepted { onFocusChange?(true) }
+        return accepted
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder()
+        if resigned { onFocusChange?(false) }
+        return resigned
+    }
+}
+
 final class TranscriptCellView: NSView {
     static let maximumVisibleAttachments = TranscriptLayoutState.maximumVisibleAttachments
     static let maximumVisibleLinks = TranscriptLayoutState.maximumVisibleLinks
@@ -2090,6 +2815,10 @@ final class TranscriptCellView: NSView {
     private let bodyLabel = NSTextField(wrappingLabelWithString: "")
     private let detailLabel = NSTextField(labelWithString: "")
     private let statusLabel = NSTextField(labelWithString: "")
+    /// Visually tiny, interactively generous. The pencil appears only while
+    /// the latest eligible user row is hovered or keyboard-focused, while the
+    /// native button remains exposed to assistive technology.
+    let editControl = TranscriptEditControl(title: "", target: nil, action: nil)
     /// A small native button whose hit area is expanded to the complete card
     /// header in `hitTest(_:)`. This gives mouse, keyboard, and VoiceOver users
     /// one consistent disclosure control without intercepting body selection or
@@ -2100,12 +2829,18 @@ final class TranscriptCellView: NSView {
     private var item: TimelineItem?
     private var fullTitleAttributedText = NSAttributedString()
     private var onToggle: ((Bool) -> Void)?
+    private var onEdit: (() -> Void)?
+    private var editTrackingArea: NSTrackingArea?
+    private var isPointerInside = false
+    private var isEditControlFocused = false
+    private var isEditable = false
     private(set) var isExpanded = true
     private var isExpandable = false
 
     var isCollapsed: Bool { isExpandable && !isExpanded }
     var canToggleExpansion: Bool { isExpandable }
     var messageBubbleFrame: NSRect { bubbleBackground.frame }
+    var itemID: String? { item?.id }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -2121,6 +2856,7 @@ final class TranscriptCellView: NSView {
         addSubview(detailLabel)
         addSubview(statusLabel)
         addSubview(expansionControl)
+        addSubview(editControl)
 
         avatar.font = .systemFont(ofSize: 12, weight: .semibold)
         avatar.textColor = NSColor.systemIndigo
@@ -2142,12 +2878,11 @@ final class TranscriptCellView: NSView {
         detailLabel.font = .systemFont(ofSize: 11.5, weight: .regular)
         detailLabel.textColor = .secondaryLabelColor
         detailLabel.lineBreakMode = .byTruncatingMiddle
-        statusLabel.font = .systemFont(ofSize: 10.5, weight: .medium)
+        statusLabel.font = .systemFont(ofSize: 10, weight: .medium)
         statusLabel.alignment = .right
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.wantsLayer = true
-        statusLabel.layer?.cornerRadius = 6
-        statusLabel.layer?.masksToBounds = true
+        statusLabel.layer?.masksToBounds = false
 
         expansionControl.isBordered = false
         expansionControl.bezelStyle = .regularSquare
@@ -2160,6 +2895,30 @@ final class TranscriptCellView: NSView {
         expansionControl.setAccessibilityRole(.button)
         expansionControl.setAccessibilityLabel("Expand activity details")
         expansionControl.setAccessibilityHelp("Shows the complete tool output, attachments, and links")
+
+        editControl.isBordered = false
+        editControl.bezelStyle = .regularSquare
+        editControl.imagePosition = .imageOnly
+        editControl.imageScaling = .scaleProportionallyDown
+        editControl.image = NSImage(
+            systemSymbolName: "pencil",
+            accessibilityDescription: "Edit last message"
+        )
+        editControl.contentTintColor = .secondaryLabelColor
+        editControl.focusRingType = .default
+        editControl.target = self
+        editControl.action = #selector(editPressed(_:))
+        editControl.toolTip = "Edit last message"
+        editControl.setAccessibilityRole(.button)
+        editControl.setAccessibilityLabel("Edit last message")
+        editControl.setAccessibilityHelp(
+            "Moves the latest message back to the composer so it can be corrected and resent"
+        )
+        editControl.onFocusChange = { [weak self] focused in
+            self?.isEditControlFocused = focused
+            self?.updateEditControlVisibility()
+        }
+        editControl.isHidden = true
     }
 
     @available(*, unavailable)
@@ -2178,6 +2937,8 @@ final class TranscriptCellView: NSView {
     func configure(
         with item: TimelineItem,
         isExpanded: Bool,
+        isEditable: Bool = false,
+        onEdit: (() -> Void)? = nil,
         onToggle: ((Bool) -> Void)? = nil
     ) {
         removeMediaViews()
@@ -2185,6 +2946,7 @@ final class TranscriptCellView: NSView {
         self.isExpandable = item.kind.isCollapsibleActivity
         self.isExpanded = self.isExpandable ? isExpanded : true
         self.onToggle = onToggle
+        self.onEdit = onEdit
 
         fullTitleAttributedText = Self.headerAttributedText(for: item, isExpanded: self.isExpanded)
         titleLabel.attributedStringValue = fullTitleAttributedText
@@ -2219,24 +2981,32 @@ final class TranscriptCellView: NSView {
         }
         bubbleBackground.isHidden = item.kind != .userMessage
         bubbleBackground.layer?.backgroundColor = backgroundColor(for: item.kind).cgColor
-        statusLabel.layer?.backgroundColor = isProminentActivity
-            ? statusBackgroundColor(for: item.status).cgColor
-            : NSColor.clear.cgColor
+        // Status copy is deliberately plain text. A filled red capsule at the
+        // far edge of a failed row reads like debug UI and competes with the
+        // useful error itself; the leading disclosure/icon carries the small
+        // semantic color accent instead.
+        statusLabel.layer?.backgroundColor = NSColor.clear.cgColor
 
         if self.isExpanded {
             rebuildMediaViews()
         }
         applyExpansionPresentation()
+        updateEditAction(isEditable: isEditable, onEdit: onEdit)
     }
 
     override func prepareForReuse() {
         super.prepareForReuse()
         removeMediaViews()
         onToggle = nil
+        onEdit = nil
         item = nil
         fullTitleAttributedText = NSAttributedString()
         isExpandable = false
         isExpanded = true
+        isEditable = false
+        isPointerInside = false
+        isEditControlFocused = false
+        updateEditControlVisibility()
         setAccessibilityElement(false)
         setAccessibilityLabel(nil)
         setAccessibilityValue(nil)
@@ -2260,6 +3030,51 @@ final class TranscriptCellView: NSView {
 
     @objc private func disclosurePressed(_ sender: NSButton) {
         toggleExpansion()
+    }
+
+    @objc private func editPressed(_ sender: NSButton) {
+        guard isEditable else { return }
+        onEdit?()
+    }
+
+    func updateEditAction(isEditable: Bool, onEdit: (() -> Void)?) {
+        self.isEditable = isEditable && item?.kind == .userMessage
+        self.onEdit = self.isEditable ? onEdit : nil
+        updateEditControlVisibility()
+        updateTrackingAreas()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let editTrackingArea {
+            removeTrackingArea(editTrackingArea)
+            self.editTrackingArea = nil
+        }
+        guard isEditable else { return }
+        let trackingArea = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(trackingArea)
+        editTrackingArea = trackingArea
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isPointerInside = true
+        updateEditControlVisibility()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isPointerInside = false
+        updateEditControlVisibility()
+    }
+
+    private func updateEditControlVisibility() {
+        editControl.isEnabled = isEditable
+        editControl.isHidden = !isEditable
+        editControl.alphaValue = isEditable && (isPointerInside || isEditControlFocused) ? 1 : 0
     }
 
     func toggleExpansion() {
@@ -2398,6 +3213,13 @@ final class TranscriptCellView: NSView {
         } else {
             bubbleBackground.frame = .zero
         }
+        let editTargetSize = OnyxHitTarget.compact
+        editControl.frame = NSRect(
+            x: max(0, bubbleBackground.frame.minX - editTargetSize - 4),
+            y: max(0, min(bounds.height - editTargetSize, 2)),
+            width: editTargetSize,
+            height: editTargetSize
+        )
         let headerTop = bounds.height - metrics.top
         let disclosureWidth: CGFloat = isExpandable ? 18 : 0
         avatar.frame = NSRect(
@@ -2550,11 +3372,8 @@ final class TranscriptCellView: NSView {
         let isActivity = item.kind.isActivity
         let isRoutineActivity = item.kind.isRoutineActivity
         let isCollapsed = item.kind.isCollapsibleActivity && !isExpanded
-        let isExceptionalRoutineActivity = isRoutineActivity
-            && (item.status == .failed || item.status == .declined)
         let isQuietRoutineActivity = isRoutineActivity
             && isCollapsed
-            && !isExceptionalRoutineActivity
         let horizontalInset: CGFloat = isUser
             ? userBubbleHorizontalPadding
             : (isActivity ? (isQuietRoutineActivity ? 5 : 14) : 0)
@@ -2650,11 +3469,14 @@ final class TranscriptCellView: NSView {
         // command/tool row creates a competing status column. Non-routine live
         // rows still need their explicit state, as do exceptional outcomes and
         // actionable approvals.
-        let showsStatus = (!isRoutineActivity && item.status != .completed)
-            || item.status == .failed
-            || item.status == .declined
-            || (item.kind == .approval && item.status != .completed)
-        let statusWidth: CGFloat = isActivity && titleHeight > 0 && showsStatus ? 68 : 0
+        // A collapsed routine failure already has a red disclosure plus its
+        // one-line error summary. Repeating a detached `Failed` label wastes
+        // space and makes the row look like a log inspector. Non-routine live
+        // states retain a compact textual status where it adds information.
+        let showsStatus = !isRoutineActivity
+            && item.kind != .error
+            && item.status != .completed
+        let statusWidth: CGFloat = isActivity && titleHeight > 0 && showsStatus ? 48 : 0
         return Metrics(
             avatarX: isActivity ? (isQuietRoutineActivity ? 4 : 14) : 0,
             contentX: contentX,
@@ -2920,7 +3742,12 @@ final class TranscriptCellView: NSView {
                 string: "  ·  \(summary)",
                 attributes: [
                     .font: NSFont.systemFont(ofSize: 11.5, weight: .regular),
-                    .foregroundColor: NSColor.tertiaryLabelColor,
+                    // Failure output is the useful part of this compact row.
+                    // Keep it readable while the small red disclosure conveys
+                    // severity; ordinary implementation output stays quieter.
+                    .foregroundColor: item.status == .failed
+                        ? NSColor.secondaryLabelColor
+                        : NSColor.tertiaryLabelColor,
                 ]
             )
         )
@@ -2944,7 +3771,18 @@ final class TranscriptCellView: NSView {
             "final", "final_answer", "finalanswer", "commentary", "analysis",
             "assistant_message", "assistantmessage",
         ]
-        return protocolLabels.contains(normalized) ? "" : detail
+        // Usage is retained on the timeline item for persistence, accounting,
+        // and model-ranking surfaces, but it is not conversation content. The
+        // provider adapter currently emits `Token usage: ...`; the broader
+        // marker check also covers older persisted forms such as
+        // `1,024 input tokens` without hiding ordinary assistant metadata.
+        let compactNormalized = normalized.filter { $0.isLetter || $0.isNumber }
+        let usageMarkers = [
+            "tokenusage", "inputtokens", "outputtokens", "prompttokens",
+            "completiontokens", "responsetokens", "totaltokens",
+        ]
+        let isTokenUsage = usageMarkers.contains { compactNormalized.contains($0) }
+        return protocolLabels.contains(normalized) || isTokenUsage ? "" : detail
     }
 
     private func statusText(for status: TimelineItemStatus) -> String {
@@ -2986,16 +3824,6 @@ final class TranscriptCellView: NSView {
         case .running: .systemBlue
         case .pending: .systemIndigo
         case .completed: .secondaryLabelColor
-        }
-    }
-
-    private func statusBackgroundColor(for status: TimelineItemStatus) -> NSColor {
-        switch status {
-        case .failed: NSColor.systemRed.withAlphaComponent(0.15)
-        case .declined: NSColor.systemOrange.withAlphaComponent(0.15)
-        case .running: NSColor.systemBlue.withAlphaComponent(0.10)
-        case .pending: NSColor.systemGray.withAlphaComponent(0.10)
-        case .completed: NSColor.systemGreen.withAlphaComponent(0.14)
         }
     }
 
@@ -3589,7 +4417,6 @@ extension TimelineItem {
     /// accessible status without turning the transcript back into cards.
     var isProminentActivity: Bool {
         kind.isProminentActivity
-            || (kind.isRoutineActivity && (status == .failed || status == .declined))
     }
 }
 

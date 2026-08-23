@@ -135,6 +135,166 @@ final class SharedRuntimeCoordinatorTests: XCTestCase {
         XCTAssertEqual(finalCount, 1)
     }
 
+    func testPaginationCompatibilityFailureDowngradesEveryWindowAndStopsAllEntryPointRetries() async throws {
+        enum EntryPoint: CaseIterable {
+            case read
+            case resume
+            case list
+
+            var name: String {
+                switch self {
+                case .read: "read"
+                case .resume: "resume"
+                case .list: "list"
+                }
+            }
+        }
+
+        for code in [-32_601, -32_602] {
+            for entryPoint in EntryPoint.allCases {
+                let session = Self.session(
+                    label: "History capable",
+                    capabilities: [.threadHistoryPagination, .threadHistoryRevert]
+                )
+                let runtime = CoordinatorFakeRuntime(
+                    connectSession: session,
+                    historyPaginationFailureCode: code
+                )
+                let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+                let firstWindow = CoordinatorEventRecorder()
+                let secondWindow = CoordinatorEventRecorder()
+                await firstWindow.start(stream: coordinator.events)
+                await secondWindow.start(stream: coordinator.events)
+
+                let firstSession = try await coordinator.connect()
+                let secondSession = try await coordinator.connect()
+                XCTAssertTrue(firstSession.capabilities.contains(.threadHistoryPagination))
+                XCTAssertTrue(secondSession.capabilities.contains(.threadHistoryPagination))
+
+                do {
+                    switch entryPoint {
+                    case .read:
+                        _ = try await coordinator.readThread(
+                            id: "history-thread",
+                            initialHistoryPage: RuntimeThreadHistoryPageRequest(limit: 12)
+                        )
+                    case .resume:
+                        _ = try await coordinator.resumeThread(
+                            id: "history-thread",
+                            initialHistoryPage: RuntimeInitialThreadHistoryPageRequest(limit: 12)
+                        )
+                    case .list:
+                        _ = try await coordinator.listThreadHistory(
+                            id: "history-thread",
+                            page: RuntimeThreadHistoryPageRequest(limit: 12)
+                        )
+                    }
+                    XCTFail("The simulated older runtime accepted \(entryPoint.name).")
+                } catch let AgentRuntimeError.requestFailed(receivedCode, _) {
+                    XCTAssertEqual(receivedCode, code)
+                } catch {
+                    XCTFail("Unexpected pagination error: \(error)")
+                }
+
+                try await firstWindow.waitForCount(1)
+                try await secondWindow.waitForCount(1)
+                let expected = [AgentRuntimeEvent.runtimeCapabilitiesDowngraded(
+                    .threadHistoryPagination
+                )]
+                let firstEvents = await firstWindow.snapshot()
+                let secondEvents = await secondWindow.snapshot()
+                XCTAssertEqual(firstEvents, expected)
+                XCTAssertEqual(secondEvents, expected)
+
+                let attachedLater = try await coordinator.connect()
+                XCTAssertFalse(attachedLater.capabilities.contains(.threadHistoryPagination))
+                XCTAssertTrue(attachedLater.capabilities.contains(.threadHistoryRevert))
+
+                for retry in EntryPoint.allCases {
+                    do {
+                        switch retry {
+                        case .read:
+                            _ = try await coordinator.readThread(
+                                id: "history-thread",
+                                initialHistoryPage: RuntimeThreadHistoryPageRequest(limit: 12)
+                            )
+                        case .resume:
+                            _ = try await coordinator.resumeThread(
+                                id: "history-thread",
+                                initialHistoryPage: RuntimeInitialThreadHistoryPageRequest(limit: 12)
+                            )
+                        case .list:
+                            _ = try await coordinator.listThreadHistory(
+                                id: "history-thread",
+                                page: RuntimeThreadHistoryPageRequest(limit: 12)
+                            )
+                        }
+                        XCTFail("A downgraded coordinator retried \(retry.name).")
+                    } catch let AgentRuntimeError.unsupported(feature) {
+                        XCTAssertEqual(feature, "paginated thread history")
+                    } catch {
+                        XCTFail("Unexpected retry error: \(error)")
+                    }
+                }
+
+                let providerCalls = await runtime.historyOperationMethods
+                XCTAssertEqual(providerCalls, [entryPoint.name])
+            }
+        }
+    }
+
+    func testHistoryRevertCompatibilityFailureDowngradesEveryWindowAndCachedSession() async throws {
+        let session = Self.session(
+            label: "Editable history",
+            capabilities: [.threadHistoryPagination, .threadHistoryRevert]
+        )
+        let runtime = CoordinatorFakeRuntime(
+            connectSession: session,
+            historyRevertFailureCode: -32_601
+        )
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+        let firstWindow = CoordinatorEventRecorder()
+        let secondWindow = CoordinatorEventRecorder()
+        await firstWindow.start(stream: coordinator.events)
+        await secondWindow.start(stream: coordinator.events)
+
+        _ = try await coordinator.connect()
+        _ = try await coordinator.connect()
+        do {
+            _ = try await coordinator.revertThread(
+                id: "history-thread",
+                beforeTurnID: "turn-new"
+            )
+            XCTFail("The simulated older runtime accepted native history editing.")
+        } catch let AgentRuntimeError.requestFailed(code, _) {
+            XCTAssertEqual(code, -32_601)
+        }
+
+        try await firstWindow.waitForCount(1)
+        try await secondWindow.waitForCount(1)
+        let expected = [AgentRuntimeEvent.runtimeCapabilitiesDowngraded(.threadHistoryRevert)]
+        let firstEvents = await firstWindow.snapshot()
+        let secondEvents = await secondWindow.snapshot()
+        XCTAssertEqual(firstEvents, expected)
+        XCTAssertEqual(secondEvents, expected)
+
+        let attachedLater = try await coordinator.connect()
+        XCTAssertFalse(attachedLater.capabilities.contains(.threadHistoryRevert))
+        XCTAssertTrue(attachedLater.capabilities.contains(.threadHistoryPagination))
+
+        do {
+            _ = try await coordinator.revertThread(
+                id: "history-thread",
+                beforeTurnID: "turn-new"
+            )
+            XCTFail("A downgraded coordinator retried native history editing.")
+        } catch let AgentRuntimeError.unsupported(feature) {
+            XCTAssertEqual(feature, "thread history editing")
+        }
+        let revertCalls = await runtime.historyRevertCallCount
+        XCTAssertEqual(revertCalls, 1)
+    }
+
     func testDisconnectEventInvalidatesTheCachedSessionBeforeSubscribersSeeIt() async throws {
         let gate = InvocationGate(isOpen: true)
         let runtime = CoordinatorFakeRuntime(connectGate: gate)
@@ -613,7 +773,10 @@ final class SharedRuntimeCoordinatorTests: XCTestCase {
         )
     }
 
-    private static func session(label: String) -> RuntimeSession {
+    private static func session(
+        label: String,
+        capabilities: RuntimeCapabilities = []
+    ) -> RuntimeSession {
         RuntimeSession(
             runtime: .local,
             displayName: label,
@@ -627,7 +790,7 @@ final class SharedRuntimeCoordinatorTests: XCTestCase {
             ),
             availableLoginMethods: [],
             availableModels: [],
-            capabilities: []
+            capabilities: capabilities
         )
     }
 }
@@ -654,12 +817,16 @@ private actor CoordinatorFakeRuntime: AgentRuntime {
     private let cancelLoginGate: InvocationGate?
     private let startTurnGate: InvocationGate?
     private let logoutEvent: AgentRuntimeEvent?
+    private let historyPaginationFailureCode: Int?
+    private let historyRevertFailureCode: Int?
     private(set) var connectCallCount = 0
     private(set) var refreshCallCount = 0
     private(set) var logoutCallCount = 0
     private(set) var loginStartCallCount = 0
     private(set) var cancelLoginCallCount = 0
     private(set) var startTurnCallCount = 0
+    private(set) var historyOperationMethods: [String] = []
+    private(set) var historyRevertCallCount = 0
     private(set) var cancelledLoginIDs: [String] = []
 
     init(
@@ -672,7 +839,9 @@ private actor CoordinatorFakeRuntime: AgentRuntime {
         loginStartGate: InvocationGate? = nil,
         cancelLoginGate: InvocationGate? = nil,
         startTurnGate: InvocationGate? = nil,
-        logoutEvent: AgentRuntimeEvent? = nil
+        logoutEvent: AgentRuntimeEvent? = nil,
+        historyPaginationFailureCode: Int? = nil,
+        historyRevertFailureCode: Int? = nil
     ) {
         let fallback = RuntimeSession(
             runtime: .local,
@@ -699,6 +868,8 @@ private actor CoordinatorFakeRuntime: AgentRuntime {
         self.cancelLoginGate = cancelLoginGate
         self.startTurnGate = startTurnGate
         self.logoutEvent = logoutEvent
+        self.historyPaginationFailureCode = historyPaginationFailureCode
+        self.historyRevertFailureCode = historyRevertFailureCode
         let pair = AsyncStream.makeStream(of: AgentRuntimeEvent.self)
         sourceEvents = pair.stream
         eventContinuation = pair.continuation
@@ -747,6 +918,54 @@ private actor CoordinatorFakeRuntime: AgentRuntime {
 
     func readThread(id _: String) async throws -> RuntimeConversation {
         throw AgentRuntimeError.unsupported("fake thread reading")
+    }
+
+    func readThread(
+        id _: String,
+        initialHistoryPage _: RuntimeThreadHistoryPageRequest
+    ) async throws -> RuntimeThreadResumeResult {
+        historyOperationMethods.append("read")
+        try throwHistoryPaginationFailure()
+    }
+
+    func resumeThread(
+        id _: String,
+        initialHistoryPage _: RuntimeInitialThreadHistoryPageRequest
+    ) async throws -> RuntimeThreadResumeResult {
+        historyOperationMethods.append("resume")
+        try throwHistoryPaginationFailure()
+    }
+
+    func listThreadHistory(
+        id _: String,
+        page _: RuntimeThreadHistoryPageRequest
+    ) async throws -> RuntimeThreadHistoryPage {
+        historyOperationMethods.append("list")
+        try throwHistoryPaginationFailure()
+    }
+
+    func revertThread(
+        id _: String,
+        beforeTurnID _: String
+    ) async throws -> RuntimeThreadRevertResult {
+        historyRevertCallCount += 1
+        if let historyRevertFailureCode {
+            throw AgentRuntimeError.requestFailed(
+                code: historyRevertFailureCode,
+                message: "simulated unsupported history revert"
+            )
+        }
+        throw AgentRuntimeError.unsupported("fake history revert")
+    }
+
+    private func throwHistoryPaginationFailure() throws -> Never {
+        if let historyPaginationFailureCode {
+            throw AgentRuntimeError.requestFailed(
+                code: historyPaginationFailureCode,
+                message: "simulated unsupported history pagination"
+            )
+        }
+        throw AgentRuntimeError.unsupported("fake paginated history")
     }
 
     func startThread(_: StartThreadRequest) async throws -> RuntimeThread {

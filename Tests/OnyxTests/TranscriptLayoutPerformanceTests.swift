@@ -4,6 +4,521 @@ import XCTest
 @testable import Onyx
 
 final class TranscriptLayoutPerformanceTests: XCTestCase {
+    func testPrependHintKeepsLargeHistoryPlanningBounded() {
+        let tail = (0..<20_000).map { index in
+            makeItem(id: "tail-\(index)", body: "Stable tail \(index)")
+        }
+        let older = (0..<80).map { index in
+            makeItem(id: "older-\(index)", body: "Earlier page \(index)")
+        }
+        var snapshot = TranscriptPresentationSnapshot(items: tail, revision: 41)
+        snapshot.prepend(contentsOf: older)
+        var instrumentation = TranscriptCollectionUpdate.PlanningInstrumentation()
+
+        let update = TranscriptCollectionUpdate.plan(
+            from: tail,
+            to: snapshot.items,
+            oldRevision: 41,
+            newRevision: snapshot.revision,
+            hint: snapshot.changeHint,
+            instrumentation: &instrumentation
+        )
+
+        XCTAssertEqual(update, .prepend(0..<older.count))
+        XCTAssertEqual(instrumentation.inspectedItemCount, 0)
+        XCTAssertEqual(instrumentation.hintedUpdateCount, 1)
+    }
+
+    @MainActor
+    func testHostedPrependKeepsMountedReaderRowAtSameViewportPosition() throws {
+        let fixture = TranscriptLayoutMutationFixture()
+        fixture.snapshot = TranscriptPresentationSnapshot(
+            items: (0..<20_000).map { index in
+                TimelineItem(
+                    id: "visible-tail-\(index)",
+                    kind: .assistantMessage,
+                    title: nil,
+                    body: "Visible tail row \(index)",
+                    status: .completed,
+                    timestamp: Date(timeIntervalSince1970: Double(index)),
+                    detail: nil
+                )
+            },
+            revision: 10
+        )
+        let hostingView = NSHostingView(
+            rootView: TranscriptLayoutMutationHarness(fixture: fixture)
+        )
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 320),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = hostingView
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+
+        func layout() {
+            hostingView.needsLayout = true
+            hostingView.layoutSubtreeIfNeeded()
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
+            hostingView.layoutSubtreeIfNeeded()
+        }
+
+        layout()
+        // Drain the initial tail-follow before choosing the reader's position.
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
+        let collectionView = try XCTUnwrap(
+            hostingView.firstDescendant(ofType: NSCollectionView.self)
+        )
+        let scrollView = try XCTUnwrap(collectionView.enclosingScrollView)
+        let oldPath = IndexPath(item: 10_000, section: 0)
+        collectionView.scrollToItems(at: [oldPath], scrollPosition: .top)
+        layout()
+        let controller = try XCTUnwrap(collectionView.dataSource as? TranscriptViewController)
+        _ = try XCTUnwrap(collectionView.item(at: oldPath))
+        let oldFrame = try XCTUnwrap(
+            collectionView.layoutAttributesForItem(at: oldPath)?.frame
+        )
+        let oldOffset = oldFrame.minY - scrollView.contentView.bounds.minY
+        let indexRebuildsBeforePrepend = controller.prependInstrumentation.displayIndexRebuildCount
+
+        let updateStart = ContinuousClock.now
+        fixture.prependEarlierMessages(count: 80)
+        layout()
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.03))
+        hostingView.layoutSubtreeIfNeeded()
+        let updateElapsed = updateStart.duration(to: .now)
+
+        let newPath = IndexPath(item: oldPath.item + 80, section: 0)
+        _ = try XCTUnwrap(collectionView.item(at: newPath))
+        let newFrame = try XCTUnwrap(
+            collectionView.layoutAttributesForItem(at: newPath)?.frame
+        )
+        let newOffset = newFrame.minY - scrollView.contentView.bounds.minY
+        XCTAssertEqual(controller.prependInstrumentation.insertedDisplayRowCount, 80)
+        XCTAssertEqual(controller.prependInstrumentation.projectedPrefixItemCount, 80)
+        XCTAssertLessThanOrEqual(
+            controller.prependInstrumentation.projectedPrefixGroupCount,
+            40,
+            "Prepend projection work must remain bounded by the incoming page"
+        )
+        XCTAssertEqual(
+            controller.prependInstrumentation.fullReloadCount,
+            0,
+            "Prepending a valid page should insert native rows instead of reloading the transcript"
+        )
+        XCTAssertEqual(
+            controller.prependInstrumentation.displayIndexRebuildCount,
+            indexRebuildsBeforePrepend,
+            "A prepend should defer rebuilding historical row lookup maps until a later mutation needs them"
+        )
+        XCTAssertEqual(
+            controller.prependInstrumentation.anchorFallbackScanCount,
+            0,
+            "A valid prepend should restore its known shifted display index without scanning history"
+        )
+        XCTAssertEqual(
+            controller.projectionStorageMaterializationCount,
+            0,
+            "A valid prepend should not materialize the already-loaded transcript projection"
+        )
+        XCTAssertEqual(
+            newOffset,
+            oldOffset,
+            accuracy: 1,
+            "The content under the reader's eyes moved while earlier history was inserted"
+        )
+        XCTAssertLessThan(
+            updateElapsed,
+            .milliseconds(250),
+            "A bounded older-history page blocked the hosted transcript for \(updateElapsed)"
+        )
+    }
+
+    @MainActor
+    func testHostedMixedLargeHistoryKeepsPostPrependTailStreamingBounded() throws {
+        let fixture = TranscriptLayoutMutationFixture()
+        fixture.snapshot = TranscriptPresentationSnapshot(
+            items: (0..<20_000).map { index in
+                mixedHistoryItem(
+                    id: "large-history-\(index)",
+                    index: index,
+                    timestamp: Double(index)
+                )
+            },
+            revision: 100
+        )
+        let hostingView = NSHostingView(
+            rootView: TranscriptLayoutMutationHarness(fixture: fixture)
+        )
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 360),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = hostingView
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+
+        func layout() {
+            hostingView.needsLayout = true
+            hostingView.layoutSubtreeIfNeeded()
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.002))
+            hostingView.layoutSubtreeIfNeeded()
+        }
+
+        layout()
+        let collectionView = try XCTUnwrap(
+            hostingView.firstDescendant(ofType: NSCollectionView.self)
+        )
+        let controller = try XCTUnwrap(
+            collectionView.dataSource as? TranscriptViewController
+        )
+        let initialDisplayIndexRebuilds =
+            controller.prependInstrumentation.displayIndexRebuildCount
+
+        for page in 0..<3 {
+            fixture.prependMixedEarlierMessages(page: page, count: 48)
+            layout()
+        }
+
+        XCTAssertGreaterThan(
+            controller.prependInstrumentation.projectedPrefixGroupCount,
+            0,
+            "The regression must exercise offset-backed prepended activity groups"
+        )
+        XCTAssertEqual(
+            controller.prependInstrumentation.displayIndexRebuildCount,
+            initialDisplayIndexRebuilds,
+            "Repeated prepends must not rebuild the historical row maps"
+        )
+
+        fixture.appendAssistant(body: "", status: .running)
+        layout()
+        for step in 0..<50 {
+            fixture.mutateTail(
+                body: "assistant streamed delta \(step)",
+                status: .running
+            )
+            layout()
+        }
+
+        fixture.appendActivity(
+            id: "bounded-tail-command",
+            kind: .command,
+            status: .completed
+        )
+        layout()
+        fixture.appendActivity(
+            id: "bounded-tail-tool",
+            kind: .tool,
+            status: .running
+        )
+        layout()
+        for step in 0..<50 {
+            fixture.mutateTail(
+                body: "tool streamed delta \(step)",
+                status: step.isMultiple(of: 2) ? .completed : .running
+            )
+            layout()
+        }
+
+        let instrumentation = controller.prependInstrumentation
+        XCTAssertEqual(
+            collectionView.numberOfItems(inSection: 0),
+            15_111,
+            "The final running tool should remain beside the completed command without losing history rows"
+        )
+        XCTAssertEqual(
+            instrumentation.displayIndexRebuildCount,
+            initialDisplayIndexRebuilds,
+            "One hundred tail mutations after prepends must not rebuild all display indexes"
+        )
+        XCTAssertEqual(
+            controller.projectionStorageMaterializationCount,
+            0,
+            "Neither grouped history nor display history may be materialized by tail streaming"
+        )
+        XCTAssertEqual(
+            instrumentation.projectionFullReloadCount,
+            0,
+            "Common tail topology changes must use suffix batch updates instead of reloadData"
+        )
+        XCTAssertGreaterThanOrEqual(
+            instrumentation.deferredReloadLookupCount,
+            50,
+            "Assistant streaming should resolve dirty post-prepend indexes through deferred lookups"
+        )
+        XCTAssertGreaterThan(instrumentation.nearTailLookupCount, 0)
+        XCTAssertEqual(instrumentation.nearTailLookupBudgetExceededCount, 0)
+        XCTAssertLessThanOrEqual(
+            instrumentation.nearTailInspectedRowCount,
+            instrumentation.nearTailLookupCount
+                * TranscriptViewController.maximumNearTailLookupRows,
+            "Every fallback lookup must obey the hard near-tail row budget"
+        )
+        XCTAssertLessThanOrEqual(
+            instrumentation.tailGroupingInspectedItemCount,
+            600,
+            "Tool completion toggles may inspect only the bounded mutable grouping tail"
+        )
+        XCTAssertGreaterThanOrEqual(
+            instrumentation.suffixBatchUpdateCount,
+            52,
+            "Lone-to-group and live-tool rollup transitions should stay on atomic suffix batches"
+        )
+
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
+    }
+
+    @MainActor
+    func testAssistantOnlyPrependShiftsExistingActivityGroupWithoutReloading() throws {
+        let fixture = TranscriptLayoutMutationFixture()
+        fixture.snapshot = TranscriptPresentationSnapshot(
+            items: [
+                makeItem(id: "group-command", kind: .command),
+                makeItem(id: "group-tool", kind: .tool),
+            ],
+            revision: 20
+        )
+        let host = TranscriptHostedFixture(fixture: fixture)
+        defer { host.close() }
+        host.layout()
+        let controller = try host.controller()
+        let initialRebuilds = controller.prependInstrumentation.displayIndexRebuildCount
+
+        fixture.prependEarlierMessages(count: 40)
+        host.layout()
+        fixture.appendActivity(id: "group-tail", kind: .command, status: .completed)
+        host.layout()
+
+        let collectionView = try host.collectionView()
+        let groupView = try XCTUnwrap(
+            try host.mountedView(at: collectionView.numberOfItems(inSection: 0) - 1)
+                as? TranscriptActivityGroupView
+        )
+
+        XCTAssertEqual(controller.projectionStorageMaterializationCount, 0)
+        XCTAssertEqual(controller.prependInstrumentation.projectionFullReloadCount, 0)
+        XCTAssertEqual(
+            controller.prependInstrumentation.displayIndexRebuildCount,
+            initialRebuilds
+        )
+        XCTAssertEqual(
+            groupView.representedItemIDs,
+            ["group-command", "group-tool", "group-tail"],
+            "An assistant-only prepend must shift the existing activity group before a tail append"
+        )
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
+    }
+
+    @MainActor
+    func testPostPrependAppendedPlanRemainsIndexedBeyondNearTailBudget() throws {
+        let fixture = TranscriptLayoutMutationFixture()
+        fixture.snapshot = TranscriptPresentationSnapshot(
+            items: (0..<20_000).map { index in
+                makeItem(id: "indexed-history-\(index)", body: "History \(index)")
+            },
+            revision: 30
+        )
+        let host = TranscriptHostedFixture(fixture: fixture)
+        defer { host.close() }
+        host.layout()
+        let controller = try host.controller()
+        fixture.prependEarlierMessages(count: 40)
+        host.layout()
+        let initialRebuilds = controller.prependInstrumentation.displayIndexRebuildCount
+
+        fixture.appendPlan(id: "indexed-plan")
+        host.layout()
+        for index in 0..<(TranscriptViewController.maximumNearTailLookupRows + 4) {
+            fixture.appendAssistant(body: "separator \(index)", status: .completed)
+            host.layout()
+        }
+        fixture.mutateItem(id: "indexed-plan", body: "Updated after a long visible suffix")
+        host.layout()
+
+        let collectionView = try host.collectionView()
+        let planDisplayIndex = collectionView.numberOfItems(inSection: 0)
+            - TranscriptViewController.maximumNearTailLookupRows
+            - 5
+        let planView = try XCTUnwrap(
+            try host.mountedView(at: planDisplayIndex) as? TranscriptCellView
+        )
+
+        XCTAssertEqual(
+            controller.prependInstrumentation.displayIndexRebuildCount,
+            initialRebuilds,
+            "Updating a post-prepend row must use its normalized suffix map"
+        )
+        XCTAssertEqual(controller.prependInstrumentation.nearTailLookupBudgetExceededCount, 0)
+        XCTAssertEqual(controller.projectionStorageMaterializationCount, 0)
+        XCTAssertEqual(planView.itemID, "indexed-plan")
+        XCTAssertTrue(
+            planView.subviews
+                .compactMap { ($0 as? NSTextField)?.stringValue }
+                .contains("Updated after a long visible suffix"),
+            "The normalized suffix map must reload the appended plan itself"
+        )
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
+    }
+
+    @MainActor
+    func testFirstVisibleTokenAtomicallyReplacesPendingRow() throws {
+        let fixture = TranscriptLayoutMutationFixture()
+        fixture.isAwaitingResponse = true
+        let host = TranscriptHostedFixture(fixture: fixture)
+        defer { host.close() }
+        host.layout()
+        let collectionView = try host.collectionView()
+        XCTAssertEqual(collectionView.numberOfItems(inSection: 0), 2)
+
+        fixture.appendAssistant(body: "First visible token", status: .running)
+        host.layout()
+
+        let assistantView = try XCTUnwrap(
+            try host.mountedView(at: 1) as? TranscriptCellView
+        )
+
+        XCTAssertEqual(
+            collectionView.numberOfItems(inSection: 0),
+            2,
+            "The assistant row must replace the waiting row in one hosted update"
+        )
+        XCTAssertEqual(assistantView.itemID, "hosting-layout-assistant-1")
+        XCTAssertTrue(
+            assistantView.subviews
+                .compactMap { ($0 as? NSTextField)?.stringValue }
+                .contains("First visible token")
+        )
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
+    }
+
+    @MainActor
+    func testPendingRemovalSharesLoneToGroupSuffixBatch() throws {
+        let fixture = TranscriptLayoutMutationFixture()
+        fixture.isAwaitingResponse = true
+        let host = TranscriptHostedFixture(fixture: fixture)
+        defer { host.close() }
+        host.layout()
+        let collectionView = try host.collectionView()
+
+        fixture.appendActivity(id: "pending-lone", kind: .command, status: .completed)
+        host.layout()
+        XCTAssertEqual(collectionView.numberOfItems(inSection: 0), 3)
+
+        fixture.appendActivity(id: "pending-grouped", kind: .tool, status: .completed)
+        fixture.isAwaitingResponse = false
+        host.layout()
+
+        let groupView = try XCTUnwrap(
+            try host.mountedView(at: 1) as? TranscriptActivityGroupView
+        )
+
+        XCTAssertEqual(
+            collectionView.numberOfItems(inSection: 0),
+            2,
+            "Lone-to-rollup replacement and waiting-row removal must share one update"
+        )
+        XCTAssertEqual(
+            groupView.representedItemIDs,
+            ["pending-lone", "pending-grouped"]
+        )
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
+    }
+
+    @MainActor
+    func testPendingRemovalSharesEightToNineSuffixBatch() throws {
+        let fixture = TranscriptLayoutMutationFixture()
+        fixture.isAwaitingResponse = true
+        let host = TranscriptHostedFixture(fixture: fixture)
+        defer { host.close() }
+        host.layout()
+        let collectionView = try host.collectionView()
+
+        for index in 0..<8 {
+            fixture.appendActivity(
+                id: "atomic-rollup-\(index)",
+                kind: index.isMultiple(of: 2) ? .command : .tool,
+                status: .completed
+            )
+            host.layout()
+        }
+        XCTAssertEqual(collectionView.numberOfItems(inSection: 0), 3)
+
+        fixture.appendActivity(
+            id: "atomic-rollup-8",
+            kind: .command,
+            status: .completed
+        )
+        fixture.isAwaitingResponse = false
+        host.layout()
+
+        let ninthActivityView = try XCTUnwrap(
+            try host.mountedView(at: 2) as? TranscriptCellView
+        )
+
+        XCTAssertEqual(
+            collectionView.numberOfItems(inSection: 0),
+            3,
+            "The ninth sibling insertion must be atomic with waiting-row removal"
+        )
+        XCTAssertEqual(ninthActivityView.itemID, "atomic-rollup-8")
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
+    }
+
+    @MainActor
+    func testPendingInsertionSharesHistoryPrependBatch() throws {
+        let fixture = TranscriptLayoutMutationFixture()
+        let host = TranscriptHostedFixture(fixture: fixture)
+        defer { host.close() }
+        host.layout()
+        let collectionView = try host.collectionView()
+        let controller = try host.controller()
+        XCTAssertEqual(collectionView.numberOfItems(inSection: 0), 1)
+
+        fixture.prependEarlierMessages(count: 40)
+        fixture.isAwaitingResponse = true
+        host.layout()
+
+        let pendingView = try host.mountedView(at: 41)
+
+        XCTAssertEqual(collectionView.numberOfItems(inSection: 0), 42)
+        XCTAssertEqual(controller.prependInstrumentation.insertedDisplayRowCount, 40)
+        XCTAssertEqual(controller.prependInstrumentation.fullReloadCount, 0)
+        XCTAssertEqual(
+            pendingView.accessibilityLabel(),
+            "Assistant response status"
+        )
+        XCTAssertEqual(pendingView.accessibilityValue() as? String, "Working")
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
+    }
+
+    private func makeItem(
+        id: String,
+        kind: TimelineItemKind = .assistantMessage,
+        body: String = "Finished"
+    ) -> TimelineItem {
+        TimelineItem(
+            id: id,
+            kind: kind,
+            title: kind == .command ? "Run command" : (kind == .tool ? "Use tool" : nil),
+            body: body,
+            status: .completed,
+            timestamp: Date(timeIntervalSince1970: 100),
+            detail: nil
+        )
+    }
+
     @MainActor
     func testHostingViewSurvivesRepeatedRowChangesDuringLayout() throws {
         let fixture = TranscriptLayoutMutationFixture()
@@ -267,19 +782,34 @@ final class TranscriptLayoutPerformanceTests: XCTestCase {
             let metrics = TranscriptFlowMetrics(collectionWidth: collectionWidth)
 
             XCTAssertTrue(metrics.itemWidth.isFinite)
-            XCTAssertTrue(metrics.horizontalInset.isFinite)
+            XCTAssertTrue(metrics.leadingInset.isFinite)
+            XCTAssertTrue(metrics.trailingInset.isFinite)
             XCTAssertGreaterThanOrEqual(metrics.itemWidth, 0)
-            XCTAssertGreaterThanOrEqual(metrics.horizontalInset, 0)
+            XCTAssertGreaterThanOrEqual(metrics.leadingInset, 0)
+            XCTAssertGreaterThanOrEqual(metrics.trailingInset, 0)
             if collectionWidth > TranscriptFlowMetrics.layoutSafetyWidth {
                 XCTAssertLessThan(
-                    metrics.itemWidth + metrics.horizontalInset * 2,
+                    metrics.itemWidth + metrics.leadingInset + metrics.trailingInset,
                     collectionWidth
                 )
             } else {
                 XCTAssertEqual(metrics.itemWidth, 0)
-                XCTAssertEqual(metrics.horizontalInset, 0)
+                XCTAssertEqual(metrics.leadingInset, 0)
+                XCTAssertEqual(metrics.trailingInset, 0)
             }
         }
+    }
+
+    func testWideTranscriptKeepsTheLeadingGutterTight() {
+        let metrics = TranscriptFlowMetrics(collectionWidth: 1_200)
+
+        XCTAssertEqual(
+            metrics.leadingInset,
+            TranscriptFlowMetrics.preferredLeadingInset,
+            accuracy: 0.001
+        )
+        XCTAssertGreaterThan(metrics.trailingInset, metrics.leadingInset)
+        XCTAssertEqual(metrics.itemWidth, TranscriptFlowMetrics.maximumReadableWidth)
     }
 
     @MainActor
@@ -471,7 +1001,11 @@ final class TranscriptLayoutPerformanceTests: XCTestCase {
             expectedFailedHeight
         }
 
-        XCTAssertNotEqual(runningHeight, expectedFailedHeight)
+        XCTAssertEqual(
+            runningHeight,
+            expectedFailedHeight,
+            "A failed routine event intentionally stays the same compact height as live work"
+        )
         XCTAssertEqual(renderedFailedHeight, expectedFailedHeight)
         XCTAssertEqual(state.instrumentation.measurementCount, 2)
         XCTAssertEqual(state.instrumentation.cacheHitCount, 0)
@@ -754,6 +1288,27 @@ final class TranscriptLayoutPerformanceTests: XCTestCase {
             detail: nil
         )
     }
+
+    private func mixedHistoryItem(
+        id: String,
+        index: Int,
+        timestamp: Double
+    ) -> TimelineItem {
+        let kind: TimelineItemKind = switch index % 4 {
+        case 1: .command
+        case 2: .tool
+        default: .assistantMessage
+        }
+        return TimelineItem(
+            id: id,
+            kind: kind,
+            title: kind == .command ? "Run command" : (kind == .tool ? "Use tool" : nil),
+            body: "Stable mixed history \(index)",
+            status: .completed,
+            timestamp: Date(timeIntervalSince1970: timestamp),
+            detail: nil
+        )
+    }
 }
 
 @MainActor
@@ -817,6 +1372,67 @@ private final class TranscriptLayoutMutationFixture: ObservableObject {
         snapshot = next
     }
 
+    func appendPlan(id: String) {
+        var next = snapshot
+        next.append(
+            TimelineItem(
+                id: id,
+                kind: .plan,
+                title: "Plan",
+                body: "Initial plan",
+                status: .running,
+                timestamp: Date(timeIntervalSince1970: 1_000 + Double(next.items.count)),
+                detail: nil
+            )
+        )
+        snapshot = next
+    }
+
+    func prependEarlierMessages(count: Int) {
+        var next = snapshot
+        next.prepend(
+            contentsOf: (0..<count).map { index in
+                TimelineItem(
+                    id: "earlier-hosted-\(index)",
+                    kind: .assistantMessage,
+                    title: nil,
+                    body: "Earlier hosted row \(index)",
+                    status: .completed,
+                    timestamp: Date(timeIntervalSince1970: Double(index - count)),
+                    detail: nil
+                )
+            }
+        )
+        snapshot = next
+    }
+
+    func prependMixedEarlierMessages(page: Int, count: Int) {
+        var next = snapshot
+        next.prepend(
+            contentsOf: (0..<count).map { index in
+                let kind: TimelineItemKind = switch index % 4 {
+                case 1: .command
+                case 2: .tool
+                default: .assistantMessage
+                }
+                return TimelineItem(
+                    id: "earlier-mixed-\(page)-\(index)",
+                    kind: kind,
+                    title: kind == .command
+                        ? "Run command"
+                        : (kind == .tool ? "Use tool" : nil),
+                    body: "Earlier mixed page \(page), row \(index)",
+                    status: .completed,
+                    timestamp: Date(
+                        timeIntervalSince1970: -Double((page + 1) * count - index)
+                    ),
+                    detail: nil
+                )
+            }
+        )
+        snapshot = next
+    }
+
     func mutateTail(body: String, status: TimelineItemStatus) {
         var next = snapshot
         let index = next.items.count - 1
@@ -825,6 +1441,65 @@ private final class TranscriptLayoutMutationFixture: ObservableObject {
             items[index].status = status
         }
         snapshot = next
+    }
+
+    func mutateItem(id: String, body: String) {
+        guard let index = snapshot.items.firstIndex(where: { $0.id == id }) else { return }
+        var next = snapshot
+        next.mutateRows(IndexSet(integer: index)) { items in
+            items[index].body = body
+        }
+        snapshot = next
+    }
+}
+
+@MainActor
+private final class TranscriptHostedFixture {
+    let hostingView: NSHostingView<TranscriptLayoutMutationHarness>
+    let window: NSWindow
+
+    init(fixture: TranscriptLayoutMutationFixture) {
+        hostingView = NSHostingView(
+            rootView: TranscriptLayoutMutationHarness(fixture: fixture)
+        )
+        window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 360),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = hostingView
+    }
+
+    func layout() {
+        hostingView.needsLayout = true
+        hostingView.layoutSubtreeIfNeeded()
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.002))
+        hostingView.layoutSubtreeIfNeeded()
+    }
+
+    func collectionView() throws -> NSCollectionView {
+        try XCTUnwrap(hostingView.firstDescendant(ofType: NSCollectionView.self))
+    }
+
+    func controller() throws -> TranscriptViewController {
+        try XCTUnwrap(try collectionView().dataSource as? TranscriptViewController)
+    }
+
+    func mountedView(at itemIndex: Int) throws -> NSView {
+        let collectionView = try collectionView()
+        let path = IndexPath(item: itemIndex, section: 0)
+        collectionView.scrollToItems(at: [path], scrollPosition: .top)
+        layout()
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
+        hostingView.layoutSubtreeIfNeeded()
+        return try XCTUnwrap(collectionView.item(at: path)?.view)
+    }
+
+    func close() {
+        window.contentView = nil
+        window.close()
     }
 }
 

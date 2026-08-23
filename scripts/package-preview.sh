@@ -4,6 +4,7 @@ set -euo pipefail
 repo_root="${0:A:h:h}"
 preview_app="$repo_root/dist-preview/Onyx Preview.app"
 preview_executable="$preview_app/Contents/MacOS/Onyx"
+prepared_app="$repo_root/dist-preview/.Onyx Preview.prepared.$$.app"
 preview_bundle_identifier="app.onyx.preview"
 preview_display_name="Onyx Preview"
 preview_build_number="$(/bin/date -u +%Y%m%d%H%M%S)"
@@ -25,8 +26,8 @@ Usage:
   scripts/package-preview.sh [--stop-running]
 
 Options:
-  --stop-running   Gracefully stop only the process executing the existing
-                   dist-preview/Onyx Preview.app, then package its replacement.
+  --stop-running   Build and verify the replacement first, then gracefully stop
+                   only the process executing dist-preview/Onyx Preview.app.
                    Never searches for or kills app-server processes globally.
   -h, --help       Show this help.
 
@@ -53,6 +54,39 @@ die() {
   exit 1
 }
 
+cleanup() {
+  if [[ -d "$prepared_app" ]]; then
+    /bin/rm -rf -- "$prepared_app"
+  fi
+}
+trap cleanup EXIT
+
+lsof_pids_or_die() {
+  [[ -x /usr/sbin/lsof ]] || die "cannot inspect the preview because /usr/sbin/lsof is unavailable"
+  local temp_dir
+  temp_dir="$(/usr/bin/mktemp -d \
+    "${TMPDIR:-/tmp}/onyx-package-preview-lsof.XXXXXX")" || \
+    die "could not create a private directory for preview inspection"
+  local output_file="$temp_dir/output"
+  local error_file="$temp_dir/error"
+  local lsof_exit=0
+
+  /usr/sbin/lsof "$@" >| "$output_file" 2>| "$error_file" || lsof_exit=$?
+  # Status 1 with no diagnostic is lsof's ordinary no-match result. Everything
+  # else, including a partial-output failure, must fail closed so packaging
+  # never signals or replaces an app after an incomplete inspection.
+  if [[ -s "$error_file" ]] || (( lsof_exit > 1 )) || \
+     (( lsof_exit == 1 && $(/usr/bin/wc -c < "$output_file") > 0 )); then
+    local diagnostic="$(<"$error_file")"
+    [[ -n "$diagnostic" ]] || diagnostic="lsof exited with status $lsof_exit"
+    /bin/rm -rf -- "$temp_dir"
+    die "could not inspect the preview process: $diagnostic"
+  fi
+  [[ -f "$output_file" ]] && local output="$(<"$output_file")" || local output=""
+  /bin/rm -rf -- "$temp_dir"
+  print -r -- "$output"
+}
+
 while (( $# > 0 )); do
   case "$1" in
     --stop-running)
@@ -70,44 +104,61 @@ while (( $# > 0 )); do
 done
 
 if [[ -z "$signing_identity" ]]; then
-  login_keychain="$(/usr/bin/security default-keychain -d user 2>/dev/null \
-    | /usr/bin/tr -d '"[:space:]' || true)"
-  if [[ -n "$login_keychain" && -f "$login_keychain" ]]; then
-    identity_output="$(/usr/bin/security find-identity -v -p codesigning \
-      "$login_keychain" 2>/dev/null || true)"
-    for identity_line in "${(f)identity_output}"; do
-      if [[ "$identity_line" =~ '([0-9A-Fa-f]{40})[[:space:]]+"' ]]; then
-        signing_identity="${match[1]}"
-        break
-      fi
-    done
-  fi
-fi
-
-if [[ -z "$signing_identity" ]]; then
-  die "no valid code-signing identity found in the default user Keychain;"\
-      "set ONYX_PREVIEW_CODESIGN_IDENTITY to a certificate fingerprint, or"\
-      "set it to '-' to explicitly request ad-hoc signing"
+  die "the preview signing identity is empty; set"\
+      "ONYX_PREVIEW_CODESIGN_IDENTITY to a certificate fingerprint, or set"\
+      "it to '-' to explicitly request ad-hoc signing"
 fi
 
 [[ ! -L "$preview_app" && ! -L "$preview_executable" ]] || \
   die "refusing to operate through a symbolic link: $preview_app"
 
-preview_pids=()
-if [[ -f "$preview_executable" ]]; then
-  preview_pids=(${(f)"$(/usr/sbin/lsof -a -d txt -t -- "$preview_executable" 2>/dev/null || true)"})
-fi
-
 pid_owns_preview_executable() {
   local preview_pid="$1"
-  [[ "$(/usr/sbin/lsof -a -p "$preview_pid" -d txt -t -- \
-    "$preview_executable" 2>/dev/null || true)" == "$preview_pid" ]]
+  [[ "$(lsof_pids_or_die -a -p "$preview_pid" -d txt -t -- \
+    "$preview_executable")" == "$preview_pid" ]]
 }
 
+package_arguments=(
+  debug
+  "$prepared_app"
+  --display-name "$preview_display_name"
+  --bundle-id "$preview_bundle_identifier"
+  --build-number "$preview_build_number"
+)
+if [[ -n "$signing_identity" ]]; then
+  package_arguments+=(--signing-identity "$signing_identity" --no-signing-timestamp)
+fi
+if [[ -n "$signing_requirement" ]]; then
+  [[ -n "$signing_identity" ]] || \
+    die "ONYX_PREVIEW_CODESIGN_REQUIREMENT requires ONYX_PREVIEW_CODESIGN_IDENTITY"
+  package_arguments+=(--designated-requirement "$signing_requirement")
+fi
+
+"$repo_root/scripts/package-app.sh" "${package_arguments[@]}"
+
+[[ "$(/usr/bin/plutil -extract CFBundleDisplayName raw -o - \
+  "$prepared_app/Contents/Info.plist")" == "$preview_display_name" ]] || \
+  die "packaged preview display name changed"
+[[ "$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - \
+  "$prepared_app/Contents/Info.plist")" == "$preview_bundle_identifier" ]] || \
+  die "packaged preview bundle identifier changed"
+
+if [[ -n "$signing_identity" && "$signing_identity" != "-" ]]; then
+  code_signature_details="$(/usr/bin/codesign -dvv "$prepared_app" 2>&1)"
+  [[ "$code_signature_details" != *'Signature=adhoc'* ]] || \
+    die "packaged preview unexpectedly has an ad-hoc signature"
+fi
+
+# Only after the complete replacement has built, signed, and verified do we
+# inspect or stop the current app. A compiler or signing failure therefore
+# leaves the working preview untouched.
+preview_pids=()
+if [[ -f "$preview_executable" ]]; then
+  preview_pids=(${(f)"$(lsof_pids_or_die -a -d txt -t -- "$preview_executable")"})
+fi
 if (( ${#preview_pids[@]} > 0 && stop_running == 0 )); then
   die "the stable preview is running (PID ${${(j:, :)preview_pids}}); quit it or pass --stop-running"
 fi
-
 if (( stop_running == 1 )); then
   remaining=()
   for preview_pid in "${preview_pids[@]}"; do
@@ -136,35 +187,23 @@ if (( stop_running == 1 )); then
     die "the owned preview did not stop; refusing to force-kill or replace it"
 fi
 
-package_arguments=(
-  debug
-  "$preview_app"
-  --display-name "$preview_display_name"
-  --bundle-id "$preview_bundle_identifier"
-  --build-number "$preview_build_number"
-)
-if [[ -n "$signing_identity" ]]; then
-  package_arguments+=(--signing-identity "$signing_identity" --no-signing-timestamp)
-fi
-if [[ -n "$signing_requirement" ]]; then
-  [[ -n "$signing_identity" ]] || \
-    die "ONYX_PREVIEW_CODESIGN_REQUIREMENT requires ONYX_PREVIEW_CODESIGN_IDENTITY"
-  package_arguments+=(--designated-requirement "$signing_requirement")
+# Close the restart race before replacing the stable bundle. If something
+# relaunched the old executable after the graceful stop, leave both the current
+# app and the verified prepared bundle untouched until cleanup.
+if [[ -f "$preview_executable" ]]; then
+  restarted_pids="$(lsof_pids_or_die -a -d txt -t -- "$preview_executable")"
+  [[ -z "$restarted_pids" ]] || \
+    die "the stable preview restarted during packaging; refusing to replace it"
 fi
 
-"$repo_root/scripts/package-app.sh" "${package_arguments[@]}"
-
-[[ "$(/usr/bin/plutil -extract CFBundleDisplayName raw -o - \
-  "$preview_app/Contents/Info.plist")" == "$preview_display_name" ]] || \
-  die "packaged preview display name changed"
-[[ "$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - \
-  "$preview_app/Contents/Info.plist")" == "$preview_bundle_identifier" ]] || \
-  die "packaged preview bundle identifier changed"
-
-if [[ -n "$signing_identity" && "$signing_identity" != "-" ]]; then
-  code_signature_details="$(/usr/bin/codesign -dvv "$preview_app" 2>&1)"
-  [[ "$code_signature_details" != *'Signature=adhoc'* ]] || \
-    die "packaged preview unexpectedly has an ad-hoc signature"
+export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-$repo_root/.build/module-cache}"
+export SWIFTPM_MODULECACHE_OVERRIDE="${SWIFTPM_MODULECACHE_OVERRIDE:-$repo_root/.build/swiftpm-module-cache}"
+if [[ -e "$preview_app" ]]; then
+  /usr/bin/swift "$repo_root/scripts/atomic-swap.swift" "$preview_app" "$prepared_app" || \
+    die "could not atomically replace the stable preview"
+else
+  /bin/mv -- "$prepared_app" "$preview_app" || \
+    die "could not move the verified preview into place"
 fi
 
 print -- "Stable preview ready: $preview_app"

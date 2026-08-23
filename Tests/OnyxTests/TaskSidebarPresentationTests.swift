@@ -1,3 +1,5 @@
+import AppKit
+import SwiftUI
 import XCTest
 @testable import Onyx
 
@@ -100,5 +102,90 @@ final class TaskSidebarPresentationTests: XCTestCase {
             nil,
             after: first
         ))
+    }
+
+    func testPrimaryDesktopControlsShareGenerousCompactTargetPolicy() {
+        XCTAssertGreaterThanOrEqual(OnyxHitTarget.compact, 32)
+        XCTAssertGreaterThanOrEqual(OnyxHitTarget.row, OnyxHitTarget.compact)
+        XCTAssertGreaterThanOrEqual(OnyxHitTarget.splitter, 10)
+    }
+
+    @MainActor
+    func testClickingProjectNameTogglesTheWholeProjectHeader() throws {
+        let project = ProjectCatalogRecord(
+            id: ProjectID("hit-target-project"),
+            folderPath: "/tmp/hit-target-project",
+            displayName: "Onyx",
+            order: 0
+        )
+        var toggleCount = 0
+        let size = NSSize(width: 280, height: 36)
+        let hostingView = NSHostingView(
+            rootView: ProjectSidebarHeader(
+                project: project,
+                taskCount: 4,
+                isExpanded: false,
+                canMoveUp: false,
+                canMoveDown: false,
+                toggleExpanded: { toggleCount += 1 },
+                newTask: {},
+                rename: {},
+                moveUp: {},
+                moveDown: {},
+                remove: {}
+            )
+            .frame(width: size.width, height: size.height)
+        )
+        hostingView.frame = NSRect(origin: .zero, size: size)
+        let window = NSWindow(
+            contentRect: hostingView.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = hostingView
+        window.orderFront(nil)
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        hostingView.layoutSubtreeIfNeeded()
+
+        // This is over the project label, well outside the tiny disclosure
+        // glyph and trailing actions menu.
+        try click(at: NSPoint(x: 76, y: size.height / 2), in: window)
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
+
+        XCTAssertEqual(toggleCount, 1)
+    }
+
+    @MainActor
+    private func click(at point: NSPoint, in window: NSWindow) throws {
+        let timestamp = ProcessInfo.processInfo.systemUptime
+        let down = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: point,
+            modifierFlags: [],
+            timestamp: timestamp,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 1,
+            clickCount: 1,
+            pressure: 1
+        ))
+        let up = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseUp,
+            location: point,
+            modifierFlags: [],
+            timestamp: timestamp + 0.001,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 2,
+            clickCount: 1,
+            pressure: 0
+        ))
+        window.sendEvent(down)
+        window.sendEvent(up)
     }
 }

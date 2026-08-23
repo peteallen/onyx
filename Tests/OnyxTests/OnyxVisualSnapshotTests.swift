@@ -48,6 +48,15 @@ final class OnyxVisualSnapshotTests: XCTestCase {
                 timestamp: .now,
                 detail: "4 files"
             ),
+            TimelineItem(
+                id: "visual-failed-tool",
+                kind: .tool,
+                title: "node_repl · js",
+                body: "Invalid app: app.onyx.preview",
+                status: .failed,
+                timestamp: .now,
+                detail: nil
+            ),
         ]
 
         let environment = ProcessInfo.processInfo.environment

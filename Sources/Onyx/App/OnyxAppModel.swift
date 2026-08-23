@@ -56,7 +56,7 @@ enum ThreadListScope: String, CaseIterable, Identifiable {
 /// One immutable publication consumed by the native transcript. Keeping the
 /// items, revision, and hint in the same value prevents SwiftUI from observing
 /// a new array with metadata from an older mutation.
-struct TranscriptPresentationSnapshot: Equatable {
+struct TranscriptPresentationSnapshot: Equatable, Sendable {
     var items: [TimelineItem]
     var revision: UInt64
     var changeHint: TranscriptCollectionUpdate.Hint?
@@ -100,6 +100,28 @@ struct TranscriptPresentationSnapshot: Equatable {
                 toRevision: revision
             )
         }
+    }
+
+    /// Inserts an older, bounded history page ahead of the currently visible
+    /// tail. The revision-bound hint lets the native transcript preserve its
+    /// mounted rows and viewport instead of treating pagination as a complete
+    /// replacement of a potentially large conversation.
+    mutating func prepend(contentsOf olderItems: [TimelineItem]) {
+        guard !olderItems.isEmpty else { return }
+        let previousRevision = revision
+        revision &+= 1
+        items.insert(contentsOf: olderItems, at: 0)
+        changeHint = .itemsPrepended(
+            count: olderItems.count,
+            fromRevision: previousRevision,
+            toRevision: revision
+        )
+    }
+
+    nonisolated func prepending(contentsOf olderItems: [TimelineItem]) -> Self {
+        var copy = self
+        copy.prepend(contentsOf: olderItems)
+        return copy
     }
 
     mutating func replaceRow(at index: Int, with item: TimelineItem) {
@@ -189,6 +211,15 @@ final class OnyxAppModel: ObservableObject {
         didSet { preferences.set(inspectorTab.rawValue, forKey: preferenceKey(PreferenceKey.inspectorTab)) }
     }
     @Published var isLoadingThread = false
+    /// Earlier history is deliberately independent from the initial task-load
+    /// state. Once the newest page is visible, the composer and transcript are
+    /// ready even while an older page is being fetched above them.
+    @Published private(set) var isLoadingEarlierHistory = false
+    @Published private(set) var canLoadEarlierHistory = false
+    /// True only while the native provider is replacing the selected task's
+    /// durable history prefix. Keeping this separate from ordinary agent work
+    /// prevents a double-click from issuing the destructive operation twice.
+    @Published private(set) var isPreparingLatestMessageEdit = false
     @Published var isTurnRunning = false
     @Published private(set) var reviewingThreadID: String?
     @Published private(set) var startingReviewThreadID: String?
@@ -266,6 +297,7 @@ final class OnyxAppModel: ObservableObject {
     private var connectionTask: Task<Void, Never>?
     private var connectionRevision: UInt64 = 0
     private var loadTask: Task<Void, Never>?
+    private var earlierHistoryTask: Task<Void, Never>?
     private var threadListTask: Task<Void, Never>?
     private var deltaFlushTask: Task<Void, Never>?
     private var draftSaveTask: Task<Void, Never>?
@@ -288,6 +320,10 @@ final class OnyxAppModel: ObservableObject {
     private var pendingDeltas: [DeltaKey: String] = [:]
     private var collaborationAgentsByID: [String: RuntimeCollaborationAgent] = [:]
     private var activeTurnIDsByThreadID: [String: String] = [:]
+    /// A fresh send paints before the provider reports its stable turn ID.
+    /// Retain that exact optimistic user item until `turnStarted` binds it to
+    /// the provider turn, then replace it with the stable item notification.
+    private var pendingUserItemByThreadID: [String: TimelineItem] = [:]
     private var liveTimelineRevisionByThreadID: [String: UInt64] = [:]
     private var liveItemRevisionByThreadID: [String: [String: UInt64]] = [:]
     private var livePlanRevisionByThreadID: [String: UInt64] = [:]
@@ -317,6 +353,13 @@ final class OnyxAppModel: ObservableObject {
     /// Invalidates async work that began while a different provider account
     /// owned the visible task state.
     private var accountEpoch: UInt64 = 0
+    /// Separates successive destructive history operations so a late completion
+    /// from an invalidated account cannot unlock a newer edit request.
+    private var latestMessageEditGeneration: UInt64 = 0
+    private var latestMessageEditThreadID: String?
+    /// An ambiguous provider failure keeps sending locked until a later task
+    /// open proves which history the provider retained.
+    private var latestMessageEditRequiresReloadThreadID: String?
     private var sideChatGeneration: UInt64 = 0
     private var sideChatPendingDeltas: [String: String] = [:]
     private var sideChatModelID: String?
@@ -327,6 +370,29 @@ final class OnyxAppModel: ObservableObject {
     /// the provider-neutral reducer safe against late events from any future
     /// ephemeral-capable adapter without an arbitrary eviction boundary.
     private var discardedSideChatThreadIDs: Set<String> = []
+
+    /// Cursor-backed providers hydrate older turns remotely. Providers without
+    /// that capability still get the same bounded presentation by retaining
+    /// their already-read transcript and revealing it one small page at a
+    /// time. This keeps the UI contract provider neutral.
+    private enum EarlierHistorySource {
+        case provider(cursor: String)
+        case buffered(
+            items: [TimelineItem],
+            visibleStartIndex: Int,
+            nextProviderCursor: String?
+        )
+    }
+
+    private var earlierHistorySource: EarlierHistorySource?
+    /// Retains provider turn identity for history operations such as editing
+    /// the latest user message. Turns are stored in chronological order even
+    /// when the provider pages newest-first.
+    private(set) var loadedConversationTurns: [RuntimeConversationTurn] = []
+    private var resumedThreadID: String?
+
+    private static let historyTurnPageSize = 12
+    private static let bufferedHistoryPageItemLimit = 120
 
     private struct SendContext: Sendable {
         /// The exact composer contents before submission. The runtime receives
@@ -375,6 +441,7 @@ final class OnyxAppModel: ObservableObject {
         static let threadListScope = "Onyx.threadListScope"
         static let selectedThread = "Onyx.selectedThreadID"
         static let composerDrafts = "Onyx.composerDrafts"
+        static let acknowledgedHistoryEditWarning = "Onyx.acknowledgedHistoryEditWarning"
     }
 
     private static let welcomeThread = RuntimeThread(
@@ -475,6 +542,7 @@ final class OnyxAppModel: ObservableObject {
         eventTask?.cancel()
         connectionTask?.cancel()
         loadTask?.cancel()
+        earlierHistoryTask?.cancel()
         threadListTask?.cancel()
         deltaFlushTask?.cancel()
         draftSaveTask?.cancel()
@@ -671,7 +739,60 @@ final class OnyxAppModel: ObservableObject {
               let thread = selectedThread,
               thread.id != Self.welcomeThread.id else { return false }
         return !thread.status.isBusy
+            && !isPreparingLatestMessageEdit(for: thread.id)
             && !hasPendingInteraction(for: thread.id, blockingOnly: true)
+    }
+
+    /// The transcript may expose one edit affordance: the newest visible user
+    /// message, provided its complete provider turn identity is loaded. Older
+    /// messages never become editable merely because a later turn is busy or
+    /// failed; that would make the button silently target the wrong history
+    /// boundary.
+    var latestEditableUserMessageID: String? {
+        latestEditableUserMessage?.message.id
+    }
+
+    var isPreparingLatestMessageEditForSelectedThread: Bool {
+        selectedThreadID.map(isPreparingLatestMessageEdit(for:)) == true
+    }
+
+    private func isPreparingLatestMessageEdit(for threadID: String) -> Bool {
+        isPreparingLatestMessageEdit && latestMessageEditThreadID == threadID
+    }
+
+    private struct EditableUserMessage {
+        let turn: RuntimeConversationTurn
+        let message: TimelineItem
+    }
+
+    private var latestEditableUserMessage: EditableUserMessage? {
+        guard canRunAgent,
+              supports(.threadHistoryRevert),
+              !isPreparingLatestMessageEdit,
+              !isLoadingThread,
+              !isShowingArchivedThreads,
+              let thread = selectedThread,
+              thread.id != Self.welcomeThread.id,
+              selectedThreadID == thread.id,
+              composerText.isEmpty,
+              composerImages.isEmpty,
+              !isTurnRunning,
+              !thread.status.isBusy,
+              !isReviewActive(for: thread.id),
+              !hasPendingInteraction(for: thread.id, blockingOnly: true),
+              let turnIndex = loadedConversationTurns.lastIndex(where: { turn in
+                  turn.items.contains(where: { $0.kind == .userMessage })
+              }) else { return nil }
+
+        let turn = loadedConversationTurns[turnIndex]
+        let userMessages = turn.items.filter { $0.kind == .userMessage }
+        guard turn.itemDetail == .full,
+              turn.status == .completed || turn.status == .interrupted || turn.status == .failed,
+              userMessages.count == 1,
+              let message = userMessages.first,
+              timeline.last(where: { $0.kind == .userMessage })?.id == message.id
+        else { return nil }
+        return EditableUserMessage(turn: turn, message: message)
     }
 
     var activeUserInteraction: RuntimeUserInteraction? {
@@ -684,6 +805,7 @@ final class OnyxAppModel: ObservableObject {
 
     func canForkThread(_ thread: RuntimeThread) -> Bool {
         !thread.status.isBusy
+            && !isPreparingLatestMessageEdit(for: thread.id)
             && !isReviewActive(for: thread.id)
             && !hasPendingInteraction(for: thread.id, blockingOnly: true)
     }
@@ -694,8 +816,15 @@ final class OnyxAppModel: ObservableObject {
 
     func canArchiveThread(_ thread: RuntimeThread) -> Bool {
         !thread.status.isBusy
+            && !isPreparingLatestMessageEdit(for: thread.id)
             && !isReviewActive(for: thread.id)
             && !hasPendingInteraction(for: thread.id, blockingOnly: false)
+    }
+
+    func canDeleteThread(_ thread: RuntimeThread) -> Bool {
+        thread.id != Self.welcomeThread.id
+            && !isPreparingLatestMessageEdit(for: thread.id)
+            && !isReviewActive(for: thread.id)
     }
 
     func isResponding(to interaction: RuntimeUserInteraction) -> Bool {
@@ -822,11 +951,15 @@ final class OnyxAppModel: ObservableObject {
 
     var selectedReasoningEffortName: String {
         guard let selectedReasoningEffort else { return "Default" }
-        switch selectedReasoningEffort.lowercased() {
+        return reasoningEffortName(selectedReasoningEffort)
+    }
+
+    func reasoningEffortName(_ effort: String) -> String {
+        switch effort.lowercased() {
         case "xhigh": return "X-High"
         case "max": return "Max"
         case "ultra": return "Ultra"
-        default: return selectedReasoningEffort.capitalized
+        default: return effort.capitalized
         }
     }
 
@@ -1326,6 +1459,7 @@ final class OnyxAppModel: ObservableObject {
         preferences.set(id, forKey: preferenceKey(PreferenceKey.selectedThread))
         loadComposerDraft(for: id)
         loadTask?.cancel()
+        resetEarlierHistory()
         let selected = selectedThread
         isTurnRunning = selected.map {
             $0.status.isBusy || isReviewActive(for: $0.id)
@@ -1346,17 +1480,19 @@ final class OnyxAppModel: ObservableObject {
         loadTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let conversation = try await runtime.readThread(id: id)
+                let loaded = try await loadInitialHistory(for: id, runtime: runtime)
                 guard accountEpoch == epoch, !Task.isCancelled, selectedThreadID == id else { return }
                 applyConversationSnapshot(
-                    conversation.items,
-                    for: conversation.thread.id,
+                    loaded.visibleItems,
+                    for: loaded.conversation.thread.id,
                     preservingLiveUpdatesAfter: liveRevisionAtReadStart
                 )
-                updateThread(conversation.thread)
-                isTurnRunning = conversation.thread.status.isBusy
-                    || isReviewActive(for: conversation.thread.id)
+                installEarlierHistory(from: loaded)
+                updateThread(loaded.conversation.thread)
+                isTurnRunning = loaded.conversation.thread.status.isBusy
+                    || isReviewActive(for: loaded.conversation.thread.id)
                 isLoadingThread = false
+                resolveLatestMessageEditAfterAuthoritativeReload(threadID: id)
             } catch {
                 guard accountEpoch == epoch, !Task.isCancelled, selectedThreadID == id else { return }
                 isLoadingThread = false
@@ -1527,6 +1663,7 @@ final class OnyxAppModel: ObservableObject {
         let cwd = sideChatCWD
         let parentID = sideChatParentThreadID
         let wasRunning = isSideChatTurnRunning
+        let optimisticItemID = "side-optimistic:\(UUID().uuidString)"
         let steeringModelID = parentID.flatMap { parentID in
             threads.first(where: { $0.id == parentID })?.model
         } ?? modelID
@@ -1537,7 +1674,7 @@ final class OnyxAppModel: ObservableObject {
         sideChatError = nil
         appendSideChatTimeline(
             TimelineItem(
-                id: "side-optimistic:\(UUID().uuidString)",
+                id: optimisticItemID,
                 kind: .userMessage,
                 title: nil,
                 body: text,
@@ -1593,17 +1730,18 @@ final class OnyxAppModel: ObservableObject {
                 sideChatComposerImages = images.filter { !laterInputs.contains($0.input) }
                     + sideChatComposerImages
                 sideChatError = error.localizedDescription
-                appendSideChatTimeline(
-                    TimelineItem(
-                        id: "side-error:\(UUID().uuidString)",
-                        kind: .error,
-                        title: "Side chat failed",
-                        body: error.localizedDescription,
-                        status: .failed,
-                        timestamp: .now,
-                        detail: nil
-                    )
-                )
+                // The error strip below the transcript is the one visible
+                // failure surface. Remove the optimistic sent row instead of
+                // leaving it behind beside a second red error row; otherwise
+                // retrying makes the panel look as though the same message
+                // was sent repeatedly even though the provider rejected it.
+                if let optimisticIndex = sideChatTimeline.firstIndex(where: {
+                    $0.id == optimisticItemID
+                }) {
+                    var reconciled = sideChatTimeline
+                    reconciled.remove(at: optimisticIndex)
+                    replaceSideChatTimeline(reconciled)
+                }
             }
         }
     }
@@ -1704,6 +1842,7 @@ final class OnyxAppModel: ObservableObject {
         pendingRestoredSelectionID = nil
         closeSideChat()
         loadTask?.cancel()
+        resetEarlierHistory()
         let wasActiveScope = threadListScope == .active
         let canReuseConnectionRefresh = wasActiveScope
             && isLoadingThreadList
@@ -1826,6 +1965,7 @@ final class OnyxAppModel: ObservableObject {
         navigationRevision += 1
         threadListTask?.cancel()
         loadTask?.cancel()
+        resetEarlierHistory()
         threadListScope = scope
         threads = scope == .active ? [Self.welcomeThread] : []
         selectedThreadID = nil
@@ -1892,6 +2032,7 @@ final class OnyxAppModel: ObservableObject {
     }
 
     func sendComposer() {
+        guard !isPreparingLatestMessageEditForSelectedThread else { return }
         let draftText = composerText
         let text = draftText.trimmingCharacters(in: .whitespacesAndNewlines)
         let images = composerImages
@@ -2070,33 +2211,41 @@ final class OnyxAppModel: ObservableObject {
                     recordModelUsageIfAvailable(modelUsed)
                     guard accountEpoch == context.accountEpoch, !Task.isCancelled else { return }
                 } else {
-                    if !createdThread {
-                        let conversation = try await runtime.resumeThread(id: threadID)
+                    if !createdThread, resumedThreadID != threadID {
+                        let loaded = try await loadInitialHistory(
+                            for: threadID,
+                            runtime: runtime,
+                            resumeUnpaginated: true
+                        )
                         guard accountEpoch == context.accountEpoch, !Task.isCancelled else { return }
                         modelUsed = context.modelID
-                            ?? conversation.thread.model
+                            ?? loaded.conversation.thread.model
                             ?? modelUsed
                         if selectedThreadID == threadID,
                            navigationRevision == context.navigationRevision {
-                            replaceTimeline(conversation.items, authoritativeFor: conversation.thread.id)
+                            replaceTimeline(
+                                loaded.visibleItems,
+                                authoritativeFor: loaded.conversation.thread.id
+                            )
+                            installEarlierHistory(from: loaded)
                         }
-                        updateThread(conversation.thread)
+                        updateThread(loaded.conversation.thread)
                     }
 
                     if selectedThreadID == threadID,
                        (createdThread || navigationRevision == context.navigationRevision) {
-                        appendTimeline(
-                            TimelineItem(
-                                id: "optimistic:\(UUID().uuidString)",
-                                kind: .userMessage,
-                                title: nil,
-                                body: context.text,
-                                status: .completed,
-                                timestamp: .now,
-                                detail: nil,
-                                attachments: context.images.map(\.timelineAttachment)
-                            )
+                        let optimisticUserItem = TimelineItem(
+                            id: "optimistic:\(UUID().uuidString)",
+                            kind: .userMessage,
+                            title: nil,
+                            body: context.text,
+                            status: .completed,
+                            timestamp: .now,
+                            detail: nil,
+                            attachments: context.images.map(\.timelineAttachment)
                         )
+                        pendingUserItemByThreadID[threadID] = optimisticUserItem
+                        appendTimeline(optimisticUserItem)
                         isTurnRunning = true
                     }
                     updateThreadLifecycle(id: threadID, status: .running)
@@ -2294,6 +2443,278 @@ final class OnyxAppModel: ObservableObject {
         pinnedThreadStore.toggle(id)
     }
 
+    /// Starts the native "edit last message" operation. The first use is
+    /// deliberately confirmation-gated because provider history and project
+    /// files have different undo semantics; later uses stay lightweight.
+    func beginEditLatestUserMessage(messageID: String, window: NSWindow?) {
+        guard latestEditableUserMessage?.message.id == messageID else { return }
+        if preferences.bool(
+            forKey: preferenceKey(PreferenceKey.acknowledgedHistoryEditWarning)
+        ) {
+            editLatestUserMessage(expectedMessageID: messageID)
+            return
+        }
+
+        guard let window else {
+            notice = (
+                "Could not show the edit warning",
+                "Try again after the task window is fully visible. Your message and draft were not changed."
+            )
+            return
+        }
+
+        let epoch = accountEpoch
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Edit your last message?"
+        alert.informativeText = "This removes that message and everything after it from the task's conversation history. Changes already made to files in your project are not reverted."
+        alert.addButton(withTitle: "Edit Message")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            Task { @MainActor [weak self] in
+                guard let self, accountEpoch == epoch else { return }
+                preferences.set(
+                    true,
+                    forKey: preferenceKey(PreferenceKey.acknowledgedHistoryEditWarning)
+                )
+                editLatestUserMessage(expectedMessageID: messageID)
+            }
+        }
+    }
+
+    /// Executes the already-confirmed native history operation. Kept internal
+    /// so model tests can exercise the provider boundary without presenting a
+    /// modal sheet.
+    func editLatestUserMessage(expectedMessageID: String? = nil) {
+        guard let candidate = latestEditableUserMessage,
+              expectedMessageID == nil || candidate.message.id == expectedMessageID,
+              let threadID = selectedThreadID,
+              let runtime else { return }
+
+        let originalText = candidate.message.body
+        let originalImages = Self.composerImages(from: candidate.message.attachments)
+        let epoch = accountEpoch
+        let revision = navigationRevision
+        latestMessageEditGeneration &+= 1
+        let editGeneration = latestMessageEditGeneration
+        latestMessageEditThreadID = threadID
+        latestMessageEditRequiresReloadThreadID = nil
+        isPreparingLatestMessageEdit = true
+
+        Task { [weak self] in
+            guard let self else { return }
+            var shouldFinishEdit = true
+            defer {
+                if shouldFinishEdit {
+                    finishLatestMessageEdit(generation: editGeneration)
+                }
+            }
+            do {
+                let result = try await runtime.revertThread(
+                    id: threadID,
+                    beforeTurnID: candidate.turn.id
+                )
+                guard accountEpoch == epoch, !Task.isCancelled else { return }
+
+                updateThread(result.thread)
+                // The native revert is itself a writer operation and leaves
+                // this task's app-server session attached. Mark ownership so
+                // the corrected send does not rehydrate the now-removed turn
+                // from a stale pre-revert read page.
+                resumedThreadID = threadID
+                guard selectedThreadID == threadID,
+                      navigationRevision == revision
+                else {
+                    // The provider operation already succeeded. Preserve the
+                    // editable message as this task's draft even if the user
+                    // navigated away while the request was in flight.
+                    restoreFailedSend(originalText, for: threadID)
+                    restoreFailedImages(originalImages, for: threadID)
+                    if selectedThreadID == threadID {
+                        let reconciled = await reconcileHistoryAfterUncertainEdit(
+                            threadID: threadID,
+                            epoch: epoch,
+                            runtime: runtime
+                        )
+                        if !reconciled, accountEpoch == epoch, !Task.isCancelled {
+                            latestMessageEditRequiresReloadThreadID = threadID
+                            shouldFinishEdit = false
+                        }
+                    }
+                    return
+                }
+
+                guard let currentTurnIndex = loadedConversationTurns.firstIndex(where: {
+                    $0.id == candidate.turn.id
+                }) else {
+                    // A native `thread/reverted` notification can start an
+                    // authoritative refresh before the request response arrives.
+                    // Preserve the input and keep the edit locked until that
+                    // refresh (or a replacement read) has reconciled the view.
+                    restoreFailedSend(originalText, for: threadID)
+                    restoreFailedImages(originalImages, for: threadID)
+                    let reconciled = await reconcileHistoryAfterUncertainEdit(
+                        threadID: threadID,
+                        epoch: epoch,
+                        runtime: runtime
+                    )
+                    if !reconciled, accountEpoch == epoch, !Task.isCancelled {
+                        latestMessageEditRequiresReloadThreadID = threadID
+                        shouldFinishEdit = false
+                    }
+                    return
+                }
+
+                let revertedItemIDs = Set(candidate.turn.items.map(\.id))
+                let cutIndex = timeline.firstIndex(where: { revertedItemIDs.contains($0.id) })
+                    ?? timeline.firstIndex(where: { $0.id == candidate.message.id })
+                if let cutIndex {
+                    replaceTimeline(
+                        Array(timeline[..<cutIndex]),
+                        authoritativeFor: threadID
+                    )
+                }
+                loadedConversationTurns.removeSubrange(currentTurnIndex...)
+
+                // The composer remains responsive while the provider works.
+                // Merge anything typed or pasted during that interval instead
+                // of silently replacing it with the restored message.
+                restoreFailedSend(originalText, for: threadID)
+                restoreFailedImages(originalImages, for: threadID)
+            } catch {
+                guard accountEpoch == epoch, !Task.isCancelled else { return }
+                let operationError = error
+                let compatibilityFailure = Self.isHistoryRevertCompatibilityFailure(operationError)
+                if compatibilityFailure {
+                    downgradeRuntimeCapability(.threadHistoryRevert)
+                    notice = (
+                        "Message editing is unavailable",
+                        "This Codex version does not support native history editing. The conversation and your current draft were not changed."
+                    )
+                    return
+                }
+                // A timeout or lost response does not prove the server left
+                // history untouched. Preserve the input first, then reload the
+                // provider's authoritative tail before allowing another send.
+                restoreFailedSend(originalText, for: threadID)
+                restoreFailedImages(originalImages, for: threadID)
+                let reconciled = if selectedThreadID == threadID {
+                    await reconcileHistoryAfterUncertainEdit(
+                        threadID: threadID,
+                        epoch: epoch,
+                        runtime: runtime
+                    )
+                } else {
+                    false
+                }
+                guard accountEpoch == epoch, !Task.isCancelled else { return }
+                if !reconciled {
+                    latestMessageEditRequiresReloadThreadID = threadID
+                    shouldFinishEdit = false
+                }
+                notice = reconciled
+                    ? (
+                        "Could not confirm the edit",
+                        "Onyx reloaded the task and preserved the original message in the composer. \(operationError.localizedDescription)"
+                    )
+                    : (
+                        "Could not confirm the edit",
+                        "The provider may have changed the conversation. The original message is preserved as this task's draft; reopen the task to confirm its history. \(operationError.localizedDescription)"
+                    )
+            }
+        }
+    }
+
+    private func finishLatestMessageEdit(generation: UInt64) {
+        guard latestMessageEditGeneration == generation else { return }
+        isPreparingLatestMessageEdit = false
+        latestMessageEditThreadID = nil
+        latestMessageEditRequiresReloadThreadID = nil
+    }
+
+    private func invalidateLatestMessageEdit() {
+        latestMessageEditGeneration &+= 1
+        isPreparingLatestMessageEdit = false
+        latestMessageEditThreadID = nil
+        latestMessageEditRequiresReloadThreadID = nil
+    }
+
+    private func resolveLatestMessageEditAfterAuthoritativeReload(threadID: String) {
+        guard latestMessageEditRequiresReloadThreadID == threadID,
+              latestMessageEditThreadID == threadID else { return }
+        finishLatestMessageEdit(generation: latestMessageEditGeneration)
+    }
+
+    private static func isHistoryRevertCompatibilityFailure(_ error: any Error) -> Bool {
+        guard let runtimeError = error as? AgentRuntimeError else { return false }
+        switch runtimeError {
+        case .unsupported:
+            return true
+        case let .requestFailed(code, _):
+            return code == -32_601 || code == -32_602
+        default:
+            return false
+        }
+    }
+
+    private func downgradeRuntimeCapability(_ capability: RuntimeCapabilities) {
+        downgradeRuntimeCapabilities(capability)
+    }
+
+    private func downgradeRuntimeCapabilities(_ unavailable: RuntimeCapabilities) {
+        guard let session,
+              !session.capabilities.intersection(unavailable).isEmpty else { return }
+        var capabilities = session.capabilities
+        capabilities.subtract(unavailable)
+        self.session = RuntimeSession(
+            runtime: session.runtime,
+            displayName: session.displayName,
+            accountLabel: session.accountLabel,
+            planLabel: session.planLabel,
+            auth: session.auth,
+            availableLoginMethods: session.availableLoginMethods,
+            availableModels: session.availableModels,
+            capabilities: capabilities
+        )
+    }
+
+    private static func composerImages(
+        from attachments: [TimelineAttachment]
+    ) -> [ComposerImageDraft] {
+        attachments.compactMap { attachment in
+            let input: RuntimeTurnInput
+            let byteCount: Int
+            switch attachment.source {
+            case let .localFilePath(path):
+                input = .localImagePath(path)
+                let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+                byteCount = max(
+                    0,
+                    (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                )
+            case let .dataURL(value):
+                input = .imageURL(value)
+                if let comma = value.firstIndex(of: ",") {
+                    // This is display/accounting metadata only. Preserve the
+                    // exact provider-normalized data URL without allocating a
+                    // second decoded image on the main actor.
+                    byteCount = max(0, value.distance(from: comma, to: value.endIndex) * 3 / 4)
+                } else {
+                    byteCount = 0
+                }
+            case let .remoteURL(url):
+                input = .imageURL(url.absoluteString)
+                byteCount = 0
+            }
+            return ComposerImageDraft(
+                input: input,
+                displayName: attachment.accessibilityLabel,
+                byteCount: byteCount
+            )
+        }
+    }
+
     func beginRename(_ id: String, window: NSWindow?) {
         guard let thread = threads.first(where: { $0.id == id }), id != Self.welcomeThread.id else { return }
         let epoch = accountEpoch
@@ -2370,6 +2791,7 @@ final class OnyxAppModel: ObservableObject {
                 threadListScope = .active
                 threads = [Self.welcomeThread]
                 selectedThreadID = nil
+                resetEarlierHistory()
                 replaceTimeline([])
                 isTurnRunning = false
                 isLoadingThread = false
@@ -2440,11 +2862,13 @@ final class OnyxAppModel: ObservableObject {
 
     func beginDelete(_ id: String, window: NSWindow?) {
         guard supports(.threadDeletion), id != Self.welcomeThread.id,
-              threads.contains(where: { $0.id == id }) else { return }
-        guard !isReviewActive(for: id) else {
+              let thread = threads.first(where: { $0.id == id }) else { return }
+        guard canDeleteThread(thread) else {
             notice = (
                 "Task is still active",
-                "Finish or stop the code review before deleting this task."
+                isPreparingLatestMessageEdit(for: id)
+                    ? "Wait for message editing to finish before deleting this task."
+                    : "Finish or stop the code review before deleting this task."
             )
             return
         }
@@ -2504,6 +2928,8 @@ final class OnyxAppModel: ObservableObject {
                 activeTurnIDsByThreadID.removeAll()
                 downgradeLiveCollaborationAgents()
             }
+        case let .runtimeCapabilitiesDowngraded(capabilities):
+            downgradeRuntimeCapabilities(capabilities)
         case let .accountUpdated(updatedAuth):
             if isSideChatPresented, updatedAuth != authState {
                 closeSideChat()
@@ -2606,9 +3032,11 @@ final class OnyxAppModel: ObservableObject {
             if item.kind == .userMessage,
                let optimisticIndex = timeline.lastIndex(where: { $0.id.hasPrefix("optimistic:") && $0.body == item.body }) {
                 replaceTimelineRow(at: optimisticIndex, with: item)
+                pendingUserItemByThreadID[threadID] = item
             } else if !timeline.contains(where: { $0.id == item.id }) {
                 appendTimeline(item)
             }
+            recordLoadedConversationItem(item, for: threadID)
             mergeCollaborationActivity(from: item)
         case let .itemDelta(threadID, itemID, delta):
             guard authState.canRun, !isSigningOut, selectedThreadID == threadID else { return }
@@ -2624,6 +3052,7 @@ final class OnyxAppModel: ObservableObject {
             } else {
                 appendTimeline(item)
             }
+            recordLoadedConversationItem(item, for: threadID)
             mergeCollaborationActivity(from: item)
         case let .turnStarted(threadID, turnID):
             guard authState.canRun, !isSigningOut else { return }
@@ -2633,6 +3062,7 @@ final class OnyxAppModel: ObservableObject {
                 plansByThreadID.removeValue(forKey: threadID)
             }
             activeTurnIDsByThreadID[threadID] = turnID
+            beginLoadedConversationTurn(threadID: threadID, turnID: turnID)
         case let .planUpdated(threadID, plan):
             guard authState.canRun,
                   !isSigningOut,
@@ -2651,7 +3081,15 @@ final class OnyxAppModel: ObservableObject {
         case let .turnCompleted(threadID, status):
             guard authState.canRun, !isSigningOut else { return }
             updateThreadLifecycle(id: threadID, status: status)
+            if let turnID = activeTurnIDsByThreadID[threadID] {
+                completeLoadedConversationTurn(
+                    threadID: threadID,
+                    turnID: turnID,
+                    threadStatus: status
+                )
+            }
             activeTurnIDsByThreadID.removeValue(forKey: threadID)
+            pendingUserItemByThreadID.removeValue(forKey: threadID)
             if selectedThreadID == threadID {
                 flushDeltas()
                 isTurnRunning = status == .running
@@ -2839,6 +3277,7 @@ final class OnyxAppModel: ObservableObject {
         case let .turnCompleted(threadID, _): threadID
         case let .userInteractionRequested(interaction): interaction.threadID
         case .connectionChanged,
+             .runtimeCapabilitiesDowngraded,
              .accountUpdated,
              .loginCompleted,
              .userInteractionResolved,
@@ -2968,6 +3407,369 @@ final class OnyxAppModel: ObservableObject {
         threadIndexCacheRevision = threadListRevision
     }
 
+    private struct InitialHistoryLoad {
+        let conversation: RuntimeConversation
+        let visibleItems: [TimelineItem]
+        let earlierSource: EarlierHistorySource?
+        let chronologicalTurns: [RuntimeConversationTurn]
+        let resumedThread: Bool
+    }
+
+    /// Loads only the useful tail when the provider has a native turn cursor.
+    /// Other providers keep their existing read contract, but Onyx still
+    /// bounds the first main-thread transcript projection and reveals the
+    /// already-read prefix page by page.
+    private func loadInitialHistory(
+        for threadID: String,
+        runtime: any AgentRuntime,
+        resumeUnpaginated: Bool = false
+    ) async throws -> InitialHistoryLoad {
+        if supports(.threadHistoryPagination) {
+            do {
+                return try await loadPaginatedInitialHistory(
+                    for: threadID,
+                    runtime: runtime,
+                    resuming: resumeUnpaginated
+                )
+            } catch {
+                // Onyx can run a user-selected, older Codex binary. Only the
+                // two JSON-RPC compatibility errors prove that its pagination
+                // surface is unavailable; transport and malformed-data errors
+                // must remain visible instead of silently rereading everything.
+                guard Self.isHistoryPaginationCompatibilityFailure(error) else {
+                    throw error
+                }
+            }
+        }
+
+        let conversation = if resumeUnpaginated {
+            try await runtime.resumeThread(id: threadID)
+        } else {
+            try await runtime.readThread(id: threadID)
+        }
+        return Self.bufferedInitialHistory(
+            conversation: conversation,
+            resumedThread: resumeUnpaginated
+        )
+    }
+
+    private func loadPaginatedInitialHistory(
+        for threadID: String,
+        runtime: any AgentRuntime,
+        resuming: Bool
+    ) async throws -> InitialHistoryLoad {
+        let loaded = if resuming {
+            try await runtime.resumeThread(
+                id: threadID,
+                initialHistoryPage: RuntimeInitialThreadHistoryPageRequest(
+                    limit: Self.historyTurnPageSize,
+                    direction: .descending,
+                    itemDetail: .full
+                )
+            )
+        } else {
+            try await runtime.readThread(
+                id: threadID,
+                initialHistoryPage: RuntimeThreadHistoryPageRequest(
+                    limit: Self.historyTurnPageSize,
+                    direction: .descending,
+                    itemDetail: .full
+                )
+            )
+        }
+        if let page = loaded.initialHistoryPage {
+            let chronologicalTurns: [RuntimeConversationTurn] = switch page.direction {
+            case .ascending: page.turns
+            case .descending: Array(page.turns.reversed())
+            }
+            let pageItems = page.chronologicalItems
+            let visibleStart = Self.bufferedHistoryPageStart(
+                in: pageItems,
+                before: pageItems.count
+            )
+            let earlierSource: EarlierHistorySource? = if visibleStart > 0 {
+                .buffered(
+                    items: pageItems,
+                    visibleStartIndex: visibleStart,
+                    nextProviderCursor: page.nextCursor
+                )
+            } else {
+                page.nextCursor.map { .provider(cursor: $0) }
+            }
+            return InitialHistoryLoad(
+                conversation: loaded.conversation,
+                visibleItems: Array(pageItems.dropFirst(visibleStart)),
+                earlierSource: earlierSource,
+                chronologicalTurns: chronologicalTurns,
+                resumedThread: resuming
+            )
+        }
+
+        // A successful native operation with no initial page is still a
+        // usable empty/metadata-only task. Do not turn it into an error by
+        // immediately issuing a second full-history read that can fail.
+        return InitialHistoryLoad(
+            conversation: loaded.conversation,
+            visibleItems: loaded.conversation.items,
+            earlierSource: nil,
+            chronologicalTurns: [],
+            resumedThread: resuming
+        )
+    }
+
+    private static func isHistoryPaginationCompatibilityFailure(_ error: any Error) -> Bool {
+        guard let runtimeError = error as? AgentRuntimeError else { return false }
+        switch runtimeError {
+        case .unsupported:
+            return true
+        case let .requestFailed(code, _):
+            return code == -32_601 || code == -32_602
+        default:
+            return false
+        }
+    }
+
+    private static func bufferedInitialHistory(
+        conversation: RuntimeConversation,
+        resumedThread: Bool
+    ) -> InitialHistoryLoad {
+        let visibleStart = bufferedHistoryPageStart(
+            in: conversation.items,
+            before: conversation.items.count
+        )
+        let visibleItems = Array(conversation.items.dropFirst(visibleStart))
+        let earlierSource: EarlierHistorySource? = visibleStart > 0
+            ? .buffered(
+                items: conversation.items,
+                visibleStartIndex: visibleStart,
+                nextProviderCursor: nil
+            )
+            : nil
+        return InitialHistoryLoad(
+            conversation: conversation,
+            visibleItems: visibleItems,
+            earlierSource: earlierSource,
+            chronologicalTurns: [],
+            resumedThread: resumedThread
+        )
+    }
+
+    /// A turn boundary is preferred, but a single pathological turn must not
+    /// put thousands of tool events back on the first render. The item bound
+    /// is therefore the hard limit and the turn count is the softer reading
+    /// boundary.
+    private static func bufferedHistoryPageStart(
+        in items: [TimelineItem],
+        before upperBound: Int
+    ) -> Int {
+        guard upperBound > 0 else { return 0 }
+        let hardLowerBound = max(0, upperBound - bufferedHistoryPageItemLimit)
+        var userTurnCount = 0
+        var start = upperBound
+        var index = upperBound - 1
+        while index >= hardLowerBound {
+            start = index
+            if items[index].kind == .userMessage {
+                userTurnCount += 1
+                if userTurnCount >= historyTurnPageSize { break }
+            }
+            if index == 0 { break }
+            index -= 1
+        }
+        return start
+    }
+
+    private func installEarlierHistory(from loaded: InitialHistoryLoad) {
+        earlierHistorySource = loaded.earlierSource
+        canLoadEarlierHistory = loaded.earlierSource != nil
+        isLoadingEarlierHistory = false
+        loadedConversationTurns = loaded.chronologicalTurns
+        resumedThreadID = loaded.resumedThread ? loaded.conversation.thread.id : nil
+    }
+
+    private func resetEarlierHistory() {
+        earlierHistoryTask?.cancel()
+        earlierHistoryTask = nil
+        earlierHistorySource = nil
+        canLoadEarlierHistory = false
+        isLoadingEarlierHistory = false
+        loadedConversationTurns = []
+        resumedThreadID = nil
+    }
+
+    private func beginLoadedConversationTurn(threadID: String, turnID: String) {
+        guard selectedThreadID == threadID else { return }
+        let initialItems = pendingUserItemByThreadID[threadID].map { [$0] } ?? []
+        if let index = loadedConversationTurns.firstIndex(where: { $0.id == turnID }) {
+            loadedConversationTurns[index].status = .inProgress
+            for item in initialItems {
+                upsert(item, inLoadedTurnAt: index)
+            }
+            return
+        }
+        loadedConversationTurns.append(
+            RuntimeConversationTurn(
+                id: turnID,
+                items: initialItems,
+                status: .inProgress,
+                itemDetail: .full,
+                startedAt: .now,
+                completedAt: nil,
+                durationMilliseconds: nil
+            )
+        )
+    }
+
+    private func recordLoadedConversationItem(_ item: TimelineItem, for threadID: String) {
+        guard selectedThreadID == threadID,
+              let turnID = activeTurnIDsByThreadID[threadID],
+              let turnIndex = loadedConversationTurns.lastIndex(where: { $0.id == turnID })
+        else { return }
+        upsert(item, inLoadedTurnAt: turnIndex)
+    }
+
+    private func upsert(_ item: TimelineItem, inLoadedTurnAt turnIndex: Int) {
+        guard loadedConversationTurns.indices.contains(turnIndex) else { return }
+        if let itemIndex = loadedConversationTurns[turnIndex].items.firstIndex(where: {
+            $0.id == item.id
+                || ($0.id.hasPrefix("optimistic:")
+                    && $0.kind == .userMessage
+                    && item.kind == .userMessage
+                    && $0.body == item.body)
+        }) {
+            loadedConversationTurns[turnIndex].items[itemIndex] = item
+        } else {
+            loadedConversationTurns[turnIndex].items.append(item)
+        }
+    }
+
+    private func completeLoadedConversationTurn(
+        threadID: String,
+        turnID: String,
+        threadStatus: RuntimeThreadStatus
+    ) {
+        guard selectedThreadID == threadID,
+              let index = loadedConversationTurns.lastIndex(where: { $0.id == turnID })
+        else { return }
+        loadedConversationTurns[index].status = switch threadStatus {
+        case .idle: .completed
+        case .failed: .failed
+        case .running, .waitingForInput, .waitingForApproval: .inProgress
+        case .unknown: .unknown("unknown")
+        }
+        if loadedConversationTurns[index].status != .inProgress {
+            let completion = Date.now
+            loadedConversationTurns[index].completedAt = completion
+            if let startedAt = loadedConversationTurns[index].startedAt {
+                loadedConversationTurns[index].durationMilliseconds = max(
+                    0,
+                    Int(completion.timeIntervalSince(startedAt) * 1_000)
+                )
+            }
+        }
+    }
+
+    func loadEarlierHistory() {
+        guard !isLoadingEarlierHistory,
+              let source = earlierHistorySource,
+              let threadID = selectedThreadID,
+              threadID != Self.welcomeThread.id else { return }
+
+        isLoadingEarlierHistory = true
+        let epoch = accountEpoch
+        let revision = navigationRevision
+        earlierHistoryTask?.cancel()
+        earlierHistoryTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                // Give the loading affordance one render opportunity before a
+                // buffered page is projected on the main actor.
+                await Task.yield()
+                let olderItems: [TimelineItem]
+                let olderTurns: [RuntimeConversationTurn]
+                let nextSource: EarlierHistorySource?
+
+                switch source {
+                case let .provider(cursor):
+                    guard let runtime else {
+                        throw AgentRuntimeError.unsupported("paginated thread history")
+                    }
+                    let page = try await runtime.listThreadHistory(
+                        id: threadID,
+                        page: RuntimeThreadHistoryPageRequest(
+                            cursor: cursor,
+                            limit: Self.historyTurnPageSize,
+                            direction: .descending,
+                            itemDetail: .full
+                        )
+                    )
+                    let pageItems = page.chronologicalItems
+                    let visibleStart = Self.bufferedHistoryPageStart(
+                        in: pageItems,
+                        before: pageItems.count
+                    )
+                    olderItems = Array(pageItems.dropFirst(visibleStart))
+                    olderTurns = switch page.direction {
+                    case .ascending: page.turns
+                    case .descending: Array(page.turns.reversed())
+                    }
+                    if visibleStart > 0 {
+                        nextSource = .buffered(
+                            items: pageItems,
+                            visibleStartIndex: visibleStart,
+                            nextProviderCursor: page.nextCursor
+                        )
+                    } else {
+                        nextSource = page.nextCursor.flatMap { nextCursor in
+                            // A provider repeating an empty page/cursor would make
+                            // the button an infinite no-op. Stop at no progress.
+                            guard !olderItems.isEmpty || nextCursor != cursor else { return nil }
+                            return .provider(cursor: nextCursor)
+                        }
+                    }
+
+                case let .buffered(items, visibleStartIndex, nextProviderCursor):
+                    let pageStart = Self.bufferedHistoryPageStart(
+                        in: items,
+                        before: visibleStartIndex
+                    )
+                    olderItems = Array(items[pageStart..<visibleStartIndex])
+                    olderTurns = []
+                    if pageStart > 0 {
+                        nextSource = .buffered(
+                            items: items,
+                            visibleStartIndex: pageStart,
+                            nextProviderCursor: nextProviderCursor
+                        )
+                    } else {
+                        nextSource = nextProviderCursor.map { .provider(cursor: $0) }
+                    }
+                }
+
+                guard accountEpoch == epoch,
+                      navigationRevision == revision,
+                      selectedThreadID == threadID,
+                      !Task.isCancelled else { return }
+                await prependTimeline(olderItems)
+                if !olderTurns.isEmpty {
+                    loadedConversationTurns.insert(contentsOf: olderTurns, at: 0)
+                }
+                earlierHistorySource = nextSource
+                canLoadEarlierHistory = nextSource != nil
+                isLoadingEarlierHistory = false
+                earlierHistoryTask = nil
+            } catch {
+                guard accountEpoch == epoch,
+                      navigationRevision == revision,
+                      selectedThreadID == threadID,
+                      !Task.isCancelled else { return }
+                isLoadingEarlierHistory = false
+                earlierHistoryTask = nil
+                notice = ("Could not load earlier messages", error.localizedDescription)
+            }
+        }
+    }
+
     private func replaceTimeline(_ items: [TimelineItem], authoritativeFor threadID: String? = nil) {
         transcriptSnapshot.replaceAll(with: items)
         if let threadID {
@@ -2982,6 +3784,27 @@ final class OnyxAppModel: ObservableObject {
 
     private func appendTimeline(_ item: TimelineItem) {
         transcriptSnapshot.append(item)
+    }
+
+    private func prependTimeline(_ items: [TimelineItem]) async {
+        guard !items.isEmpty else { return }
+        // Array's front insertion copies the complete loaded suffix. Prepare
+        // that immutable snapshot away from the main actor, then publish it
+        // with one constant-time copy-on-write assignment.
+        while !Task.isCancelled {
+            let base = transcriptSnapshot
+            let prepared = await Task.detached(priority: .userInitiated) {
+                base.prepending(contentsOf: items)
+            }.value
+            guard transcriptSnapshot.revision != base.revision else {
+                transcriptSnapshot = prepared
+                break
+            }
+        }
+        for item in items {
+            mergeCollaborationActivity(from: item, publish: false)
+        }
+        publishCollaborationAgents()
     }
 
     private func replaceTimelineRow(at index: Int, with item: TimelineItem) {
@@ -3312,6 +4135,7 @@ final class OnyxAppModel: ObservableObject {
             composerDraftKey = Self.welcomeThread.id
             composerText = composerDrafts[composerDraftKey] ?? ""
             composerImages = composerImageDrafts[composerDraftKey] ?? []
+            resetEarlierHistory()
             replaceTimeline([])
             isLoadingThread = false
         }
@@ -3335,26 +4159,66 @@ final class OnyxAppModel: ObservableObject {
     private func refreshThreadIfSelected(_ threadID: String) {
         guard selectedThreadID == threadID, let runtime else { return }
         loadTask?.cancel()
+        resetEarlierHistory()
         isLoadingThread = true
         let epoch = accountEpoch
         let liveRevisionAtReadStart = liveTimelineRevision(for: threadID)
         loadTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let conversation = try await runtime.readThread(id: threadID)
+                let loaded = try await loadInitialHistory(for: threadID, runtime: runtime)
                 guard accountEpoch == epoch, !Task.isCancelled, selectedThreadID == threadID else { return }
                 applyConversationSnapshot(
-                    conversation.items,
-                    for: conversation.thread.id,
+                    loaded.visibleItems,
+                    for: loaded.conversation.thread.id,
                     preservingLiveUpdatesAfter: liveRevisionAtReadStart
                 )
-                updateThread(conversation.thread)
+                installEarlierHistory(from: loaded)
+                updateThread(loaded.conversation.thread)
                 isLoadingThread = false
+                resolveLatestMessageEditAfterAuthoritativeReload(threadID: threadID)
             } catch {
                 guard accountEpoch == epoch, !Task.isCancelled, selectedThreadID == threadID else { return }
                 isLoadingThread = false
                 notice = ("Could not refresh task", error.localizedDescription)
             }
+        }
+    }
+
+    /// Re-reads the selected task after a destructive request whose local
+    /// completion can no longer be trusted (timeout, navigation race, or an
+    /// early lifecycle notification). The edit lock stays held while this runs.
+    private func reconcileHistoryAfterUncertainEdit(
+        threadID: String,
+        epoch: UInt64,
+        runtime: any AgentRuntime
+    ) async -> Bool {
+        guard selectedThreadID == threadID, accountEpoch == epoch else { return false }
+        loadTask?.cancel()
+        loadTask = nil
+        resetEarlierHistory()
+        isLoadingThread = true
+        let liveRevisionAtReadStart = liveTimelineRevision(for: threadID)
+        do {
+            let loaded = try await loadInitialHistory(for: threadID, runtime: runtime)
+            guard accountEpoch == epoch,
+                  selectedThreadID == threadID,
+                  !Task.isCancelled else { return false }
+            applyConversationSnapshot(
+                loaded.visibleItems,
+                for: loaded.conversation.thread.id,
+                preservingLiveUpdatesAfter: liveRevisionAtReadStart
+            )
+            installEarlierHistory(from: loaded)
+            updateThread(loaded.conversation.thread)
+            isLoadingThread = false
+            return true
+        } catch {
+            guard accountEpoch == epoch,
+                  selectedThreadID == threadID,
+                  !Task.isCancelled else { return false }
+            isLoadingThread = false
+            return false
         }
     }
 
@@ -3366,23 +4230,30 @@ final class OnyxAppModel: ObservableObject {
     private func resumeThreadAfterReconnect(_ threadID: String) {
         guard selectedThreadID == threadID, let runtime else { return }
         loadTask?.cancel()
+        resetEarlierHistory()
         isLoadingThread = true
         let epoch = accountEpoch
         let revision = connectionRevision
         loadTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let conversation = try await runtime.resumeThread(id: threadID)
+                let loaded = try await loadInitialHistory(
+                    for: threadID,
+                    runtime: runtime,
+                    resumeUnpaginated: true
+                )
                 guard accountEpoch == epoch,
                       connectionRevision == revision,
                       !Task.isCancelled,
                       selectedThreadID == threadID,
                       case .connected = connectionState else { return }
-                replaceTimeline(conversation.items, authoritativeFor: conversation.thread.id)
-                updateThread(conversation.thread)
-                isTurnRunning = conversation.thread.status.isBusy
-                    || isReviewActive(for: conversation.thread.id)
+                replaceTimeline(loaded.visibleItems, authoritativeFor: loaded.conversation.thread.id)
+                installEarlierHistory(from: loaded)
+                updateThread(loaded.conversation.thread)
+                isTurnRunning = loaded.conversation.thread.status.isBusy
+                    || isReviewActive(for: loaded.conversation.thread.id)
                 isLoadingThread = false
+                resolveLatestMessageEditAfterAuthoritativeReload(threadID: threadID)
             } catch {
                 guard accountEpoch == epoch,
                       connectionRevision == revision,
@@ -3459,7 +4330,17 @@ final class OnyxAppModel: ObservableObject {
     }
 
     private func deleteThread(_ id: String) async {
-        guard let runtime else { return }
+        guard let runtime,
+              let thread = threads.first(where: { $0.id == id }),
+              canDeleteThread(thread) else {
+            if isPreparingLatestMessageEdit(for: id) {
+                notice = (
+                    "Task history is still changing",
+                    "Wait for message editing to finish, then confirm deletion again."
+                )
+            }
+            return
+        }
         let epoch = accountEpoch
         do {
             try await runtime.deleteThread(id: id)
@@ -3513,6 +4394,7 @@ final class OnyxAppModel: ObservableObject {
 
         guard let targetID else {
             selectedThreadID = nil
+            resetEarlierHistory()
             replaceTimeline([])
             isLoadingThread = false
             return
@@ -3570,6 +4452,7 @@ final class OnyxAppModel: ObservableObject {
     private func closeAccountBoundary() {
         closeSideChat()
         workspacePersistenceStore?.clearAccountOwnedState()
+        invalidateLatestMessageEdit()
         accountEpoch &+= 1
         connectionRevision &+= 1
         navigationRevision += 1
@@ -3578,6 +4461,7 @@ final class OnyxAppModel: ObservableObject {
         connectionTask = nil
         loadTask?.cancel()
         loadTask = nil
+        resetEarlierHistory()
         threadListTask?.cancel()
         threadListTask = nil
         accountRefreshTask?.cancel()

@@ -19,6 +19,7 @@ final class CodexProjectionTests: XCTestCase {
               {
                 "id": "turn-1",
                 "status": "completed",
+                "startedAt": 1787385601,
                 "items": [
                   {
                     "type": "userMessage",
@@ -52,7 +53,17 @@ final class CodexProjectionTests: XCTestCase {
         XCTAssertEqual(conversation.thread.title, "Build a native client")
         XCTAssertEqual(conversation.thread.branch, "codex/onyx")
         XCTAssertTrue(conversation.thread.isPinned)
+        XCTAssertEqual(
+            conversation.thread.updatedAt,
+            Date(timeIntervalSince1970: 1_787_385_660),
+            "Projecting history must preserve the server's task recency"
+        )
         XCTAssertEqual(conversation.items.map(\.kind), [.userMessage, .assistantMessage, .command])
+        XCTAssertEqual(
+            conversation.items.map(\.timestamp),
+            Array(repeating: Date(timeIntervalSince1970: 1_787_385_601), count: 3),
+            "Schema items without timestamps should inherit their stable turn time"
+        )
         XCTAssertEqual(conversation.items[0].body, "Make it fast")
         XCTAssertEqual(conversation.items[2].title, "swift test")
     }

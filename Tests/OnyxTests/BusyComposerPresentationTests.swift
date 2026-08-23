@@ -40,6 +40,13 @@ final class BusyComposerPresentationTests: XCTestCase {
         )
     }
 
+    func testCompactStripInvitesAFollowUpInsteadOfRepeatingBusyStatus() {
+        XCTAssertEqual(
+            BusyComposerPresentation.compactActionLabel,
+            "Write a follow-up"
+        )
+    }
+
     private func usesCompactStrip(
         isTurnRunning: Bool = false,
         isReviewRunning: Bool = false,

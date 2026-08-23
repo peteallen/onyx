@@ -996,12 +996,16 @@ actor OpenAICompatibleRuntime: AgentRuntime {
             capabilities.insert(.reasoning)
         }
         let models = discoveredModels.enumerated().map { index, model in
-            RuntimeModel(
+            let defaultReasoningEffort = record?.requestBehavior.enableThinking == false
+                && model.capabilities.reasoningEfforts.contains("none")
+                ? "none"
+                : model.preferredDefaultReasoningEffort
+            return RuntimeModel(
                 id: model.id,
                 displayName: model.displayName,
                 description: model.description,
                 isDefault: model.id == record?.selectedModelID || (record?.selectedModelID == nil && index == 0),
-                defaultReasoningEffort: model.capabilities.reasoningEfforts.first,
+                defaultReasoningEffort: defaultReasoningEffort,
                 reasoningEfforts: model.capabilities.reasoningEfforts,
                 inputModalities: model.capabilities.inputModalities,
                 serverAdvertisedRequestParameters: model.capabilities.supportedParameters,
@@ -1366,12 +1370,13 @@ actor OpenAICompatibleRuntime: AgentRuntime {
     }
 
     private static func cachedModel(_ id: String) -> ProviderModelDescriptor? {
-        try? ProviderModelDescriptor(
+        let descriptor = try? ProviderModelDescriptor(
             id: id,
             wireProtocol: .openAIChatCompletions,
             capabilities: ProviderCapabilitySet(),
             capabilityEvidence: .unknown
         )
+        return descriptor?.applyingKnownModelProfile()
     }
 
     private static func cachedModels(
@@ -1380,7 +1385,7 @@ actor OpenAICompatibleRuntime: AgentRuntime {
     ) -> [ProviderModelDescriptor] {
         var models: [ProviderModelDescriptor]
         if !metadata.discoveredModels.isEmpty {
-            models = metadata.discoveredModels
+            models = metadata.discoveredModels.map { $0.applyingKnownModelProfile() }
         } else {
             models = metadata.discoveredModelIDs.compactMap(Self.cachedModel)
         }

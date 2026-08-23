@@ -128,6 +128,153 @@ final class CodexRuntimeTests: XCTestCase {
 
         XCTAssertEqual(session.availableModels.first?.defaultReasoningEffort, "low")
         XCTAssertEqual(session.availableModels.first?.reasoningEfforts, ["low", "high"])
+        XCTAssertTrue(session.capabilities.contains(.threadHistoryPagination))
+        XCTAssertTrue(session.capabilities.contains(.threadHistoryRevert))
+    }
+
+    func testBoundedResumeMapsInitialTurnsPageAndPresentsTranscriptChronologically() async throws {
+        let transport = RecordingCodexTransport()
+        let runtime = CodexRuntime(client: transport)
+
+        let resumed = try await runtime.resumeThread(
+            id: "history-thread",
+            initialHistoryPage: RuntimeInitialThreadHistoryPageRequest(
+                limit: 20,
+                direction: .descending,
+                itemDetail: .full
+            )
+        )
+        try await runtime.steer(threadID: "history-thread", text: "Keep going")
+
+        let requests = await transport.recordedRequests()
+        let resume = try XCTUnwrap(requests.first(where: { $0.method == "thread/resume" }))
+        XCTAssertEqual(resume.params["threadId"]?.stringValue, "history-thread")
+        XCTAssertEqual(resume.params["excludeTurns"]?.boolValue, true)
+        XCTAssertEqual(resume.params["initialTurnsPage"]?["limit"]?.intValue, 20)
+        XCTAssertEqual(resume.params["initialTurnsPage"]?["sortDirection"]?.stringValue, "desc")
+        XCTAssertEqual(resume.params["initialTurnsPage"]?["itemsView"]?.stringValue, "full")
+
+        let page = try XCTUnwrap(resumed.initialHistoryPage)
+        XCTAssertEqual(page.turns.map(\.id), ["turn-new", "turn-old"])
+        XCTAssertEqual(page.turns.map(\.status), [.inProgress, .completed])
+        XCTAssertEqual(page.turns.map(\.itemDetail), [.full, .full])
+        XCTAssertEqual(page.nextCursor, "older-turns")
+        XCTAssertEqual(page.backwardsCursor, "newer-turns")
+        XCTAssertEqual(page.chronologicalItems.map(\.id), ["user-old", "assistant-new"])
+        XCTAssertEqual(resumed.conversation.items.map(\.id), ["user-old", "assistant-new"])
+        XCTAssertEqual(
+            resumed.conversation.items.map(\.timestamp),
+            [
+                Date(timeIntervalSince1970: 200),
+                Date(timeIntervalSince1970: 300),
+            ],
+            "Persisted items without their own timestamps should inherit the turn start"
+        )
+        XCTAssertEqual(
+            resumed.conversation.thread.updatedAt,
+            Date(timeIntervalSince1970: 100),
+            "Opening paginated history must not make the task appear newly active"
+        )
+        XCTAssertEqual(resumed.turnsBackwardsCursor, "resume-turn-head")
+        XCTAssertEqual(resumed.itemsBackwardsCursor, "resume-item-head")
+
+        let steer = try XCTUnwrap(requests.first(where: { $0.method == "turn/steer" }))
+        XCTAssertEqual(steer.params["expectedTurnId"]?.stringValue, "turn-new")
+    }
+
+    func testBoundedReadUsesReadOnlyMetadataAndTurnPageWithoutResuming() async throws {
+        let transport = RecordingCodexTransport()
+        let runtime = CodexRuntime(client: transport)
+
+        let read = try await runtime.readThread(
+            id: "history-thread",
+            initialHistoryPage: RuntimeThreadHistoryPageRequest(
+                limit: 12,
+                direction: .descending,
+                itemDetail: .full
+            )
+        )
+
+        let requests = await transport.recordedRequests()
+        XCTAssertEqual(requests.map(\.method), ["thread/read", "thread/turns/list"])
+        let metadataRead = try XCTUnwrap(requests.first)
+        XCTAssertEqual(metadataRead.params["threadId"]?.stringValue, "history-thread")
+        XCTAssertEqual(metadataRead.params["includeTurns"]?.boolValue, false)
+        XCTAssertFalse(requests.contains(where: { $0.method == "thread/resume" }))
+        XCTAssertEqual(read.conversation.thread.id, "history-thread")
+        XCTAssertEqual(read.initialHistoryPage?.turns.map(\.id), ["page-turn"])
+        XCTAssertEqual(read.conversation.items.map(\.id), ["page-item"])
+        XCTAssertEqual(
+            read.conversation.items.first?.timestamp,
+            Date(timeIntervalSince1970: 90)
+        )
+        XCTAssertEqual(
+            read.conversation.thread.updatedAt,
+            Date(timeIntervalSince1970: 100),
+            "Read-only navigation must preserve the metadata recency"
+        )
+    }
+
+    func testTurnHistoryPaginationAndRevertUseExactCodexFields() async throws {
+        let transport = RecordingCodexTransport()
+        let runtime = CodexRuntime(client: transport)
+
+        let page = try await runtime.listThreadHistory(
+            id: "history-thread",
+            page: RuntimeThreadHistoryPageRequest(
+                cursor: "older-turns",
+                limit: 12,
+                direction: .ascending,
+                itemDetail: .summary
+            )
+        )
+        let reverted = try await runtime.revertThread(
+            id: "history-thread",
+            beforeTurnID: "turn-new"
+        )
+
+        let requests = await transport.recordedRequests()
+        let list = try XCTUnwrap(requests.first(where: { $0.method == "thread/turns/list" }))
+        XCTAssertEqual(list.params["threadId"]?.stringValue, "history-thread")
+        XCTAssertEqual(list.params["cursor"]?.stringValue, "older-turns")
+        XCTAssertEqual(list.params["limit"]?.intValue, 12)
+        XCTAssertEqual(list.params["sortDirection"]?.stringValue, "asc")
+        XCTAssertEqual(list.params["itemsView"]?.stringValue, "summary")
+        XCTAssertEqual(page.direction, .ascending)
+        XCTAssertEqual(page.turns.map(\.id), ["page-turn"])
+        XCTAssertEqual(page.nextCursor, "page-next")
+        XCTAssertEqual(page.backwardsCursor, "page-backwards")
+
+        let revert = try XCTUnwrap(requests.first(where: { $0.method == "thread/revert" }))
+        XCTAssertEqual(revert.params["threadId"]?.stringValue, "history-thread")
+        XCTAssertEqual(revert.params["beforeTurnId"]?.stringValue, "turn-new")
+        XCTAssertEqual(reverted.thread.id, "history-thread")
+        XCTAssertEqual(reverted.turnsBackwardsCursor, "retained-turn-head")
+        XCTAssertEqual(reverted.itemsBackwardsCursor, "retained-item-head")
+    }
+
+    func testUnsupportedNativeRevertIsDowngradedForLaterSessionSnapshots() async throws {
+        let transport = RecordingCodexTransport(revertFailureCode: -32_601)
+        let runtime = CodexRuntime(client: transport)
+
+        let initial = try await runtime.connect()
+        XCTAssertTrue(initial.capabilities.contains(.threadHistoryRevert))
+
+        do {
+            _ = try await runtime.revertThread(
+                id: "history-thread",
+                beforeTurnID: "turn-new"
+            )
+            XCTFail("An older app-server should reject native history editing")
+        } catch let error as AgentRuntimeError {
+            guard case .unsupported = error else {
+                return XCTFail("Expected an unsupported capability error, got \(error)")
+            }
+        }
+
+        let refreshed = try await runtime.refreshAccount()
+        XCTAssertFalse(refreshed.capabilities.contains(.threadHistoryRevert))
+        XCTAssertTrue(refreshed.capabilities.contains(.threadHistoryPagination))
     }
 
     func testCompleteThreadCatalogFollowsEveryCursorWithoutLosingOrDuplicatingRows() async throws {
@@ -211,8 +358,10 @@ private actor RecordingCodexTransport: CodexAppServerTransport {
 
     nonisolated let events: AsyncStream<AppServerEvent>
     private var requests: [Request] = []
+    private let revertFailureCode: Int?
 
-    init() {
+    init(revertFailureCode: Int? = nil) {
+        self.revertFailureCode = revertFailureCode
         events = AsyncStream { continuation in
             continuation.finish()
         }
@@ -234,6 +383,52 @@ private actor RecordingCodexTransport: CodexAppServerTransport {
                 ]),
             ])
         }
+        if method == "thread/resume", params["initialTurnsPage"] != nil {
+            return .object([
+                "thread": .object([
+                    "id": .string("history-thread"),
+                    "preview": .string("History task"),
+                    "updatedAt": .integer(100),
+                    "turns": .array([]),
+                ]),
+                "initialTurnsPage": .object([
+                    "data": .array([
+                        .object([
+                            "id": .string("turn-new"),
+                            "itemsView": .string("full"),
+                            "status": .string("inProgress"),
+                            "startedAt": .integer(300),
+                            "items": .array([
+                                .object([
+                                    "id": .string("assistant-new"),
+                                    "type": .string("agentMessage"),
+                                    "text": .string("Recent answer"),
+                                ]),
+                            ]),
+                        ]),
+                        .object([
+                            "id": .string("turn-old"),
+                            "itemsView": .string("full"),
+                            "status": .string("completed"),
+                            "startedAt": .integer(200),
+                            "completedAt": .integer(210),
+                            "durationMs": .integer(10_000),
+                            "items": .array([
+                                .object([
+                                    "id": .string("user-old"),
+                                    "type": .string("userMessage"),
+                                    "text": .string("Earlier request"),
+                                ]),
+                            ]),
+                        ]),
+                    ]),
+                    "nextCursor": .string("older-turns"),
+                    "backwardsCursor": .string("newer-turns"),
+                ]),
+                "turnsBackwardsCursor": .string("resume-turn-head"),
+                "itemsBackwardsCursor": .string("resume-item-head"),
+            ])
+        }
         if method == "thread/resume" {
             return .object([
                 "thread": .object([
@@ -241,6 +436,54 @@ private actor RecordingCodexTransport: CodexAppServerTransport {
                     "preview": .string("Resumed task"),
                     "turns": .array([]),
                 ]),
+            ])
+        }
+        if method == "thread/read", params["includeTurns"]?.boolValue == false {
+            return .object([
+                "thread": .object([
+                    "id": .string("history-thread"),
+                    "preview": .string("History task"),
+                    "updatedAt": .integer(100),
+                    "turns": .array([]),
+                ]),
+            ])
+        }
+        if method == "thread/turns/list" {
+            return .object([
+                "data": .array([
+                    .object([
+                        "id": .string("page-turn"),
+                        "itemsView": .string("summary"),
+                        "status": .string("completed"),
+                        "startedAt": .integer(90),
+                        "items": .array([
+                            .object([
+                                "id": .string("page-item"),
+                                "type": .string("agentMessage"),
+                                "text": .string("Read-only page item"),
+                            ]),
+                        ]),
+                    ]),
+                ]),
+                "nextCursor": .string("page-next"),
+                "backwardsCursor": .string("page-backwards"),
+            ])
+        }
+        if method == "thread/revert" {
+            if let revertFailureCode {
+                throw AgentRuntimeError.requestFailed(
+                    code: revertFailureCode,
+                    message: "simulated unsupported method"
+                )
+            }
+            return .object([
+                "thread": .object([
+                    "id": .string("history-thread"),
+                    "preview": .string("History task"),
+                    "turns": .array([]),
+                ]),
+                "turnsBackwardsCursor": .string("retained-turn-head"),
+                "itemsBackwardsCursor": .string("retained-item-head"),
             ])
         }
         if method == "thread/start" {

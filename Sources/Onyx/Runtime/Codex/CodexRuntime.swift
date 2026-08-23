@@ -48,6 +48,11 @@ actor CodexRuntime: AgentRuntime {
     private var quarantinedEphemeralThreadIDs: Set<String> = []
     private var bufferedThreadLifecycleEvents: [BufferedThreadLifecycleEvent] = []
     private var cachedModels: [RuntimeModel] = []
+    /// Older user-selected binaries can reject newer protocol methods even
+    /// though the adapter knows how to call them. Remember that evidence for
+    /// the life of this runtime so reconnect/account refresh does not re-offer a
+    /// control that already proved unavailable.
+    private var unavailableCapabilities: RuntimeCapabilities = []
     private var connected = false
 
     init(executableURL: URL) {
@@ -285,6 +290,32 @@ actor CodexRuntime: AgentRuntime {
         return try CodexProjection.conversation(from: result)
     }
 
+    /// Reads a recent turn page without attaching this window as the task's
+    /// active writer. Ordinary sidebar navigation uses this path; reconnect
+    /// and sending continue to use `thread/resume` explicitly.
+    func readThread(
+        id: String,
+        initialHistoryPage request: RuntimeThreadHistoryPageRequest
+    ) async throws -> RuntimeThreadResumeResult {
+        try validateHistoryPageLimit(request.limit)
+        let metadataResult = try await requestPaginatedHistory(
+            method: "thread/read",
+            params: .object([
+                "threadId": .string(id),
+                "includeTurns": .bool(false),
+            ])
+        )
+        var conversation = try CodexProjection.conversation(from: metadataResult)
+        let page = try await listThreadHistory(id: id, page: request)
+        conversation.items = page.chronologicalItems
+        return RuntimeThreadResumeResult(
+            conversation: conversation,
+            initialHistoryPage: page,
+            turnsBackwardsCursor: metadataResult["turnsBackwardsCursor"]?.stringValue,
+            itemsBackwardsCursor: metadataResult["itemsBackwardsCursor"]?.stringValue
+        )
+    }
+
     func resumeThread(id: String) async throws -> RuntimeConversation {
         let result = try await client.request(
             method: "thread/resume",
@@ -301,6 +332,99 @@ actor CodexRuntime: AgentRuntime {
             activeTurnIDs.removeValue(forKey: id)
         }
         return try CodexProjection.conversation(from: result)
+    }
+
+    func resumeThread(
+        id: String,
+        initialHistoryPage request: RuntimeInitialThreadHistoryPageRequest
+    ) async throws -> RuntimeThreadResumeResult {
+        try validateHistoryPageLimit(request.limit)
+        let result = try await requestPaginatedHistory(
+            method: "thread/resume",
+            params: .object([
+                "threadId": .string(id),
+                "excludeTurns": .bool(true),
+                "initialTurnsPage": .object([
+                    "limit": .integer(request.limit),
+                    "sortDirection": .string(codexHistoryDirection(request.direction)),
+                    "itemsView": .string(try codexTurnItemDetail(request.itemDetail)),
+                ]),
+            ])
+        )
+
+        var conversation = try CodexProjection.conversation(from: result)
+        let initialHistoryPage: RuntimeThreadHistoryPage?
+        if let pageValue = result["initialTurnsPage"], pageValue != .null {
+            let page = try CodexProjection.historyPage(
+                from: pageValue,
+                direction: request.direction
+            )
+            initialHistoryPage = page
+            conversation.items = page.chronologicalItems
+            synchronizeActiveTurn(threadID: id, turns: page.turns)
+        } else {
+            initialHistoryPage = nil
+            activeTurnIDs.removeValue(forKey: id)
+        }
+
+        return RuntimeThreadResumeResult(
+            conversation: conversation,
+            initialHistoryPage: initialHistoryPage,
+            turnsBackwardsCursor: result["turnsBackwardsCursor"]?.stringValue,
+            itemsBackwardsCursor: result["itemsBackwardsCursor"]?.stringValue
+        )
+    }
+
+    func listThreadHistory(
+        id: String,
+        page request: RuntimeThreadHistoryPageRequest
+    ) async throws -> RuntimeThreadHistoryPage {
+        try validateHistoryPageLimit(request.limit)
+        var params: [String: JSONValue] = [
+            "threadId": .string(id),
+            "limit": .integer(request.limit),
+            "sortDirection": .string(codexHistoryDirection(request.direction)),
+            "itemsView": .string(try codexTurnItemDetail(request.itemDetail)),
+        ]
+        if let cursor = request.cursor {
+            params["cursor"] = .string(cursor)
+        }
+        let result = try await requestPaginatedHistory(
+            method: "thread/turns/list",
+            params: .object(params)
+        )
+        return try CodexProjection.historyPage(from: result, direction: request.direction)
+    }
+
+    func revertThread(id: String, beforeTurnID: String) async throws -> RuntimeThreadRevertResult {
+        guard !unavailableCapabilities.contains(.threadHistoryRevert) else {
+            throw AgentRuntimeError.unsupported("native history editing in this Codex version")
+        }
+        let result: JSONValue
+        do {
+            result = try await client.request(
+                method: "thread/revert",
+                params: .object([
+                    "threadId": .string(id),
+                    "beforeTurnId": .string(beforeTurnID),
+                ])
+            )
+        } catch {
+            if Self.isProtocolCompatibilityFailure(error) {
+                unavailableCapabilities.insert(.threadHistoryRevert)
+                throw AgentRuntimeError.unsupported("native history editing in this Codex version")
+            }
+            throw error
+        }
+        guard let thread = CodexProjection.thread(from: result["thread"] ?? result) else {
+            throw AgentRuntimeError.missingField("thread/revert.thread.id")
+        }
+        activeTurnIDs.removeValue(forKey: id)
+        return RuntimeThreadRevertResult(
+            thread: thread,
+            turnsBackwardsCursor: result["turnsBackwardsCursor"]?.stringValue,
+            itemsBackwardsCursor: result["itemsBackwardsCursor"]?.stringValue
+        )
     }
 
     func startThread(_ request: StartThreadRequest) async throws -> RuntimeThread {
@@ -613,6 +737,14 @@ actor CodexRuntime: AgentRuntime {
         if models != nil { cachedModels = projectedModels }
         let availableModels = models == nil ? cachedModels : projectedModels
 
+        var capabilities: RuntimeCapabilities = [
+            .streaming, .steering, .interruption, .approvals, .threadForking,
+            .threadArchiving, .threadCompaction, .threadDeletion, .reasoning,
+            .tools, .diffs, .codeReview, .terminal, .images, .usage,
+            .ephemeralThreadForking, .threadHistoryPagination, .threadHistoryRevert,
+        ]
+        capabilities.subtract(unavailableCapabilities)
+
         return RuntimeSession(
             runtime: .codex,
             displayName: "Codex app-server",
@@ -621,13 +753,35 @@ actor CodexRuntime: AgentRuntime {
             auth: auth,
             availableLoginMethods: [Self.browserLoginMethod, Self.deviceCodeLoginMethod],
             availableModels: availableModels,
-            capabilities: [
-                .streaming, .steering, .interruption, .approvals, .threadForking,
-                .threadArchiving, .threadCompaction, .threadDeletion, .reasoning,
-                .tools, .diffs, .codeReview, .terminal, .images, .usage,
-                .ephemeralThreadForking,
-            ]
+            capabilities: capabilities
         )
+    }
+
+    private static func isProtocolCompatibilityFailure(_ error: any Error) -> Bool {
+        guard let runtimeError = error as? AgentRuntimeError,
+              case let .requestFailed(code, _) = runtimeError else { return false }
+        return code == -32_601 || code == -32_602
+    }
+
+    /// A user-selected older app-server can reject any one of the pagination
+    /// entry points. One such protocol response proves the whole cursor
+    /// capability unavailable for this runtime and prevents repeated retries
+    /// through read, resume, or older-page loading.
+    private func requestPaginatedHistory(
+        method: String,
+        params: JSONValue
+    ) async throws -> JSONValue {
+        guard !unavailableCapabilities.contains(.threadHistoryPagination) else {
+            throw AgentRuntimeError.unsupported("paginated thread history in this Codex version")
+        }
+        do {
+            return try await client.request(method: method, params: params)
+        } catch {
+            if Self.isProtocolCompatibilityFailure(error) {
+                unavailableCapabilities.insert(.threadHistoryPagination)
+            }
+            throw error
+        }
     }
 
     private func authState(from account: JSONValue?, requiresAuthentication: Bool) -> RuntimeAuthState {
@@ -1043,6 +1197,38 @@ actor CodexRuntime: AgentRuntime {
         case .readOnly: "read-only"
         case .workspaceWrite: "workspace-write"
         case .fullAccess: "danger-full-access"
+        }
+    }
+
+    private func validateHistoryPageLimit(_ limit: Int) throws {
+        guard limit > 0 else {
+            throw AgentRuntimeError.protocolFailure("Thread history page limit must be greater than zero")
+        }
+    }
+
+    private func codexHistoryDirection(_ direction: RuntimeHistoryDirection) -> String {
+        switch direction {
+        case .ascending: "asc"
+        case .descending: "desc"
+        }
+    }
+
+    private func codexTurnItemDetail(_ detail: RuntimeTurnItemDetail) throws -> String {
+        switch detail {
+        case .notLoaded: "notLoaded"
+        case .summary: "summary"
+        case .full: "full"
+        case let .unknown(value):
+            throw AgentRuntimeError.unsupported("thread history item detail \(value)")
+        }
+    }
+
+    private func synchronizeActiveTurn(threadID: String, turns: [RuntimeConversationTurn]) {
+        if let activeTurnID = turns.first(where: { $0.status == .inProgress })?.id {
+            activeTurnIDs[threadID] = activeTurnID
+            eventContinuation.yield(.turnStarted(threadID: threadID, turnID: activeTurnID))
+        } else {
+            activeTurnIDs.removeValue(forKey: threadID)
         }
     }
 

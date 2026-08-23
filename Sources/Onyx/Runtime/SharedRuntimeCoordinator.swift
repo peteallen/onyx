@@ -151,9 +151,42 @@ final class SharedRuntimeCoordinator: AgentRuntime, @unchecked Sendable {
         }
     }
 
+    func readThread(
+        id: String,
+        initialHistoryPage: RuntimeThreadHistoryPageRequest
+    ) async throws -> RuntimeThreadResumeResult {
+        try await withCapabilityOperation(.threadHistoryPagination) { [runtime] in
+            try await runtime.readThread(id: id, initialHistoryPage: initialHistoryPage)
+        }
+    }
+
     func resumeThread(id: String) async throws -> RuntimeConversation {
         try await withAccountOperation { [runtime] in
             try await runtime.resumeThread(id: id)
+        }
+    }
+
+    func resumeThread(
+        id: String,
+        initialHistoryPage: RuntimeInitialThreadHistoryPageRequest
+    ) async throws -> RuntimeThreadResumeResult {
+        try await withCapabilityOperation(.threadHistoryPagination) { [runtime] in
+            try await runtime.resumeThread(id: id, initialHistoryPage: initialHistoryPage)
+        }
+    }
+
+    func listThreadHistory(
+        id: String,
+        page: RuntimeThreadHistoryPageRequest
+    ) async throws -> RuntimeThreadHistoryPage {
+        try await withCapabilityOperation(.threadHistoryPagination) { [runtime] in
+            try await runtime.listThreadHistory(id: id, page: page)
+        }
+    }
+
+    func revertThread(id: String, beforeTurnID: String) async throws -> RuntimeThreadRevertResult {
+        try await withCapabilityOperation(.threadHistoryRevert) { [runtime] in
+            try await runtime.revertThread(id: id, beforeTurnID: beforeTurnID)
         }
     }
 
@@ -258,6 +291,47 @@ final class SharedRuntimeCoordinator: AgentRuntime, @unchecked Sendable {
         }
     }
 
+    /// Records protocol evidence once at the shared provider boundary. This
+    /// keeps a stale window from retrying a method another window has already
+    /// proved unavailable, updates later connection snapshots, and broadcasts
+    /// the same downgrade to every window that is already attached.
+    private func withCapabilityOperation<Result: Sendable>(
+        _ capability: RuntimeCapabilities,
+        _ operation: @Sendable () async throws -> Result
+    ) async throws -> Result {
+        guard await sessionState.isCapabilityAvailable(capability) else {
+            throw AgentRuntimeError.unsupported(Self.capabilityName(capability))
+        }
+
+        do {
+            return try await withAccountOperation(operation)
+        } catch {
+            guard Self.isCapabilityCompatibilityFailure(error) else { throw error }
+            if await sessionState.markCapabilityUnavailable(capability) {
+                await eventEmitter.yield(.runtimeCapabilitiesDowngraded(capability))
+            }
+            throw error
+        }
+    }
+
+    private static func isCapabilityCompatibilityFailure(_ error: any Error) -> Bool {
+        guard let runtimeError = error as? AgentRuntimeError else { return false }
+        switch runtimeError {
+        case .unsupported:
+            return true
+        case let .requestFailed(code, _):
+            return code == -32_601 || code == -32_602
+        default:
+            return false
+        }
+    }
+
+    private static func capabilityName(_ capability: RuntimeCapabilities) -> String {
+        if capability == .threadHistoryPagination { return "paginated thread history" }
+        if capability == .threadHistoryRevert { return "thread history editing" }
+        return "this runtime capability"
+    }
+
     fileprivate static let accountBoundaryError = AgentRuntimeError.requestFailed(
         code: -32_100,
         message: "Account sign-out is in progress."
@@ -293,6 +367,10 @@ private actor SharedRuntimeSessionState {
     }
 
     private var cachedSession: RuntimeSession?
+    /// Protocol downgrades are runtime/binary facts rather than account facts,
+    /// so they survive cached-session invalidation, logout, and reconnect for
+    /// the lifetime of this coordinator.
+    private var unavailableCapabilities: RuntimeCapabilities = []
     private var attempt: Attempt?
     private var nextAttemptID: UInt64 = 0
     private var revision: UInt64 = 0
@@ -540,6 +618,21 @@ private actor SharedRuntimeSessionState {
         !isLoggingOut && !signedOutBoundaryActive
     }
 
+    func isCapabilityAvailable(_ capability: RuntimeCapabilities) -> Bool {
+        !unavailableCapabilities.contains(capability)
+    }
+
+    /// Returns true only for the first observation so concurrent failing
+    /// callers cannot broadcast duplicate downgrade events.
+    func markCapabilityUnavailable(_ capability: RuntimeCapabilities) -> Bool {
+        guard !unavailableCapabilities.contains(capability) else { return false }
+        unavailableCapabilities.formUnion(capability)
+        if let cachedSession {
+            self.cachedSession = applyingCapabilityDowngrades(to: cachedSession)
+        }
+        return true
+    }
+
     private func waitForLogoutIfNeeded() async {
         guard isLoggingOut else { return }
         await withCheckedContinuation { continuation in
@@ -610,7 +703,9 @@ private actor SharedRuntimeSessionState {
     private func result(of pending: Attempt) async throws -> RuntimeSession {
         do {
             let providerSession = try await pending.task.value
-            let session = boundarySafeSession(providerSession)
+            let session = boundarySafeSession(
+                applyingCapabilityDowngrades(to: providerSession)
+            )
             if attempt?.id == pending.id {
                 attempt = nil
             }
@@ -639,6 +734,25 @@ private actor SharedRuntimeSessionState {
             availableLoginMethods: session.availableLoginMethods,
             availableModels: session.availableModels,
             capabilities: session.capabilities
+        )
+    }
+
+    private func applyingCapabilityDowngrades(to session: RuntimeSession) -> RuntimeSession {
+        guard !unavailableCapabilities.isEmpty,
+              !session.capabilities.intersection(unavailableCapabilities).isEmpty else {
+            return session
+        }
+        var capabilities = session.capabilities
+        capabilities.subtract(unavailableCapabilities)
+        return RuntimeSession(
+            runtime: session.runtime,
+            displayName: session.displayName,
+            accountLabel: session.accountLabel,
+            planLabel: session.planLabel,
+            auth: session.auth,
+            availableLoginMethods: session.availableLoginMethods,
+            availableModels: session.availableModels,
+            capabilities: capabilities
         )
     }
 }
