@@ -23,7 +23,11 @@ struct OnyxWorkspaceView: View {
     private let onSelectProviderConnection: @MainActor (ProviderConnectionID) -> Void
     private let rankedModelChoices: [OnyxApplicationHost.ProviderModelChoice]
     private let onSelectProviderModel: @MainActor (OnyxApplicationHost.ProviderModelChoice) -> Void
-    private let onSelectProviderTask: @MainActor (ProviderConnectionID, String) -> Void
+    private let onSelectProviderTask: @MainActor (
+        ProviderConnectionID,
+        String,
+        ThreadListScope
+    ) -> Void
 
     init(
         model: OnyxAppModel,
@@ -36,7 +40,11 @@ struct OnyxWorkspaceView: View {
         onSelectProviderConnection: @escaping @MainActor (ProviderConnectionID) -> Void = { _ in },
         rankedModelChoices: [OnyxApplicationHost.ProviderModelChoice] = [],
         onSelectProviderModel: @escaping @MainActor (OnyxApplicationHost.ProviderModelChoice) -> Void = { _ in },
-        onSelectProviderTask: @escaping @MainActor (ProviderConnectionID, String) -> Void = { _, _ in }
+        onSelectProviderTask: @escaping @MainActor (
+            ProviderConnectionID,
+            String,
+            ThreadListScope
+        ) -> Void = { _, _, _ in }
     ) {
         self.model = model
         self.projectCatalog = projectCatalog
@@ -151,7 +159,8 @@ struct OnyxWorkspaceView: View {
                             InspectorWorkspacePane(
                                 model: model,
                                 sourceNavigator: sourceNavigator,
-                                width: inspectorWidth
+                                width: inspectorWidth,
+                                onSelectProviderTask: selectActiveProviderTask
                             )
                                 .frame(maxHeight: .infinity, alignment: .top)
                                 .transition(reduceMotion ? .identity : .move(edge: .trailing).combined(with: .opacity))
@@ -232,10 +241,52 @@ struct OnyxWorkspaceView: View {
 
     @MainActor
     private func selectProviderTask(_ connectionID: ProviderConnectionID, threadID: String) {
-        if connectionID == selectedProviderConnectionID {
+        Self.routeProviderTaskSelection(
+            connectionID,
+            threadID: threadID,
+            scope: model.threadListScope,
+            selectedProviderConnectionID: selectedProviderConnectionID,
+            model: model,
+            onSelectProviderTask: onSelectProviderTask
+        )
+    }
+
+    @MainActor
+    private func selectActiveProviderTask(
+        _ connectionID: ProviderConnectionID,
+        threadID: String
+    ) {
+        Self.routeProviderTaskSelection(
+            connectionID,
+            threadID: threadID,
+            scope: .active,
+            selectedProviderConnectionID: selectedProviderConnectionID,
+            model: model,
+            onSelectProviderTask: onSelectProviderTask
+        )
+    }
+
+    /// Provider-aware task routing shared by the sidebar and collaboration
+    /// inspector. The child id does not need to exist in either catalog: the
+    /// destination runtime reads it authoritatively after selection.
+    @MainActor
+    static func routeProviderTaskSelection(
+        _ connectionID: ProviderConnectionID,
+        threadID: String,
+        scope: ThreadListScope,
+        selectedProviderConnectionID: ProviderConnectionID,
+        model: OnyxAppModel,
+        onSelectProviderTask: @MainActor (
+            ProviderConnectionID,
+            String,
+            ThreadListScope
+        ) -> Void
+    ) {
+        if connectionID == selectedProviderConnectionID,
+           scope == model.threadListScope {
             model.selectThread(threadID)
         } else {
-            onSelectProviderTask(connectionID, threadID)
+            onSelectProviderTask(connectionID, threadID, scope)
         }
     }
 
@@ -381,8 +432,11 @@ struct OnyxWorkspaceView: View {
 
     @MainActor
     private func synchronizeProviderTasks() {
-        guard case .connected = model.connectionState,
-              !model.isLoadingThreadList else { return }
+        guard ProviderTaskCatalogSynchronizationPolicy.shouldReplaceCachedTasks(
+            connectionState: model.connectionState,
+            isLoadingThreadList: model.isLoadingThreadList,
+            hasAuthoritativeThreadList: model.hasAuthoritativeThreadListForCurrentScope
+        ) else { return }
         projectCatalog.replaceTasks(
             for: selectedProviderConnectionID,
             providerDisplayName: providerDisplayName,
@@ -404,10 +458,14 @@ private struct InspectorWorkspacePane: View {
     @ObservedObject var model: OnyxAppModel
     @ObservedObject var sourceNavigator: ProjectSourceNavigatorModel
     let width: CGFloat
+    let onSelectProviderTask: @MainActor (ProviderConnectionID, String) -> Void
 
     var body: some View {
-        ContextInspectorView(model: model, sourceNavigator: sourceNavigator)
-            .frame(width: width)
+        ContextInspectorView(
+            model: model,
+            sourceNavigator: sourceNavigator,
+            onSelectProviderTask: onSelectProviderTask
+        )
         .frame(width: width)
         .frame(maxHeight: .infinity, alignment: .top)
         .background(OnyxTheme.canvas)

@@ -137,6 +137,7 @@ struct AgentRuntimeDelegationExecutor: DelegationExecutor {
                     inputs: [.text(request.prompt)],
                     model: request.targetModel.modelID,
                     cwd: workingDirectory,
+                    reasoningEffort: request.reasoningEffort,
                     sandboxMode: sandboxMode,
                     approvalPolicy: approvalPolicy
                 )

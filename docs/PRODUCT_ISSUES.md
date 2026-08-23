@@ -108,7 +108,7 @@ Status values: **Open**, **In progress**, **Blocked**, **Done**, **Deferred**.
 - **Problem:** Users need a lightweight branch for a question or experiment without changing the durable task conversation.
 - **Decision:** Offer a Codex side chat as an isolated ephemeral fork over the main conversation rather than another permanent sidebar task.
 - **Acceptance:** Side chat opens from an eligible task, streams and accepts images/interactions independently, does not shrink or mutate the main conversation, interrupts safely when closed, and never appears as a durable task.
-- **Verification:** Automated side-chat and native-fork coverage exercises isolation, streaming, image paste, interactions, navigation, cancellation, and unsupported runtimes. Running-preview verification is pending.
+- **Verification:** Automated side-chat and native-fork coverage exercises isolation, streaming, image paste, interactions, navigation, cancellation, unsupported runtimes, and the installed app-server requirement that paginated ephemeral forks use `excludeTurns: true`. Because that valid response is metadata-only, the panel paints its already-visible parent context immediately without another full-history request. Failure coverage confirms a rejected fork leaves that context and any local draft intact behind a disabled composer with a retry action, while a rejected follow-up keeps the original turn visibly running and retries through steering. Running-preview verification is pending.
 
 ### UI-012 — Waiting feedback belongs inside the conversation
 
@@ -158,6 +158,14 @@ Status values: **Open**, **In progress**, **Blocked**, **Done**, **Deferred**.
 - **Acceptance:** Command-P works from an active task or new-task workspace; arrow keys move the selection; Return reveals the Files inspector and previews the selected file; Escape closes without changing the previously visible panes, inspector tab, or file preview; a missing project has a clear state; an existing task without a provider workspace never inherits the new-task draft project; typing remains responsive with 4,000 indexed files.
 - **Verification:** Hosted coverage confirms the palette and its immediately focusable native search field paint while a delayed 4,000-file index is still running; after the XCTest host installs that field editor, native arrow/Return opens the selected result and Escape dismisses without opening a file or losing the Files inspector's prior query. Typing only schedules off-main ranking, results stay capped at 40, stale rows are removed before a replacement query finishes, superseded project indexes are cancelled, and command routing remains window-local. Search-model coverage also protects stale-query rejection and shared indexing for an unchanged project. Multiwindow coverage confirms a cwd-less existing task cannot reuse a staged new-task project in Files, Review, Terminal, Summary, or Command-P. Automatic focus and the complete flow still require canonical-preview verification.
 
+### UI-018 — Selecting a task makes the sidebar jump and flash
+
+- **Status:** In progress
+- **Problem:** Clicking a task can reorder its row and collapse or expand project groups while the pointer is still in the list. The sidebar appears to flash and the user's spatial target disappears.
+- **Decision:** Selection is navigation, not activity. Refresh the selected task's metadata in place and reveal its project without collapsing projects the user already opened. Only genuine provider lifecycle activity, an accepted send, or an explicit project-management action may reorder the sidebar.
+- **Acceptance:** Clicking between tasks never moves existing rows, collapses an open project, or replaces the task projection with a loading layout; selecting a task in a collapsed project reveals it without hiding other projects; real new activity may still update recency ordering.
+- **Verification:** Automated model coverage confirms that opening a task refreshes changed metadata without accepting navigation-time recency or folder changes that would move its row. Sidebar disclosure coverage confirms that selection reveals the destination project, including another task in a manually collapsed project, while preserving every project the user already expanded. A navigation-aborted provider list cannot steal a cached selection whose read is still pending, and an omitted selected task retains its existing row position. Canonical-preview clicking across projects is still required before this issue can be **Done**.
+
 ### PERF-002 — New Task can beachball the app
 
 - **Status:** In progress
@@ -189,6 +197,14 @@ Status values: **Open**, **In progress**, **Blocked**, **Done**, **Deferred**.
 - **Decision:** Use one provider-and-model picker in the composer. Load saved catalogs before connection, keep manually configured models selectable when discovery is empty or omits them, and rank accepted usage by frequency then recency. New tasks may switch providers; existing tasks may switch the model for the next turn only within their bound provider and can reset to the task default.
 - **Acceptance:** A saved vLLM model appears without requiring a restart or successful rediscovery; selecting it changes provider and model together for a new task; frequent/recent models appear first; existing tasks clearly show their provider and current/default model behavior.
 - **Verification:** Automated host, Settings, runtime, and draft-safety coverage exercises cached/manual vLLM catalogs, provider switching, frequent/recent ranking, accepted-send usage, next-turn model overrides, reset, and task deletion cleanup. Hands-on selection against Pete’s configured vLLM endpoint is still pending.
+
+### PROVIDER-003 — Codex tasks need native delegation to configured providers
+
+- **Status:** In progress
+- **Problem:** Codex tasks need a native way to ask a configured vLLM/Qwen model to handle a bounded subtask, receive the result in the same turn, and open the resulting child task without exposing provider credentials or pretending the remote model has Codex's local tools.
+- **Decision:** Advertise one Onyx-owned delegation tool to newly created Codex tasks through `app-server`. Resolve and validate provider/model targets inside Onyx, never expose endpoints or credentials to Codex, and run the first version as a durable text-only child task with read-only workspace access and no approvals. Return bounded result text plus provider-scoped child-task metadata, and show that child as ordinary collaboration activity with cross-provider click-through. Existing Codex tasks created without the tool remain unchanged until app-server supports adding thread tools after creation.
+- **Acceptance:** A new Codex task can delegate a text prompt to an explicitly configured provider/model pair; an unavailable or mismatched target fails clearly without leaking connection details; the child result reaches Codex exactly once; interruption cancels bounded child work; and the child appears in Onyx with a working link that switches to the owning provider and opens the durable task without removing the parent.
+- **Verification:** Protocol, broker, projection, failure/cancellation, production-composition, and provider-scoped navigation coverage now passes. On 2026-08-23, the installed app-server accepted the advertised dynamic tool and delivered one real `onyx_delegate` invocation to Onyx with the expected provider, model, prompt, thread, and working directory. Separately, the opt-in live Qwen/vLLM broker test completed a `medium` request, returned the bounded structured result, and verified its durable provider-scoped child. Running-preview verification of the combined invocation and child click-through remains pending, so this issue stays **In progress**.
 
 ## Decision log
 
@@ -268,3 +284,10 @@ Status values: **Open**, **In progress**, **Blocked**, **Done**, **Deferred**.
 - **Decision:** Global palettes must become visible and keyboard-ready before starting data preparation. Project indexing is shared per window, search results are bounded and published asynchronously, and stale work cannot replace newer input.
 - **Consequence:** Keyboard navigation never waits for a complete filesystem scan or synchronous path ranking, and opening both Command-P and Files cannot start duplicate indexes for the same project.
 - **Verification:** Hosted large-project coverage must prove the palette mounts promptly while indexing is suspended, plus cancellation, stale-result, result-bound, and shared-index regressions.
+
+### D-012 — Cross-provider delegation is mediated by Onyx
+
+- **Status:** Active
+- **Decision:** Provider agents exchange bounded prompts and results through an Onyx-owned delegation tool and scheduler. Codex receives only stable configured-provider/model identifiers and child-task metadata; Onyx retains credentials, endpoints, concurrency, cancellation, and provider-runtime ownership.
+- **Consequence:** Cross-provider subagents can participate in one task without teaching app-server about third-party authentication or pretending remote models have local tools. The first production path is intentionally text-only and read-only; richer modalities, tools, and recursive delegation require explicit capability and approval work.
+- **Verification:** Protocol, production-composition, failure/cancellation, and navigation fixtures prove target validation, exactly-once responses, shared provider-runtime reuse, and provider-scoped child routing. On 2026-08-23, opt-in live tests separately proved installed app-server invocation and configured Qwen/vLLM result return with durable child persistence. The canonical running preview must still prove the combined user flow and provider-aware child click-through.

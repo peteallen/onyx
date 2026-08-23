@@ -454,11 +454,34 @@ enum RuntimeCollaborationAgentStatus: String, Sendable, Codable, Hashable {
 }
 
 struct RuntimeCollaborationAgent: Identifiable, Sendable, Hashable {
+    /// Stable identity for the inspector row and successive status updates.
+    /// This is deliberately independent from the provider-owned conversation
+    /// identity because two providers may return the same child thread id.
     let id: String
     var path: String?
     var status: RuntimeCollaborationAgentStatus
     var message: String?
     var updatedAt: Date
+    /// Provider-scoped conversation to open when the user selects this agent.
+    /// A missing destination means the runtime reported activity but did not
+    /// provide enough identity to navigate to the child conversation.
+    var destination: RuntimeCollaborationAgentDestination?
+
+    init(
+        id: String,
+        path: String?,
+        status: RuntimeCollaborationAgentStatus,
+        message: String?,
+        updatedAt: Date,
+        destination: RuntimeCollaborationAgentDestination? = nil
+    ) {
+        self.id = id
+        self.path = path
+        self.status = status
+        self.message = message
+        self.updatedAt = updatedAt
+        self.destination = destination
+    }
 
     var displayName: String {
         guard let path = path?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -474,6 +497,26 @@ struct RuntimeCollaborationAgent: Identifiable, Sendable, Hashable {
             .split(separator: " ")
             .map { $0.capitalized }
         return words.isEmpty ? path : words.joined(separator: " ")
+    }
+}
+
+struct RuntimeCollaborationAgentDestination: Sendable, Hashable {
+    let connectionID: ProviderConnectionID
+    let threadID: String
+
+    init(connectionID: ProviderConnectionID, threadID: String) {
+        self.connectionID = connectionID
+        self.threadID = threadID
+    }
+
+    var navigableThreadID: String? {
+        let trimmed = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    var isNavigable: Bool {
+        let connection = connectionID.rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !connection.isEmpty && navigableThreadID != nil
     }
 }
 

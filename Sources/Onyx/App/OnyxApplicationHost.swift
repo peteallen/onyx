@@ -22,6 +22,28 @@ extension EnvironmentValues {
     }
 }
 
+/// Breaks the app-host/runtime construction cycle without retaining the app
+/// host from the Codex runtime. The broker keeps this bridge, while the bridge
+/// refers weakly back to the fully initialized composition root.
+@MainActor
+private final class OnyxDelegationHostBridge {
+    weak var host: OnyxApplicationHost?
+
+    func providerConfigurations() async throws -> [DelegationProviderConfiguration] {
+        guard let host else { throw DelegationHostBridgeError.unavailable }
+        return try await host.delegationProviderConfigurations()
+    }
+
+    func runtime(
+        for connectionID: ProviderConnectionID
+    ) throws -> any AgentRuntime {
+        guard let host else { throw DelegationHostBridgeError.unavailable }
+        return try host.delegationRuntime(for: connectionID)
+    }
+
+    private enum DelegationHostBridgeError: Error { case unavailable }
+}
+
 /// Durable scene identity used by SwiftUI to restore each workspace window
 /// independently. The UUID never crosses the provider boundary; it only scopes
 /// app-owned window state and macOS frame restoration.
@@ -134,6 +156,7 @@ final class OnyxApplicationHost: ObservableObject {
     let projectCatalogModel: ProjectCatalogModel
     let settingsModel: OnyxAppModel
     let providerSettingsModel: ProviderSettingsModel
+    private let delegationBroker: OnyxDelegationBroker
     /// Changes only after an accepted turn is attributed to a model. Views
     /// observe this narrow signal to refresh the picker once, instead of
     /// rebuilding rankings for every streamed transcript publication.
@@ -201,15 +224,32 @@ final class OnyxApplicationHost: ObservableObject {
         providerModelDiscovery: any ProviderModelDiscovery = URLSessionProviderModelDiscovery(),
         providerConversationStore: OpenAICompatibleConversationStore = OpenAICompatibleConversationStore()
     ) {
+        let delegationBridge = OnyxDelegationHostBridge()
+        let delegationBroker = OnyxDelegationBroker(
+            providerCatalogResolver: {
+                try await delegationBridge.providerConfigurations()
+            },
+            runtimeResolver: { connectionID in
+                try await delegationBridge.runtime(for: connectionID)
+            }
+        )
         self.registry = registry
         self.defaultConnectionID = connectionID
         self.providerConnectionStore = providerConnectionStore
         self.providerCredentialStore = providerCredentialStore
         self.providerConversationStore = providerConversationStore
+        self.delegationBroker = delegationBroker
         let coordinator: SharedRuntimeCoordinator?
         let resolutionError: (any Error)?
         do {
-            coordinator = SharedRuntimeCoordinator(runtime: try registry.resolve(connectionID))
+            coordinator = SharedRuntimeCoordinator(
+                runtime: try registry.resolve(
+                    connectionID,
+                    dynamicToolHandler: connectionID == .codexDefault
+                        ? delegationBroker
+                        : nil
+                )
+            )
             resolutionError = nil
         } catch {
             coordinator = nil
@@ -245,6 +285,7 @@ final class OnyxApplicationHost: ObservableObject {
         providerSettingsModel.onConnectionMutation = { [weak self] connectionID in
             self?.invalidateProviderRuntime(for: connectionID)
         }
+        delegationBridge.host = self
     }
 
     /// Creates a window model for the provider encoded by its scene identity.
@@ -359,42 +400,34 @@ final class OnyxApplicationHost: ObservableObject {
     func cachedProviderModelCatalogs() async -> [ProviderConnectionID: [RuntimeModel]] {
         guard let records = try? await providerConnectionStore.connections() else { return [:] }
         return Dictionary(uniqueKeysWithValues: records.map { record in
-            // A provider can be saved with a manually entered default model
-            // before `/models` discovery succeeds (common for a local vLLM
-            // endpoint). Keep that model visible in the workspace picker so
-            // the user can start a task and retry discovery later. IDs from
-            // older records are retained as a second fallback as well.
-            let discovered = record.discovery.discoveredModels.isEmpty
-                ? record.discovery.discoveredModelIDs.compactMap(Self.fallbackModelDescriptor)
-                : record.discovery.discoveredModels.map { $0.applyingKnownModelProfile() }
-            var descriptors = discovered
-            if let selectedModelID = record.selectedModelID,
-               !descriptors.contains(where: { $0.id == selectedModelID }),
-               let fallback = Self.fallbackModelDescriptor(selectedModelID) {
-                descriptors.append(fallback)
-            }
-            let models = descriptors.enumerated().map { index, descriptor in
-                let defaultReasoningEffort = record.requestBehavior.enableThinking == false
-                    && descriptor.capabilities.reasoningEfforts.contains("none")
-                    ? "none"
-                    : descriptor.preferredDefaultReasoningEffort
-                return RuntimeModel(
-                    id: descriptor.id,
-                    displayName: descriptor.displayName,
-                    description: descriptor.description,
-                    isDefault: descriptor.id == record.selectedModelID
-                        || (record.selectedModelID == nil && index == 0),
-                    defaultReasoningEffort: defaultReasoningEffort,
-                    reasoningEfforts: descriptor.capabilities.reasoningEfforts,
-                    inputModalities: descriptor.capabilities.inputModalities,
-                    serverAdvertisedRequestParameters: descriptor.capabilities.supportedParameters,
-                    supportedRequestParameters: descriptor.capabilities.clientUsableParameters,
-                    serverAdvertisedCapabilities: descriptor.capabilities.serverAdvertisedCapabilities,
-                    capabilityEvidence: descriptor.capabilityEvidence
-                )
-            }
-            return (record.id, models)
+            (record.id, Self.cachedRuntimeModels(for: record))
         })
+    }
+
+    fileprivate func delegationProviderConfigurations() async throws
+        -> [DelegationProviderConfiguration]
+    {
+        try await providerConnectionStore.connections().map { record in
+            DelegationProviderConfiguration(
+                connectionID: record.id,
+                displayName: record.displayName,
+                models: Self.cachedRuntimeModels(for: record)
+            )
+        }
+    }
+
+    fileprivate func delegationRuntime(
+        for connectionID: ProviderConnectionID
+    ) throws -> any AgentRuntime {
+        guard connectionID != defaultConnectionID else {
+            throw AgentRuntimeError.unsupported("delegating back to the parent Codex provider")
+        }
+        let resolved = runtimeCoordinator(for: connectionID)
+        if let error = resolved.error { throw error }
+        guard let coordinator = resolved.coordinator else {
+            throw AgentRuntimeError.unsupported("delegation provider connection")
+        }
+        return coordinator
     }
 
     /// Loads the complete task catalog for every configured connection. The
@@ -631,6 +664,43 @@ final class OnyxApplicationHost: ObservableObject {
         return descriptor?.applyingKnownModelProfile()
     }
 
+    private static func cachedRuntimeModels(
+        for record: ProviderConnectionRecord
+    ) -> [RuntimeModel] {
+        // A provider can be saved with a manually entered default model before
+        // `/models` discovery succeeds (common for a local vLLM endpoint).
+        // Retain it for both task selection and delegated work.
+        let discovered = record.discovery.discoveredModels.isEmpty
+            ? record.discovery.discoveredModelIDs.compactMap(fallbackModelDescriptor)
+            : record.discovery.discoveredModels.map { $0.applyingKnownModelProfile() }
+        var descriptors = discovered
+        if let selectedModelID = record.selectedModelID,
+           !descriptors.contains(where: { $0.id == selectedModelID }),
+           let fallback = fallbackModelDescriptor(selectedModelID) {
+            descriptors.append(fallback)
+        }
+        return descriptors.enumerated().map { index, descriptor in
+            let defaultReasoningEffort = record.requestBehavior.enableThinking == false
+                && descriptor.capabilities.reasoningEfforts.contains("none")
+                ? "none"
+                : descriptor.preferredDefaultReasoningEffort
+            return RuntimeModel(
+                id: descriptor.id,
+                displayName: descriptor.displayName,
+                description: descriptor.description,
+                isDefault: descriptor.id == record.selectedModelID
+                    || (record.selectedModelID == nil && index == 0),
+                defaultReasoningEffort: defaultReasoningEffort,
+                reasoningEfforts: descriptor.capabilities.reasoningEfforts,
+                inputModalities: descriptor.capabilities.inputModalities,
+                serverAdvertisedRequestParameters: descriptor.capabilities.supportedParameters,
+                supportedRequestParameters: descriptor.capabilities.clientUsableParameters,
+                serverAdvertisedCapabilities: descriptor.capabilities.serverAdvertisedCapabilities,
+                capabilityEvidence: descriptor.capabilityEvidence
+            )
+        }
+    }
+
     /// Resolves configured OpenAI-compatible connections in the same
     /// composition root as Codex.  The connection record and credential are
     /// intentionally supplied to the adapter rather than copied into a
@@ -668,6 +738,7 @@ final class OnyxApplicationHost: ObservableObject {
     /// adapter, then disconnect the old coordinator so already-open windows
     /// cannot keep using the stale or deleted provider configuration.
     private func invalidateProviderRuntime(for connectionID: ProviderConnectionID) {
+        Task { await delegationBroker.invalidate(connectionID: connectionID) }
         guard connectionID != defaultConnectionID,
               let coordinator = runtimeCoordinators.removeValue(forKey: connectionID)
         else { return }
@@ -787,8 +858,12 @@ struct OnyxWindowRootView: View {
             preferring: selection.model.session?.availableModels
         )
         selection.modelRankingRevision &+= 1
-        if case .connected = selection.model.connectionState,
-           !selection.model.isLoadingThreadList,
+        if ProviderTaskCatalogSynchronizationPolicy.shouldReplaceCachedTasks(
+            connectionState: selection.model.connectionState,
+            isLoadingThreadList: selection.model.isLoadingThreadList,
+            hasAuthoritativeThreadList: selection.model
+                .hasAuthoritativeThreadListForCurrentScope
+        ),
            let currentConnection = loadedConnections.first(where: {
                $0.id == selection.connectionID
            }) {
@@ -873,7 +948,9 @@ private struct ProviderWorkspaceContent: View {
     var body: some View {
         OnyxWorkspaceView(
             model: model,
-            preferenceKeyPrefix: providerWindowID.providerPreferenceKeyPrefix(),
+            preferenceKeyPrefix: ProviderWorkspaceShellIdentity.preferenceKeyPrefix(
+                for: selection.windowID
+            ),
             defaults: defaults,
             projectCatalog: host.projectCatalogModel,
             windowProvider: { windowReference.window },
@@ -884,7 +961,11 @@ private struct ProviderWorkspaceContent: View {
             onSelectProviderModel: selectProviderModel,
             onSelectProviderTask: selectProviderTask
         )
-        .id(selection.connectionID)
+        // Provider task navigation replaces the runtime-bound model, not the
+        // window's workspace shell. A window-stable identity preserves the
+        // sidebar projection, scroll position, and disclosure state while the
+        // destination provider connects behind it.
+        .id(ProviderWorkspaceShellIdentity.id(for: selection.windowID))
         .task(id: selection.connectionID) {
             model.start()
         }
@@ -980,16 +1061,23 @@ private struct ProviderWorkspaceContent: View {
     @MainActor
     private func selectProviderTask(
         _ connectionID: ProviderConnectionID,
-        threadID: String
+        threadID: String,
+        scope: ThreadListScope
     ) {
         guard connectionID != selection.connectionID else {
-            model.selectThread(threadID)
+            if scope == model.threadListScope {
+                model.selectThread(threadID)
+            } else {
+                selection.pendingThreadID = threadID
+                selection.pendingThreadScope = scope
+                model.setThreadListScope(scope)
+            }
             return
         }
         replaceSelection(
             with: connectionID,
             pendingThreadID: threadID,
-            pendingThreadScope: model.threadListScope
+            pendingThreadScope: scope
         )
     }
 
@@ -1052,6 +1140,20 @@ private struct ProviderWorkspaceContent: View {
             pendingThreadID: pendingThreadID,
             pendingThreadScope: pendingThreadScope
         )
+    }
+}
+
+enum ProviderWorkspaceShellIdentity {
+    static func id(for windowID: WorkspaceWindowID) -> UUID {
+        windowID.rawValue
+    }
+
+    /// Pane geometry belongs to the retained window shell, not the runtime
+    /// currently displayed inside it. Keeping the defaults namespace stable
+    /// prevents a provider switch from restoring or later persisting a
+    /// different sidebar, inspector, or terminal size.
+    static func preferenceKeyPrefix(for windowID: WorkspaceWindowID) -> String {
+        windowID.preferenceKeyPrefix
     }
 }
 

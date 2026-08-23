@@ -19,12 +19,26 @@ actor CodexRuntime: AgentRuntime {
 
     private let eventContinuation: AsyncStream<AgentRuntimeEvent>.Continuation
     private let client: any CodexAppServerTransport
+    private let dynamicToolHandler: (any CodexDynamicToolHandler)?
     private var appServerTask: Task<Void, Never>?
     private var connectionAttempt: Task<RuntimeSession, any Error>?
     private var connectionGeneration: UInt64 = 0
     private var activeTransportGeneration: UInt64?
     private var activeTurnIDs: [String: String] = [:]
     private var pendingUserInteractions: [RuntimeRequestID: AppServerRequest] = [:]
+    private struct DynamicToolTask {
+        let token: UUID
+        let threadID: String?
+        let task: Task<Void, Never>
+    }
+
+    private struct DynamicToolParentContext {
+        var modelID: String?
+        var workingDirectory: String?
+    }
+
+    private var dynamicToolTasks: [RuntimeRequestID: DynamicToolTask] = [:]
+    private var dynamicToolParentContexts: [String: DynamicToolParentContext] = [:]
     /// App-server can emit `thread/started` before the matching `thread/fork`
     /// response reaches this actor. Keep every thread lifecycle notification
     /// behind this small classification barrier while an ephemeral fork is in
@@ -55,12 +69,22 @@ actor CodexRuntime: AgentRuntime {
     private var unavailableCapabilities: RuntimeCapabilities = []
     private var connected = false
 
-    init(executableURL: URL) {
-        self.init(client: CodexAppServerClient(executableURL: executableURL))
+    init(
+        executableURL: URL,
+        dynamicToolHandler: (any CodexDynamicToolHandler)? = nil
+    ) {
+        self.init(
+            client: CodexAppServerClient(executableURL: executableURL),
+            dynamicToolHandler: dynamicToolHandler
+        )
     }
 
-    init(client: any CodexAppServerTransport) {
+    init(
+        client: any CodexAppServerTransport,
+        dynamicToolHandler: (any CodexDynamicToolHandler)? = nil
+    ) {
         self.client = client
+        self.dynamicToolHandler = dynamicToolHandler
         let stream = AsyncStream.makeStream(of: AgentRuntimeEvent.self)
         events = stream.stream
         eventContinuation = stream.continuation
@@ -68,14 +92,22 @@ actor CodexRuntime: AgentRuntime {
 
     deinit {
         appServerTask?.cancel()
+        for task in dynamicToolTasks.values {
+            task.task.cancel()
+        }
         eventContinuation.finish()
     }
 
-    static func makeDefault() throws -> CodexRuntime {
+    static func makeDefault(
+        dynamicToolHandler: (any CodexDynamicToolHandler)? = nil
+    ) throws -> CodexRuntime {
         guard let url = resolveExecutable() else {
             throw AgentRuntimeError.executableNotFound
         }
-        return CodexRuntime(executableURL: url)
+        return CodexRuntime(
+            executableURL: url,
+            dynamicToolHandler: dynamicToolHandler
+        )
     }
 
     func connect() async throws -> RuntimeSession {
@@ -122,6 +154,7 @@ actor CodexRuntime: AgentRuntime {
             connectionAttempt = nil
             activeTurnIDs.removeAll()
             pendingUserInteractions.removeAll()
+            cancelDynamicToolTasks()
             resetEphemeralThreadBoundary()
             await client.stop()
             guard connectionGeneration == generation else { throw error }
@@ -139,6 +172,7 @@ actor CodexRuntime: AgentRuntime {
         connected = false
         activeTurnIDs.removeAll()
         pendingUserInteractions.removeAll()
+        cancelDynamicToolTasks()
         resetEphemeralThreadBoundary()
         await client.stop()
         guard connectionGeneration == generation else { return }
@@ -287,7 +321,9 @@ actor CodexRuntime: AgentRuntime {
                 "includeTurns": .bool(true),
             ])
         )
-        return try CodexProjection.conversation(from: result)
+        let conversation = try CodexProjection.conversation(from: result)
+        rememberDynamicToolParentContext(from: conversation.thread)
+        return conversation
     }
 
     /// Reads a recent turn page without attaching this window as the task's
@@ -306,6 +342,7 @@ actor CodexRuntime: AgentRuntime {
             ])
         )
         var conversation = try CodexProjection.conversation(from: metadataResult)
+        rememberDynamicToolParentContext(from: conversation.thread)
         let page = try await listThreadHistory(id: id, page: request)
         conversation.items = page.chronologicalItems
         return RuntimeThreadResumeResult(
@@ -331,7 +368,9 @@ actor CodexRuntime: AgentRuntime {
         } else {
             activeTurnIDs.removeValue(forKey: id)
         }
-        return try CodexProjection.conversation(from: result)
+        let conversation = try CodexProjection.conversation(from: result)
+        rememberDynamicToolParentContext(from: conversation.thread)
+        return conversation
     }
 
     func resumeThread(
@@ -353,6 +392,7 @@ actor CodexRuntime: AgentRuntime {
         )
 
         var conversation = try CodexProjection.conversation(from: result)
+        rememberDynamicToolParentContext(from: conversation.thread)
         let initialHistoryPage: RuntimeThreadHistoryPage?
         if let pageValue = result["initialTurnsPage"], pageValue != .null {
             let page = try CodexProjection.historyPage(
@@ -436,9 +476,19 @@ actor CodexRuntime: AgentRuntime {
             "approvalPolicy": .string(codexApprovalPolicy(request.approvalPolicy)),
         ]
         if let model = request.model { params["model"] = .string(model) }
+        if let dynamicToolHandler {
+            let definition = await dynamicToolHandler.dynamicToolDefinition()
+            params["dynamicTools"] = .array([Self.dynamicToolSpecification(definition)])
+        }
         let result = try await client.request(method: "thread/start", params: .object(params))
         guard let thread = CodexProjection.thread(from: result["thread"] ?? result) else {
             throw AgentRuntimeError.missingField("thread.id")
+        }
+        if dynamicToolHandler != nil {
+            dynamicToolParentContexts[thread.id] = DynamicToolParentContext(
+                modelID: request.model ?? thread.model,
+                workingDirectory: request.cwd
+            )
         }
         return thread
     }
@@ -451,13 +501,24 @@ actor CodexRuntime: AgentRuntime {
         guard let thread = CodexProjection.thread(from: result["thread"] ?? result) else {
             throw AgentRuntimeError.missingField("thread.id")
         }
+        if dynamicToolHandler != nil {
+            dynamicToolParentContexts[thread.id] = dynamicToolParentContexts[id]
+                ?? DynamicToolParentContext(
+                    modelID: thread.model,
+                    workingDirectory: thread.cwd
+                )
+        }
         return thread
     }
 
     func forkEphemeralThread(id: String) async throws -> RuntimeConversation {
         // `ThreadForkParams.ephemeral` is part of the installed app-server's
-        // generated v2 schema. An ephemeral fork keeps the parent's history in
-        // the response but is not materialized in Codex's durable thread store.
+        // generated v2 schema. Ephemeral forks use the paginated fork shape,
+        // which requires `excludeTurns: true`; the response therefore carries
+        // metadata/live state but no `thread.turns`. The app-owned side-chat
+        // UI keeps its parent snapshot as the visible inherited context. The
+        // app-server intentionally does not allow `thread/turns/list` for an
+        // ephemeral thread, so do not issue a follow-up history request here.
         nextEphemeralForkToken &+= 1
         let token = nextEphemeralForkToken
         pendingEphemeralForks[token] = PendingEphemeralFork(sourceThreadID: id)
@@ -469,7 +530,7 @@ actor CodexRuntime: AgentRuntime {
                 params: .object([
                     "threadId": .string(id),
                     "ephemeral": .bool(true),
-                    "excludeTurns": .bool(false),
+                    "excludeTurns": .bool(true),
                 ])
             )
         } catch {
@@ -526,6 +587,13 @@ actor CodexRuntime: AgentRuntime {
 
         do {
             let conversation = try CodexProjection.conversation(from: result)
+            if dynamicToolHandler != nil {
+                dynamicToolParentContexts[threadID] = dynamicToolParentContexts[id]
+                    ?? DynamicToolParentContext(
+                        modelID: conversation.thread.model,
+                        workingDirectory: conversation.thread.cwd
+                    )
+            }
             finishEphemeralFork(token)
             return conversation
         } catch {
@@ -550,6 +618,7 @@ actor CodexRuntime: AgentRuntime {
             method: "thread/delete",
             params: .object(["threadId": .string(id)])
         )
+        dynamicToolParentContexts.removeValue(forKey: id)
     }
 
     func startTurn(_ request: StartTurnRequest) async throws {
@@ -561,6 +630,14 @@ actor CodexRuntime: AgentRuntime {
         if let model = request.model { params["model"] = .string(model) }
         if let cwd = request.cwd { params["cwd"] = .string(cwd) }
         if let reasoningEffort = request.reasoningEffort { params["effort"] = .string(reasoningEffort) }
+        if dynamicToolParentContexts[request.threadID] != nil {
+            if let model = request.model {
+                dynamicToolParentContexts[request.threadID]?.modelID = model
+            }
+            if let cwd = request.cwd {
+                dynamicToolParentContexts[request.threadID]?.workingDirectory = cwd
+            }
+        }
         params["approvalPolicy"] = .string(codexApprovalPolicy(request.approvalPolicy))
         params["sandboxPolicy"] = codexSandboxPolicy(request.sandboxMode, cwd: request.cwd)
         let result = try await client.request(method: "turn/start", params: .object(params))
@@ -664,6 +741,11 @@ actor CodexRuntime: AgentRuntime {
             "threadId": .string(threadID),
             "turnId": .string(turnID),
         ]
+        // The parent interrupt is still attempted first so a local cancellation
+        // cannot leave Codex running after Onyx reports a failed stop. The
+        // delegated child must nevertheless be cancelled when that request
+        // throws; otherwise it can continue for the full provider timeout.
+        defer { cancelDynamicToolTasks(threadID: threadID) }
         _ = try await client.request(method: "turn/interrupt", params: .object(params))
     }
 
@@ -819,6 +901,10 @@ actor CodexRuntime: AgentRuntime {
             if let interaction = CodexProjection.userInteraction(from: request) {
                 pendingUserInteractions[request.id] = request
                 eventContinuation.yield(.userInteractionRequested(interaction))
+            } else if request.method == "item/tool/call",
+                      request.params["tool"]?.stringValue == Self.delegationToolName,
+                      dynamicToolHandler != nil {
+                handleDynamicToolCall(request, generation: generation)
             } else {
                 await rejectUnsupportedServerRequest(request)
             }
@@ -836,6 +922,7 @@ actor CodexRuntime: AgentRuntime {
             activeTransportGeneration = nil
             activeTurnIDs.removeAll()
             pendingUserInteractions.removeAll()
+            cancelDynamicToolTasks()
             resetEphemeralThreadBoundary()
             eventContinuation.yield(.connectionChanged(.failed(reason)))
         }
@@ -889,6 +976,7 @@ actor CodexRuntime: AgentRuntime {
         if let lifecycleEvent = CodexProjection.threadLifecycleEvent(from: notification) {
             if case let .threadDeleted(threadID) = lifecycleEvent {
                 activeTurnIDs.removeValue(forKey: threadID)
+                dynamicToolParentContexts.removeValue(forKey: threadID)
             }
             publishOrBufferThreadLifecycleEvent(lifecycleEvent, threadID: threadID)
             return
@@ -940,6 +1028,7 @@ actor CodexRuntime: AgentRuntime {
             eventContinuation.yield(.itemDelta(threadID: threadID, itemID: itemID, delta: delta))
         case "turn/completed":
             activeTurnIDs.removeValue(forKey: threadID)
+            cancelDynamicToolTasks(threadID: threadID)
             let rawStatus = params["turn"]?["status"]?.stringValue ?? "idle"
             let status: RuntimeThreadStatus = rawStatus == "failed" ? .failed : .idle
             eventContinuation.yield(.turnCompleted(threadID: threadID, status: status))
@@ -1166,6 +1255,152 @@ actor CodexRuntime: AgentRuntime {
                 title: "Codex requested an unsupported capability",
                 detail: detail
             )
+        )
+    }
+
+    private static let delegationToolName = "onyx_delegate"
+
+    private static func dynamicToolSpecification(
+        _ definition: CodexDynamicToolDefinition
+    ) -> JSONValue {
+        .object([
+            "type": .string("function"),
+            "name": .string(delegationToolName),
+            "description": .string(definition.description),
+            "inputSchema": definition.inputSchema,
+        ])
+    }
+
+    private func handleDynamicToolCall(
+        _ request: AppServerRequest,
+        generation: UInt64
+    ) {
+        guard let dynamicToolHandler else { return }
+        // DynamicToolCallRequest supplies the owning turn, not a thread id.
+        // Resolve that turn through state captured from turn/start or
+        // turn/started so model-authored input cannot choose another parent.
+        guard let turnID = request.params["turnId"]?.stringValue,
+              !turnID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let threadID = activeTurnIDs.first(where: { $0.value == turnID })?.key,
+              let callID = request.params["callId"]?.stringValue,
+              !callID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let arguments = request.params["arguments"],
+              arguments.objectValue != nil else {
+            startDynamicToolResponseTask(
+                requestID: request.id,
+                generation: generation,
+                threadID: nil,
+                operation: {
+                    .failed("The onyx_delegate request is missing a valid turnId, callId, or arguments object.")
+                }
+            )
+            return
+        }
+
+        let parentContext = dynamicToolParentContexts[threadID]
+        let call = CodexDynamicToolCall(
+            threadID: threadID,
+            callID: callID,
+            arguments: arguments,
+            parentModelID: parentContext?.modelID ?? "codex",
+            workingDirectory: parentContext?.workingDirectory
+        )
+        startDynamicToolResponseTask(
+            requestID: request.id,
+            generation: generation,
+            threadID: threadID,
+            operation: {
+                do {
+                    return try await dynamicToolHandler.handleDynamicToolCall(call)
+                } catch {
+                    // Handler errors can contain provider endpoints or request
+                    // details. Keep the app-server response deliberately
+                    // generic; the handler can return an explicit sanitized
+                    // failure result when it has safe user-facing context.
+                    return .failed("Onyx could not complete this delegation.")
+                }
+            }
+        )
+    }
+
+    private func startDynamicToolResponseTask(
+        requestID: RuntimeRequestID,
+        generation: UInt64,
+        threadID: String?,
+        operation: @escaping @Sendable () async -> CodexDynamicToolResult
+    ) {
+        dynamicToolTasks[requestID]?.task.cancel()
+        let token = UUID()
+        let task = Task { [weak self] in
+            let result = await operation()
+            guard !Task.isCancelled else { return }
+            await self?.completeDynamicToolCall(
+                requestID: requestID,
+                generation: generation,
+                token: token,
+                result: result
+            )
+        }
+        dynamicToolTasks[requestID] = DynamicToolTask(
+            token: token,
+            threadID: threadID,
+            task: task
+        )
+    }
+
+    private func completeDynamicToolCall(
+        requestID: RuntimeRequestID,
+        generation: UInt64,
+        token: UUID,
+        result: CodexDynamicToolResult
+    ) async {
+        guard dynamicToolTasks[requestID]?.token == token else { return }
+        dynamicToolTasks.removeValue(forKey: requestID)
+        guard generation == activeTransportGeneration else { return }
+
+        do {
+            try await client.respond(
+                id: requestID,
+                result: .object([
+                    "contentItems": .array([
+                        .object([
+                            "type": .string("inputText"),
+                            "text": .string(result.text),
+                        ]),
+                    ]),
+                    "success": .bool(result.success),
+                ])
+            )
+        } catch {
+            guard generation == activeTransportGeneration else { return }
+            eventContinuation.yield(
+                .runtimeNotice(
+                    title: "Codex delegation response failed",
+                    detail: "Onyx could not return the delegation result to Codex."
+                )
+            )
+        }
+    }
+
+    private func cancelDynamicToolTasks() {
+        let tasks = dynamicToolTasks.values.map(\.task)
+        dynamicToolTasks.removeAll()
+        for task in tasks { task.cancel() }
+    }
+
+    private func cancelDynamicToolTasks(threadID: String) {
+        let requestIDs = dynamicToolTasks.compactMap { requestID, entry in
+            entry.threadID == threadID ? requestID : nil
+        }
+        let tasks = requestIDs.compactMap { dynamicToolTasks.removeValue(forKey: $0)?.task }
+        for task in tasks { task.cancel() }
+    }
+
+    private func rememberDynamicToolParentContext(from thread: RuntimeThread) {
+        guard dynamicToolHandler != nil else { return }
+        dynamicToolParentContexts[thread.id] = DynamicToolParentContext(
+            modelID: thread.model,
+            workingDirectory: thread.cwd
         )
     }
 

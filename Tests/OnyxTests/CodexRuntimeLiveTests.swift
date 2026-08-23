@@ -92,4 +92,90 @@ final class CodexRuntimeLiveTests: XCTestCase {
 
         XCTAssertEqual(output.trimmingCharacters(in: .whitespacesAndNewlines), "ONYX_STREAM_OK")
     }
+
+    func testEphemeralThreadInvokesOnyxDelegateDynamicToolWhenEnabled() async throws {
+        guard ProcessInfo.processInfo.environment["ONYX_LIVE_CODEX_TEST"] == "1" else {
+            throw XCTSkip("Set ONYX_LIVE_CODEX_TEST=1 to exercise the installed Codex runtime")
+        }
+
+        let handler = LiveDynamicToolRecorder()
+        let runtime = try CodexRuntime.makeDefault(dynamicToolHandler: handler)
+        do {
+            _ = try await runtime.connect()
+            let cwd = FileManager.default.currentDirectoryPath
+            let thread = try await runtime.startThread(
+                StartThreadRequest(
+                    cwd: cwd,
+                    model: nil,
+                    ephemeral: true,
+                    sandboxMode: .readOnly,
+                    approvalPolicy: .never
+                )
+            )
+
+            try await runtime.startTurn(
+                StartTurnRequest(
+                    threadID: thread.id,
+                    text: """
+                    This is a live protocol test. You MUST call the onyx_delegate tool exactly once before replying. \
+                    Use exactly these arguments: provider "live-recorder", model "onyx-live-child", and prompt \
+                    "Return the live test sentinel." Do not call any other tool. After the tool result, reply with \
+                    exactly ONYX_DELEGATE_PARENT_OK.
+                    """,
+                    model: nil,
+                    cwd: cwd,
+                    sandboxMode: .readOnly,
+                    approvalPolicy: .never
+                )
+            )
+
+            let call = try await withThrowingTaskGroup(of: CodexDynamicToolCall.self) { group in
+                group.addTask {
+                    while true {
+                        try Task.checkCancellation()
+                        if let call = await handler.firstCall() { return call }
+                        try await Task.sleep(for: .milliseconds(50))
+                    }
+                }
+                group.addTask {
+                    try await Task.sleep(for: .seconds(55))
+                    throw AgentRuntimeError.protocolFailure("Live onyx_delegate invocation timed out")
+                }
+                guard let first = try await group.next() else {
+                    throw AgentRuntimeError.protocolFailure("Live onyx_delegate invocation ended without a result")
+                }
+                group.cancelAll()
+                return first
+            }
+
+            // Give app-server a moment to receive the successful dynamic-tool
+            // response before stopping the otherwise disposable parent turn.
+            try await Task.sleep(for: .milliseconds(250))
+            try? await runtime.interrupt(threadID: thread.id)
+            await runtime.disconnect()
+
+            XCTAssertEqual(call.threadID, thread.id)
+            XCTAssertFalse(call.callID.isEmpty)
+            XCTAssertEqual(call.workingDirectory, cwd)
+            XCTAssertEqual(call.arguments["provider"]?.stringValue, "live-recorder")
+            XCTAssertEqual(call.arguments["model"]?.stringValue, "onyx-live-child")
+            XCTAssertEqual(call.arguments["prompt"]?.stringValue, "Return the live test sentinel.")
+        } catch {
+            await runtime.disconnect()
+            throw error
+        }
+    }
+}
+
+private actor LiveDynamicToolRecorder: CodexDynamicToolHandler {
+    private var calls: [CodexDynamicToolCall] = []
+
+    func handleDynamicToolCall(_ call: CodexDynamicToolCall) -> CodexDynamicToolResult {
+        calls.append(call)
+        return .succeeded("ONYX_DELEGATE_TOOL_OK")
+    }
+
+    func firstCall() -> CodexDynamicToolCall? {
+        calls.first
+    }
 }

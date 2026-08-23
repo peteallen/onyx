@@ -4,6 +4,87 @@ import XCTest
 
 @MainActor
 final class OnyxAppModelRaceTests: XCTestCase {
+    func testCollaborationDestinationRequiresProviderAndChildIdentity() {
+        XCTAssertFalse(RuntimeCollaborationAgentDestination(
+            connectionID: ProviderConnectionID("   "),
+            threadID: "child"
+        ).isNavigable)
+        XCTAssertFalse(RuntimeCollaborationAgentDestination(
+            connectionID: .codexDefault,
+            threadID: "  \n"
+        ).isNavigable)
+        XCTAssertTrue(RuntimeCollaborationAgentDestination(
+            connectionID: .codexDefault,
+            threadID: " child "
+        ).isNavigable)
+    }
+
+    func testSelectingTaskRefreshesMetadataWithoutMovingSidebarRow() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        model.start()
+        await waitUntil("The runtime did not finish its initial load") {
+            model.selectedThreadID == Fixture.threadAID
+                && !model.isLoadingThread
+        }
+        let originalOrder = model.threads.map(\.id)
+        var refreshedThreadB = Fixture.threadB
+        refreshedThreadB.title = "Refreshed Thread B"
+        refreshedThreadB.updatedAt = Date(timeIntervalSince1970: 100)
+        refreshedThreadB.cwd = "/tmp/a-different-project"
+        await fixture.runtime.setReadThreadOverride(refreshedThreadB)
+
+        model.selectThread(Fixture.threadBID)
+        await waitUntil("Thread B did not finish loading") {
+            model.selectedThreadID == Fixture.threadBID
+                && model.selectedThread?.title == refreshedThreadB.title
+                && !model.isLoadingThread
+        }
+
+        XCTAssertEqual(
+            model.threads.map(\.id),
+            originalOrder,
+            "Reading the clicked task must not move its row under the pointer."
+        )
+        XCTAssertEqual(
+            model.threads.first(where: { $0.id == Fixture.threadBID })?.updatedAt,
+            Fixture.threadB.updatedAt,
+            "A navigation read must not replace the task-list recency authority."
+        )
+        XCTAssertEqual(
+            model.threads.first(where: { $0.id == Fixture.threadBID })?.cwd,
+            Fixture.threadB.cwd,
+            "A navigation read must not move the clicked task into another project group."
+        )
+        let projected = ProjectTaskSidebarProjection.group(
+            ProjectTaskSidebarProjection.mergedTaskReferences(
+                from: [ProjectProviderTaskList(
+                    providerConnectionID: .codexDefault,
+                    providerDisplayName: "Codex",
+                    scope: .active,
+                    threads: model.threads
+                )],
+                scope: .active
+            ),
+            by: []
+        )
+        XCTAssertEqual(
+            projected.unassigned.map(\.thread.id),
+            originalOrder,
+            "The project projection must preserve the model's stable row order."
+        )
+
+        await fixture.runtime.emit(
+            .threadStatusChanged(threadID: Fixture.threadBID, status: .running)
+        )
+        await waitUntil("Genuine lifecycle activity did not reorder the task") {
+            model.threads.first?.id == Fixture.threadBID
+        }
+        XCTAssertEqual(model.threads.map(\.id), [Fixture.threadBID, Fixture.threadAID])
+    }
+
     func testLateInitialReadPreservesNewerLiveItemsCollaborationAndPlan() async {
         let fixture = makeFixture()
         defer { fixture.cleanUp() }
@@ -91,6 +172,120 @@ final class OnyxAppModelRaceTests: XCTestCase {
             Fixture.welcomeThreadID,
             "Clicking New Task must invalidate the restored startup selection."
         )
+    }
+
+    func testNavigationAbortedInitialListCannotReplaceCompleteSidebarCache() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        await fixture.runtime.prepareSuspendedActiveList()
+        model.start()
+        await fixture.runtime.waitUntilActiveListIsSuspended()
+        await waitUntil("The initial task list did not begin loading") {
+            model.isLoadingThreadList
+                && !model.hasAuthoritativeThreadListForCurrentScope
+        }
+
+        // The shared project catalog can already show this cached task even
+        // though the destination provider model has not finished its list.
+        model.selectThread(Fixture.threadBID)
+        await waitUntil("The cached task did not open while the list was pending") {
+            model.selectedThreadID == Fixture.threadBID && !model.isLoadingThread
+        }
+
+        await fixture.runtime.releaseSuspendedActiveList()
+        await waitUntil("The navigation-invalidated list did not settle") {
+            !model.isLoadingThreadList
+        }
+
+        XCTAssertTrue(model.hasAuthoritativeThreadListForCurrentScope)
+        XCTAssertTrue(
+            ProviderTaskCatalogSynchronizationPolicy.shouldReplaceCachedTasks(
+                connectionState: model.connectionState,
+                isLoadingThreadList: model.isLoadingThreadList,
+                hasAuthoritativeThreadList: model
+                    .hasAuthoritativeThreadListForCurrentScope
+            ),
+            "A complete list that finished after navigation should refresh the cache without changing selection."
+        )
+        XCTAssertEqual(model.selectedThreadID, Fixture.threadBID)
+        XCTAssertEqual(model.threads.map(\.id), [Fixture.threadAID, Fixture.threadBID])
+    }
+
+    func testNavigationAbortedListKeepsAnOmittedSelectedTaskAtItsExistingPosition() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        model.start()
+        await waitUntil("The runtime did not finish its initial load") {
+            model.selectedThreadID == Fixture.threadAID
+                && !model.isLoadingThreadList
+        }
+        model.selectThread(Fixture.threadBID)
+        await waitUntil("Thread B did not finish loading") {
+            model.selectedThreadID == Fixture.threadBID && !model.isLoadingThread
+        }
+
+        await fixture.runtime.setNextActiveListOverride([Fixture.threadB])
+        await fixture.runtime.prepareSuspendedActiveList()
+        await fixture.runtime.emit(.connectionChanged(.disconnected))
+        await waitUntil("The runtime did not enter the disconnected state") {
+            if case .disconnected = model.connectionState { return true }
+            return false
+        }
+        model.reconnect()
+        await fixture.runtime.waitUntilActiveListIsSuspended()
+
+        model.selectThread(Fixture.threadAID)
+        await waitUntil("Thread A did not finish loading during reconnect") {
+            model.selectedThreadID == Fixture.threadAID && !model.isLoadingThread
+        }
+        await fixture.runtime.releaseSuspendedActiveList()
+        await waitUntil("The reconnect list did not settle") {
+            !model.isLoadingThreadList
+        }
+
+        XCTAssertEqual(model.selectedThreadID, Fixture.threadAID)
+        XCTAssertEqual(
+            model.threads.map(\.id),
+            [Fixture.threadAID, Fixture.threadBID],
+            "Retaining an omitted selected task must not append it at a new visible position."
+        )
+    }
+
+    func testNavigationAbortedListCannotStealAnUncachedSelectionWhoseReadIsPending() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        await fixture.runtime.setNextActiveListOverride([Fixture.threadA])
+        await fixture.runtime.prepareSuspendedActiveList()
+        await fixture.runtime.prepareSuspendedRead(for: Fixture.threadBID)
+        model.start()
+        await fixture.runtime.waitUntilActiveListIsSuspended()
+
+        model.selectThread(Fixture.threadBID)
+        await fixture.runtime.waitUntilReadIsSuspended(for: Fixture.threadBID)
+        await fixture.runtime.releaseSuspendedActiveList()
+        await waitUntil("The navigation-invalidated list did not settle") {
+            !model.isLoadingThreadList
+        }
+
+        XCTAssertEqual(
+            model.selectedThreadID,
+            Fixture.threadBID,
+            "A completed list must not replace the cached task the user already chose."
+        )
+        XCTAssertTrue(model.isLoadingThread)
+
+        await fixture.runtime.releaseSuspendedRead(for: Fixture.threadBID)
+        await waitUntil("The pending cached task did not finish loading") {
+            model.selectedThreadID == Fixture.threadBID
+                && !model.isLoadingThread
+        }
+        XCTAssertEqual(model.threads.map(\.id), [Fixture.threadAID, Fixture.threadBID])
     }
 
     func testNewTaskWinsOverActiveRefreshWhileTaskListIsLoading() async {
@@ -897,7 +1092,11 @@ final class OnyxAppModelRaceTests: XCTestCase {
             path: "/root/image_attachments",
             status: .working,
             message: "Inspecting the attachment",
-            updatedAt: .now
+            updatedAt: .now,
+            destination: RuntimeCollaborationAgentDestination(
+                connectionID: .codexDefault,
+                threadID: Fixture.childThreadID
+            )
         )
         XCTAssertFalse(model.threads.contains { $0.id == Fixture.childThreadID })
 
@@ -919,6 +1118,196 @@ final class OnyxAppModelRaceTests: XCTestCase {
                 && !model.isLoadingThread
                 && model.timeline == [Fixture.itemA]
         }
+    }
+
+    func testCrossProviderCollaborationDestinationRoutesUnlistedChildWithoutReplacingParent() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+        let vLLMConnection = ProviderConnectionID("provider.vllm.test")
+        let unlistedChildID = "shared-provider-child"
+
+        model.start()
+        await waitUntil("The runtime did not finish its initial load") {
+            model.connectionState == .connected("Race test runtime")
+                && model.selectedThreadID == Fixture.threadAID
+                && !model.isLoadingThread
+        }
+        XCTAssertFalse(model.threads.contains { $0.id == unlistedChildID })
+
+        var routedDestination: RuntimeCollaborationAgentDestination?
+        OnyxWorkspaceView.routeProviderTaskSelection(
+            vLLMConnection,
+            threadID: unlistedChildID,
+            scope: .active,
+            selectedProviderConnectionID: .codexDefault,
+            model: model
+        ) { connectionID, threadID, _ in
+            routedDestination = RuntimeCollaborationAgentDestination(
+                connectionID: connectionID,
+                threadID: threadID
+            )
+        }
+
+        XCTAssertEqual(
+            routedDestination,
+            RuntimeCollaborationAgentDestination(
+                connectionID: vLLMConnection,
+                threadID: unlistedChildID
+            )
+        )
+        XCTAssertEqual(model.selectedThreadID, Fixture.threadAID)
+        XCTAssertTrue(model.threads.contains { $0.id == Fixture.threadAID })
+    }
+
+    func testCollaborationRowsKeepSameChildThreadIDsDistinctAcrossProviders() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+        let sharedChildID = "provider-reused-child-id"
+        let vLLMConnection = ProviderConnectionID("provider.vllm.test")
+        let openRouterConnection = ProviderConnectionID("provider.openrouter.test")
+
+        model.start()
+        await waitUntil("The runtime did not finish its initial load") {
+            model.selectedThreadID == Fixture.threadAID && !model.isLoadingThread
+        }
+
+        let activity = TimelineItem(
+            id: "provider-scoped-collaboration",
+            kind: .tool,
+            title: "Delegated work",
+            body: "Two providers are working",
+            status: .running,
+            timestamp: .now,
+            detail: nil,
+            collaboration: RuntimeCollaborationActivity(
+                action: .spawn,
+                agents: [
+                    RuntimeCollaborationAgent(
+                        id: "delegate-call-vllm",
+                        path: "/root/vllm_child",
+                        status: .working,
+                        message: nil,
+                        updatedAt: .now,
+                        destination: RuntimeCollaborationAgentDestination(
+                            connectionID: vLLMConnection,
+                            threadID: sharedChildID
+                        )
+                    ),
+                    RuntimeCollaborationAgent(
+                        id: "delegate-call-openrouter",
+                        path: "/root/openrouter_child",
+                        status: .working,
+                        message: nil,
+                        updatedAt: .now,
+                        destination: RuntimeCollaborationAgentDestination(
+                            connectionID: openRouterConnection,
+                            threadID: sharedChildID
+                        )
+                    ),
+                ]
+            )
+        )
+
+        await fixture.runtime.emit(
+            .itemCompleted(threadID: Fixture.threadAID, item: activity)
+        )
+        await fixture.runtime.emit(.runtimeNotice(title: "Delegations settled", detail: "Barrier"))
+        await waitUntil("Provider-scoped collaboration rows were merged") {
+            model.notice?.title == "Delegations settled"
+                && model.collaborationAgents.count == 2
+        }
+
+        XCTAssertEqual(Set(model.collaborationAgents.map(\.id)), [
+            "delegate-call-vllm",
+            "delegate-call-openrouter",
+        ])
+        XCTAssertEqual(
+            Set(model.collaborationAgents.compactMap(\.destination?.connectionID)),
+            [vLLMConnection, openRouterConnection]
+        )
+        XCTAssertEqual(
+            Set(model.collaborationAgents.compactMap(\.destination?.threadID)),
+            [sharedChildID]
+        )
+    }
+
+    func testCompletedCollaborationUpdateAddsItsDurableChildDestination() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+        let vLLMConnection = ProviderConnectionID("provider.vllm.test")
+        let startedAt = Date(timeIntervalSince1970: 10)
+        let completedAt = Date(timeIntervalSince1970: 20)
+
+        model.start()
+        await waitUntil("The runtime did not finish its initial load") {
+            model.selectedThreadID == Fixture.threadAID && !model.isLoadingThread
+        }
+
+        func activity(
+            itemID: String,
+            status: RuntimeCollaborationAgentStatus,
+            updatedAt: Date,
+            destination: RuntimeCollaborationAgentDestination?
+        ) -> TimelineItem {
+            TimelineItem(
+                id: itemID,
+                kind: .tool,
+                title: "Delegated work",
+                body: status.label,
+                status: status == .completed ? .completed : .running,
+                timestamp: updatedAt,
+                detail: nil,
+                collaboration: RuntimeCollaborationActivity(
+                    action: .spawn,
+                    agents: [RuntimeCollaborationAgent(
+                        id: "delegate-call",
+                        path: "/root/vllm_child",
+                        status: status,
+                        message: nil,
+                        updatedAt: updatedAt,
+                        destination: destination
+                    )]
+                )
+            )
+        }
+
+        await fixture.runtime.emit(.itemCompleted(
+            threadID: Fixture.threadAID,
+            item: activity(
+                itemID: "delegation-started",
+                status: .working,
+                updatedAt: startedAt,
+                destination: nil
+            )
+        ))
+        await fixture.runtime.emit(.itemCompleted(
+            threadID: Fixture.threadAID,
+            item: activity(
+                itemID: "delegation-completed",
+                status: .completed,
+                updatedAt: completedAt,
+                destination: RuntimeCollaborationAgentDestination(
+                    connectionID: vLLMConnection,
+                    threadID: "durable-child"
+                )
+            )
+        ))
+        await fixture.runtime.emit(.runtimeNotice(title: "Child destination settled", detail: "Barrier"))
+        await waitUntil("The completed child destination was not published") {
+            model.notice?.title == "Child destination settled"
+        }
+
+        XCTAssertEqual(model.collaborationAgents.count, 1)
+        XCTAssertEqual(
+            model.collaborationAgents.first?.destination,
+            RuntimeCollaborationAgentDestination(
+                connectionID: vLLMConnection,
+                threadID: "durable-child"
+            )
+        )
     }
 
     func testExternalArchivePurgesPendingInteractionAndDraft() async {
@@ -1264,11 +1653,13 @@ private actor RaceTestRuntime: AgentRuntime {
     private var failingResponseAttempts: Set<Int> = []
     private var archivedThreadIDs: [String] = []
     private var readItemsByThreadID: [String: [TimelineItem]] = [:]
+    private var readThreadOverrides: [String: RuntimeThread] = [:]
     private var readsToSuspend: Set<String> = []
     private var suspendedReadIDs: Set<String> = []
     private var suspendedReadContinuations: [String: CheckedContinuation<Void, Never>] = [:]
     private var suspendedReadWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
     private var suspendNextActiveList = false
+    private var nextActiveListOverride: [RuntimeThread]?
     private var activeListIsSuspended = false
     private var activeListContinuation: CheckedContinuation<Void, Never>?
     private var activeListWaiters: [CheckedContinuation<Void, Never>] = []
@@ -1317,7 +1708,8 @@ private actor RaceTestRuntime: AgentRuntime {
                 for waiter in waiters { waiter.resume() }
             }
         }
-        var activeThreads = [Fixture.threadA, Fixture.threadB]
+        var activeThreads = nextActiveListOverride ?? [Fixture.threadA, Fixture.threadB]
+        nextActiveListOverride = nil
         if restoredThreadIDs.contains(Fixture.archivedThreadID) {
             activeThreads.append(Fixture.archivedThread)
         }
@@ -1337,11 +1729,14 @@ private actor RaceTestRuntime: AgentRuntime {
         switch id {
         case Fixture.threadAID:
             return RuntimeConversation(
-                thread: Fixture.threadA,
+                thread: readThreadOverrides[id] ?? Fixture.threadA,
                 items: readItemsByThreadID[id] ?? [Fixture.itemA]
             )
         case Fixture.threadBID:
-            return RuntimeConversation(thread: Fixture.threadB, items: [Fixture.itemB])
+            return RuntimeConversation(
+                thread: readThreadOverrides[id] ?? Fixture.threadB,
+                items: [Fixture.itemB]
+            )
         case Fixture.archivedThreadID:
             return RuntimeConversation(thread: Fixture.archivedThread, items: [Fixture.archivedItem])
         case Fixture.childThreadID:
@@ -1356,6 +1751,10 @@ private actor RaceTestRuntime: AgentRuntime {
 
     func resumeThread(id: String) async throws -> RuntimeConversation {
         try await readThread(id: id)
+    }
+
+    func setReadThreadOverride(_ thread: RuntimeThread) {
+        readThreadOverrides[thread.id] = thread
     }
 
     func startThread(_ request: StartThreadRequest) async throws -> RuntimeThread {
@@ -1429,6 +1828,10 @@ private actor RaceTestRuntime: AgentRuntime {
     func prepareSuspendedActiveList() {
         suspendNextActiveList = true
         activeListIsSuspended = false
+    }
+
+    func setNextActiveListOverride(_ threads: [RuntimeThread]) {
+        nextActiveListOverride = threads
     }
 
     func waitUntilActiveListIsSuspended() async {

@@ -93,7 +93,11 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
         XCTAssertFalse(model.isLoadingThread)
         XCTAssertFalse(model.isLoadingThreadList)
         XCTAssertFalse(model.isTurnRunning)
-        XCTAssertNotNil(model.sidebarWelcomeThread)
+        XCTAssertEqual(
+            model.catalogThreads.map(\.id),
+            [DraftSafetyFixture.threadA.id],
+            "New Task is composer state and must not insert a synthetic sidebar row."
+        )
         XCTAssertEqual(
             model.threadListRevision,
             taskListRevisionBeforeNavigation,

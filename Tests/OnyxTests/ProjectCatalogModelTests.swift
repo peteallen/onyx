@@ -4,6 +4,37 @@ import XCTest
 
 @MainActor
 final class ProjectCatalogModelTests: XCTestCase {
+    func testCatalogSynchronizationRequiresACompleteConnectedSnapshot() {
+        XCTAssertTrue(
+            ProviderTaskCatalogSynchronizationPolicy.shouldReplaceCachedTasks(
+                connectionState: .connected("Provider"),
+                isLoadingThreadList: false,
+                hasAuthoritativeThreadList: true
+            )
+        )
+        XCTAssertFalse(
+            ProviderTaskCatalogSynchronizationPolicy.shouldReplaceCachedTasks(
+                connectionState: .connected("Provider"),
+                isLoadingThreadList: false,
+                hasAuthoritativeThreadList: false
+            )
+        )
+        XCTAssertFalse(
+            ProviderTaskCatalogSynchronizationPolicy.shouldReplaceCachedTasks(
+                connectionState: .connected("Provider"),
+                isLoadingThreadList: true,
+                hasAuthoritativeThreadList: true
+            )
+        )
+        XCTAssertFalse(
+            ProviderTaskCatalogSynchronizationPolicy.shouldReplaceCachedTasks(
+                connectionState: .disconnected,
+                isLoadingThreadList: false,
+                hasAuthoritativeThreadList: true
+            )
+        )
+    }
+
     func testDefaultCatalogLivesInApplicationSupportInsteadOfAProjectFolder() {
         let fileURL = ProjectCatalogLocation.applicationSupportFileURL()
 
@@ -86,6 +117,44 @@ final class ProjectCatalogModelTests: XCTestCase {
             grouping.groups[0].tasks.map(\.thread.id),
             ["newer-pinned", "older-pinned", "newest"]
         )
+    }
+
+    func testMergedProviderSnapshotKeepsAuthoritativeRowOrderWhenMetadataTies() {
+        let firstProvider = ProviderConnectionID("provider.a")
+        let secondProvider = ProviderConnectionID("provider.b")
+        let first = thread(id: "same-id", title: "Zulu title", cwd: nil, updatedAt: 100)
+        let second = thread(id: "same-id", title: "Alpha title", cwd: nil, updatedAt: 100)
+        let firstList = ProjectProviderTaskList(
+            providerConnectionID: firstProvider,
+            providerDisplayName: "Provider A",
+            scope: .active,
+            threads: [first]
+        )
+        let secondList = ProjectProviderTaskList(
+            providerConnectionID: secondProvider,
+            providerDisplayName: "Provider B",
+            scope: .active,
+            threads: [second]
+        )
+
+        func projectedIDs(_ lists: [ProjectProviderTaskList]) -> [String] {
+            ProjectTaskSidebarProjection.group(
+                ProjectTaskSidebarProjection.mergedTaskReferences(
+                    from: lists,
+                    scope: .active
+                ),
+                by: []
+            ).unassigned.map { "\($0.providerConnectionID.rawValue):\($0.thread.id)" }
+        }
+
+        let initial = projectedIDs([firstList, secondList])
+        // Replacing provider A's list removes it and appends the fresh live
+        // snapshot after provider B. The visible order must not change merely
+        // because a navigation read renamed one task.
+        let afterLiveReplacement = projectedIDs([secondList, firstList])
+
+        XCTAssertEqual(initial, afterLiveReplacement)
+        XCTAssertEqual(initial, ["provider.a:same-id", "provider.b:same-id"])
     }
 
     func testProjectionSearchesProjectAndProviderNamesAndHidesEmptyGroups() {
@@ -260,10 +329,7 @@ final class ProjectCatalogModelTests: XCTestCase {
                 searchText: "first",
                 liveProviderConnectionID: nil,
                 liveProviderDisplayName: nil,
-                liveProviderThreadListRevision: nil,
-                welcomeProviderConnectionID: nil,
-                welcomeProviderDisplayName: nil,
-                welcomeWorkspacePath: nil
+                liveProviderThreadListRevision: nil
             ),
             taskLists: [ProjectProviderTaskList(
                 providerConnectionID: .codexDefault,
@@ -271,8 +337,7 @@ final class ProjectCatalogModelTests: XCTestCase {
                 scope: .active,
                 threads: [thread(id: "first", title: "First", cwd: alpha.folderPath)]
             )],
-            projects: [alpha],
-            welcomeThread: nil
+            projects: [alpha]
         )
         let latestRequest = ProjectTaskSidebarProjectionRequest(
             key: .init(
@@ -281,10 +346,7 @@ final class ProjectCatalogModelTests: XCTestCase {
                 searchText: "second",
                 liveProviderConnectionID: nil,
                 liveProviderDisplayName: nil,
-                liveProviderThreadListRevision: nil,
-                welcomeProviderConnectionID: nil,
-                welcomeProviderDisplayName: nil,
-                welcomeWorkspacePath: nil
+                liveProviderThreadListRevision: nil
             ),
             taskLists: [ProjectProviderTaskList(
                 providerConnectionID: .codexDefault,
@@ -292,8 +354,7 @@ final class ProjectCatalogModelTests: XCTestCase {
                 scope: .active,
                 threads: [thread(id: "second", title: "Second", cwd: alpha.folderPath)]
             )],
-            projects: [alpha],
-            welcomeThread: nil
+            projects: [alpha]
         )
 
         let projection = ProjectTaskSidebarProjectionModel()
@@ -338,11 +399,7 @@ final class ProjectCatalogModelTests: XCTestCase {
             liveProviderConnectionID: provider,
             liveProviderDisplayName: "Local Qwen",
             liveProviderThreadListRevision: 42,
-            liveProviderThreads: [liveThread],
-            welcomeThread: nil,
-            welcomeProviderConnectionID: provider,
-            welcomeProviderDisplayName: "Local Qwen",
-            welcomeWorkspacePath: nil
+            liveProviderThreads: [liveThread]
         )
         let grouping = request.grouping()
         let projected = grouping.unassigned.first?.thread
@@ -363,11 +420,7 @@ final class ProjectCatalogModelTests: XCTestCase {
             liveProviderConnectionID: provider,
             liveProviderDisplayName: "Local Qwen",
             liveProviderThreadListRevision: 43,
-            liveProviderThreads: [liveThread],
-            welcomeThread: nil,
-            welcomeProviderConnectionID: provider,
-            welcomeProviderDisplayName: "Local Qwen",
-            welcomeWorkspacePath: nil
+            liveProviderThreads: [liveThread]
         )
         XCTAssertNotEqual(request.key, nextRequest.key)
     }

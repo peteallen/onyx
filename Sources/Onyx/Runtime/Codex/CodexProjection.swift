@@ -222,6 +222,13 @@ enum CodexProjection {
                 timestamp: timestamp,
                 detail: "\(changes.count) file\(changes.count == 1 ? "" : "s")"
             )
+        case "dynamicToolCall" where value["tool"]?.stringValue == "onyx_delegate":
+            return onyxDelegationTimelineItem(
+                from: value,
+                id: id,
+                status: status,
+                timestamp: timestamp
+            )
         case "mcpToolCall", "dynamicToolCall", "webSearch":
             let attachments = toolImageAttachments(from: value, itemID: id)
             let links = toolLinks(from: value, itemID: id)
@@ -1262,6 +1269,148 @@ enum CodexProjection {
         return name.isEmpty ? nil : name
     }
 
+    /// Onyx-owned delegation is represented by Codex as a normal dynamic tool
+    /// call. Project it as collaboration activity so the transcript stays quiet
+    /// and the inspector can follow the child agent without learning about the
+    /// app-server wire format. All other dynamic tools continue through the
+    /// ordinary collapsed tool projection above.
+    private static func onyxDelegationTimelineItem(
+        from value: JSONValue,
+        id: String,
+        status: TimelineItemStatus,
+        timestamp: Date
+    ) -> TimelineItem {
+        let arguments = onyxDelegationArguments(from: value["arguments"])
+        let result = onyxDelegationResult(from: value)
+        let providerConnectionID = firstNonemptyOptionalString(
+            result?["provider_connection_id"]?.stringValue,
+            arguments?["provider"]?.stringValue
+        )
+        let model = firstNonemptyOptionalString(
+            result?["model"]?.stringValue,
+            arguments?["model"]?.stringValue
+        )
+        let prompt = boundedText(arguments?["prompt"]?.stringValue, maximumCharacters: 560)
+        let errorMessage = firstNonemptyOptionalString(
+            boundedText(result?["error_message"]?.stringValue, maximumCharacters: 560),
+            onyxDelegationPlainTextFailure(from: value)
+        )
+        let childConversationID = firstNonemptyOptionalString(
+            result?["child_conversation_id"]?.stringValue
+        )
+        let destination: RuntimeCollaborationAgentDestination? = if let providerConnectionID,
+                                                                    let childConversationID {
+            RuntimeCollaborationAgentDestination(
+                connectionID: ProviderConnectionID(providerConnectionID),
+                threadID: childConversationID
+            )
+        } else {
+            nil
+        }
+        let reportedSuccess = result?["success"]?.boolValue ?? value["success"]?.boolValue
+        let projectedStatus: TimelineItemStatus = if reportedSuccess == false || status == .failed {
+            .failed
+        } else {
+            status
+        }
+
+        let agentStatus: RuntimeCollaborationAgentStatus = switch projectedStatus {
+        case .running, .pending: .working
+        case .completed: reportedSuccess == false ? .failed : .completed
+        case .failed: .failed
+        case .declined: .interrupted
+        }
+        let displayModel = onyxDelegationModelDisplayName(model)
+        let title: String = switch projectedStatus {
+        case .running, .pending: "Delegating to \(displayModel)"
+        case .completed: "\(displayModel) completed"
+        case .failed: "Delegation failed"
+        case .declined: "Delegation interrupted"
+        }
+        let body = if projectedStatus == .failed {
+            firstString(errorMessage, "The delegated task could not be completed.")
+        } else {
+            firstString(prompt, "A configured provider handled part of this task.")
+        }
+        let agentMessage: String? = if projectedStatus == .failed {
+            errorMessage
+        } else if let prompt {
+            boundedText(prompt, maximumCharacters: 280)
+        } else {
+            nil
+        }
+        let agent = RuntimeCollaborationAgent(
+            id: id,
+            path: model,
+            status: agentStatus,
+            message: agentMessage,
+            updatedAt: timestamp,
+            destination: destination
+        )
+        let detailParts = [providerConnectionID, model].compactMap { $0 }
+
+        return TimelineItem(
+            id: id,
+            kind: .tool,
+            title: title,
+            body: body,
+            status: projectedStatus,
+            timestamp: timestamp,
+            detail: detailParts.isEmpty ? nil : detailParts.joined(separator: " · "),
+            collaboration: RuntimeCollaborationActivity(action: .spawn, agents: [agent])
+        )
+    }
+
+    private static func onyxDelegationArguments(from value: JSONValue?) -> JSONValue? {
+        guard let value else { return nil }
+        if value.objectValue != nil { return value }
+        guard let text = value.stringValue else { return nil }
+        return decodedJSON(from: text)
+    }
+
+    private static func onyxDelegationResult(from value: JSONValue) -> JSONValue? {
+        let contentItems = value["contentItems"]?.arrayValue ?? []
+        for item in contentItems {
+            guard let text = item["text"]?.stringValue,
+                  text.count <= 128 * 1_024,
+                  let decoded = decodedJSON(from: text),
+                  decoded["type"]?.stringValue == "onyx_delegation_result",
+                  decoded["version"]?.intValue == 1 else { continue }
+            return decoded
+        }
+
+        guard let direct = value["result"],
+              direct["type"]?.stringValue == "onyx_delegation_result",
+              direct["version"]?.intValue == 1 else { return nil }
+        return direct
+    }
+
+    private static func onyxDelegationPlainTextFailure(from value: JSONValue) -> String? {
+        guard value["success"]?.boolValue == false else { return nil }
+        for item in value["contentItems"]?.arrayValue ?? [] {
+            guard let text = item["text"]?.stringValue,
+                  decodedJSON(from: text) == nil,
+                  let safeText = safeTextCandidate(text),
+                  let bounded = boundedText(safeText, maximumCharacters: 560) else { continue }
+            return bounded
+        }
+        return nil
+    }
+
+    private static func onyxDelegationModelDisplayName(_ model: String?) -> String {
+        guard let model = model?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !model.isEmpty else { return "another model" }
+        return model.split(separator: "/").last.map(String.init) ?? model
+    }
+
+    private static func firstNonemptyOptionalString(_ candidates: String?...) -> String? {
+        candidates.compactMap { candidate -> String? in
+            guard let candidate = candidate?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !candidate.isEmpty else { return nil }
+            return candidate
+        }.first
+    }
+
     private static func collaborationToolTimelineItem(
         from value: JSONValue,
         id: String,
@@ -1284,7 +1433,11 @@ enum CodexProjection {
                     callStatus: status
                 ),
                 message: boundedText(state?["message"]?.stringValue, maximumCharacters: 280),
-                updatedAt: timestamp
+                updatedAt: timestamp,
+                destination: RuntimeCollaborationAgentDestination(
+                    connectionID: .codexDefault,
+                    threadID: agentID
+                )
             )
         }
 
@@ -1345,7 +1498,11 @@ enum CodexProjection {
             path: path,
             status: agentStatus,
             message: nil,
-            updatedAt: timestamp
+            updatedAt: timestamp,
+            destination: RuntimeCollaborationAgentDestination(
+                connectionID: .codexDefault,
+                threadID: agentID
+            )
         )
         let title: String = switch action {
         case .started: "Agent started"

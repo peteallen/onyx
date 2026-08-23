@@ -43,6 +43,33 @@ final class OnyxMultiwindowTests: XCTestCase {
         XCTAssertNil(migrated.providerConnectionID)
     }
 
+    func testProviderWorkspaceShellKeepsWindowIdentityAndPanePreferencesStable() throws {
+        let rawValue = try XCTUnwrap(
+            UUID(uuidString: "44444444-4444-4444-8444-444444444444")
+        )
+        let codex = WorkspaceWindowID(
+            rawValue: rawValue,
+            providerConnectionID: .codexDefault
+        )
+        let qwen = WorkspaceWindowID(
+            rawValue: rawValue,
+            providerConnectionID: ProviderConnectionID("local.qwen.primary")
+        )
+
+        XCTAssertEqual(
+            ProviderWorkspaceShellIdentity.id(for: codex),
+            ProviderWorkspaceShellIdentity.id(for: qwen)
+        )
+        XCTAssertEqual(
+            ProviderWorkspaceShellIdentity.preferenceKeyPrefix(for: codex),
+            ProviderWorkspaceShellIdentity.preferenceKeyPrefix(for: qwen)
+        )
+        XCTAssertEqual(
+            ProviderWorkspaceShellIdentity.preferenceKeyPrefix(for: qwen),
+            "Onyx.window.44444444-4444-4444-8444-444444444444"
+        )
+    }
+
     func testProviderModelUsageRanksFrequencyThenRecency() throws {
         let suite = makeDefaults()
         defer { suite.cleanUp() }

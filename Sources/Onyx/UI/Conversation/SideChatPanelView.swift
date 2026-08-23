@@ -70,6 +70,17 @@ struct SideChatPanelView: View {
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                     Spacer(minLength: 0)
+
+                    if model.canRetrySideChatFork {
+                        Button("Retry", action: model.retrySideChatFork)
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundStyle(OnyxTheme.iris)
+                            .frame(minWidth: 44, minHeight: OnyxHitTarget.compact)
+                            .contentShape(Rectangle())
+                            .buttonStyle(.plain)
+                            .onyxHelp("Retry side chat")
+                            .accessibilityLabel("Retry side chat")
+                    }
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
@@ -141,7 +152,7 @@ struct SideChatPanelView: View {
             NativeComposerTextView(
                 text: $model.sideChatComposerText,
                 measuredHeight: $textHeight,
-                isEnabled: model.canRunAgent && !model.isSideChatLoading,
+                isEnabled: model.canComposeSideChat,
                 canSubmit: { canSend },
                 onSubmit: {
                     if canSend { model.sendSideChat() }

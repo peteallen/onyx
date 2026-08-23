@@ -26,6 +26,11 @@ final class OnyxSideChatTests: XCTestCase {
         let durableTimelineBefore = model.timeline
 
         model.openSideChat()
+        XCTAssertEqual(
+            model.sideChatTimeline,
+            [SideChatFixture.parentItem],
+            "The side-chat panel should paint the visible parent context before the fork responds."
+        )
         await waitUntil("Ephemeral fork did not open") {
             model.sideChatThreadID == SideChatFixture.fork.id
                 && model.sideChatTimeline == [SideChatFixture.parentItem]
@@ -156,7 +161,7 @@ final class OnyxSideChatTests: XCTestCase {
     func testSideChatSendFailureRemovesOptimisticRowAndShowsOneErrorSurface() async {
         let fixture = makeFixture(
             capabilities: [.streaming, .interruption, .ephemeralThreadForking],
-            failTurn: true
+            turnFailure: .start
         )
         defer { fixture.cleanUp() }
         let model = fixture.model
@@ -183,6 +188,103 @@ final class OnyxSideChatTests: XCTestCase {
             "The panel error strip is the single failure surface"
         )
         XCTAssertEqual(model.sideChatComposerText, "This should be restored")
+    }
+
+    func testFailedFollowUpSteerKeepsOriginalTurnRunningAndRetrySteersAgain() async {
+        let fixture = makeFixture(
+            capabilities: [.streaming, .interruption, .ephemeralThreadForking],
+            turnFailure: .firstSteer
+        )
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        model.start()
+        await waitUntil("Parent task did not load") {
+            model.selectedThreadID == SideChatFixture.parent.id
+        }
+        model.openSideChat()
+        await waitUntil("Fork did not open") { model.sideChatThreadID == SideChatFixture.fork.id }
+
+        model.sideChatComposerText = "Start the original response"
+        model.sendSideChat()
+        await waitUntilAsync("Original side-chat turn did not start") {
+            await fixture.runtime.startTurnRequests().count == 1
+        }
+        XCTAssertTrue(model.isSideChatTurnRunning)
+
+        model.sideChatComposerText = "Add this while you work"
+        model.sendSideChat()
+        await waitUntil("Failed steering did not restore the follow-up") {
+            model.sideChatError != nil
+                && model.sideChatComposerText == "Add this while you work"
+        }
+        XCTAssertTrue(
+            model.isSideChatTurnRunning,
+            "A failed steer must not pretend the original remote turn stopped."
+        )
+
+        model.sendSideChat()
+        await waitUntilAsync("Retry did not keep using steer") {
+            await fixture.runtime.steerRequests().count == 2
+        }
+        let startTurnRequests = await fixture.runtime.startTurnRequests()
+        XCTAssertEqual(startTurnRequests.count, 1)
+        XCTAssertTrue(model.isSideChatTurnRunning)
+
+        await fixture.runtime.emit(
+            .turnCompleted(threadID: SideChatFixture.fork.id, status: .idle)
+        )
+        await waitUntil("Original side-chat turn did not finish") {
+            !model.isSideChatTurnRunning
+        }
+    }
+
+    func testForkFailureDisablesComposerAndRetryPreservesContextAndDraft() async {
+        let fixture = makeFixture(
+            capabilities: [.streaming, .interruption, .images, .ephemeralThreadForking],
+            forkFailureCount: 1
+        )
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        model.start()
+        await waitUntil("Parent task did not load") {
+            model.selectedThreadID == SideChatFixture.parent.id
+                && model.timeline == [SideChatFixture.parentItem]
+        }
+        model.openSideChat()
+        model.sideChatComposerText = "Keep this local draft"
+        await waitUntil("Fork failure did not surface") {
+            model.sideChatError != nil && !model.isSideChatLoading
+        }
+
+        XCTAssertNil(model.sideChatThreadID)
+        XCTAssertFalse(model.canComposeSideChat)
+        XCTAssertFalse(model.canSendSideChat)
+        XCTAssertFalse(model.canAttachSideChatImages)
+        XCTAssertTrue(model.canRetrySideChatFork)
+        XCTAssertEqual(model.sideChatTimeline, [SideChatFixture.parentItem])
+        XCTAssertEqual(model.sideChatComposerText, "Keep this local draft")
+
+        model.sendSideChat()
+        let startTurnRequests = await fixture.runtime.startTurnRequests()
+        XCTAssertEqual(startTurnRequests.count, 0)
+        model.retrySideChatFork()
+
+        await waitUntil("Retry did not open the side-chat fork") {
+            model.sideChatThreadID == SideChatFixture.fork.id
+                && !model.isSideChatLoading
+                && model.sideChatError == nil
+        }
+        let forkRequests = await fixture.runtime.forkRequests()
+        XCTAssertEqual(forkRequests, [
+            SideChatFixture.parent.id,
+            SideChatFixture.parent.id,
+        ])
+        XCTAssertEqual(model.sideChatTimeline, [SideChatFixture.parentItem])
+        XCTAssertEqual(model.sideChatComposerText, "Keep this local draft")
+        XCTAssertTrue(model.canComposeSideChat)
+        XCTAssertTrue(model.canSendSideChat)
     }
 
     func testSideChatKeepsDeltaThatArrivesBeforeMatchingItemStart() async {
@@ -399,7 +501,8 @@ final class OnyxSideChatTests: XCTestCase {
     private func makeFixture(
         capabilities: RuntimeCapabilities,
         delayedFork: Bool = false,
-        failTurn: Bool = false
+        forkFailureCount: Int = 0,
+        turnFailure: SideChatTestRuntime.TurnFailure = .none
     ) -> SideChatTestFixture {
         let suiteName = "OnyxSideChatTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -410,7 +513,8 @@ final class OnyxSideChatTests: XCTestCase {
         let runtime = SideChatTestRuntime(
             capabilities: capabilities,
             delayedFork: delayedFork,
-            failTurn: failTurn
+            forkFailureCount: forkFailureCount,
+            turnFailure: turnFailure
         )
         return SideChatTestFixture(
             model: OnyxAppModel(runtime: runtime, defaults: defaults),
@@ -511,6 +615,12 @@ private enum SideChatFixture {
 }
 
 private actor SideChatTestRuntime: AgentRuntime {
+    enum TurnFailure: Equatable {
+        case none
+        case start
+        case firstSteer
+    }
+
     struct RecordedResponse: Sendable, Equatable {
         let id: RuntimeRequestID
         let response: RuntimeUserInteractionResponse
@@ -522,7 +632,8 @@ private actor SideChatTestRuntime: AgentRuntime {
     private let continuation: AsyncStream<AgentRuntimeEvent>.Continuation
     private let capabilities: RuntimeCapabilities
     private let delayedFork: Bool
-    private let failTurn: Bool
+    private let turnFailure: TurnFailure
+    private var remainingForkFailures: Int
     private var forkedParents: [String] = []
     private var turns: [StartTurnRequest] = []
     private var steeredThreads: [String] = []
@@ -530,10 +641,16 @@ private actor SideChatTestRuntime: AgentRuntime {
     private var responses: [RecordedResponse] = []
     private var delayedForkContinuation: CheckedContinuation<RuntimeConversation, any Error>?
 
-    init(capabilities: RuntimeCapabilities, delayedFork: Bool, failTurn: Bool) {
+    init(
+        capabilities: RuntimeCapabilities,
+        delayedFork: Bool,
+        forkFailureCount: Int,
+        turnFailure: TurnFailure
+    ) {
         self.capabilities = capabilities
         self.delayedFork = delayedFork
-        self.failTurn = failTurn
+        self.remainingForkFailures = forkFailureCount
+        self.turnFailure = turnFailure
         let stream = AsyncStream.makeStream(of: AgentRuntimeEvent.self)
         events = stream.stream
         continuation = stream.continuation
@@ -594,10 +711,16 @@ private actor SideChatTestRuntime: AgentRuntime {
 
     func forkEphemeralThread(id: String) async throws -> RuntimeConversation {
         forkedParents.append(id)
+        if remainingForkFailures > 0 {
+            remainingForkFailures -= 1
+            throw AgentRuntimeError.requestFailed(code: -1, message: "Side-chat fork test failure")
+        }
         if delayedFork {
             return try await withCheckedThrowingContinuation { delayedForkContinuation = $0 }
         }
-        return RuntimeConversation(thread: SideChatFixture.fork, items: [SideChatFixture.parentItem])
+        // Current app-server requires paginated ephemeral forks to omit turns
+        // from the response. The app seeds the visible context locally.
+        return RuntimeConversation(thread: SideChatFixture.fork, items: [])
     }
 
     func startThread(_: StartThreadRequest) async throws -> RuntimeThread {
@@ -605,7 +728,7 @@ private actor SideChatTestRuntime: AgentRuntime {
     }
 
     func startTurn(_ request: StartTurnRequest) async throws {
-        if failTurn {
+        if turnFailure == .start {
             throw AgentRuntimeError.requestFailed(code: -1, message: "Side-chat test failure")
         }
         turns.append(request)
@@ -614,6 +737,9 @@ private actor SideChatTestRuntime: AgentRuntime {
 
     func steer(threadID: String, text _: String) async throws {
         steeredThreads.append(threadID)
+        if turnFailure == .firstSteer, steeredThreads.count == 1 {
+            throw AgentRuntimeError.requestFailed(code: -1, message: "Side-chat steer test failure")
+        }
     }
 
     func interrupt(threadID: String) async throws {
@@ -629,7 +755,7 @@ private actor SideChatTestRuntime: AgentRuntime {
 
     func completeDelayedFork() {
         delayedForkContinuation?.resume(
-            returning: RuntimeConversation(thread: SideChatFixture.fork, items: [SideChatFixture.parentItem])
+            returning: RuntimeConversation(thread: SideChatFixture.fork, items: [])
         )
         delayedForkContinuation = nil
     }
@@ -640,6 +766,7 @@ private actor SideChatTestRuntime: AgentRuntime {
 
     func forkRequests() -> [String] { forkedParents }
     func startTurnRequests() -> [StartTurnRequest] { turns }
+    func steerRequests() -> [String] { steeredThreads }
     func interruptRequests() -> [String] { interruptedThreads }
     func interactionResponses() -> [RecordedResponse] { responses }
 }

@@ -276,6 +276,11 @@ final class OnyxAppModel: ObservableObject {
         didSet { preferences.set(threadListScope.rawValue, forKey: preferenceKey(PreferenceKey.threadListScope)) }
     }
     @Published var isLoadingThreadList = false
+    /// Indicates that the current scope has been populated by a successful
+    /// provider list read. New/failed destination models keep the shared
+    /// project catalog visible until this becomes true; logout explicitly
+    /// marks its empty list authoritative.
+    @Published private(set) var hasAuthoritativeThreadListForCurrentScope = false
 
     private let runtime: (any AgentRuntime)?
     /// The runtime kind is available before a provider session has connected.
@@ -693,19 +698,32 @@ final class OnyxAppModel: ObservableObject {
         return true
     }
 
-    var canSendSideChat: Bool {
+    var canComposeSideChat: Bool {
+        isSideChatPresented
+            && !isSideChatLoading
+            && sideChatThreadID != nil
+            && canRunAgent
+    }
+
+    var canRetrySideChatFork: Bool {
         guard isSideChatPresented,
               !isSideChatLoading,
-              sideChatThreadID != nil,
-              canRunAgent,
+              sideChatThreadID == nil,
+              sideChatError != nil,
+              let parentID = sideChatParentThreadID,
+              selectedThreadID == parentID else { return false }
+        return canOpenSideChat
+    }
+
+    var canSendSideChat: Bool {
+        guard canComposeSideChat,
               sideChatInteraction?.isBlocking != true else { return false }
         return !sideChatComposerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || !sideChatComposerImages.isEmpty
     }
 
     var canAttachSideChatImages: Bool {
-        guard isSideChatPresented,
-              !isSideChatLoading,
+        guard canComposeSideChat,
               supports(.images),
               canRunAgent else { return false }
         guard let sideChatModelID,
@@ -878,13 +896,6 @@ final class OnyxAppModel: ObservableObject {
                 || $0.preview.localizedCaseInsensitiveContains(query)
                 || ($0.cwd?.localizedCaseInsensitiveContains(query) ?? false)
         }
-    }
-
-    /// The synthetic New Task row is relevant only while it is selected.
-    /// Exposing it directly avoids scanning the complete task history every
-    /// time SwiftUI reevaluates the sidebar during transcript streaming.
-    var sidebarWelcomeThread: RuntimeThread? {
-        selectedThreadID == Self.welcomeThread.id ? Self.welcomeThread : nil
     }
 
     /// Durable provider tasks exclude Onyx's synthetic composer row. Keeping
@@ -1412,9 +1423,21 @@ final class OnyxAppModel: ObservableObject {
                 // flight owns the visible selection. The one exception is an
                 // explicit New Task action: its welcome selection must win
                 // over the restored/refresh selection captured above.
-                guard navigationRevision == navigationAtStart
-                        || hasExplicitNewTaskSelection else {
-                    isLoadingThreadList = false
+                let navigationStillValid = navigationRevision == navigationAtStart
+                    || hasExplicitNewTaskSelection
+                if !navigationStillValid {
+                    // The list read is still a complete provider snapshot even
+                    // when a click changed the selected task while it was in
+                    // flight. Publish it without taking ownership of that
+                    // newer selection; discarding it would leave the sidebar
+                    // permanently cache-only and stale until reconnect.
+                    applyThreadList(
+                        liveThreads,
+                        scope: scope,
+                        preferredSelection: selectedThreadID,
+                        preserveCurrentSelection: true
+                    )
+                    pendingRestoredSelectionID = nil
                     return
                 }
                 let effectivePreferredSelection = hasExplicitNewTaskSelection
@@ -1491,7 +1514,10 @@ final class OnyxAppModel: ObservableObject {
                     preservingLiveUpdatesAfter: liveRevisionAtReadStart
                 )
                 installEarlierHistory(from: loaded)
-                updateThread(loaded.conversation.thread)
+                updateThread(
+                    loaded.conversation.thread,
+                    preservePositionIfPresent: true
+                )
                 isTurnRunning = loaded.conversation.thread.status.isBusy
                     || isReviewActive(for: loaded.conversation.thread.id)
                 isLoadingThread = false
@@ -1530,13 +1556,16 @@ final class OnyxAppModel: ObservableObject {
 
         closeSideChat()
         sideChatGeneration &+= 1
-        let generation = sideChatGeneration
-        let epoch = accountEpoch
         let parentID = parentThread.id
+        // Paginated Codex threads must fork with turns omitted from the wire
+        // response. The ephemeral branch still inherits the provider context;
+        // seed its UI from the already-visible parent snapshot so the panel
+        // paints immediately without another full-history request.
+        let visibleParentContext = timeline
 
         sideChatParentThreadID = parentID
         sideChatThreadID = nil
-        replaceSideChatTimeline([])
+        replaceSideChatTimeline(visibleParentContext)
         sideChatComposerText = ""
         sideChatComposerImages = []
         sideChatError = nil
@@ -1548,6 +1577,26 @@ final class OnyxAppModel: ObservableObject {
         sideChatReasoningEffort = selectedReasoningEffort
         sideChatCWD = parentThread.cwd
 
+        startSideChatFork(parentID: parentID, runtime: runtime)
+    }
+
+    /// Retries only the failed remote fork. The panel, visible parent context,
+    /// and any defensively retained local draft stay in place.
+    func retrySideChatFork() {
+        guard canRetrySideChatFork,
+              let runtime,
+              let parentID = sideChatParentThreadID else { return }
+
+        sideChatForkTask?.cancel()
+        sideChatForkTask = nil
+        isSideChatLoading = true
+        sideChatError = nil
+        startSideChatFork(parentID: parentID, runtime: runtime)
+    }
+
+    private func startSideChatFork(parentID: String, runtime: any AgentRuntime) {
+        let generation = sideChatGeneration
+        let epoch = accountEpoch
         sideChatForkTask = Task { [weak self] in
             guard let self else { return }
             do {
@@ -1567,11 +1616,14 @@ final class OnyxAppModel: ObservableObject {
                 }
 
                 sideChatThreadID = conversation.thread.id
-                replaceSideChatTimeline(conversation.items)
+                if !conversation.items.isEmpty {
+                    replaceSideChatTimeline(conversation.items)
+                }
                 sideChatModelID = conversation.thread.model ?? sideChatModelID
                 sideChatCWD = conversation.thread.cwd ?? sideChatCWD
                 isSideChatLoading = false
                 sideChatError = nil
+                sideChatForkTask = nil
             } catch {
                 guard accountEpoch == epoch,
                       sideChatGeneration == generation,
@@ -1580,6 +1632,7 @@ final class OnyxAppModel: ObservableObject {
                       !Task.isCancelled else { return }
                 isSideChatLoading = false
                 sideChatError = error.localizedDescription
+                sideChatForkTask = nil
             }
         }
     }
@@ -1722,7 +1775,13 @@ final class OnyxAppModel: ObservableObject {
                       isSideChatPresented,
                       sideChatThreadID == threadID,
                       !Task.isCancelled else { return }
-                isSideChatTurnRunning = false
+                // A failed fresh start leaves no remote turn to stop. A failed
+                // follow-up steer does not end the original turn, though, so
+                // preserve its live state (unless a completion event already
+                // cleared it while the steer request was in flight).
+                if !wasRunning {
+                    isSideChatTurnRunning = false
+                }
                 let laterDraft = sideChatComposerText
                 if laterDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     sideChatComposerText = draft
@@ -1802,18 +1861,18 @@ final class OnyxAppModel: ObservableObject {
         }
     }
 
-    /// Opens a child conversation reported by a collaboration-capable runtime.
+    /// Opens a same-runtime child conversation reported by a collaboration-capable runtime.
     ///
     /// Child threads are not guaranteed to be present in the current task list
     /// (for example, the provider may omit them from its normal listing). The
     /// normal selection path intentionally accepts an unknown id and reads it
     /// directly, after which the returned thread is inserted into the list.
-    /// This keeps the parent task in the list and makes the action provider
-    /// neutral; runtimes that do not support child conversations can surface
-    /// their normal read error through the existing task-load UI.
+    /// Cross-provider destinations are routed by the workspace composition
+    /// layer, which owns provider selection. This compatibility entry point is
+    /// retained for callers that are already bound to the destination runtime.
     func openCollaborationAgent(_ agent: RuntimeCollaborationAgent) {
-        let childThreadID = agent.id.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !childThreadID.isEmpty else {
+        guard agent.destination?.isNavigable == true,
+              let childThreadID = agent.destination?.navigableThreadID else {
             notice = ("Agent conversation unavailable", "This agent did not provide a conversation id.")
             return
         }
@@ -1871,6 +1930,7 @@ final class OnyxAppModel: ObservableObject {
             || (isLoadingThreadList && !canReuseConnectionRefresh)
         if shouldClearCurrentList {
             isLoadingThreadList = true
+            hasAuthoritativeThreadListForCurrentScope = false
             threads = [Self.welcomeThread]
             threadListScope = .active
         }
@@ -1976,6 +2036,7 @@ final class OnyxAppModel: ObservableObject {
         loadTask?.cancel()
         resetEarlierHistory()
         threadListScope = scope
+        hasAuthoritativeThreadListForCurrentScope = false
         threads = scope == .active ? [Self.welcomeThread] : []
         selectedThreadID = nil
         composerDraftKey = Self.welcomeThread.id
@@ -2238,7 +2299,10 @@ final class OnyxAppModel: ObservableObject {
                             )
                             installEarlierHistory(from: loaded)
                         }
-                        updateThread(loaded.conversation.thread)
+                        updateThread(
+                            loaded.conversation.thread,
+                            preservePositionIfPresent: true
+                        )
                     }
 
                     if selectedThreadID == threadID,
@@ -2798,6 +2862,7 @@ final class OnyxAppModel: ObservableObject {
                       navigationRevision == navigationAtStart,
                       !Task.isCancelled else { return }
                 threadListScope = .active
+                hasAuthoritativeThreadListForCurrentScope = false
                 threads = [Self.welcomeThread]
                 selectedThreadID = nil
                 resetEarlierHistory()
@@ -3297,10 +3362,30 @@ final class OnyxAppModel: ObservableObject {
         return discardedSideChatThreadIDs.contains(threadID)
     }
 
-    private func updateThread(_ thread: RuntimeThread) {
+    private func updateThread(
+        _ thread: RuntimeThread,
+        preservePositionIfPresent: Bool = false
+    ) {
         var thread = thread
         thread.isPinned = pinnedThreadIDs.contains(thread.id)
-        upsertThreadInRecencyOrder(thread)
+        if preservePositionIfPresent,
+           let index = threadIndex(for: thread.id),
+           threads.indices.contains(index) {
+            // Reading a task refreshes descriptive metadata but is not new
+            // activity. Keep the list snapshot's recency timestamp as the
+            // ordering authority and its folder as the project-grouping
+            // authority. Accepting either value from a navigation read could
+            // move the row under the pointer; the next provider list refresh
+            // remains responsible for genuine recency or project changes.
+            thread.updatedAt = threads[index].updatedAt
+            thread.cwd = threads[index].cwd
+            if threads[index] != thread {
+                threads[index] = thread
+                threadIndexCacheRevision = threadListRevision
+            }
+        } else {
+            upsertThreadInRecencyOrder(thread)
+        }
         if selectedThreadID == thread.id {
             isTurnRunning = thread.status.isBusy || isReviewActive(for: thread.id)
             validateSelectedReasoningEffort()
@@ -4057,6 +4142,7 @@ final class OnyxAppModel: ObservableObject {
                 if let path = incoming.path, !path.isEmpty { existing.path = path }
                 if incoming.status != .unknown { existing.status = incoming.status }
                 if let message = incoming.message, !message.isEmpty { existing.message = message }
+                if let destination = incoming.destination { existing.destination = destination }
                 existing.updatedAt = incoming.updatedAt
                 collaborationAgentsByID[incoming.id] = existing
             } else {
@@ -4183,7 +4269,10 @@ final class OnyxAppModel: ObservableObject {
                     preservingLiveUpdatesAfter: liveRevisionAtReadStart
                 )
                 installEarlierHistory(from: loaded)
-                updateThread(loaded.conversation.thread)
+                updateThread(
+                    loaded.conversation.thread,
+                    preservePositionIfPresent: true
+                )
                 isLoadingThread = false
                 resolveLatestMessageEditAfterAuthoritativeReload(threadID: threadID)
             } catch {
@@ -4219,7 +4308,10 @@ final class OnyxAppModel: ObservableObject {
                 preservingLiveUpdatesAfter: liveRevisionAtReadStart
             )
             installEarlierHistory(from: loaded)
-            updateThread(loaded.conversation.thread)
+            updateThread(
+                loaded.conversation.thread,
+                preservePositionIfPresent: true
+            )
             isLoadingThread = false
             return true
         } catch {
@@ -4258,7 +4350,10 @@ final class OnyxAppModel: ObservableObject {
                       case .connected = connectionState else { return }
                 replaceTimeline(loaded.visibleItems, authoritativeFor: loaded.conversation.thread.id)
                 installEarlierHistory(from: loaded)
-                updateThread(loaded.conversation.thread)
+                updateThread(
+                    loaded.conversation.thread,
+                    preservePositionIfPresent: true
+                )
                 isTurnRunning = loaded.conversation.thread.status.isBusy
                     || isReviewActive(for: loaded.conversation.thread.id)
                 isLoadingThread = false
@@ -4384,15 +4479,58 @@ final class OnyxAppModel: ObservableObject {
     private func applyThreadList(
         _ liveThreads: [RuntimeThread],
         scope: ThreadListScope,
-        preferredSelection: String? = nil
+        preferredSelection: String? = nil,
+        preserveCurrentSelection: Bool = false
     ) {
         guard threadListScope == scope else { return }
+        hasAuthoritativeThreadListForCurrentScope = true
         isLoadingThreadList = false
+        let currentSelection = selectedThreadID
+        let currentThreadIndex = currentSelection.flatMap { id in
+            threads.firstIndex(where: { $0.id == id && id != Self.welcomeThread.id })
+        }
+        let currentThreadPresentationIndex = currentThreadIndex.map { index in
+            threads[..<index].lazy.filter { $0.id != Self.welcomeThread.id }.count
+        }
+        let currentThread = currentThreadIndex.map { index in
+            threads[index]
+        }
         let shouldKeepNewTask = scope == .active && preferredSelection == Self.welcomeThread.id
+            || (preserveCurrentSelection && currentSelection == Self.welcomeThread.id)
+        var publishedThreads = liveThreads
+        if preserveCurrentSelection,
+           let currentSelection,
+           currentSelection != Self.welcomeThread.id,
+           !publishedThreads.contains(where: { $0.id == currentSelection }),
+           let currentThread {
+            // A provider may intentionally omit child/legacy tasks from its
+            // normal list. Keep the task the user is actively viewing in the
+            // published snapshot until a later lifecycle/list refresh can
+            // reconcile it, instead of blanking the selected workspace. Keep
+            // its former ordinal too: appending the retained row would still
+            // make the selected target visibly jump to the bottom.
+            publishedThreads.insert(
+                currentThread,
+                at: min(
+                    currentThreadPresentationIndex ?? publishedThreads.count,
+                    publishedThreads.count
+                )
+            )
+        }
         if shouldKeepNewTask {
-            threads = [Self.welcomeThread] + liveThreads.filter { $0.id != Self.welcomeThread.id }
+            threads = [Self.welcomeThread] + publishedThreads.filter { $0.id != Self.welcomeThread.id }
         } else {
-            threads = liveThreads.isEmpty && scope == .active ? [Self.welcomeThread] : liveThreads
+            threads = publishedThreads.isEmpty && scope == .active ? [Self.welcomeThread] : publishedThreads
+        }
+
+        if preserveCurrentSelection,
+           currentSelection != nil {
+            // Navigation already loaded this task (or is loading it). Do not
+            // issue a second read or replace its timeline just because the
+            // background list completed. The selected ID may not be in either
+            // snapshot yet when a cached sidebar click races its provider read;
+            // that pending read still owns the user's navigation intent.
+            return
         }
 
         let targetID = preferredSelection.flatMap { preferredID in
@@ -4507,6 +4645,7 @@ final class OnyxAppModel: ObservableObject {
         draftWorkspacePath = nil
         searchText = ""
         threadListScope = .active
+        hasAuthoritativeThreadListForCurrentScope = true
         threads = [Self.welcomeThread]
         selectedThreadID = Self.welcomeThread.id
         replaceTimeline([.welcome()])

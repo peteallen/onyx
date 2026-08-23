@@ -64,6 +64,34 @@ final class RuntimeRegistryTests: XCTestCase {
         XCTAssertEqual(session.displayName, "Fake runtime")
     }
 
+    func testRegistryPassesDynamicToolHandlerOnlyToOptInFactory() throws {
+        let adapterID = RuntimeAdapterID("test.dynamic-tools")
+        let connectionID = ProviderConnectionID("test.dynamic-tools.primary")
+        let provider = RuntimeProviderDescriptor(
+            id: adapterID,
+            displayName: "Dynamic tools",
+            dynamicToolFactory: { requestedID, handler in
+                guard requestedID == connectionID else {
+                    throw RuntimeRegistryError.connectionNotRegistered(requestedID)
+                }
+                return RegistryFakeRuntime(hasDynamicToolHandler: handler != nil)
+            }
+        )
+        let registry = try RuntimeRegistry(
+            providers: [provider],
+            connections: [
+                RuntimeConnectionRegistration(id: connectionID, adapterID: adapterID),
+            ]
+        )
+
+        let runtime = try registry.resolve(
+            connectionID,
+            dynamicToolHandler: RegistryDynamicToolHandler()
+        )
+
+        XCTAssertTrue(try XCTUnwrap(runtime as? RegistryFakeRuntime).hasDynamicToolHandler)
+    }
+
     func testRegistryRejectsUnknownConnectionsAndInvalidRegistrations() throws {
         let connectionID = ProviderConnectionID("test.missing")
         let adapterID = RuntimeAdapterID("test.missing-adapter")
@@ -124,8 +152,13 @@ final class RuntimeRegistryTests: XCTestCase {
 
 private actor RegistryFakeRuntime: AgentRuntime {
     nonisolated let kind = AgentRuntimeKind.local
+    nonisolated let hasDynamicToolHandler: Bool
     nonisolated let events: AsyncStream<AgentRuntimeEvent> = AsyncStream { continuation in
         continuation.finish()
+    }
+
+    init(hasDynamicToolHandler: Bool = false) {
+        self.hasDynamicToolHandler = hasDynamicToolHandler
     }
 
     func connect() async throws -> RuntimeSession {
@@ -189,5 +222,13 @@ private actor RegistryFakeRuntime: AgentRuntime {
 
     func unarchiveThread(id _: String) async throws {
         throw AgentRuntimeError.unsupported("fake restoring")
+    }
+}
+
+private actor RegistryDynamicToolHandler: CodexDynamicToolHandler {
+    func handleDynamicToolCall(
+        _: CodexDynamicToolCall
+    ) async throws -> CodexDynamicToolResult {
+        .succeeded("unused")
     }
 }

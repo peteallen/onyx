@@ -5,8 +5,19 @@ struct ContextInspectorView: View {
     @ObservedObject var model: OnyxAppModel
     @ObservedObject var sourceNavigator: ProjectSourceNavigatorModel
     @State private var summaryContentHeight: CGFloat = 0
+    private let onSelectProviderTask: @MainActor (ProviderConnectionID, String) -> Void
 
     private let summaryMaximumHeight: CGFloat = 640
+
+    init(
+        model: OnyxAppModel,
+        sourceNavigator: ProjectSourceNavigatorModel,
+        onSelectProviderTask: @escaping @MainActor (ProviderConnectionID, String) -> Void = { _, _ in }
+    ) {
+        self.model = model
+        self.sourceNavigator = sourceNavigator
+        self.onSelectProviderTask = onSelectProviderTask
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -85,7 +96,10 @@ struct ContextInspectorView: View {
     /// (up to a sensible cap) so a quiet task produces a compact card.
     private var summarySurface: some View {
         ScrollView {
-            SummaryInspector(model: model)
+            SummaryInspector(
+                model: model,
+                onSelectProviderTask: onSelectProviderTask
+            )
                 .padding(.horizontal, 12)
                 .padding(.vertical, 4)
                 .background {
@@ -143,6 +157,7 @@ private struct InspectorContentHeightPreferenceKey: PreferenceKey {
 
 private struct SummaryInspector: View {
     @ObservedObject var model: OnyxAppModel
+    let onSelectProviderTask: @MainActor (ProviderConnectionID, String) -> Void
     @State private var isTaskExpanded = false
     @State private var isPlanExpanded = false
     @State private var isAgentsExpanded = false
@@ -263,8 +278,14 @@ private struct SummaryInspector: View {
                 ? model.collaborationAgents
                 : Array(model.collaborationAgents.prefix(6))
             ForEach(visibleAgents) { agent in
+                let destination = agent.destination
+                let destinationThreadID = destination?.navigableThreadID
+                let isNavigable = destination?.isNavigable == true
                 Button {
-                    model.openCollaborationAgent(agent)
+                    guard let destination,
+                          destination.isNavigable,
+                          let destinationThreadID else { return }
+                    onSelectProviderTask(destination.connectionID, destinationThreadID)
                 } label: {
                     HStack(spacing: 7) {
                         Circle()
@@ -284,27 +305,37 @@ private struct SummaryInspector: View {
                             }
                         }
                         Spacer(minLength: 4)
-                        Text(agent.status.label)
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(agentColor(for: agent.status))
-                        Image(systemName: "chevron.forward")
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(.quaternary)
-                            .accessibilityHidden(true)
+                        if isNavigable {
+                            Text(agent.status.label)
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(agentColor(for: agent.status))
+                            Image(systemName: "chevron.forward")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(.quaternary)
+                                .accessibilityHidden(true)
+                        } else {
+                            Text("Unavailable")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(OnyxTheme.quietText)
+                        }
                     }
                     .frame(minHeight: OnyxHitTarget.row)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .disabled(agent.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                .onyxHelp("Open agent task")
+                .disabled(!isNavigable)
+                .onyxHelp(isNavigable ? "Open agent task" : "Agent conversation unavailable")
                 .accessibilityElement(children: .ignore)
-                .accessibilityLabel("\(agent.displayName), \(agent.status.label)")
+                .accessibilityLabel(
+                    isNavigable
+                        ? "\(agent.displayName), \(agent.status.label)"
+                        : "\(agent.displayName), conversation unavailable"
+                )
                 .accessibilityValue(agentAccessibilityValue(agent))
                 .accessibilityHint(
-                    agent.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        ? "No child conversation is available"
-                        : "Opens this agent's conversation"
+                    isNavigable
+                        ? "Opens this agent's conversation"
+                        : "No child conversation is available"
                 )
             }
             if model.collaborationAgents.count > 6 {

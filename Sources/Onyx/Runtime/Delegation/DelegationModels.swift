@@ -217,6 +217,10 @@ struct DelegationRequest: Codable, Equatable, Hashable, Sendable {
     let parentAgent: DelegationAgentIdentity
     let target: DelegationTarget
     let prompt: String
+    /// Optional provider/model-specific reasoning control. The broker
+    /// validates it against the credential-free model catalog before an
+    /// executor is allowed to send the request.
+    let reasoningEffort: String?
     /// Workspace selected by the parent task for this invocation. Keeping the
     /// path on the request prevents a provider-wide executor shared by several
     /// windows from accidentally running every child in the first workspace
@@ -229,6 +233,7 @@ struct DelegationRequest: Codable, Equatable, Hashable, Sendable {
         parentAgent: DelegationAgentIdentity,
         target: DelegationTarget,
         prompt: String,
+        reasoningEffort: String? = nil,
         workingDirectory: String? = nil,
         lineage: DelegationLineage? = nil
     ) {
@@ -236,6 +241,12 @@ struct DelegationRequest: Codable, Equatable, Hashable, Sendable {
         self.parentAgent = parentAgent
         self.target = target
         self.prompt = prompt
+        let normalizedReasoning = reasoningEffort?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        self.reasoningEffort = normalizedReasoning?.isEmpty == true
+            ? nil
+            : normalizedReasoning
         self.workingDirectory = workingDirectory
         self.lineage = lineage ?? .root(parent: parentAgent)
     }
@@ -245,6 +256,7 @@ struct DelegationRequest: Codable, Equatable, Hashable, Sendable {
         parent: DelegationAgentIdentity,
         target: DelegationTarget,
         prompt: String,
+        reasoningEffort: String? = nil,
         workingDirectory: String? = nil,
         lineage: DelegationLineage? = nil
     ) {
@@ -253,6 +265,7 @@ struct DelegationRequest: Codable, Equatable, Hashable, Sendable {
             parentAgent: parent,
             target: target,
             prompt: prompt,
+            reasoningEffort: reasoningEffort,
             workingDirectory: workingDirectory,
             lineage: lineage
         )
@@ -266,6 +279,7 @@ struct DelegationRequest: Codable, Equatable, Hashable, Sendable {
         targetModel: ModelRef,
         targetAgentID: String = "default",
         prompt: String,
+        reasoningEffort: String? = nil,
         workingDirectory: String? = nil,
         lineage: DelegationLineage? = nil
     ) {
@@ -278,6 +292,7 @@ struct DelegationRequest: Codable, Equatable, Hashable, Sendable {
                 agentID: targetAgentID
             ),
             prompt: prompt,
+            reasoningEffort: reasoningEffort,
             workingDirectory: workingDirectory,
             lineage: lineage
         )
@@ -293,6 +308,7 @@ struct DelegationRequest: Codable, Equatable, Hashable, Sendable {
             parentAgent: parentAgent,
             target: target,
             prompt: prompt,
+            reasoningEffort: reasoningEffort,
             workingDirectory: workingDirectory,
             lineage: lineage.assigningRootIfNeeded(id)
         )

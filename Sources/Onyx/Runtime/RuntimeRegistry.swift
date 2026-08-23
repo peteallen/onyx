@@ -53,10 +53,14 @@ struct ModelRef: Codable, Hashable, Sendable {
 /// Static metadata and construction boundary for one runtime adapter.
 struct RuntimeProviderDescriptor: Identifiable, Sendable {
     typealias Factory = @Sendable (ProviderConnectionID) throws -> any AgentRuntime
+    typealias DynamicToolFactory = @Sendable (
+        ProviderConnectionID,
+        (any CodexDynamicToolHandler)?
+    ) throws -> any AgentRuntime
 
     let id: RuntimeAdapterID
     let displayName: String
-    private let factory: Factory
+    private let factory: DynamicToolFactory
 
     init(
         id: RuntimeAdapterID,
@@ -65,19 +69,36 @@ struct RuntimeProviderDescriptor: Identifiable, Sendable {
     ) {
         self.id = id
         self.displayName = displayName
-        self.factory = factory
+        self.factory = { connectionID, _ in try factory(connectionID) }
     }
 
-    func makeRuntime(for connectionID: ProviderConnectionID) throws -> any AgentRuntime {
-        try factory(connectionID)
+    /// Construction seam used by adapters whose protocol surface is extended
+    /// by app-owned tools. Generic providers continue using the simpler
+    /// one-argument factory above and never learn about Codex app-server.
+    init(
+        id: RuntimeAdapterID,
+        displayName: String,
+        dynamicToolFactory: @escaping DynamicToolFactory
+    ) {
+        self.id = id
+        self.displayName = displayName
+        factory = dynamicToolFactory
+    }
+
+    func makeRuntime(
+        for connectionID: ProviderConnectionID,
+        dynamicToolHandler: (any CodexDynamicToolHandler)? = nil
+    ) throws -> any AgentRuntime {
+        try factory(connectionID, dynamicToolHandler)
     }
 
     static let codexAppServer = Self(
         id: .codexAppServer,
-        displayName: "Codex"
-    ) { _ in
-        try CodexRuntime.makeDefault()
-    }
+        displayName: "Codex",
+        dynamicToolFactory: { _, handler in
+            try CodexRuntime.makeDefault(dynamicToolHandler: handler)
+        }
+    )
 }
 
 /// The app-owned binding from a durable connection identity to the adapter
@@ -166,14 +187,20 @@ struct RuntimeRegistry: Sendable {
         self.connectionsByID = connectionsByID
     }
 
-    func resolve(_ connectionID: ProviderConnectionID) throws -> any AgentRuntime {
+    func resolve(
+        _ connectionID: ProviderConnectionID,
+        dynamicToolHandler: (any CodexDynamicToolHandler)? = nil
+    ) throws -> any AgentRuntime {
         guard let registration = connectionsByID[connectionID] else {
             throw RuntimeRegistryError.connectionNotRegistered(connectionID)
         }
         guard let provider = providersByID[registration.adapterID] else {
             throw RuntimeRegistryError.adapterNotRegistered(registration.adapterID)
         }
-        return try provider.makeRuntime(for: connectionID)
+        return try provider.makeRuntime(
+            for: connectionID,
+            dynamicToolHandler: dynamicToolHandler
+        )
     }
 
     /// The production registry intentionally exposes only Codex today. Adding

@@ -11,6 +11,22 @@ struct ProjectTaskReference: Identifiable, Hashable, Sendable {
     let providerConnectionID: ProviderConnectionID
     let providerDisplayName: String
     var thread: RuntimeThread
+    /// Stable rank supplied by the provider task-list merge. Metadata reads
+    /// can change titles and other row content without turning navigation into
+    /// a fresh sort. Lifecycle list updates still produce a new rank.
+    let presentationOrder: Int?
+
+    init(
+        providerConnectionID: ProviderConnectionID,
+        providerDisplayName: String,
+        thread: RuntimeThread,
+        presentationOrder: Int? = nil
+    ) {
+        self.providerConnectionID = providerConnectionID
+        self.providerDisplayName = providerDisplayName
+        self.thread = thread
+        self.presentationOrder = presentationOrder
+    }
 
     var id: ID {
         ID(providerConnectionID: providerConnectionID, threadID: thread.id)
@@ -49,36 +65,16 @@ struct ProjectTaskSidebarProjectionRequest: Sendable {
         let liveProviderConnectionID: ProviderConnectionID?
         let liveProviderDisplayName: String?
         let liveProviderThreadListRevision: UInt64?
-        let welcomeProviderConnectionID: ProviderConnectionID?
-        let welcomeProviderDisplayName: String?
-        let welcomeWorkspacePath: String?
     }
 
     let key: Key
     let taskLists: [ProjectProviderTaskList]
     let projects: [ProjectCatalogRecord]
-    let welcomeThread: RuntimeThread?
-
     func grouping() -> ProjectTaskGrouping {
-        var references = ProjectTaskSidebarProjection.mergedTaskReferences(
+        let references = ProjectTaskSidebarProjection.mergedTaskReferences(
             from: taskLists,
             scope: ThreadListScope(rawValue: key.scopeRawValue) ?? .active
         )
-        // The live provider snapshot is sourced from `OnyxAppModel.threads`,
-        // which may contain the synthetic welcome row while an active list is
-        // loading. The welcome row is projected separately below so it can
-        // carry the current draft workspace path; never show it twice.
-        references.removeAll { $0.thread.id == "onyx:welcome" }
-        if var welcomeThread,
-           let connectionID = key.welcomeProviderConnectionID,
-           let providerDisplayName = key.welcomeProviderDisplayName {
-            welcomeThread.cwd = key.welcomeWorkspacePath
-            references.append(ProjectTaskReference(
-                providerConnectionID: connectionID,
-                providerDisplayName: providerDisplayName,
-                thread: welcomeThread
-            ))
-        }
         return ProjectTaskSidebarProjection.group(
             references,
             by: projects,
@@ -211,7 +207,11 @@ enum ProjectTaskSidebarProjection {
         from lists: [ProjectProviderTaskList],
         scope: ThreadListScope
     ) -> [ProjectTaskReference] {
-        var byID: [ProjectTaskReference.ID: ProjectTaskReference] = [:]
+        struct Candidate {
+            var task: ProjectTaskReference
+        }
+
+        var byID: [ProjectTaskReference.ID: Candidate] = [:]
         for list in lists where list.scope.rawValue == scope.rawValue {
             for thread in list.threads where thread.id != "onyx:welcome" {
                 let task = ProjectTaskReference(
@@ -219,13 +219,31 @@ enum ProjectTaskSidebarProjection {
                     providerDisplayName: list.providerDisplayName,
                     thread: thread
                 )
-                if let existing = byID[task.id], existing.thread.updatedAt > thread.updatedAt {
+                if let existing = byID[task.id],
+                   existing.task.thread.updatedAt > thread.updatedAt {
                     continue
                 }
-                byID[task.id] = task
+                byID[task.id] = Candidate(task: task)
             }
         }
-        return Array(byID.values)
+        let ordered = byID.values.sorted { lhs, rhs in
+            if lhs.task.thread.updatedAt != rhs.task.thread.updatedAt {
+                return lhs.task.thread.updatedAt > rhs.task.thread.updatedAt
+            }
+            if lhs.task.providerConnectionID != rhs.task.providerConnectionID {
+                return lhs.task.providerConnectionID.rawValue
+                    < rhs.task.providerConnectionID.rawValue
+            }
+            return lhs.task.thread.id < rhs.task.thread.id
+        }
+        return ordered.enumerated().map { index, candidate in
+            ProjectTaskReference(
+                providerConnectionID: candidate.task.providerConnectionID,
+                providerDisplayName: candidate.task.providerDisplayName,
+                thread: candidate.task.thread,
+                presentationOrder: index
+            )
+        }
     }
 
     private static func sorted(
@@ -234,6 +252,11 @@ enum ProjectTaskSidebarProjection {
         tasks.sorted { lhs, rhs in
             if lhs.thread.isPinned != rhs.thread.isPinned {
                 return lhs.thread.isPinned
+            }
+            if let lhsOrder = lhs.presentationOrder,
+               let rhsOrder = rhs.presentationOrder,
+               lhsOrder != rhsOrder {
+                return lhsOrder < rhsOrder
             }
             if lhs.thread.updatedAt != rhs.thread.updatedAt {
                 return lhs.thread.updatedAt > rhs.thread.updatedAt
@@ -324,6 +347,20 @@ struct ProjectProviderTaskCatalog: Sendable {
 
     var allThreads: [RuntimeThread] {
         lists.flatMap(\.threads)
+    }
+}
+
+/// Protects the shared sidebar cache from transient provider-model snapshots.
+/// A navigation can invalidate an in-flight list read after the selected task
+/// itself has loaded; that partial model must never replace the complete cache.
+enum ProviderTaskCatalogSynchronizationPolicy {
+    static func shouldReplaceCachedTasks(
+        connectionState: RuntimeConnectionState,
+        isLoadingThreadList: Bool,
+        hasAuthoritativeThreadList: Bool
+    ) -> Bool {
+        guard case .connected = connectionState else { return false }
+        return !isLoadingThreadList && hasAuthoritativeThreadList
     }
 }
 
@@ -635,11 +672,7 @@ final class ProjectCatalogModel: ObservableObject {
         liveProviderConnectionID: ProviderConnectionID,
         liveProviderDisplayName: String,
         liveProviderThreadListRevision: UInt64?,
-        liveProviderThreads: [RuntimeThread]?,
-        welcomeThread: RuntimeThread?,
-        welcomeProviderConnectionID: ProviderConnectionID,
-        welcomeProviderDisplayName: String,
-        welcomeWorkspacePath: String?
+        liveProviderThreads: [RuntimeThread]?
     ) -> ProjectTaskSidebarProjectionRequest {
         let normalizedSearch = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         // Replace only the selected provider/scope snapshot. This walks the
@@ -668,14 +701,10 @@ final class ProjectCatalogModel: ObservableObject {
                 searchText: normalizedSearch,
                 liveProviderConnectionID: liveProviderConnectionID,
                 liveProviderDisplayName: liveProviderDisplayName,
-                liveProviderThreadListRevision: liveProviderThreadListRevision,
-                welcomeProviderConnectionID: welcomeThread == nil ? nil : welcomeProviderConnectionID,
-                welcomeProviderDisplayName: welcomeThread == nil ? nil : welcomeProviderDisplayName,
-                welcomeWorkspacePath: welcomeThread == nil ? nil : welcomeWorkspacePath
+                liveProviderThreadListRevision: liveProviderThreadListRevision
             ),
             taskLists: taskLists,
-            projects: projects,
-            welcomeThread: welcomeThread
+            projects: projects
         )
     }
 

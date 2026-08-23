@@ -93,13 +93,21 @@ struct TaskSidebarView: View {
             resetProjectDisclosureToSelection(in: projectionModel.grouping)
         }
         .onChange(of: model.selectedThreadID) {
-            resetProjectDisclosureToSelection(in: projectionModel.grouping)
+            // Selecting a task must not collapse other projects and move the
+            // rows that were under the pointer. Reveal the destination project
+            // even when another task in that same project was selected before.
+            // Projection-only metadata refreshes use the guarded reconciler
+            // below so they do not reopen a group the user deliberately closed.
+            revealSelectedProject(in: projectionModel.grouping)
         }
         .onChange(of: model.threadListScope) {
             resetProjectDisclosureToSelection(in: projectionModel.grouping)
         }
         .onChange(of: providerConnectionID) {
-            resetProjectDisclosureToSelection(in: projectionModel.grouping)
+            // Provider-aware task navigation keeps the same sidebar shell.
+            // Preserve the user's open projects while the destination
+            // provider's projection replaces the rows in place.
+            reconcileProjectDisclosure(in: projectionModel.grouping)
         }
         .onChange(of: projectionModel.publicationRevision) {
             reconcileProjectDisclosure(in: projectionModel.grouping)
@@ -288,21 +296,21 @@ struct TaskSidebarView: View {
     }
 
     private var sidebarProjectionRequest: ProjectTaskSidebarProjectionRequest {
-        projectCatalog.sidebarProjectionRequest(
+        let useLiveSnapshot = TaskSidebarLiveSnapshotPolicy.shouldUseLiveSnapshot(
+            hasAuthoritativeThreadList: model.hasAuthoritativeThreadListForCurrentScope
+        )
+        return projectCatalog.sidebarProjectionRequest(
             scope: model.threadListScope,
             searchText: model.searchText,
             liveProviderConnectionID: providerConnectionID,
             liveProviderDisplayName: providerDisplayName,
-            liveProviderThreadListRevision: model.isLoadingThreadList
-                ? nil
-                : model.threadListRevision,
-            liveProviderThreads: model.isLoadingThreadList
-                ? nil
-                : model.threads,
-            welcomeThread: model.sidebarWelcomeThread,
-            welcomeProviderConnectionID: providerConnectionID,
-            welcomeProviderDisplayName: providerDisplayName,
-            welcomeWorkspacePath: model.draftWorkspacePath
+            liveProviderThreadListRevision: useLiveSnapshot
+                ? model.threadListRevision
+                : nil,
+            // New Task is a composer state, not a durable task. Excluding its
+            // synthetic row also keeps every durable row fixed during
+            // Task -> New Task -> Task navigation.
+            liveProviderThreads: useLiveSnapshot ? model.catalogThreads : nil
         )
     }
 
@@ -332,18 +340,29 @@ struct TaskSidebarView: View {
         lastResolvedSelectedProjectID = selected
     }
 
-    /// A projection can arrive after selection (notably when the synthetic
-    /// welcome row is first attached to its project). Expand that project once
-    /// when it becomes resolvable, but preserve every disclosure the user has
-    /// already chosen during ordinary task/search updates.
+    /// A projection can arrive after selection. Expand that project once when
+    /// it becomes resolvable, but preserve every disclosure the user has
+    /// already chosen during ordinary task/search/provider updates.
     private func reconcileProjectDisclosure(in grouping: ProjectTaskGrouping) {
         let selected = selectedProjectID(in: grouping)
         if TaskSidebarProjectDisclosure.shouldExpandResolvedSelection(
             selected,
             after: lastResolvedSelectedProjectID
-        ), let selected {
-            expandedProjectIDs.insert(selected)
+        ) {
+            expandedProjectIDs = TaskSidebarProjectDisclosure.expandedProjectIDs(
+                revealing: selected,
+                within: expandedProjectIDs
+            )
         }
+        lastResolvedSelectedProjectID = selected
+    }
+
+    private func revealSelectedProject(in grouping: ProjectTaskGrouping) {
+        let selected = selectedProjectID(in: grouping)
+        expandedProjectIDs = TaskSidebarProjectDisclosure.expandedProjectIDs(
+            revealing: selected,
+            within: expandedProjectIDs
+        )
         lastResolvedSelectedProjectID = selected
     }
 
@@ -798,6 +817,14 @@ extension RuntimeTaskAttention {
     }
 }
 
+enum TaskSidebarLiveSnapshotPolicy {
+    static func shouldUseLiveSnapshot(
+        hasAuthoritativeThreadList: Bool
+    ) -> Bool {
+        hasAuthoritativeThreadList
+    }
+}
+
 enum TaskSidebarProjectDisclosure {
     static func shouldExpandResolvedSelection(
         _ selectedProjectID: ProjectID?,
@@ -812,6 +839,16 @@ enum TaskSidebarProjectDisclosure {
     ) -> Set<ProjectID> {
         guard let selectedProjectID else { return [] }
         return [selectedProjectID]
+    }
+
+    static func expandedProjectIDs(
+        revealing selectedProjectID: ProjectID?,
+        within expandedProjectIDs: Set<ProjectID>
+    ) -> Set<ProjectID> {
+        guard let selectedProjectID else { return expandedProjectIDs }
+        var result = expandedProjectIDs
+        result.insert(selectedProjectID)
+        return result
     }
 
     static func isExpanded(

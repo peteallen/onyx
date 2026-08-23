@@ -107,6 +107,123 @@ final class CodexProjectionTests: XCTestCase {
 
         XCTAssertEqual(projected.title, "node_repl · js")
         XCTAssertEqual(projected.body, "Onyx quit for relaunch")
+        XCTAssertNil(projected.collaboration, "Ordinary dynamic tools must remain routine activity")
+    }
+
+    func testProjectsRunningOnyxDelegationAsQuietCollaborationActivity() throws {
+        let item = JSONValue.object([
+            "type": .string("dynamicToolCall"),
+            "id": .string("delegate-call-1"),
+            "tool": .string("onyx_delegate"),
+            "status": .string("inProgress"),
+            "arguments": .object([
+                "provider": .string("qwen-home"),
+                "model": .string("Qwen/Qwen3.8-27B-FP8"),
+                "prompt": .string("Check the provider capability mapping."),
+            ]),
+        ])
+
+        let projected = CodexProjection.timelineItem(from: item)
+        let activity = try XCTUnwrap(projected.collaboration)
+        let agent = try XCTUnwrap(activity.agents.first)
+
+        XCTAssertEqual(projected.kind, .tool)
+        XCTAssertEqual(projected.status, .running)
+        XCTAssertEqual(projected.title, "Delegating to Qwen3.8-27B-FP8")
+        XCTAssertEqual(projected.body, "Check the provider capability mapping.")
+        XCTAssertEqual(projected.detail, "qwen-home · Qwen/Qwen3.8-27B-FP8")
+        XCTAssertEqual(activity.action, .spawn)
+        XCTAssertEqual(agent.id, "delegate-call-1")
+        XCTAssertEqual(agent.path, "Qwen/Qwen3.8-27B-FP8")
+        XCTAssertEqual(agent.displayName, "Qwen3.8 27B Fp8")
+        XCTAssertEqual(agent.status, .working)
+        XCTAssertEqual(agent.message, "Check the provider capability mapping.")
+        XCTAssertNil(agent.destination, "The child is not navigable before the provider returns its durable id")
+    }
+
+    func testProjectsCompletedOnyxDelegationWithProviderScopedChildDestination() throws {
+        let result = #"{"type":"onyx_delegation_result","version":1,"success":true,"job_id":"delegate-call-2","provider_connection_id":"qwen-home","model":"Qwen/Qwen3.8-27B-FP8","child_conversation_id":"child-42","text":"A deliberately noisy delegated result that belongs in the child task.","truncated":false}"#
+        let item = JSONValue.object([
+            "type": .string("dynamicToolCall"),
+            "id": .string("delegate-call-2"),
+            "tool": .string("onyx_delegate"),
+            "status": .string("completed"),
+            "arguments": .string(#"{"provider":"qwen-home","model":"Qwen/Qwen3.8-27B-FP8","prompt":"Audit model capability discovery."}"#),
+            "contentItems": .array([
+                .object(["type": .string("inputText"), "text": .string(result)]),
+            ]),
+        ])
+
+        let projected = CodexProjection.timelineItem(from: item)
+        let agent = try XCTUnwrap(projected.collaboration?.agents.first)
+        let destination = try XCTUnwrap(agent.destination)
+
+        XCTAssertEqual(projected.status, .completed)
+        XCTAssertEqual(projected.title, "Qwen3.8-27B-FP8 completed")
+        XCTAssertEqual(projected.body, "Audit model capability discovery.")
+        XCTAssertFalse(projected.body.contains("noisy delegated result"))
+        XCTAssertFalse(projected.body.contains("onyx_delegation_result"))
+        XCTAssertEqual(agent.id, "delegate-call-2", "The inspector identity stays stable across call updates")
+        XCTAssertEqual(agent.status, .completed)
+        XCTAssertEqual(destination.connectionID, ProviderConnectionID("qwen-home"))
+        XCTAssertEqual(destination.threadID, "child-42")
+    }
+
+    func testProjectsFailedOnyxDelegationFromStructuredResult() throws {
+        let result = #"{"type":"onyx_delegation_result","version":1,"success":false,"job_id":"delegate-call-3","provider_connection_id":"qwen-home","model":"Qwen/Qwen3.8-27B-FP8","error_code":"provider_request_failed","error_message":"The selected provider could not complete the request."}"#
+        let item = JSONValue.object([
+            "type": .string("dynamicToolCall"),
+            "id": .string("delegate-call-3"),
+            "tool": .string("onyx_delegate"),
+            "status": .string("completed"),
+            "arguments": .object([
+                "provider": .string("qwen-home"),
+                "model": .string("Qwen/Qwen3.8-27B-FP8"),
+                "prompt": .string("Review the change."),
+            ]),
+            "contentItems": .array([
+                .object(["type": .string("inputText"), "text": .string(result)]),
+            ]),
+        ])
+
+        let projected = CodexProjection.timelineItem(from: item)
+        let agent = try XCTUnwrap(projected.collaboration?.agents.first)
+
+        XCTAssertEqual(projected.status, .failed)
+        XCTAssertEqual(projected.title, "Delegation failed")
+        XCTAssertEqual(projected.body, "The selected provider could not complete the request.")
+        XCTAssertEqual(agent.status, .failed)
+        XCTAssertEqual(agent.message, "The selected provider could not complete the request.")
+        XCTAssertNil(agent.destination)
+        XCTAssertFalse(projected.body.contains("provider_connection_id"))
+    }
+
+    func testProjectsSanitizedPlainTextDelegationFailureWithoutDebugEnvelope() throws {
+        let projected = CodexProjection.timelineItem(
+            from: .object([
+                "type": .string("dynamicToolCall"),
+                "id": .string("delegate-call-plain-failure"),
+                "tool": .string("onyx_delegate"),
+                "status": .string("completed"),
+                "success": .bool(false),
+                "arguments": .object([
+                    "provider": .string("qwen-home"),
+                    "model": .string("Qwen/Qwen3.8-27B-FP8"),
+                    "prompt": .string("Review the change."),
+                ]),
+                "contentItems": .array([
+                    .object([
+                        "type": .string("inputText"),
+                        "text": .string("Onyx could not complete this delegation."),
+                    ]),
+                ]),
+            ])
+        )
+
+        XCTAssertEqual(projected.status, .failed)
+        XCTAssertEqual(projected.body, "Onyx could not complete this delegation.")
+        XCTAssertEqual(projected.collaboration?.agents.first?.status, .failed)
+        XCTAssertFalse(projected.body.contains("contentItems"))
     }
 
     func testProjectsUserImageAndLocalImageWithoutLeakingMediaIntoBody() {
@@ -488,6 +605,14 @@ final class CodexProjectionTests: XCTestCase {
             Set(projected.collaboration?.agents.map(\.status) ?? []),
             Set([.working, .completed])
         )
+        XCTAssertEqual(
+            Set(projected.collaboration?.agents.compactMap(\.destination?.connectionID) ?? []),
+            Set([.codexDefault])
+        )
+        XCTAssertEqual(
+            Set(projected.collaboration?.agents.compactMap(\.destination?.threadID) ?? []),
+            Set(["thread-child-a", "thread-child-b"])
+        )
     }
 
     func testProjectsSubAgentActivityAsReadableProviderNeutralCard() {
@@ -507,6 +632,8 @@ final class CodexProjectionTests: XCTestCase {
         XCTAssertEqual(projected.detail, "Collaboration")
         XCTAssertEqual(projected.collaboration?.agents.first?.id, "thread-child")
         XCTAssertEqual(projected.collaboration?.agents.first?.status, .working)
+        XCTAssertEqual(projected.collaboration?.agents.first?.destination?.connectionID, .codexDefault)
+        XCTAssertEqual(projected.collaboration?.agents.first?.destination?.threadID, "thread-child")
         XCTAssertFalse(projected.body.contains("agentThreadId"))
     }
 

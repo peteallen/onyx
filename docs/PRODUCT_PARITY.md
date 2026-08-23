@@ -41,6 +41,7 @@ enabling work only, not a completed user surface.
 - [ ] Hands-on verification for every destructive task-management action
 - [x] Read-only plan, task-attention, and collaboration-agent progress in the transcript, sidebar, and inspector
 - [x] Click-through collaboration-agent detail and isolated ephemeral Codex side chat
+- [x] `onyx_delegate` dynamic-tool advertisement on newly created Codex threads, structured result responses, interruption/reconnect cancellation isolation, and opt-in invocation proof through the installed app-server
 - [ ] Skills, plugins, apps, MCP authentication, goals, collaboration controls, and usage surfaces
 - [ ] Worktree creation, handoff, Git review, and cloud/local task parity
 
@@ -71,6 +72,9 @@ enabling work only, not a completed user surface.
 - [x] OpenAI-compatible runtime adapter with streamed chat and provider-owned local conversation persistence
 - [x] Production provider/model selection with cached catalogs and frequent/recent ranking
 - [x] Capability-aware OpenAI-compatible image and reasoning controls with conservative unknowns
+- [x] Production Codex-to-configured-provider delegation with credential-free target validation, shared provider runtimes, durable text-only read-only/no-approval children, bounded results, and provider-scoped click-through
+- [x] Opt-in live Qwen/vLLM proof of delegated result return and durable provider-scoped child persistence
+- [ ] Running-preview proof that a Codex task invokes the configured provider and opens the returned child in its owning provider scope
 - [ ] Production integration of the conversation catalog with task discovery, drafts, and restoration
 - [ ] End-to-end capability negotiation through a second live runtime adapter
 - [ ] Claude runtime adapter (not implemented)

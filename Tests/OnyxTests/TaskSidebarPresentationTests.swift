@@ -104,6 +104,47 @@ final class TaskSidebarPresentationTests: XCTestCase {
         ))
     }
 
+    func testSelectionRevealsDestinationWithoutCollapsingOpenProjects() {
+        let first = ProjectID("first")
+        let second = ProjectID("second")
+
+        XCTAssertEqual(
+            TaskSidebarProjectDisclosure.expandedProjectIDs(
+                revealing: second,
+                within: [first]
+            ),
+            [first, second]
+        )
+        XCTAssertEqual(
+            TaskSidebarProjectDisclosure.expandedProjectIDs(
+                revealing: nil,
+                within: [first]
+            ),
+            [first]
+        )
+        XCTAssertEqual(
+            TaskSidebarProjectDisclosure.expandedProjectIDs(
+                revealing: first,
+                within: []
+            ),
+            [first],
+            "Selecting another task in a manually collapsed project must reveal its row."
+        )
+    }
+
+    func testSidebarUsesCachedRowsUntilAProviderListIsAuthoritative() {
+        XCTAssertFalse(
+            TaskSidebarLiveSnapshotPolicy.shouldUseLiveSnapshot(
+                hasAuthoritativeThreadList: false
+            )
+        )
+        XCTAssertTrue(
+            TaskSidebarLiveSnapshotPolicy.shouldUseLiveSnapshot(
+                hasAuthoritativeThreadList: true
+            )
+        )
+    }
+
     func testPrimaryDesktopControlsShareGenerousCompactTargetPolicy() {
         XCTAssertGreaterThanOrEqual(OnyxHitTarget.compact, 32)
         XCTAssertGreaterThanOrEqual(OnyxHitTarget.row, OnyxHitTarget.compact)

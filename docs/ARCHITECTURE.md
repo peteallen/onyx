@@ -68,7 +68,70 @@ windows update without overwriting one another. Legacy single-window state
 migrates once into the first restored workspace, and sign-out clears
 account-owned selected-task, draft, and workspace preferences from known
 window namespaces, including windows that are currently closed.
-Cross-provider continuation and a native Anthropic runtime remain incomplete.
+Bounded Codex-to-configured-provider delegation is now wired into production
+composition. This is distinct from general cross-provider continuation, which
+remains incomplete alongside a native Anthropic runtime.
+
+## Codex-to-configured-provider delegation
+
+Onyx mediates delegation instead of teaching `codex app-server` how to
+authenticate with third-party providers:
+
+```text
+new Codex thread
+      |
+`onyx_delegate` app-server dynamic tool
+      |
+app-lifetime Onyx delegation broker
+      |
+configured provider's existing SharedRuntimeCoordinator
+      |
+durable, text-only child conversation
+      |
+bounded result to Codex + provider-scoped child destination to Onyx
+```
+
+The production host injects the broker only into the default Codex runtime.
+When a new Codex thread starts, `CodexRuntime` builds the tool definition from
+saved, credential-free provider/model catalogs and sends it through
+`thread/start.dynamicTools`. Current app-server protocol exposes no equivalent
+way to add a dynamic tool to an existing thread, so Codex threads created
+before this wiring do not gain delegation retroactively.
+
+For each call, the broker re-reads the current provider/model catalog, validates
+the exact connection/model pair, text input support, and requested reasoning
+effort, and rejects delegation back to Codex. Endpoint URLs, bearer tokens, and
+credential handles have no representation in the tool contract. Model-authored
+endpoint or credential fields are ignored, and provider failures are reduced to
+bounded, sanitized messages before a result returns to Codex.
+
+After validation, the broker resolves the same provider-scoped runtime
+coordinator used by normal workspace windows. It starts a durable child task
+with the selected model, reasoning effort, and parent working directory under a
+read-only execution policy and `never` approval policy. The current path sends
+only a self-contained text prompt; it does not grant the remote child Codex
+tools or local file access. Successful output is bounded and returned once as
+structured text containing the job, provider connection, model, reasoning
+effort, child conversation, and result metadata.
+
+Codex still records the exchange as a dynamic-tool item, but projection renders
+`onyx_delegate` as quiet collaboration activity instead of a generic noisy tool
+card. When child metadata is available, selecting the agent switches to the
+owning provider connection and opens that durable conversation while the parent
+Codex task remains in its project. Calls are bounded by global concurrency,
+duplicate call IDs are rejected, and parent interruption or runtime teardown
+cancels queued or active work.
+
+Focused protocol, broker, production-composition, projection, and navigation
+fixtures cover this path. On 2026-08-23, the opt-in live Qwen/vLLM broker test
+completed a real `medium` request, returned the bounded structured result, and
+verified that the provider-scoped child was durably persisted. The installed
+app-server also accepted the advertised dynamic tool and delivered one real
+`onyx_delegate` invocation to Onyx with the expected provider, model, prompt,
+thread, and working directory. Running-preview verification of the combined
+invocation, result presentation, and provider-aware child click-through remains
+pending. Richer input modalities, child tools, recursive delegation, and
+general cross-provider continuation remain future capability work.
 
 ## Why app-server stays behind an adapter
 

@@ -396,14 +396,22 @@ private enum BusyTaskSnapshotFixture {
                         path: "/root/contrast_audit",
                         status: .starting,
                         message: "Checking light and dark contrast",
-                        updatedAt: baseDate.addingTimeInterval(5)
+                        updatedAt: baseDate.addingTimeInterval(5),
+                        destination: RuntimeCollaborationAgentDestination(
+                            connectionID: .codexDefault,
+                            threadID: "snapshot-agent-contrast"
+                        )
                     ),
                     RuntimeCollaborationAgent(
                         id: "snapshot-agent-review",
                         path: "/root/snapshot_review",
                         status: .starting,
                         message: "Comparing the busy task composition",
-                        updatedAt: baseDate.addingTimeInterval(5)
+                        updatedAt: baseDate.addingTimeInterval(5),
+                        destination: RuntimeCollaborationAgentDestination(
+                            connectionID: .codexDefault,
+                            threadID: "snapshot-agent-review"
+                        )
                     ),
                 ]
             )
@@ -459,14 +467,22 @@ private enum BusyTaskSnapshotFixture {
                         path: "/root/contrast_audit",
                         status: .completed,
                         message: "Contrast checks passed in both appearances",
-                        updatedAt: baseDate.addingTimeInterval(9)
+                        updatedAt: baseDate.addingTimeInterval(9),
+                        destination: RuntimeCollaborationAgentDestination(
+                            connectionID: .codexDefault,
+                            threadID: "snapshot-agent-contrast"
+                        )
                     ),
                     RuntimeCollaborationAgent(
                         id: "snapshot-agent-review",
                         path: "/root/snapshot_review",
                         status: .working,
                         message: "Finishing the side-by-side review",
-                        updatedAt: baseDate.addingTimeInterval(9)
+                        updatedAt: baseDate.addingTimeInterval(9),
+                        destination: RuntimeCollaborationAgentDestination(
+                            connectionID: .codexDefault,
+                            threadID: "snapshot-agent-review"
+                        )
                     ),
                 ]
             )

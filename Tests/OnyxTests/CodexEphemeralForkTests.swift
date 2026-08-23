@@ -3,7 +3,7 @@ import XCTest
 @testable import Onyx
 
 final class CodexEphemeralForkTests: XCTestCase {
-    func testEphemeralForkStaysOutOfDurableTasksAndCatalogAndLeavesParentUntouched() async throws {
+    func testEphemeralForkUsesPaginatedMetadataOnlyResponseAndLeavesParentUntouched() async throws {
         let catalogDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("OnyxEphemeralForkTests-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: catalogDirectory) }
@@ -34,14 +34,22 @@ final class CodexEphemeralForkTests: XCTestCase {
         let catalogAfter = try await catalog.snapshot()
         let recordedForkRequest = await transport.forkRequest()
         let forkRequest = try XCTUnwrap(recordedForkRequest)
+        let recordedRequests = await transport.recordedRequests()
         await runtime.disconnect()
 
         XCTAssertEqual(forkRequest.params["threadId"]?.stringValue, "parent-thread")
         XCTAssertEqual(forkRequest.params["ephemeral"]?.boolValue, true)
-        XCTAssertEqual(forkRequest.params["excludeTurns"]?.boolValue, false)
+        XCTAssertEqual(forkRequest.params["excludeTurns"]?.boolValue, true)
         XCTAssertTrue(session.capabilities.contains(.ephemeralThreadForking))
         XCTAssertEqual(sideChat.thread.id, "side-thread")
-        XCTAssertEqual(sideChat.items, parentBefore.items, "The fork should begin with an isolated copy of parent history")
+        XCTAssertTrue(
+            sideChat.items.isEmpty,
+            "The installed app-server returns metadata only for an ephemeral paginated fork; the UI owns inherited context"
+        )
+        XCTAssertFalse(
+            recordedRequests.contains { $0.method == "thread/turns/list" },
+            "Codex rejects history pagination for ephemeral fork IDs"
+        )
         XCTAssertEqual(durableTasks.map(\.id), ["parent-thread"])
         XCTAssertEqual(parentAfter, parentBefore, "Forking must not append to or replace the parent transcript")
         XCTAssertEqual(catalogAfter.conversations, [parentCatalogRecord])
@@ -314,6 +322,10 @@ private actor EphemeralForkCodexTransport: CodexAppServerTransport {
                 sideThread.removeValue(forKey: "ephemeral")
             }
             sideThread["forkedFromId"] = .string("parent-thread")
+            // The installed server's ephemeral/paginated fork response is
+            // metadata-only. It rejects thread/turns/list for the ephemeral
+            // ID, so inherited context is seeded by the app UI instead.
+            sideThread["turns"] = .array([])
             let result = JSONValue.object(["thread": .object(sideThread)])
             if delayForkResponse {
                 return await withCheckedContinuation { delayedForkContinuation = $0 }
@@ -368,6 +380,7 @@ private actor EphemeralForkCodexTransport: CodexAppServerTransport {
             sideThread.removeValue(forKey: "ephemeral")
         }
         sideThread["forkedFromId"] = .string("parent-thread")
+        sideThread["turns"] = .array([])
         delayedForkContinuation = nil
         continuation.resume(returning: .object(["thread": .object(sideThread)]))
     }
