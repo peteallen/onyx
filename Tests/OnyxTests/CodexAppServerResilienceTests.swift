@@ -10,7 +10,8 @@ final class CodexAppServerResilienceTests: XCTestCase {
           case "$line" in
             *'"method":"initialize"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
             *'"method":"initialized"'*) ;;
-            *'"method":"crash"'*) exec 1>&-; sleep 0.02; exit 23 ;;
+            *'"method":"crash"'*) exec 1>&-; sleep 0.2; exit 23 ;;
+            *'"method":"echo"'*) printf '{"id":%s,"result":{"ok":true}}\n' "$id" ;;
           esac
         done
         """#
@@ -45,6 +46,16 @@ final class CodexAppServerResilienceTests: XCTestCase {
             }
             XCTAssertEqual(status, 23)
         }
+
+        // Reconnect before the deferred EOF task's grace period elapses, then
+        // wait past that boundary. A stale task must neither close the new
+        // generation nor publish a second stopped event for the old one.
+        let second = try await client.start()
+        XCTAssertNotEqual(connection.generation, second.generation)
+        try await Task.sleep(for: .milliseconds(1_100))
+        let echo = try await client.request(method: "echo", params: .object([:]))
+        XCTAssertEqual(echo["ok"]?.boolValue, true)
+        try await expectNoStoppedEvent(in: client.events, for: .milliseconds(25))
 
         await client.stop()
     }
@@ -288,6 +299,7 @@ private actor ResilienceCodexTransport: CodexAppServerTransport {
 private enum ResilienceTestError: Error {
     case streamEnded
     case timedOut
+    case unexpectedStoppedEvent(generation: UInt64, reason: String)
 }
 
 private func nextStoppedEvent(
@@ -326,6 +338,30 @@ private func nextConnectionFailure(
             }
         }
         throw ResilienceTestError.streamEnded
+    }
+}
+
+private func expectNoStoppedEvent(
+    in events: AsyncStream<AppServerEvent>,
+    for duration: Duration
+) async throws {
+    let clock = ContinuousClock()
+    try await withThrowingTaskGroup(of: Void.self) { group in
+        defer { group.cancelAll() }
+        group.addTask {
+            for await event in events {
+                if case let .stopped(generation, reason) = event {
+                    throw ResilienceTestError.unexpectedStoppedEvent(
+                        generation: generation,
+                        reason: reason
+                    )
+                }
+            }
+        }
+        group.addTask {
+            try await clock.sleep(for: duration)
+        }
+        _ = try await group.next()
     }
 }
 

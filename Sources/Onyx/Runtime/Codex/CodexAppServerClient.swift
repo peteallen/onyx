@@ -485,6 +485,10 @@ actor CodexAppServerClient: CodexAppServerTransport {
             processExited(status: terminationStatus, generation: generation)
             return
         }
+        if let process, !process.isRunning {
+            processExited(status: process.terminationStatus, generation: generation)
+            return
+        }
         closeConnection(
             generation: generation,
             pendingError: AgentRuntimeError.protocolFailure(reason)

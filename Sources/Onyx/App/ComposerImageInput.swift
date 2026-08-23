@@ -108,6 +108,25 @@ enum ComposerImageValidator {
         )
     }
 
+    /// Clipboard decoding and PNG/base64 encoding are CPU- and allocation-
+    /// heavy for screenshots. Keep that work off the main actor so paste can
+    /// acknowledge immediately and the native composer remains responsive.
+    static func pastedImages(_ images: [NSImage]) async -> [Result<ComposerImageDraft, any Error>] {
+        let representations = images.map(\.tiffRepresentation)
+        return await Task.detached(priority: .userInitiated) {
+            representations.enumerated().map { index, representation in
+                let name = representations.count == 1 ? "Pasted image" : "Pasted image \(index + 1)"
+                return Result {
+                    guard let representation,
+                          let image = NSImage(data: representation) else {
+                        throw ComposerImageValidationError.unreadable(name)
+                    }
+                    return try pastedImage(image, name: name)
+                }
+            }
+        }.value
+    }
+
     private static func validateByteCount(_ count: Int, name: String) throws {
         guard count > 0 else { throw ComposerImageValidationError.unreadable(name) }
         guard count <= maximumBytes else {

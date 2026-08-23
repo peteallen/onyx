@@ -18,6 +18,11 @@ final class TranscriptActivityGroupingTests: XCTestCase {
         row.configure(group: group, isExpanded: false) { toggles.append($0) }
         row.layoutSubtreeIfNeeded()
 
+        XCTAssertLessThan(row.expansionControl.frame.maxX, row.bounds.midX)
+        XCTAssertEqual(
+            row.accessibilityValue() as? String,
+            "Completed, 2 activities, Collapsed"
+        )
         XCTAssertTrue(row.hitTest(NSPoint(x: 120, y: 17)) === row)
         let event = try XCTUnwrap(
             NSEvent.mouseEvent(
@@ -36,6 +41,10 @@ final class TranscriptActivityGroupingTests: XCTestCase {
 
         XCTAssertTrue(row.isExpanded)
         XCTAssertEqual(toggles, [true])
+        XCTAssertEqual(
+            row.accessibilityValue() as? String,
+            "Completed, 2 activities, Expanded"
+        )
     }
 
     func testGroupsAdjacentCompletedRoutineActivityIntoOneSummary() {

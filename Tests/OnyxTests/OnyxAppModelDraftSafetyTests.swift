@@ -1,10 +1,370 @@
 import AppKit
 import Foundation
+import SwiftUI
 import XCTest
 @testable import Onyx
 
 @MainActor
 final class OnyxAppModelDraftSafetyTests: XCTestCase {
+    func testComposerDraftWriterOrdersBackgroundWritesAndRejectsStaleRevisions() throws {
+        let suiteName = "OnyxAppModelDraftSafetyTests.writer-order.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let writer = OnyxComposerDraftPersistenceWriter(defaults: defaults)
+        let key = "drafts"
+
+        writer.persist(["task": "old"], forKey: key, revision: 1, mode: .background)
+        writer.persist(["task": "new"], forKey: key, revision: 2, mode: .synchronous)
+        XCTAssertEqual(defaults.dictionary(forKey: key)?["task"] as? String, "new")
+
+        writer.persist(["task": "stale"], forKey: key, revision: 1, mode: .synchronous)
+        XCTAssertEqual(defaults.dictionary(forKey: key)?["task"] as? String, "new")
+
+        writer.remove(forKey: key, revision: 3, mode: .synchronous)
+        writer.persist(["task": "resurrected"], forKey: key, revision: 2, mode: .synchronous)
+        XCTAssertNil(defaults.object(forKey: key))
+    }
+
+    func testNewTaskPublishesImmediatelyWithoutWaitingForDraftStorage() async {
+        let suiteName = "OnyxAppModelDraftSafetyTests.new-task-responsive.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let persistence = ControllableComposerDraftPersistence()
+        let runtime = DraftSafetyRuntime(
+            initialThreads: [DraftSafetyFixture.threadA],
+            failurePoint: .none,
+            capabilities: [.streaming]
+        )
+        let model = OnyxAppModel(
+            runtime: runtime,
+            defaults: defaults,
+            composerDraftPersistence: persistence
+        )
+        model.start()
+        await waitUntil("Thread A did not load") {
+            model.selectedThreadID == DraftSafetyFixture.threadA.id
+                && !model.isLoadingThread
+        }
+        model.composerText = "Keep the task draft"
+        let synchronousPersistCountBeforeNavigation = persistence.synchronousPersistCount
+        let backgroundPersistCountBeforeNavigation = persistence.backgroundPersistCount
+        let taskListRevisionBeforeNavigation = model.threadListRevision
+
+        model.newTask()
+
+        XCTAssertEqual(model.selectedThreadID, DraftSafetyFixture.welcomeThreadID)
+        XCTAssertEqual(model.timeline.map(\.id), ["onyx-welcome"])
+        XCTAssertTrue(model.composerText.isEmpty)
+        XCTAssertFalse(model.isLoadingThread)
+        XCTAssertFalse(model.isLoadingThreadList)
+        XCTAssertFalse(model.isTurnRunning)
+        XCTAssertNotNil(model.sidebarWelcomeThread)
+        XCTAssertEqual(
+            model.threadListRevision,
+            taskListRevisionBeforeNavigation,
+            "The synthetic composer row must not republish the full provider task list."
+        )
+        XCTAssertEqual(
+            persistence.backgroundPersistCount,
+            backgroundPersistCountBeforeNavigation + 1
+        )
+        XCTAssertEqual(
+            persistence.synchronousPersistCount,
+            synchronousPersistCountBeforeNavigation,
+            "New Task must not add a synchronous draft write on the main actor."
+        )
+        XCTAssertEqual(
+            persistence.latestDrafts?[DraftSafetyFixture.threadA.id],
+            "Keep the task draft"
+        )
+    }
+
+    func testFirstNewTaskWithRealisticHistoryStaysWithinInteractionBudget() async {
+        let suiteName = "OnyxAppModelDraftSafetyTests.new-task-scale.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let tasks = (0..<4_824).map { index in
+            RuntimeThread(
+                id: "scale-task-\(index)",
+                title: "Scale task \(index)",
+                preview: "A realistic long-lived task history",
+                cwd: "/work/project-\(index % 224)",
+                updatedAt: Date(timeIntervalSince1970: TimeInterval(index + 1)),
+                status: .idle,
+                isPinned: false,
+                runtime: .codex,
+                model: "test-model",
+                branch: nil
+            )
+        }
+        let model = OnyxAppModel(
+            runtime: DraftSafetyRuntime(
+                initialThreads: tasks,
+                failurePoint: .none,
+                capabilities: [.streaming]
+            ),
+            defaults: defaults
+        )
+        model.start()
+        await waitUntil("The realistic task history did not load") {
+            model.threads.count == tasks.count && !model.isLoadingThread
+        }
+        let taskListRevision = model.threadListRevision
+
+        let clock = ContinuousClock()
+        let start = clock.now
+        model.newTask()
+        let elapsed = start.duration(to: clock.now)
+
+        XCTAssertEqual(model.selectedThreadID, DraftSafetyFixture.welcomeThreadID)
+        XCTAssertEqual(
+            model.selectedThread?.id,
+            DraftSafetyFixture.welcomeThreadID,
+            "The synthetic New Task selection must resolve without searching the durable task catalog"
+        )
+        XCTAssertEqual(model.threadListRevision, taskListRevision)
+        XCTAssertLessThan(
+            elapsed,
+            .milliseconds(50),
+            "The first New Task click missed the interaction budget: \(elapsed)"
+        )
+    }
+
+    func testHostedNewTaskButtonShowsWelcomeComposerPromptlyWithRealisticHistory() async throws {
+        let suiteName = "OnyxAppModelDraftSafetyTests.hosted-new-task-scale.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let tasks = (0..<4_824).map { index in
+            RuntimeThread(
+                id: "hosted-scale-task-\(index)",
+                title: "Hosted scale task \(index)",
+                preview: "A realistic long-lived task history",
+                cwd: "/work/project-\(index % 224)",
+                updatedAt: Date(timeIntervalSince1970: TimeInterval(index + 1)),
+                status: .idle,
+                isPinned: false,
+                runtime: .codex,
+                model: "test-model",
+                branch: nil
+            )
+        }
+        let initiallySelectedTask = try XCTUnwrap(tasks.last)
+        defaults.set(true, forKey: "Onyx.sidebarVisible")
+        defaults.set(false, forKey: "Onyx.inspectorVisible")
+        defaults.set(false, forKey: "Onyx.bottomPanelVisible")
+        defaults.set(initiallySelectedTask.id, forKey: "Onyx.selectedThreadID")
+
+        let model = OnyxAppModel(
+            runtime: DraftSafetyRuntime(
+                initialThreads: tasks,
+                failurePoint: .none,
+                capabilities: [.streaming]
+            ),
+            defaults: defaults
+        )
+        model.start()
+        await waitUntil("The hosted realistic task history did not load") {
+            model.threads.count == tasks.count
+                && model.selectedThreadID == initiallySelectedTask.id
+                && !model.isLoadingThread
+        }
+
+        let size = NSSize(width: 1_200, height: 800)
+        let hostingView = NSHostingView(
+            rootView: OnyxWorkspaceView(model: model, defaults: defaults)
+                .frame(width: size.width, height: size.height)
+        )
+        hostingView.frame = NSRect(origin: .zero, size: size)
+        let window = NSWindow(
+            contentRect: hostingView.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = hostingView
+        window.orderFront(nil)
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        hostingView.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(20))
+        hostingView.layoutSubtreeIfNeeded()
+
+        // Hit the live SwiftUI control through AppKit's normal mouse-event
+        // path. SwiftUI does not materialize its Button as an NSButton, and
+        // querying the process-global accessibility server would turn this
+        // into a permissions-sensitive UI test. The point is derived from the
+        // sidebar/header metrics rather than from the machine's screen.
+        let newTaskButtonPoint = NSPoint(
+            x: WorkspacePaneLayout.sidebarDefaultWidth - 26.5,
+            y: size.height - 24
+        )
+        let taskListRevision = model.threadListRevision
+        let clock = ContinuousClock()
+        let start = clock.now
+
+        try click(at: newTaskButtonPoint, in: window)
+        hostingView.needsLayout = true
+        hostingView.layoutSubtreeIfNeeded()
+        await Task.yield()
+        hostingView.layoutSubtreeIfNeeded()
+        let elapsed = start.duration(to: clock.now)
+
+        XCTAssertEqual(model.selectedThreadID, DraftSafetyFixture.welcomeThreadID)
+        XCTAssertEqual(model.threadListRevision, taskListRevision)
+        XCTAssertNotNil(
+            hostingView.firstDescendantTextField(
+                withString: "What are we building? I can work in this project, inspect its history, run tools, and keep the result grounded in the current checkout."
+            ),
+            "The hosted transcript did not publish the welcome surface after pressing New task"
+        )
+        let composer = try XCTUnwrap(hostingView.firstDescendant(ofType: NSTextView.self))
+        XCTAssertFalse(composer.isHidden)
+        XCTAssertNotNil(composer.window)
+        XCTAssertLessThan(
+            elapsed,
+            .milliseconds(100),
+            "The hosted New task interaction missed the paint budget: \(elapsed)"
+        )
+    }
+
+    func testRepeatedNewTaskClicksAreIdempotent() async {
+        let suiteName = "OnyxAppModelDraftSafetyTests.new-task-repeat.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let persistence = ControllableComposerDraftPersistence()
+        let runtime = DraftSafetyRuntime(
+            initialThreads: [DraftSafetyFixture.threadA],
+            failurePoint: .none,
+            capabilities: [.streaming]
+        )
+        let model = OnyxAppModel(
+            runtime: runtime,
+            defaults: defaults,
+            composerDraftPersistence: persistence
+        )
+        model.start()
+        await waitUntil("Thread A did not load") {
+            model.selectedThreadID == DraftSafetyFixture.threadA.id
+                && !model.isLoadingThread
+        }
+
+        model.newTask()
+        let transcriptRevision = model.transcriptSnapshot.revision
+        let taskListRevision = model.threadListRevision
+        let persistCount = persistence.backgroundPersistCount
+
+        for _ in 0..<50 { model.newTask() }
+
+        XCTAssertEqual(model.selectedThreadID, DraftSafetyFixture.welcomeThreadID)
+        XCTAssertEqual(model.transcriptSnapshot.revision, transcriptRevision)
+        XCTAssertEqual(model.threadListRevision, taskListRevision)
+        XCTAssertEqual(persistence.backgroundPersistCount, persistCount)
+    }
+
+    func testNewTaskFromArchivedReturnsToActiveAndRefreshesWithoutKeepingArchivedRows() async {
+        let fixture = makeFixture(initialThreads: [DraftSafetyFixture.threadA])
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        model.start()
+        await waitUntil("The active task did not load") {
+            model.selectedThreadID == DraftSafetyFixture.threadA.id
+                && !model.isLoadingThreadList
+        }
+
+        model.setThreadListScope(.archived)
+        await waitUntil("The archived list did not load") {
+            model.isShowingArchivedThreads && !model.isLoadingThreadList
+        }
+        XCTAssertTrue(model.threads.isEmpty)
+
+        model.newTask()
+
+        XCTAssertEqual(model.threadListScope, .active)
+        XCTAssertEqual(model.selectedThreadID, DraftSafetyFixture.welcomeThreadID)
+        XCTAssertEqual(model.threads.map(\.id), [DraftSafetyFixture.welcomeThreadID])
+        await waitUntil("New Task did not refresh active tasks after leaving Archived") {
+            !model.isLoadingThreadList
+                && model.threads.contains(where: { $0.id == DraftSafetyFixture.threadA.id })
+        }
+        XCTAssertEqual(model.selectedThreadID, DraftSafetyFixture.welcomeThreadID)
+    }
+
+    func testNewTaskWhileAThreadIsStartingInvalidatesThePendingSelection() async {
+        let fixture = makeFixture(initialThreads: [], failurePoint: .startThread)
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        model.start()
+        await waitUntil("The new-task composer did not load") {
+            model.canRunAgent && model.selectedThreadID == DraftSafetyFixture.welcomeThreadID
+        }
+
+        model.composerText = "Start this task"
+        model.sendComposer()
+        await waitUntilAsync("The start-thread request did not begin") {
+            await fixture.runtime.startThreadRequestCount() == 1
+        }
+        XCTAssertTrue(model.isTurnRunning)
+
+        model.newTask()
+        XCTAssertEqual(model.selectedThreadID, DraftSafetyFixture.welcomeThreadID)
+        XCTAssertFalse(model.isTurnRunning)
+
+        await fixture.runtime.releaseFailure()
+        await waitUntil("The failed pending send did not settle") {
+            model.notice?.title == "Could not send"
+        }
+        XCTAssertEqual(
+            model.selectedThreadID,
+            DraftSafetyFixture.welcomeThreadID,
+            "A late start-thread failure must not undo the user's New Task navigation."
+        )
+    }
+
+    func testFailedPendingStartPreservesANewerWelcomeDraftAfterNewTask() async {
+        let fixture = makeFixture(initialThreads: [], failurePoint: .startThread)
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        model.start()
+        await waitUntil("The new-task composer did not load") {
+            model.canRunAgent && model.selectedThreadID == DraftSafetyFixture.welcomeThreadID
+        }
+
+        model.composerText = "First request"
+        model.sendComposer()
+        await waitUntilAsync("The start-thread request did not begin") {
+            await fixture.runtime.startThreadRequestCount() == 1
+        }
+
+        model.newTask()
+        model.composerText = "New welcome draft"
+        await fixture.runtime.releaseFailure()
+        await waitUntil("The failed pending send did not settle") {
+            model.notice?.title == "Could not send"
+        }
+
+        XCTAssertEqual(model.selectedThreadID, DraftSafetyFixture.welcomeThreadID)
+        XCTAssertEqual(model.composerText, "First request\n\nNew welcome draft")
+        await waitForPersistedDraft(
+            fixture,
+            key: DraftSafetyFixture.welcomeThreadID,
+            value: "First request\n\nNew welcome draft"
+        )
+    }
+
     func testProviderWithoutCatalogUsesNeutralModelPlaceholder() async {
         let suiteName = "OnyxAppModelDraftSafetyTests.neutral-model-placeholder.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -452,6 +812,33 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
         XCTAssertTrue(recordedUsage.isEmpty, "Switching providers or models must not count as use.")
     }
 
+    func testProviderSwitchStagesDraftWithoutSynchronousMainActorPersistence() throws {
+        let sourceDefaults = UserDefaults(
+            suiteName: "OnyxAppModelDraftSafetyTests.provider-switch-source.\(UUID().uuidString)"
+        )!
+        let targetDefaults = UserDefaults(
+            suiteName: "OnyxAppModelDraftSafetyTests.provider-switch-target.\(UUID().uuidString)"
+        )!
+        let persistence = ControllableComposerDraftPersistence()
+        let source = OnyxAppModel(
+            runtime: nil,
+            defaults: sourceDefaults,
+            composerDraftPersistence: persistence
+        )
+        let target = OnyxAppModel(runtime: nil, defaults: targetDefaults)
+        source.composerText = "Keep this provider-switch draft"
+
+        OnyxApplicationHost.transferNewTaskContext(from: source, to: target)
+
+        XCTAssertEqual(target.composerText, "Keep this provider-switch draft")
+        XCTAssertEqual(persistence.backgroundPersistCount, 1)
+        XCTAssertEqual(
+            persistence.synchronousPersistCount,
+            0,
+            "Switching providers must paint before draft serialization finishes"
+        )
+    }
+
     func testWorkspaceValidationPersistsDraftAndChoosingWorkspaceKeepsItUntilSuccessfulSend() async throws {
         let fixture = makeFixture(initialThreads: [], workspacePath: nil)
         defer { fixture.cleanUp() }
@@ -468,7 +855,11 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
 
         XCTAssertEqual(model.notice?.title, "Choose a project")
         XCTAssertEqual(model.composerText, exactDraft)
-        XCTAssertEqual(persistedDrafts(fixture)[DraftSafetyFixture.welcomeThreadID], exactDraft)
+        await waitForPersistedDraft(
+            fixture,
+            key: DraftSafetyFixture.welcomeThreadID,
+            value: exactDraft
+        )
         let rejectedStartThreadCount = await fixture.runtime.startThreadRequestCount()
         XCTAssertEqual(rejectedStartThreadCount, 0)
 
@@ -476,7 +867,11 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
 
         XCTAssertEqual(model.draftWorkspacePath, DraftSafetyFixture.workspacePath)
         XCTAssertEqual(model.composerText, exactDraft)
-        XCTAssertEqual(persistedDrafts(fixture)[DraftSafetyFixture.welcomeThreadID], exactDraft)
+        await waitForPersistedDraft(
+            fixture,
+            key: DraftSafetyFixture.welcomeThreadID,
+            value: exactDraft
+        )
 
         model.dismissNotice()
         model.sendComposer()
@@ -495,11 +890,13 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
         XCTAssertEqual(turn.threadID, DraftSafetyFixture.createdThread.id)
         XCTAssertEqual(turn.text, "Build the project carefully.")
         XCTAssertEqual(model.selectedThreadID, DraftSafetyFixture.createdThread.id)
-        XCTAssertNil(persistedDrafts(fixture)[DraftSafetyFixture.welcomeThreadID])
-        XCTAssertNil(persistedDrafts(fixture)[DraftSafetyFixture.createdThread.id])
+        await waitForPersistedDraftRemoval(
+            fixture,
+            keys: [DraftSafetyFixture.welcomeThreadID, DraftSafetyFixture.createdThread.id]
+        )
     }
 
-    func testUnavailableRuntimeKeepsDraftVisibleAndDurable() {
+    func testUnavailableRuntimeKeepsDraftVisibleAndDurable() async {
         let suiteName = "OnyxAppModelDraftSafetyTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defaults.removePersistentDomain(forName: suiteName)
@@ -516,8 +913,10 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
 
         XCTAssertEqual(model.notice?.title, "Agent runtime is unavailable")
         XCTAssertEqual(model.composerText, exactDraft)
-        let persisted = defaults.dictionary(forKey: "Onyx.composerDrafts") as? [String: String]
-        XCTAssertEqual(persisted?[DraftSafetyFixture.welcomeThreadID], exactDraft)
+        await waitUntil("The unavailable-runtime draft was not persisted") {
+            let persisted = defaults.dictionary(forKey: "Onyx.composerDrafts") as? [String: String]
+            return persisted?[DraftSafetyFixture.welcomeThreadID] == exactDraft
+        }
 
         let relaunchedModel = OnyxAppModel(runtime: nil, defaults: defaults)
         XCTAssertEqual(relaunchedModel.composerText, exactDraft)
@@ -551,7 +950,11 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
 
         let restored = exactDraft + "\n\n" + followUp
         XCTAssertEqual(model.composerText, restored)
-        XCTAssertEqual(persistedDrafts(fixture)[DraftSafetyFixture.welcomeThreadID], restored)
+        await waitForPersistedDraft(
+            fixture,
+            key: DraftSafetyFixture.welcomeThreadID,
+            value: restored
+        )
         let startedTurnCount = await fixture.runtime.recordedStartTurns().count
         XCTAssertEqual(startedTurnCount, 0)
     }
@@ -596,7 +999,11 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
         let restoredForA = exactDraft + "\n\n" + followUpForA
         XCTAssertEqual(model.selectedThreadID, DraftSafetyFixture.threadB.id)
         XCTAssertEqual(model.composerText, draftForB)
-        XCTAssertEqual(persistedDrafts(fixture)[DraftSafetyFixture.threadA.id], restoredForA)
+        await waitForPersistedDraft(
+            fixture,
+            key: DraftSafetyFixture.threadA.id,
+            value: restoredForA
+        )
         XCTAssertEqual(
             model.threads.first(where: { $0.id == DraftSafetyFixture.threadA.id })?.status,
             .idle
@@ -604,7 +1011,11 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
 
         model.selectThread(DraftSafetyFixture.threadA.id)
         XCTAssertEqual(model.composerText, restoredForA)
-        XCTAssertEqual(persistedDrafts(fixture)[DraftSafetyFixture.threadB.id], draftForB)
+        await waitForPersistedDraft(
+            fixture,
+            key: DraftSafetyFixture.threadB.id,
+            value: draftForB
+        )
     }
 
     func testImageOnlySendReachesRuntimeAndAppearsOptimisticallyInTimeline() async throws {
@@ -621,6 +1032,9 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
         }
 
         model.addPastedComposerImages([makeImage(color: .systemPurple)])
+        await waitUntil("The pasted image did not finish preparing") {
+            model.composerImages.count == 1
+        }
         let draft = try XCTUnwrap(model.composerImages.first)
         model.sendComposer()
 
@@ -652,6 +1066,9 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
         }
 
         model.addPastedComposerImages([makeImage(color: .systemRed)])
+        await waitUntil("The first pasted image did not finish preparing") {
+            model.composerImages.count == 1
+        }
         let sentID = try XCTUnwrap(model.composerImages.first?.id)
         model.sendComposer()
         await waitUntilAsync("The image turn did not begin") {
@@ -659,10 +1076,16 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
         }
 
         model.addPastedComposerImages([makeImage(color: .systemOrange)])
+        await waitUntil("The follow-up image did not finish preparing") {
+            model.composerImages.count == 1
+        }
         let laterAID = try XCTUnwrap(model.composerImages.first?.id)
         model.selectThread(DraftSafetyFixture.threadB.id)
         await waitUntil("Thread B did not load") { model.selectedThreadID == DraftSafetyFixture.threadB.id }
         model.addPastedComposerImages([makeImage(color: .systemBlue)])
+        await waitUntil("Thread B's image did not finish preparing") {
+            model.composerImages.count == 1
+        }
         let draftBIDs = model.composerImages.map(\.id)
 
         await fixture.runtime.releaseFailure()
@@ -685,6 +1108,7 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
         }
 
         model.addPastedComposerImages([makeImage(color: .systemPurple)])
+        await Task.yield()
 
         XCTAssertFalse(model.canAttachImages)
         XCTAssertTrue(model.composerImages.isEmpty)
@@ -729,6 +1153,28 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
         fixture.defaults.dictionary(forKey: "Onyx.composerDrafts") as? [String: String] ?? [:]
     }
 
+    private func waitForPersistedDraft(
+        _ fixture: DraftSafetyFixture,
+        key: String,
+        value: String,
+        timeout: Duration = .seconds(1)
+    ) async {
+        await waitUntil("Draft (key) was not persisted", timeout: timeout) {
+            persistedDrafts(fixture)[key] == value
+        }
+    }
+
+    private func waitForPersistedDraftRemoval(
+        _ fixture: DraftSafetyFixture,
+        keys: [String],
+        timeout: Duration = .seconds(1)
+    ) async {
+        await waitUntil("Draft removal was not persisted", timeout: timeout) {
+            let drafts = persistedDrafts(fixture)
+            return keys.allSatisfy { drafts[$0] == nil }
+        }
+    }
+
     private func waitUntil(
         _ failureMessage: String,
         timeout: Duration = .seconds(1),
@@ -754,6 +1200,102 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
         }
         let didMeetCondition = await condition()
         XCTAssertTrue(didMeetCondition, failureMessage)
+    }
+
+    private func click(at point: NSPoint, in window: NSWindow) throws {
+        let timestamp = ProcessInfo.processInfo.systemUptime
+        let down = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: point,
+            modifierFlags: [],
+            timestamp: timestamp,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 1,
+            clickCount: 1,
+            pressure: 1
+        ))
+        let up = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseUp,
+            location: point,
+            modifierFlags: [],
+            timestamp: timestamp + 0.001,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 2,
+            clickCount: 1,
+            pressure: 0
+        ))
+        window.sendEvent(down)
+        window.sendEvent(up)
+    }
+}
+
+private extension NSView {
+    func firstDescendant<View: NSView>(ofType type: View.Type) -> View? {
+        if let match = self as? View { return match }
+        for subview in subviews {
+            if let match = subview.firstDescendant(ofType: type) { return match }
+        }
+        return nil
+    }
+
+    func firstDescendantTextField(withString string: String) -> NSTextField? {
+        if let textField = self as? NSTextField, textField.stringValue == string {
+            return textField
+        }
+        for subview in subviews {
+            if let match = subview.firstDescendantTextField(withString: string) { return match }
+        }
+        return nil
+    }
+}
+
+private final class ControllableComposerDraftPersistence: OnyxComposerDraftPersisting, @unchecked Sendable {
+    private let lock = NSLock()
+    private var backgroundCount = 0
+    private var synchronousCount = 0
+    private var recordedDrafts: [String: String]?
+
+    var backgroundPersistCount: Int {
+        lock.withLock { backgroundCount }
+    }
+
+    var synchronousPersistCount: Int {
+        lock.withLock { synchronousCount }
+    }
+
+    var latestDrafts: [String: String]? {
+        lock.withLock { recordedDrafts }
+    }
+
+    func persist(
+        _ drafts: [String: String],
+        forKey key: String,
+        revision: UInt64,
+        mode: OnyxComposerDraftPersistenceMode
+    ) {
+        lock.withLock {
+            recordedDrafts = drafts
+            switch mode {
+            case .background: backgroundCount += 1
+            case .synchronous: synchronousCount += 1
+            }
+        }
+    }
+
+    func remove(
+        forKey key: String,
+        revision: UInt64,
+        mode: OnyxComposerDraftPersistenceMode
+    ) {
+        lock.withLock {
+            recordedDrafts = nil
+            switch mode {
+            case .background: backgroundCount += 1
+            case .synchronous: synchronousCount += 1
+            }
+        }
     }
 }
 

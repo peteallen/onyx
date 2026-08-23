@@ -208,14 +208,20 @@ struct DelegationLineage: Codable, Equatable, Hashable, Sendable {
     }
 }
 
-/// A provider-neutral delegation request.  It intentionally contains only
-/// routing data and user-provided prompt text.  Credentials are resolved by
-/// the selected executor and can never be transported through this value.
+/// A provider-neutral delegation request. It intentionally contains only
+/// routing data, user-provided prompt text, and the selected workspace path.
+/// Credentials are resolved by the selected executor and can never be
+/// transported through this value.
 struct DelegationRequest: Codable, Equatable, Hashable, Sendable {
     let id: DelegationJobID
     let parentAgent: DelegationAgentIdentity
     let target: DelegationTarget
     let prompt: String
+    /// Workspace selected by the parent task for this invocation. Keeping the
+    /// path on the request prevents a provider-wide executor shared by several
+    /// windows from accidentally running every child in the first workspace
+    /// that constructed it.
+    let workingDirectory: String?
     let lineage: DelegationLineage
 
     init(
@@ -223,12 +229,14 @@ struct DelegationRequest: Codable, Equatable, Hashable, Sendable {
         parentAgent: DelegationAgentIdentity,
         target: DelegationTarget,
         prompt: String,
+        workingDirectory: String? = nil,
         lineage: DelegationLineage? = nil
     ) {
         self.id = id
         self.parentAgent = parentAgent
         self.target = target
         self.prompt = prompt
+        self.workingDirectory = workingDirectory
         self.lineage = lineage ?? .root(parent: parentAgent)
     }
 
@@ -237,6 +245,7 @@ struct DelegationRequest: Codable, Equatable, Hashable, Sendable {
         parent: DelegationAgentIdentity,
         target: DelegationTarget,
         prompt: String,
+        workingDirectory: String? = nil,
         lineage: DelegationLineage? = nil
     ) {
         self.init(
@@ -244,6 +253,7 @@ struct DelegationRequest: Codable, Equatable, Hashable, Sendable {
             parentAgent: parent,
             target: target,
             prompt: prompt,
+            workingDirectory: workingDirectory,
             lineage: lineage
         )
     }
@@ -256,6 +266,7 @@ struct DelegationRequest: Codable, Equatable, Hashable, Sendable {
         targetModel: ModelRef,
         targetAgentID: String = "default",
         prompt: String,
+        workingDirectory: String? = nil,
         lineage: DelegationLineage? = nil
     ) {
         self.init(
@@ -267,6 +278,7 @@ struct DelegationRequest: Codable, Equatable, Hashable, Sendable {
                 agentID: targetAgentID
             ),
             prompt: prompt,
+            workingDirectory: workingDirectory,
             lineage: lineage
         )
     }
@@ -281,6 +293,7 @@ struct DelegationRequest: Codable, Equatable, Hashable, Sendable {
             parentAgent: parentAgent,
             target: target,
             prompt: prompt,
+            workingDirectory: workingDirectory,
             lineage: lineage.assigningRootIfNeeded(id)
         )
     }
@@ -337,12 +350,15 @@ struct DelegationUsage: Codable, Equatable, Hashable, Sendable {
     }
 }
 
-/// Safe output returned by a provider-specific executor.  Provider response
+/// Safe output returned by a provider-specific executor. Provider response
 /// IDs and raw JSON are deliberately omitted so adapters cannot accidentally
-/// leak headers or credentials into the app-owned delegation log.
+/// leak headers or credentials into the app-owned delegation log. A bounded
+/// child-conversation identity is retained separately when the provider owns
+/// one, because that is the join key for opening a delegated task in the UI.
 struct DelegationOutput: Codable, Equatable, Hashable, Sendable {
     let text: String
     let usage: DelegationUsage?
+    let childConversationID: String?
     /// Set when the executor or coordinator had to bound an otherwise valid
     /// response. Callers can surface this rather than silently presenting a
     /// partial result as complete.
@@ -351,10 +367,14 @@ struct DelegationOutput: Codable, Equatable, Hashable, Sendable {
     init(
         text: String,
         usage: DelegationUsage? = nil,
+        childConversationID: String? = nil,
         truncatedAtCharacterLimit: Int? = nil
     ) {
         self.text = text
         self.usage = usage
+        self.childConversationID = childConversationID.flatMap {
+            DelegationSafeText.boundedIdentifier($0)
+        }
         self.truncatedAtCharacterLimit = truncatedAtCharacterLimit.flatMap {
             $0 > 0 ? $0 : nil
         }
@@ -705,6 +725,13 @@ enum DelegationSafeText {
     }
 
     static let outputCharacterLimit = 100_000
+    static let identifierCharacterLimit = 512
+
+    static func boundedIdentifier(_ rawValue: String) -> String? {
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty, value.count <= identifierCharacterLimit else { return nil }
+        return value
+    }
 
     static func boundedOutput(
         _ rawValue: String,

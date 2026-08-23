@@ -33,6 +33,132 @@ struct ProjectTaskGrouping: Hashable, Sendable {
     }
 }
 
+/// The complete, immutable input to one sidebar calculation. Keeping the key
+/// beside the payload makes invalidation explicit: navigation and transcript
+/// changes are intentionally absent, while every source that can change the
+/// rows is represented.
+struct ProjectTaskSidebarProjectionRequest: Sendable {
+    struct Key: Hashable, Sendable {
+        let sourceRevision: UInt64
+        let scopeRawValue: String
+        let searchText: String
+        /// The selected provider's model is the live source of truth. Its
+        /// revision is separate from the app-wide cached catalog so task
+        /// lifecycle changes can invalidate the background projection without
+        /// first copying or comparing the complete task list on the main actor.
+        let liveProviderConnectionID: ProviderConnectionID?
+        let liveProviderDisplayName: String?
+        let liveProviderThreadListRevision: UInt64?
+        let welcomeProviderConnectionID: ProviderConnectionID?
+        let welcomeProviderDisplayName: String?
+        let welcomeWorkspacePath: String?
+    }
+
+    let key: Key
+    let taskLists: [ProjectProviderTaskList]
+    let projects: [ProjectCatalogRecord]
+    let welcomeThread: RuntimeThread?
+
+    func grouping() -> ProjectTaskGrouping {
+        var references = ProjectTaskSidebarProjection.mergedTaskReferences(
+            from: taskLists,
+            scope: ThreadListScope(rawValue: key.scopeRawValue) ?? .active
+        )
+        // The live provider snapshot is sourced from `OnyxAppModel.threads`,
+        // which may contain the synthetic welcome row while an active list is
+        // loading. The welcome row is projected separately below so it can
+        // carry the current draft workspace path; never show it twice.
+        references.removeAll { $0.thread.id == "onyx:welcome" }
+        if var welcomeThread,
+           let connectionID = key.welcomeProviderConnectionID,
+           let providerDisplayName = key.welcomeProviderDisplayName {
+            welcomeThread.cwd = key.welcomeWorkspacePath
+            references.append(ProjectTaskReference(
+                providerConnectionID: connectionID,
+                providerDisplayName: providerDisplayName,
+                thread: welcomeThread
+            ))
+        }
+        return ProjectTaskSidebarProjection.group(
+            references,
+            by: projects,
+            searchText: key.searchText
+        )
+    }
+}
+
+/// Runs grouping away from the main actor. The serial actor also makes a
+/// repeated identical request cheap without sharing mutable resolver state
+/// across executors.
+actor ProjectTaskSidebarProjectionWorker {
+    private var cachedKey: ProjectTaskSidebarProjectionRequest.Key?
+    private var cachedGrouping: ProjectTaskGrouping?
+
+    func grouping(
+        for request: ProjectTaskSidebarProjectionRequest
+    ) -> ProjectTaskGrouping? {
+        // A fast search can enqueue several actor calls. Skip canceled work
+        // before it reaches the expensive merge/sort path so the latest query
+        // never waits behind every intermediate keystroke.
+        guard !Task.isCancelled else { return nil }
+        if cachedKey == request.key, let cachedGrouping { return cachedGrouping }
+        let grouping = request.grouping()
+        guard !Task.isCancelled else { return nil }
+        cachedKey = request.key
+        cachedGrouping = grouping
+        return grouping
+    }
+}
+
+/// View-owned, one-snapshot presentation state. A new request leaves the last
+/// grouping visible while the replacement is calculated, and only the newest
+/// request may publish. That keeps clicks paintable even with a very large
+/// task history while avoiding empty-sidebar flashes during search.
+@MainActor
+final class ProjectTaskSidebarProjectionModel: ObservableObject {
+    private(set) var grouping = ProjectTaskGrouping(groups: [], unassigned: [])
+    private(set) var isReady = false
+    /// Monotonic publication token for views that need to react to a new
+    /// immutable grouping without asking SwiftUI to deep-compare thousands of
+    /// task rows on the main actor.
+    @Published private(set) var publicationRevision: UInt64 = 0
+
+    private let worker: ProjectTaskSidebarProjectionWorker
+    private var task: Task<Void, Never>?
+    private var latestKey: ProjectTaskSidebarProjectionRequest.Key?
+
+    init(worker: ProjectTaskSidebarProjectionWorker = ProjectTaskSidebarProjectionWorker()) {
+        self.worker = worker
+    }
+
+    func refresh(_ request: ProjectTaskSidebarProjectionRequest) {
+        guard latestKey != request.key else { return }
+        latestKey = request.key
+        task?.cancel()
+        task = Task { [weak self, worker] in
+            guard let projected = await worker.grouping(for: request) else { return }
+            guard !Task.isCancelled,
+                  let self,
+                  self.latestKey == request.key else { return }
+            // The request key already changed, so this result is the only
+            // projection that may be published for it. Avoid a synthesized
+            // equality walk over every task on the main actor; with a large
+            // history that comparison recreated the very interaction stall
+            // this worker is meant to remove.
+            self.grouping = projected
+            self.isReady = true
+            // Publish once, after all snapshot state has been installed. The
+            // view reads the immutable grouping/isReady values during that
+            // one invalidation instead of receiving three separate emissions.
+            self.publicationRevision &+= 1
+        }
+    }
+
+    deinit {
+        task?.cancel()
+    }
+}
+
 /// Pure projection used by the sidebar. Provider thread IDs are only unique
 /// inside a connection, so every task retains its connection identity while
 /// projects remain provider-neutral and resolve from the task working folder.
@@ -43,6 +169,12 @@ enum ProjectTaskSidebarProjection {
         searchText: String = ""
     ) -> ProjectTaskGrouping {
         let orderedProjects = projects.sorted(by: ProjectCatalogOrdering.areInIncreasingOrder)
+        // Build the ancestor matcher once per projection. Calling
+        // `ProjectCatalogResolver.project` for every task rebuilt and sorted
+        // the complete candidate list each time, which made a simple sidebar
+        // publication quadratic in the number of projects. With a large task
+        // history that work ran during navigation and could beachball the UI.
+        let resolver = ProjectTaskProjectResolver(projects: orderedProjects)
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let filtered = tasks.filter { task in
             guard !query.isEmpty else { return true }
@@ -50,19 +182,14 @@ enum ProjectTaskSidebarProjection {
                 || task.thread.preview.localizedCaseInsensitiveContains(query)
                 || (task.thread.cwd?.localizedCaseInsensitiveContains(query) ?? false)
                 || task.providerDisplayName.localizedCaseInsensitiveContains(query)
-                || (ProjectCatalogResolver.project(
-                    forFolderPath: task.thread.cwd,
-                    in: orderedProjects
-                )?.displayName.localizedCaseInsensitiveContains(query) ?? false)
+                || (resolver.project(forFolderPath: task.thread.cwd)?
+                    .displayName.localizedCaseInsensitiveContains(query) ?? false)
         }
 
         var tasksByProject: [ProjectID: [ProjectTaskReference]] = [:]
         var unassigned: [ProjectTaskReference] = []
         for task in filtered {
-            if let project = ProjectCatalogResolver.project(
-                forFolderPath: task.thread.cwd,
-                in: orderedProjects
-            ) {
+            if let project = resolver.project(forFolderPath: task.thread.cwd) {
                 tasksByProject[project.id, default: []].append(task)
             } else {
                 unassigned.append(task)
@@ -122,6 +249,64 @@ enum ProjectTaskSidebarProjection {
     }
 }
 
+/// One projection-scoped, allocation-light ancestor resolver. Project paths
+/// are immutable for the duration of the sidebar calculation, so normalising
+/// and sorting them once avoids repeating Foundation path work for every task.
+private final class ProjectTaskProjectResolver {
+    private struct Candidate {
+        let project: ProjectCatalogRecord
+        let components: [String]
+        let depth: Int
+    }
+
+    private let candidates: [Candidate]
+    private var matchedProjectsByPath: [String: ProjectCatalogRecord] = [:]
+    private var unmatchedPaths: Set<String> = []
+
+    init(projects: [ProjectCatalogRecord]) {
+        candidates = projects
+            .compactMap { project in
+                ProjectPathNormalizer.normalize(project.folderPath).map { path in
+                    let components = NSString(string: path).pathComponents
+                    return Candidate(
+                        project: project,
+                        components: components,
+                        depth: components.count
+                    )
+                }
+            }
+            .sorted { lhs, rhs in
+                if lhs.depth != rhs.depth { return lhs.depth > rhs.depth }
+                if lhs.project.order != rhs.project.order {
+                    return lhs.project.order < rhs.project.order
+                }
+                return lhs.project.id.rawValue < rhs.project.id.rawValue
+            }
+    }
+
+    func project(forFolderPath rawPath: String?) -> ProjectCatalogRecord? {
+        guard let rawPath else { return nil }
+        if let cached = matchedProjectsByPath[rawPath] { return cached }
+        if unmatchedPaths.contains(rawPath) { return nil }
+        guard let path = ProjectPathNormalizer.normalize(rawPath) else {
+            unmatchedPaths.insert(rawPath)
+            return nil
+        }
+        let components = NSString(string: path).pathComponents
+        let match = candidates.first { candidate in
+            components.count >= candidate.components.count
+                && components.prefix(candidate.components.count)
+                    .elementsEqual(candidate.components)
+        }?.project
+        if let match {
+            matchedProjectsByPath[rawPath] = match
+        } else {
+            unmatchedPaths.insert(rawPath)
+        }
+        return match
+    }
+}
+
 struct ProjectProviderTaskList: Sendable {
     let providerConnectionID: ProviderConnectionID
     var providerDisplayName: String
@@ -173,9 +358,21 @@ final class ProjectCatalogModel: ObservableObject {
     @Published private(set) var isLoading = false
     @Published var notice: ProjectCatalogNotice?
 
+    /// Changes only when project/task-list inputs to the sidebar change.
+    /// Transcript and composer publications can therefore reuse the last
+    /// expensive grouping instead of sorting the complete task history again.
+    private(set) var sidebarProjectionRevision: UInt64 = 0
+
     private let store: ProjectCatalogStore?
     private var didStart = false
     private var persistenceRevision: UInt64 = 0
+
+    private struct CachedTaskReferences {
+        let revision: UInt64
+        let references: [ProjectTaskReference]
+    }
+
+    private var taskReferencesCache: [String: CachedTaskReferences] = [:]
 
     init(store: ProjectCatalogStore? = nil) {
         self.store = store
@@ -228,7 +425,7 @@ final class ProjectCatalogModel: ObservableObject {
         do {
             let loaded = try await store.projects()
             guard revision == persistenceRevision else { return }
-            projects = loaded
+            assignProjectsIfChanged(loaded)
         } catch {
             guard revision == persistenceRevision else { return }
             report(title: "Could not load projects", error: error, onFailure: onFailure)
@@ -253,9 +450,7 @@ final class ProjectCatalogModel: ObservableObject {
         do {
             _ = try await store.importTaskProjects(from: catalog.allThreads)
             let loaded = try await store.projects()
-            if revision == persistenceRevision {
-                projects = loaded
-            }
+            if revision == persistenceRevision { assignProjectsIfChanged(loaded) }
             return true
         } catch {
             if revision == persistenceRevision {
@@ -280,7 +475,7 @@ final class ProjectCatalogModel: ObservableObject {
         do {
             let imported = try await store.importProject(folderPath: folderPath)
             let loaded = try await store.projects()
-            if revision == persistenceRevision { projects = loaded }
+            if revision == persistenceRevision { assignProjectsIfChanged(loaded) }
             return imported
         } catch {
             if revision == persistenceRevision {
@@ -302,7 +497,7 @@ final class ProjectCatalogModel: ObservableObject {
         do {
             _ = try await store.rename(id: id, displayName: displayName)
             let loaded = try await store.projects()
-            if revision == persistenceRevision { projects = loaded }
+            if revision == persistenceRevision { assignProjectsIfChanged(loaded) }
             return true
         } catch {
             if revision == persistenceRevision {
@@ -323,7 +518,7 @@ final class ProjectCatalogModel: ObservableObject {
         do {
             _ = try await store.removeFromOnyx(id: id)
             let loaded = try await store.projects()
-            if revision == persistenceRevision { projects = loaded }
+            if revision == persistenceRevision { assignProjectsIfChanged(loaded) }
             return true
         } catch {
             if revision == persistenceRevision {
@@ -352,7 +547,7 @@ final class ProjectCatalogModel: ObservableObject {
         orderedIDs.insert(moved, at: destination)
         do {
             let reordered = try await store.reorder(orderedIDs)
-            if revision == persistenceRevision { projects = reordered }
+            if revision == persistenceRevision { assignProjectsIfChanged(reordered) }
             return true
         } catch {
             if revision == persistenceRevision {
@@ -388,31 +583,99 @@ final class ProjectCatalogModel: ObservableObject {
                 || existing.threads != incoming.threads
             else { return }
             providerTaskLists[index] = incoming
+            bumpSidebarProjectionRevision()
         } else {
             providerTaskLists.append(incoming)
+            bumpSidebarProjectionRevision()
         }
     }
 
     func retainTaskLists(for availableProviderIDs: Set<ProviderConnectionID>) {
-        providerTaskLists.removeAll {
-            !availableProviderIDs.contains($0.providerConnectionID)
+        let retained = providerTaskLists.filter {
+            availableProviderIDs.contains($0.providerConnectionID)
         }
+        guard retained.count != providerTaskLists.count else { return }
+        providerTaskLists = retained
+        bumpSidebarProjectionRevision()
     }
 
     func removeTaskList(
         for providerConnectionID: ProviderConnectionID,
         scope: ThreadListScope
     ) {
-        providerTaskLists.removeAll {
-            $0.providerConnectionID == providerConnectionID
-                && $0.scope.rawValue == scope.rawValue
+        let retained = providerTaskLists.filter {
+            !($0.providerConnectionID == providerConnectionID
+                && $0.scope.rawValue == scope.rawValue)
         }
+        guard retained.count != providerTaskLists.count else { return }
+        providerTaskLists = retained
+        bumpSidebarProjectionRevision()
     }
 
     func taskReferences(for scope: ThreadListScope) -> [ProjectTaskReference] {
-        ProjectTaskSidebarProjection.mergedTaskReferences(
+        let cacheKey = scope.rawValue
+        if let cached = taskReferencesCache[cacheKey],
+           cached.revision == sidebarProjectionRevision {
+            return cached.references
+        }
+        let references = ProjectTaskSidebarProjection.mergedTaskReferences(
             from: providerTaskLists,
             scope: scope
+        )
+        taskReferencesCache[cacheKey] = CachedTaskReferences(
+            revision: sidebarProjectionRevision,
+            references: references
+        )
+        return references
+    }
+
+    func sidebarProjectionRequest(
+        scope: ThreadListScope,
+        searchText: String,
+        liveProviderConnectionID: ProviderConnectionID,
+        liveProviderDisplayName: String,
+        liveProviderThreadListRevision: UInt64?,
+        liveProviderThreads: [RuntimeThread]?,
+        welcomeThread: RuntimeThread?,
+        welcomeProviderConnectionID: ProviderConnectionID,
+        welcomeProviderDisplayName: String,
+        welcomeWorkspacePath: String?
+    ) -> ProjectTaskSidebarProjectionRequest {
+        let normalizedSearch = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Replace only the selected provider/scope snapshot. This walks the
+        // handful of provider lists, not the potentially multi-thousand-row
+        // task array; filtering, merging, and sorting stay on the projection
+        // worker. The live model therefore wins over an older cached catalog
+        // immediately after rename, pin, status, archive, or recency changes.
+        var taskLists = providerTaskLists
+        if liveProviderThreadListRevision != nil,
+           let liveProviderThreads {
+            taskLists.removeAll {
+                $0.providerConnectionID == liveProviderConnectionID
+                    && $0.scope.rawValue == scope.rawValue
+            }
+            taskLists.append(ProjectProviderTaskList(
+                providerConnectionID: liveProviderConnectionID,
+                providerDisplayName: liveProviderDisplayName,
+                scope: scope,
+                threads: liveProviderThreads
+            ))
+        }
+        return ProjectTaskSidebarProjectionRequest(
+            key: .init(
+                sourceRevision: sidebarProjectionRevision,
+                scopeRawValue: scope.rawValue,
+                searchText: normalizedSearch,
+                liveProviderConnectionID: liveProviderConnectionID,
+                liveProviderDisplayName: liveProviderDisplayName,
+                liveProviderThreadListRevision: liveProviderThreadListRevision,
+                welcomeProviderConnectionID: welcomeThread == nil ? nil : welcomeProviderConnectionID,
+                welcomeProviderDisplayName: welcomeThread == nil ? nil : welcomeProviderDisplayName,
+                welcomeWorkspacePath: welcomeThread == nil ? nil : welcomeWorkspacePath
+            ),
+            taskLists: taskLists,
+            projects: projects,
+            welcomeThread: welcomeThread
         )
     }
 
@@ -431,5 +694,16 @@ final class ProjectCatalogModel: ObservableObject {
         } else {
             notice = reported
         }
+    }
+
+    private func assignProjectsIfChanged(_ incoming: [ProjectCatalogRecord]) {
+        guard projects != incoming else { return }
+        projects = incoming
+        bumpSidebarProjectionRevision()
+    }
+
+    private func bumpSidebarProjectionRevision() {
+        sidebarProjectionRevision &+= 1
+        taskReferencesCache.removeAll(keepingCapacity: true)
     }
 }

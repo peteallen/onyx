@@ -11,8 +11,16 @@ struct TaskSidebarView: View {
     let onProjectFailure: ProjectCatalogFailureHandler
     var searchFocusRequest = 0
     @FocusState private var isSearchFocused: Bool
+    @State private var expandedProjectIDs: Set<ProjectID> = []
+    @State private var lastResolvedSelectedProjectID: ProjectID?
+    @StateObject private var projectionModel = ProjectTaskSidebarProjectionModel()
 
     var body: some View {
+        // Read one immutable snapshot. Grouping is calculated by the
+        // projection worker, never while SwiftUI is evaluating this body.
+        let grouping = projectionModel.grouping
+        let displayedGroups = displayedProjectGroups(from: grouping)
+
         VStack(spacing: 0) {
             header
             search
@@ -20,34 +28,42 @@ struct TaskSidebarView: View {
                 .padding(.horizontal, 8)
 
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 2) {
-                    ForEach(displayedProjectGroups) { group in
+                LazyVStack(alignment: .leading, spacing: 3) {
+                    ForEach(displayedGroups) { group in
                         projectHeader(group)
-                            .padding(.top, 5)
-                        if group.tasks.isEmpty {
-                            Text("No tasks yet")
-                                .font(.system(size: 10.5))
-                                .foregroundStyle(.tertiary)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                        } else {
-                            ForEach(group.tasks) { task in threadRow(task) }
+                            .padding(.top, 8)
+                        if isProjectExpanded(group.id) {
+                            if group.tasks.isEmpty {
+                                Text("No tasks yet")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.tertiary)
+                                    .padding(.leading, 28)
+                                    .padding(.vertical, 5)
+                            } else {
+                                // A small inset makes the project/task relationship
+                                // readable without turning each project into a card.
+                                ForEach(group.tasks) { task in
+                                    threadRow(task)
+                                        .padding(.leading, 12)
+                                }
+                            }
                         }
                     }
 
-                    if !sidebarGrouping.unassigned.isEmpty {
+                    if !grouping.unassigned.isEmpty {
                         SidebarSectionLabel(
                             title: projectCatalog.projects.isEmpty
                                 ? (model.isShowingArchivedThreads ? "Archived" : "Tasks")
                                 : "Other Tasks",
-                            count: sidebarGrouping.unassigned.count
+                            count: grouping.unassigned.count
                         )
-                        .padding(.top, displayedProjectGroups.isEmpty ? 4 : 10)
-                        ForEach(sidebarGrouping.unassigned) { task in threadRow(task) }
+                        .padding(.top, displayedGroups.isEmpty ? 8 : 14)
+                        ForEach(grouping.unassigned) { task in threadRow(task) }
                     }
 
-                    if sidebarGrouping.taskCount == 0,
-                       displayedProjectGroups.isEmpty,
+                    if projectionModel.isReady,
+                       grouping.taskCount == 0,
+                       displayedGroups.isEmpty,
                        !model.isLoadingThreadList {
                         sidebarEmptyState
                     }
@@ -63,10 +79,30 @@ struct TaskSidebarView: View {
                         .accessibilityLabel("Loading tasks")
                 }
             }
+
+            SidebarUtilityFooter(model: model)
         }
         .background(OnyxTheme.sidebar)
         .overlay(alignment: .trailing) {
             Rectangle().fill(OnyxTheme.border).frame(width: OnyxTheme.hairline)
+        }
+        .task(id: sidebarProjectionRequest.key) {
+            projectionModel.refresh(sidebarProjectionRequest)
+        }
+        .onAppear {
+            resetProjectDisclosureToSelection(in: projectionModel.grouping)
+        }
+        .onChange(of: model.selectedThreadID) {
+            resetProjectDisclosureToSelection(in: projectionModel.grouping)
+        }
+        .onChange(of: model.threadListScope) {
+            resetProjectDisclosureToSelection(in: projectionModel.grouping)
+        }
+        .onChange(of: providerConnectionID) {
+            resetProjectDisclosureToSelection(in: projectionModel.grouping)
+        }
+        .onChange(of: projectionModel.publicationRevision) {
+            reconcileProjectDisclosure(in: projectionModel.grouping)
         }
     }
 
@@ -151,19 +187,19 @@ struct TaskSidebarView: View {
     private var projectListHeader: some View {
         HStack(spacing: 6) {
             Text("Projects")
-                .font(.system(size: 10.5, weight: .medium))
-                .foregroundStyle(.tertiary)
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(.secondary)
             Spacer()
             if projectCatalog.isLoading {
                 ProgressView()
                     .controlSize(.mini)
                     .accessibilityLabel("Loading projects")
             }
-            scopePicker
+            scopeMenu
             Button(action: beginImportProject) {
                 Image(systemName: "plus")
-                    .font(.system(size: 10, weight: .bold))
-                    .frame(width: 22, height: 20)
+                    .font(.system(size: 10.5, weight: .bold))
+                    .frame(width: 24, height: 22)
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
@@ -172,41 +208,53 @@ struct TaskSidebarView: View {
             .accessibilityHint("Opens a folder chooser; you can also create a new folder there")
         }
         .padding(.horizontal, 7)
-        .padding(.bottom, 3)
+        .padding(.bottom, 4)
     }
 
-    private var scopePicker: some View {
-        HStack(spacing: 0) {
+    private var scopeMenu: some View {
+        Menu {
             ForEach(ThreadListScope.allCases) { scope in
                 Button {
                     model.setThreadListScope(scope)
                 } label: {
-                    Text(scope.label)
-                        .font(.system(size: 9.5, weight: model.threadListScope == scope ? .semibold : .medium))
-                        .foregroundStyle(model.threadListScope == scope ? Color.primary : Color.secondary)
-                        .padding(.horizontal, 6)
-                        .frame(height: 20)
-                        .background {
-                            if model.threadListScope == scope {
-                                RoundedRectangle(cornerRadius: 5, style: .continuous)
-                                    .fill(Color.primary.opacity(0.075))
-                            }
+                    HStack {
+                        Text(scopeMenuTitle(for: scope, includeTasks: true))
+                        if model.threadListScope == scope {
+                            Image(systemName: "checkmark")
                         }
-                        .contentShape(Rectangle())
+                    }
                 }
-                .buttonStyle(.plain)
                 .accessibilityAddTraits(model.threadListScope == scope ? .isSelected : [])
-                .accessibilityLabel(scope.label)
-                .accessibilityHint("Shows \(scope.label.lowercased()) tasks")
             }
+        } label: {
+            HStack(spacing: 4) {
+                Text(scopeMenuTitle(for: model.threadListScope))
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 7.5, weight: .semibold))
+            }
+            .font(.system(size: 10.5, weight: .medium))
+            .foregroundStyle(.secondary)
+            .frame(height: 22)
+            .contentShape(Rectangle())
         }
-        .padding(1)
-        .background(Color.primary.opacity(0.025))
-        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
         .disabled(!isConnected)
         .opacity(isConnected ? 1 : 0.55)
-        .accessibilityLabel("Task list")
+        .accessibilityLabel("Task list scope")
+        .accessibilityValue(scopeMenuTitle(for: model.threadListScope, includeTasks: true))
         .accessibilityHint("Choose active or archived tasks")
+    }
+
+    private func scopeMenuTitle(
+        for scope: ThreadListScope,
+        includeTasks: Bool = false
+    ) -> String {
+        switch scope {
+        case .active: includeTasks ? "Active Tasks" : "Active"
+        case .archived: includeTasks ? "Archived Tasks" : "Archived"
+        }
     }
 
     private var sidebarEmptyState: some View {
@@ -233,39 +281,97 @@ struct TaskSidebarView: View {
             ?? (providerConnectionID == .codexDefault ? "Codex" : "Provider")
     }
 
-    private var sidebarGrouping: ProjectTaskGrouping {
-        var references = projectCatalog.taskReferences(for: model.threadListScope)
-        if let welcome = model.visibleThreads.first(where: { $0.id == "onyx:welcome" }) {
-            var projected = welcome
-            projected.cwd = model.draftWorkspacePath
-            references.append(ProjectTaskReference(
-                providerConnectionID: providerConnectionID,
-                providerDisplayName: providerDisplayName,
-                thread: projected
-            ))
+    private var sidebarProjectionRequest: ProjectTaskSidebarProjectionRequest {
+        projectCatalog.sidebarProjectionRequest(
+            scope: model.threadListScope,
+            searchText: model.searchText,
+            liveProviderConnectionID: providerConnectionID,
+            liveProviderDisplayName: providerDisplayName,
+            liveProviderThreadListRevision: model.isLoadingThreadList
+                ? nil
+                : model.threadListRevision,
+            liveProviderThreads: model.isLoadingThreadList
+                ? nil
+                : model.threads,
+            welcomeThread: model.sidebarWelcomeThread,
+            welcomeProviderConnectionID: providerConnectionID,
+            welcomeProviderDisplayName: providerDisplayName,
+            welcomeWorkspacePath: model.draftWorkspacePath
+        )
+    }
+
+    private func displayedProjectGroups(
+        from grouping: ProjectTaskGrouping
+    ) -> [ProjectTaskGroup] {
+        if model.isShowingArchivedThreads || !model.searchText
+            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return grouping.groups.filter { !$0.tasks.isEmpty }
         }
-        return ProjectTaskSidebarProjection.group(
-            references,
-            by: projectCatalog.projects,
+        return grouping.groups
+    }
+
+    private func isProjectExpanded(_ projectID: ProjectID) -> Bool {
+        TaskSidebarProjectDisclosure.isExpanded(
+            projectID,
+            expandedProjectIDs: expandedProjectIDs,
             searchText: model.searchText
         )
     }
 
-    private var displayedProjectGroups: [ProjectTaskGroup] {
-        if model.isShowingArchivedThreads || !model.searchText
-            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return sidebarGrouping.groups.filter { !$0.tasks.isEmpty }
+    private func resetProjectDisclosureToSelection(in grouping: ProjectTaskGrouping) {
+        let selected = selectedProjectID(in: grouping)
+        expandedProjectIDs = TaskSidebarProjectDisclosure.defaultExpandedProjectIDs(
+            selectedProjectID: selected
+        )
+        lastResolvedSelectedProjectID = selected
+    }
+
+    /// A projection can arrive after selection (notably when the synthetic
+    /// welcome row is first attached to its project). Expand that project once
+    /// when it becomes resolvable, but preserve every disclosure the user has
+    /// already chosen during ordinary task/search updates.
+    private func reconcileProjectDisclosure(in grouping: ProjectTaskGrouping) {
+        let selected = selectedProjectID(in: grouping)
+        if TaskSidebarProjectDisclosure.shouldExpandResolvedSelection(
+            selected,
+            after: lastResolvedSelectedProjectID
+        ), let selected {
+            expandedProjectIDs.insert(selected)
         }
-        return sidebarGrouping.groups
+        lastResolvedSelectedProjectID = selected
+    }
+
+    private func selectedProjectID(in grouping: ProjectTaskGrouping) -> ProjectID? {
+        guard let selectedThreadID = model.selectedThreadID else { return nil }
+        return grouping.groups.first(where: { group in
+            group.tasks.contains {
+                $0.providerConnectionID == providerConnectionID
+                    && $0.thread.id == selectedThreadID
+            }
+        })?.id
+    }
+
+    private func toggleProjectDisclosure(_ projectID: ProjectID) {
+        guard TaskSidebarProjectDisclosure.mayToggle(
+            searchText: model.searchText
+        ) else { return }
+        if expandedProjectIDs.contains(projectID) {
+            expandedProjectIDs.remove(projectID)
+        } else {
+            expandedProjectIDs.insert(projectID)
+        }
     }
 
     private func projectHeader(_ group: ProjectTaskGroup) -> some View {
-        ProjectSidebarHeader(
+        let isExpanded = isProjectExpanded(group.id)
+        return ProjectSidebarHeader(
             project: group.project,
             taskCount: group.tasks.count,
+            isExpanded: isExpanded,
             canMoveUp: projectCatalog.canMoveProject(id: group.id, offset: -1),
             canMoveDown: projectCatalog.canMoveProject(id: group.id, offset: 1),
-            select: { model.selectWorkspace(group.project.folderPath) },
+            toggleExpanded: { toggleProjectDisclosure(group.id) },
+            newTask: { model.selectWorkspace(group.project.folderPath) },
             rename: { beginRenameProject(group.project) },
             moveUp: {
                 Task {
@@ -371,6 +477,7 @@ struct TaskSidebarView: View {
         if thread.isPinned { details.append("Pinned") }
         details.append(isArchived ? "Archived" : attention.label)
         if !thread.preview.isEmpty { details.append(thread.preview) }
+        details.append("Updated \(TaskSidebarTimestamp.accessibilityDescription(for: thread.updatedAt))")
         return details.joined(separator: ". ")
     }
 
@@ -439,16 +546,17 @@ private struct SidebarSectionLabel: View {
     let count: Int
 
     var body: some View {
-        HStack {
+        HStack(spacing: 7) {
             Text(title)
-                .font(.system(size: 10.5, weight: .medium))
+                .font(.system(size: 11.5, weight: .semibold))
             Spacer()
             Text("\(count)")
-                .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundStyle(.tertiary)
         }
-        .foregroundStyle(.tertiary)
-        .padding(.horizontal, 7)
-        .padding(.bottom, 3)
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 9)
+        .padding(.bottom, 4)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(title), \(count) \(count == 1 ? "task" : "tasks")")
     }
@@ -457,9 +565,11 @@ private struct SidebarSectionLabel: View {
 private struct ProjectSidebarHeader: View {
     let project: ProjectCatalogRecord
     let taskCount: Int
+    let isExpanded: Bool
     let canMoveUp: Bool
     let canMoveDown: Bool
-    let select: () -> Void
+    let toggleExpanded: () -> Void
+    let newTask: () -> Void
     let rename: () -> Void
     let moveUp: () -> Void
     let moveDown: () -> Void
@@ -467,28 +577,37 @@ private struct ProjectSidebarHeader: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            Button(action: select) {
-                HStack(spacing: 6) {
-                    Image(systemName: "folder")
-                        .font(.system(size: 9.5, weight: .medium))
-                        .foregroundStyle(.secondary)
+            Button(action: toggleExpanded) {
+                HStack(spacing: 7) {
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 8.5, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 9)
+                    Image(systemName: isExpanded ? "folder.fill" : "folder")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(isExpanded ? Color.secondary : Color.secondary.opacity(0.78))
                     Text(project.displayName)
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.system(size: 11.5, weight: isExpanded ? .medium : .regular))
+                        .foregroundStyle(isExpanded ? Color.primary : Color.secondary)
                         .lineLimit(1)
                     Spacer(minLength: 4)
                     Text("\(taskCount)")
-                        .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
                         .foregroundStyle(.tertiary)
                 }
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .onyxHelp("Start a new task in \(project.folderPath)")
+            .onyxHelp(isExpanded ? "Collapse \(project.displayName)" : "Expand \(project.displayName)")
             .accessibilityLabel(project.displayName)
-            .accessibilityValue("\(taskCount) \(taskCount == 1 ? "task" : "tasks")")
-            .accessibilityHint("Starts a new task in this project")
+            .accessibilityValue(
+                "\(isExpanded ? "Expanded" : "Collapsed"), \(taskCount) \(taskCount == 1 ? "task" : "tasks")"
+            )
+            .accessibilityHint(isExpanded ? "Collapses this project" : "Expands this project")
 
             Menu {
+                Button("New Task in \(project.displayName)", action: newTask)
+                Divider()
                 Button("Rename…", action: rename)
                 Divider()
                 Button("Move Up", action: moveUp)
@@ -499,8 +618,8 @@ private struct ProjectSidebarHeader: View {
                 Button("Remove from Onyx…", role: .destructive, action: remove)
             } label: {
                 Image(systemName: "ellipsis")
-                    .font(.system(size: 10, weight: .bold))
-                    .frame(width: 22, height: 20)
+                    .font(.system(size: 10.5, weight: .bold))
+                    .frame(width: 24, height: 22)
                     .contentShape(Rectangle())
             }
             .menuStyle(.borderlessButton)
@@ -508,10 +627,11 @@ private struct ProjectSidebarHeader: View {
             .fixedSize()
             .onyxHelp("Manage \(project.displayName)")
             .accessibilityLabel("Manage \(project.displayName)")
+            .accessibilityHint("Create a task, rename, reorder, or remove this project")
         }
-        .padding(.leading, 7)
+        .padding(.leading, 9)
         .padding(.trailing, 2)
-        .padding(.bottom, 2)
+        .padding(.bottom, 3)
     }
 }
 
@@ -525,12 +645,13 @@ private struct TaskSidebarRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
             statusIndicator
-                .padding(.top, 5)
+                .frame(width: 11, height: 12)
+                .padding(.top, 4)
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     Text(thread.title)
-                        .font(.system(size: 12.5, weight: isSelected ? .semibold : .medium))
+                        .font(.system(size: 12.5, weight: isSelected ? .medium : .regular))
                         .foregroundStyle(.primary)
                         .lineLimit(1)
                     Spacer(minLength: 4)
@@ -548,21 +669,31 @@ private struct TaskSidebarRow: View {
                             .foregroundStyle(OnyxTheme.iris.opacity(0.78))
                             .accessibilityHidden(true)
                     }
-                    Text(thread.preview)
-                        .lineLimit(1)
+                    if let previewText {
+                        Text(previewText)
+                            .foregroundStyle(
+                                isSelected
+                                    ? Color.secondary
+                                    : Color.secondary.opacity(0.72)
+                            )
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
                     Spacer(minLength: 4)
                     if let providerName {
                         Text(providerName)
                             .lineLimit(1)
                     }
-                    Text(thread.updatedAt, style: .relative)
+                    Text(TaskSidebarTimestamp.compact(thread.updatedAt))
+                        .monospacedDigit()
+                        .foregroundStyle(.tertiary)
                 }
                 .font(.system(size: 10.5))
                 .foregroundStyle(.secondary)
             }
         }
         .padding(.horizontal, 9)
-        .padding(.vertical, 5.5)
+        .padding(.vertical, 6.5)
         .background {
             if isSelected {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -576,6 +707,14 @@ private struct TaskSidebarRow: View {
             }
         }
         .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var previewText: String? {
+        let preview = thread.preview.trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = thread.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !preview.isEmpty,
+              preview.caseInsensitiveCompare(title) != .orderedSame else { return nil }
+        return preview
     }
 
     @ViewBuilder
@@ -643,9 +782,91 @@ extension RuntimeThreadStatus {
 extension RuntimeTaskAttention {
     var showsSidebarAttentionLabel: Bool {
         switch self {
-        case .working, .needsInput, .needsApproval, .failed, .unknown: true
-        case .ready: false
+        // A progress indicator already communicates routine work. Keep text
+        // for states that require the user's attention or explain an error.
+        case .working, .ready: false
+        case .needsInput, .needsApproval, .failed, .unknown: true
         }
+    }
+}
+
+enum TaskSidebarProjectDisclosure {
+    static func shouldExpandResolvedSelection(
+        _ selectedProjectID: ProjectID?,
+        after previousProjectID: ProjectID?
+    ) -> Bool {
+        guard let selectedProjectID else { return false }
+        return selectedProjectID != previousProjectID
+    }
+
+    static func defaultExpandedProjectIDs(
+        selectedProjectID: ProjectID?
+    ) -> Set<ProjectID> {
+        guard let selectedProjectID else { return [] }
+        return [selectedProjectID]
+    }
+
+    static func isExpanded(
+        _ projectID: ProjectID,
+        expandedProjectIDs: Set<ProjectID>,
+        searchText: String
+    ) -> Bool {
+        let isSearching = !searchText
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty
+        return isSearching || expandedProjectIDs.contains(projectID)
+    }
+
+    static func mayToggle(searchText: String) -> Bool {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
+/// A deliberately short timestamp for the task list. SwiftUI's `.relative`
+/// style is useful in prose, but can produce long compound strings (for
+/// example, "4 mths, 20 days ago") that overwhelm a narrow sidebar row.
+enum TaskSidebarTimestamp {
+    private static let minute: TimeInterval = 60
+    private static let hour: TimeInterval = 60 * minute
+    private static let day: TimeInterval = 24 * hour
+    private static let week: TimeInterval = 7 * day
+    private static let month: TimeInterval = 30 * day
+    private static let year: TimeInterval = 365 * day
+
+    static func compact(
+        _ date: Date,
+        relativeTo now: Date = .now
+    ) -> String {
+        let interval = now.timeIntervalSince(date)
+        guard interval.isFinite else { return "—" }
+
+        let future = interval < 0
+        let magnitude = abs(interval)
+        if magnitude < minute {
+            return "now"
+        }
+
+        let unit: (seconds: TimeInterval, suffix: String)
+        switch magnitude {
+        case ..<hour: unit = (minute, "m")
+        case ..<day: unit = (hour, "h")
+        case ..<week: unit = (day, "d")
+        case ..<month: unit = (week, "w")
+        case ..<year: unit = (month, "mo")
+        default: unit = (year, "y")
+        }
+
+        let value = max(1, Int(magnitude / unit.seconds))
+        return future ? "in \(value)\(unit.suffix)" : "\(value)\(unit.suffix)"
+    }
+
+    static func accessibilityDescription(
+        for date: Date,
+        relativeTo now: Date = .now
+    ) -> String {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return formatter.localizedString(for: date, relativeTo: now)
     }
 }
 

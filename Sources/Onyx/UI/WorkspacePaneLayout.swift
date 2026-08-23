@@ -7,7 +7,6 @@ import SwiftUI
 /// type intentionally contains no view or persistence state so the rules can
 /// be exercised without constructing an AppKit window.
 enum WorkspacePaneLayout {
-    static let commandRailWidth: CGFloat = 52
     static let dividerWidth: CGFloat = 7
     /// Protect enough room for the transcript and composer to remain the
     /// primary workspace, even when both supporting panes are open.
@@ -25,8 +24,7 @@ enum WorkspacePaneLayout {
     /// the conversation below its protected width. Below this point a
     /// requested inspector temporarily takes the side-pane slot; the sidebar
     /// preference remains intact for wider windows.
-    static let compactBreakpoint: CGFloat = commandRailWidth
-        + dividerWidth * 2
+    static let compactBreakpoint: CGFloat = dividerWidth * 2
         + sidebarMinimumWidth
         + inspectorMinimumWidth
         + minimumConversationWidth
@@ -51,9 +49,9 @@ enum WorkspacePaneLayout {
         sidebarRequested && (!isCompact || !inspectorVisible)
     }
 
-    /// Resolves the state change requested by the task-rail button. The
-    /// button follows what is on screen, so revealing the sidebar at a compact
-    /// width also dismisses the inspector that was keeping it hidden.
+    /// Resolves a sidebar visibility command against what is on screen, so
+    /// revealing it at a compact width also dismisses the inspector that was
+    /// keeping it hidden.
     static func sidebarToggleTarget(
         sidebarDisplayed: Bool,
         inspectorVisible: Bool,
@@ -91,7 +89,6 @@ enum WorkspacePaneLayout {
             ? dividerWidth + clampedStoredInspectorWidth(inspectorWidth)
             : 0
         let availableMaximum = totalWidth
-            - commandRailWidth
             - dividerWidth
             - minimumConversationWidth
             - reservedInspector
@@ -111,7 +108,6 @@ enum WorkspacePaneLayout {
             ? dividerWidth + clampedStoredSidebarWidth(sidebarWidth)
             : 0
         let availableMaximum = totalWidth
-            - commandRailWidth
             - dividerWidth
             - minimumConversationWidth
             - reservedSidebar

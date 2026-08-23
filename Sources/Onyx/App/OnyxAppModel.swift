@@ -144,8 +144,31 @@ final class OnyxAppModel: ObservableObject {
     @Published var loginAttempt: RuntimeLoginStart?
     @Published var isAuthenticating = false
     @Published var isSigningOut = false
-    @Published var threads: [RuntimeThread]
-    @Published var selectedThreadID: String?
+    @Published var threads: [RuntimeThread] {
+        didSet {
+            threadListRevision &+= 1
+            selectedThreadCacheNeedsRefresh = true
+            threadIndexCacheRevision = nil
+        }
+    }
+    /// Cheap identity for views that react to task-list mutations. Comparing
+    /// the full multi-thousand-task array after every unrelated model
+    /// publication made streaming and navigation contend with sidebar work.
+    private(set) var threadListRevision: UInt64 = 0
+    @Published var selectedThreadID: String? {
+        didSet { selectedThreadCacheNeedsRefresh = true }
+    }
+    /// The selected task is read by most workspace panes. Keep one projection
+    /// per model publication instead of making every observer scan the full
+    /// catalog independently (which is especially visible while a large task
+    /// list is streaming status updates).
+    private var selectedThreadCache: RuntimeThread?
+    private var selectedThreadCacheNeedsRefresh = true
+    /// Lifecycle notifications address tasks by id. A lazy index keeps routine
+    /// title/status updates constant-time after a catalog publication instead
+    /// of linearly searching a multi-thousand-task history for every event.
+    private var threadIndexByID: [String: Int] = [:]
+    private var threadIndexCacheRevision: UInt64?
     @Published private(set) var transcriptSnapshot: TranscriptPresentationSnapshot
     var timeline: [TimelineItem] { transcriptSnapshot.items }
     @Published var composerText: String {
@@ -183,6 +206,7 @@ final class OnyxAppModel: ObservableObject {
     @Published private(set) var sideChatTranscriptSnapshot = TranscriptPresentationSnapshot(items: [])
     var sideChatTimeline: [TimelineItem] { sideChatTranscriptSnapshot.items }
     @Published var sideChatComposerText = ""
+    @Published private(set) var sideChatComposerImages: [ComposerImageDraft] = []
     @Published private(set) var isSideChatTurnRunning = false
     @Published private(set) var sideChatInteraction: RuntimeUserInteraction?
     @Published private(set) var isRespondingToSideChatInteraction = false
@@ -229,6 +253,7 @@ final class OnyxAppModel: ObservableObject {
     private let runtimeKind: AgentRuntimeKind?
     private let startupError: (any Error)?
     private let preferences: UserDefaults
+    private let composerDraftPersistence: any OnyxComposerDraftPersisting
     private let preferenceNamespace: OnyxPreferenceNamespace
     private let pinnedThreadStore: OnyxPinnedThreadStore
     private let workspacePersistenceStore: OnyxWorkspacePersistenceStore?
@@ -244,6 +269,14 @@ final class OnyxAppModel: ObservableObject {
     private var threadListTask: Task<Void, Never>?
     private var deltaFlushTask: Task<Void, Never>?
     private var draftSaveTask: Task<Void, Never>?
+    private var composerDraftPersistenceRevision: UInt64 = 0
+    /// Coalesces the small set of changed draft entries until the next writer
+    /// submission. The production writer consumes these deltas without
+    /// retaining `composerDrafts` and forcing a whole-dictionary COW on the
+    /// next keystroke or navigation action.
+    private var pendingComposerDraftMutations: [String: OnyxComposerDraftMutation] = [:]
+    private var catalogThreadsCacheRevision: UInt64?
+    private var catalogThreadsCache: [RuntimeThread] = []
     private var accountRefreshTask: Task<Void, Never>?
     private var sideChatForkTask: Task<Void, Never>?
     private var sideChatTurnTask: Task<Void, Never>?
@@ -275,6 +308,12 @@ final class OnyxAppModel: ObservableObject {
     private var cancelledLoginID: String?
     private var didStart = false
     private var navigationRevision = 0
+    /// Distinguishes the user's first explicit New Task action from the
+    /// synthetic welcome surface shown while the provider catalog is loading.
+    /// Repeated clicks on an already-visible blank composer remain idempotent,
+    /// while the first click can invalidate startup restoration or a stale
+    /// refresh result.
+    private var hasExplicitNewTaskSelection = false
     /// Invalidates async work that began while a different provider account
     /// owned the visible task state.
     private var accountEpoch: UInt64 = 0
@@ -359,7 +398,8 @@ final class OnyxAppModel: ObservableObject {
         pinnedThreadStore: OnyxPinnedThreadStore? = nil,
         workspacePersistenceStore: OnyxWorkspacePersistenceStore? = nil,
         startsWithNewTask: Bool = false,
-        modelUsageRecorder: @escaping @MainActor (String) -> Void = { _ in }
+        modelUsageRecorder: @escaping @MainActor (String) -> Void = { _ in },
+        composerDraftPersistence: (any OnyxComposerDraftPersisting)? = nil
     ) {
         let preferenceNamespace = OnyxPreferenceNamespace(prefix: preferenceKeyPrefix)
         let pinnedThreadStore = pinnedThreadStore ?? OnyxPinnedThreadStore(defaults: defaults)
@@ -367,6 +407,8 @@ final class OnyxAppModel: ObservableObject {
         runtimeKind = runtime?.kind
         self.startupError = startupError
         preferences = defaults
+        self.composerDraftPersistence = composerDraftPersistence
+            ?? OnyxComposerDraftPersistenceWriter(defaults: defaults)
         self.preferenceNamespace = preferenceNamespace
         self.pinnedThreadStore = pinnedThreadStore
         self.workspacePersistenceStore = workspacePersistenceStore
@@ -425,6 +467,7 @@ final class OnyxAppModel: ObservableObject {
             .sink { [weak self] ids in
                 self?.applyPinnedThreadIDs(ids)
             }
+        refreshSelectedThreadCache()
 
     }
 
@@ -440,8 +483,30 @@ final class OnyxAppModel: ObservableObject {
         sideChatTurnTask?.cancel()
     }
 
+    private func refreshSelectedThreadCache() {
+        guard let selectedThreadID else {
+            selectedThreadCache = nil
+            selectedThreadCacheNeedsRefresh = false
+            return
+        }
+        // The New Task composer is intentionally absent from the durable
+        // provider catalog. Resolve that synthetic selection directly instead
+        // of scanning thousands of provider tasks for an id that cannot be
+        // present after ordinary New Task navigation.
+        if selectedThreadID == Self.welcomeThread.id {
+            selectedThreadCache = Self.welcomeThread
+            selectedThreadCacheNeedsRefresh = false
+            return
+        }
+        selectedThreadCache = threadIndex(for: selectedThreadID).map { threads[$0] }
+        selectedThreadCacheNeedsRefresh = false
+    }
+
     var selectedThread: RuntimeThread? {
-        threads.first { $0.id == selectedThreadID }
+        if selectedThreadCacheNeedsRefresh {
+            refreshSelectedThreadCache()
+        }
+        return selectedThreadCache
     }
 
     /// The model originally recorded by the provider remains the task default.
@@ -567,6 +632,18 @@ final class OnyxAppModel: ObservableObject {
               canRunAgent,
               sideChatInteraction?.isBlocking != true else { return false }
         return !sideChatComposerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !sideChatComposerImages.isEmpty
+    }
+
+    var canAttachSideChatImages: Bool {
+        guard isSideChatPresented,
+              !isSideChatLoading,
+              supports(.images),
+              canRunAgent else { return false }
+        guard let sideChatModelID,
+              let model = session?.availableModels.first(where: { $0.id == sideChatModelID })
+        else { return true }
+        return model.inputModalities.contains(.image)
     }
 
     var sideChatModelName: String {
@@ -672,6 +749,27 @@ final class OnyxAppModel: ObservableObject {
                 || $0.preview.localizedCaseInsensitiveContains(query)
                 || ($0.cwd?.localizedCaseInsensitiveContains(query) ?? false)
         }
+    }
+
+    /// The synthetic New Task row is relevant only while it is selected.
+    /// Exposing it directly avoids scanning the complete task history every
+    /// time SwiftUI reevaluates the sidebar during transcript streaming.
+    var sidebarWelcomeThread: RuntimeThread? {
+        selectedThreadID == Self.welcomeThread.id ? Self.welcomeThread : nil
+    }
+
+    /// Durable provider tasks exclude Onyx's synthetic composer row. Keeping
+    /// that row out of the published multi-thousand-task array means New Task
+    /// can change selection without copying and republishing the whole list.
+    var catalogThreads: [RuntimeThread] {
+        if catalogThreadsCacheRevision == threadListRevision {
+            return catalogThreadsCache
+        }
+        // Filter by identity rather than relying on the synthetic row staying
+        // at index zero. A provider update can reorder the array by recency.
+        catalogThreadsCache = threads.filter { $0.id != Self.welcomeThread.id }
+        catalogThreadsCacheRevision = threadListRevision
+        return catalogThreadsCache
     }
 
     var projectName: String {
@@ -785,19 +883,105 @@ final class OnyxAppModel: ObservableObject {
     }
 
     func addPastedComposerImages(_ images: [NSImage]) {
-        addComposerImages(images.enumerated().map { index, image in
-            Result {
-                try ComposerImageValidator.pastedImage(
-                    image,
-                    name: images.count == 1 ? "Pasted image" : "Pasted image \(index + 1)"
-                )
-            }
-        })
+        guard canAttachImages else {
+            notice = ("Images are not available", "The selected runtime does not support image input for this task.")
+            return
+        }
+        let epoch = accountEpoch
+        let draftKey = composerDraftKey
+        Task { [weak self] in
+            let results = await ComposerImageValidator.pastedImages(images)
+            guard let self,
+                  accountEpoch == epoch,
+                  composerDraftKey == draftKey else { return }
+            addComposerImages(results)
+        }
     }
 
     func removeComposerImage(id: UUID) {
         composerImages.removeAll { $0.id == id }
         saveCurrentImageDraftNow()
+    }
+
+    func chooseSideChatImages(window: NSWindow?) {
+        guard canAttachSideChatImages else {
+            notice = ("Images are not available", "The side chat model does not support image input.")
+            return
+        }
+        let epoch = accountEpoch
+        let generation = sideChatGeneration
+        let panel = NSOpenPanel()
+        panel.title = "Attach images to side chat"
+        panel.prompt = "Attach"
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = true
+        panel.allowedContentTypes = [.png, .jpeg, .gif, .webP, .heic, .heif]
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .OK else { return }
+            Task { @MainActor [weak self] in
+                guard let self,
+                      accountEpoch == epoch,
+                      sideChatGeneration == generation,
+                      isSideChatPresented else { return }
+                addSideChatImageFiles(panel.urls)
+            }
+        }
+        guard let window else { return }
+        panel.beginSheetModal(for: window, completionHandler: completion)
+    }
+
+    func addSideChatImageFiles(_ urls: [URL]) {
+        addSideChatImages(urls.map { url in
+            Result { try ComposerImageValidator.localFile(at: url) }
+        })
+    }
+
+    func addPastedSideChatImages(_ images: [NSImage]) {
+        guard canAttachSideChatImages else {
+            notice = ("Images are not available", "The side chat model does not support image input.")
+            return
+        }
+        let epoch = accountEpoch
+        let generation = sideChatGeneration
+        Task { [weak self] in
+            let results = await ComposerImageValidator.pastedImages(images)
+            guard let self,
+                  accountEpoch == epoch,
+                  sideChatGeneration == generation,
+                  isSideChatPresented else { return }
+            addSideChatImages(results)
+        }
+    }
+
+    func removeSideChatImage(id: UUID) {
+        sideChatComposerImages.removeAll { $0.id == id }
+    }
+
+    private func addSideChatImages(_ results: [Result<ComposerImageDraft, any Error>]) {
+        guard canAttachSideChatImages else {
+            notice = ("Images are not available", "The side chat model does not support image input.")
+            return
+        }
+        var accepted = sideChatComposerImages
+        var firstError: (any Error)?
+        for result in results {
+            guard accepted.count < ComposerImageValidator.maximumCount else {
+                firstError = firstError ?? ComposerImageValidationError.tooMany(
+                    maximum: ComposerImageValidator.maximumCount
+                )
+                break
+            }
+            do {
+                accepted.append(try result.get())
+            } catch {
+                firstError = firstError ?? error
+            }
+        }
+        sideChatComposerImages = accepted
+        if let firstError {
+            notice = ("Could not attach image", firstError.localizedDescription)
+        }
     }
 
     private func addComposerImages(_ results: [Result<ComposerImageDraft, any Error>]) {
@@ -1035,6 +1219,7 @@ final class OnyxAppModel: ObservableObject {
         connectionRevision &+= 1
         let revision = connectionRevision
         let epoch = accountEpoch
+        let navigationAtStart = navigationRevision
         connectionTask?.cancel()
         connectionState = .connecting
         if notice?.title == connectionFailureNoticeTitle {
@@ -1087,10 +1272,22 @@ final class OnyxAppModel: ObservableObject {
                     isLoadingThreadList = false
                     return
                 }
+                // A user navigation that happened while the catalog was in
+                // flight owns the visible selection. The one exception is an
+                // explicit New Task action: its welcome selection must win
+                // over the restored/refresh selection captured above.
+                guard navigationRevision == navigationAtStart
+                        || hasExplicitNewTaskSelection else {
+                    isLoadingThreadList = false
+                    return
+                }
+                let effectivePreferredSelection = hasExplicitNewTaskSelection
+                    ? Self.welcomeThread.id
+                    : preferredSelection
                 applyThreadList(
                     liveThreads,
                     scope: scope,
-                    preferredSelection: preferredSelection
+                    preferredSelection: effectivePreferredSelection
                 )
                 pendingRestoredSelectionID = nil
 
@@ -1116,6 +1313,9 @@ final class OnyxAppModel: ObservableObject {
 
     func selectThread(_ id: String) {
         guard selectedThreadID != id else { return }
+        if id != Self.welcomeThread.id {
+            hasExplicitNewTaskSelection = false
+        }
         closeSideChat()
         saveCurrentDraftNow()
         saveCurrentImageDraftNow()
@@ -1126,7 +1326,8 @@ final class OnyxAppModel: ObservableObject {
         preferences.set(id, forKey: preferenceKey(PreferenceKey.selectedThread))
         loadComposerDraft(for: id)
         loadTask?.cancel()
-        isTurnRunning = threads.first(where: { $0.id == id }).map {
+        let selected = selectedThread
+        isTurnRunning = selected.map {
             $0.status.isBusy || isReviewActive(for: $0.id)
         } ?? false
 
@@ -1136,7 +1337,7 @@ final class OnyxAppModel: ObservableObject {
             return
         }
 
-        rememberWorkspace(threads.first(where: { $0.id == id })?.cwd)
+        rememberWorkspace(selected?.cwd)
 
         isLoadingThread = true
         replaceTimeline([])
@@ -1198,6 +1399,7 @@ final class OnyxAppModel: ObservableObject {
         sideChatThreadID = nil
         replaceSideChatTimeline([])
         sideChatComposerText = ""
+        sideChatComposerImages = []
         sideChatError = nil
         isSideChatPresented = true
         isSideChatLoading = true
@@ -1247,6 +1449,24 @@ final class OnyxAppModel: ObservableObject {
     /// turn is live, interrupt it best-effort so closing the panel does not
     /// leave an invisible provider turn consuming resources.
     func closeSideChat() {
+        // This path is also used by every navigation action. Avoid publishing
+        // a dozen unchanged side-chat properties when the panel has never
+        // been opened; those publications used to make a simple New Task
+        // click rebuild the workspace repeatedly.
+        guard isSideChatPresented
+                || isSideChatLoading
+                || sideChatParentThreadID != nil
+                || sideChatThreadID != nil
+                || !sideChatTimeline.isEmpty
+                || !sideChatComposerText.isEmpty
+                || !sideChatComposerImages.isEmpty
+                || isSideChatTurnRunning
+                || sideChatInteraction != nil
+                || isRespondingToSideChatInteraction
+                || sideChatError != nil
+                || sideChatForkTask != nil
+                || sideChatTurnTask != nil else { return }
+
         let threadID = sideChatThreadID
         let shouldInterrupt = isSideChatTurnRunning
         if let interactionID = sideChatInteraction?.id {
@@ -1268,6 +1488,7 @@ final class OnyxAppModel: ObservableObject {
         sideChatThreadID = nil
         replaceSideChatTimeline([])
         sideChatComposerText = ""
+        sideChatComposerImages = []
         isSideChatTurnRunning = false
         sideChatInteraction = nil
         isRespondingToSideChatInteraction = false
@@ -1283,13 +1504,21 @@ final class OnyxAppModel: ObservableObject {
     func sendSideChat() {
         let draft = sideChatComposerText
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty,
+        let images = sideChatComposerImages
+        guard !text.isEmpty || !images.isEmpty,
               isSideChatPresented,
               !isSideChatLoading,
               let threadID = sideChatThreadID,
               let runtime,
               canRunAgent,
               sideChatInteraction?.isBlocking != true else { return }
+        guard images.isEmpty || canAttachSideChatImages else {
+            notice = (
+                "Images are not available",
+                "The side chat model cannot receive these attachments. Remove them and try again."
+            )
+            return
+        }
 
         let generation = sideChatGeneration
         let epoch = accountEpoch
@@ -1301,8 +1530,10 @@ final class OnyxAppModel: ObservableObject {
         let steeringModelID = parentID.flatMap { parentID in
             threads.first(where: { $0.id == parentID })?.model
         } ?? modelID
+        let inputs: [RuntimeTurnInput] = (text.isEmpty ? [] : [.text(text)]) + images.map(\.input)
 
         sideChatComposerText = ""
+        sideChatComposerImages = []
         sideChatError = nil
         appendSideChatTimeline(
             TimelineItem(
@@ -1312,7 +1543,8 @@ final class OnyxAppModel: ObservableObject {
                 body: text,
                 status: .completed,
                 timestamp: .now,
-                detail: nil
+                detail: nil,
+                attachments: images.map(\.timelineAttachment)
             )
         )
         isSideChatTurnRunning = true
@@ -1322,13 +1554,13 @@ final class OnyxAppModel: ObservableObject {
             guard let self else { return }
             do {
                 if wasRunning {
-                    try await runtime.steer(threadID: threadID, inputs: [.text(text)])
+                    try await runtime.steer(threadID: threadID, inputs: inputs)
                     recordModelUsageIfAvailable(steeringModelID)
                 } else {
                     try await runtime.startTurn(
                         StartTurnRequest(
                             threadID: threadID,
-                            inputs: [.text(text)],
+                            inputs: inputs,
                             model: modelID,
                             cwd: cwd,
                             reasoningEffort: reasoningEffort,
@@ -1351,7 +1583,15 @@ final class OnyxAppModel: ObservableObject {
                       sideChatThreadID == threadID,
                       !Task.isCancelled else { return }
                 isSideChatTurnRunning = false
-                sideChatComposerText = draft
+                let laterDraft = sideChatComposerText
+                if laterDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    sideChatComposerText = draft
+                } else if laterDraft != draft {
+                    sideChatComposerText = draft.isEmpty ? laterDraft : draft + "\n\n" + laterDraft
+                }
+                let laterInputs = Set(sideChatComposerImages.map(\.input))
+                sideChatComposerImages = images.filter { !laterInputs.contains($0.input) }
+                    + sideChatComposerImages
                 sideChatError = error.localizedDescription
                 appendSideChatTimeline(
                     TimelineItem(
@@ -1444,25 +1684,119 @@ final class OnyxAppModel: ObservableObject {
     }
 
     func newTask() {
+        // Treat a blank welcome surface as an idempotent click before
+        // cancelling any in-flight list refresh. This matters while the first
+        // active catalog is still loading: repeated clicks should not restart
+        // a full provider fetch or queue several 4,824-row results.
+        let isBlankWelcome = threadListScope == .active
+            && selectedThreadID == Self.welcomeThread.id
+            && composerText.isEmpty
+            && composerImages.isEmpty
+            && timeline.count == 1
+            && timeline.first?.id == "onyx-welcome"
+        if isBlankWelcome && !isTurnRunning
+                && (hasExplicitNewTaskSelection
+                    || (pendingRestoredSelectionID == nil && !isLoadingThreadList)) {
+            return
+        }
+
+        hasExplicitNewTaskSelection = true
+        pendingRestoredSelectionID = nil
         closeSideChat()
-        saveCurrentDraftNow()
+        loadTask?.cancel()
+        let wasActiveScope = threadListScope == .active
+        let canReuseConnectionRefresh = wasActiveScope
+            && isLoadingThreadList
+            && connectionTask != nil
+            && threadListTask == nil
+        threadListTask?.cancel()
+        threadListTask = nil
+
+        // New Task is also the escape hatch from the Archived view. Clear the
+        // archived rows before changing scope so the workspace never projects
+        // them into the active project catalog while the active list refreshes.
+        // Mark the list as loading first; the workspace's catalog synchronizer
+        // will wait for the active fetch instead of recording a transient
+        // archived snapshot under the active scope.
+        let shouldClearCurrentList = threadListScope != .active || isLoadingThreadList
+        let shouldRefreshActiveList = threadListScope != .active
+            || (isLoadingThreadList && !canReuseConnectionRefresh)
+        if shouldClearCurrentList {
+            isLoadingThreadList = true
+            threads = [Self.welcomeThread]
+            threadListScope = .active
+        }
+
+        // Navigation must preserve the task being left, but serializing the
+        // entire draft dictionary must not hold the main actor. Stage the
+        // final in-memory snapshot first and let the revisioned writer handle
+        // UserDefaults on its utility queue.
+        draftSaveTask?.cancel()
+        draftSaveTask = nil
+        updateDraftCache(composerText, for: composerDraftKey)
         saveCurrentImageDraftNow()
         navigationRevision += 1
-        loadTask?.cancel()
-        threadListTask?.cancel()
-        threadListScope = .active
-        selectedThreadID = Self.welcomeThread.id
+        if threadListScope != .active { threadListScope = .active }
+        if selectedThreadID != Self.welcomeThread.id {
+            selectedThreadID = Self.welcomeThread.id
+        }
         preferences.set(Self.welcomeThread.id, forKey: preferenceKey(PreferenceKey.selectedThread))
         composerDraftKey = Self.welcomeThread.id
-        composerText = ""
-        composerImages = []
-        saveCurrentDraftNow()
+        if !composerText.isEmpty { composerText = "" }
+        if !composerImages.isEmpty { composerImages = [] }
+        draftSaveTask?.cancel()
+        draftSaveTask = nil
+        updateDraftCache(composerText, for: composerDraftKey)
+        persistComposerDraftCache(mode: .background)
         saveCurrentImageDraftNow()
-        if !threads.contains(where: { $0.id == Self.welcomeThread.id }) {
-            threads.insert(Self.welcomeThread, at: 0)
+        if timeline.count != 1 || timeline.first?.id != "onyx-welcome" {
+            replaceTimeline([.welcome()])
         }
-        replaceTimeline([.welcome()])
-        isTurnRunning = false
+        if isLoadingThread { isLoadingThread = false }
+        if isTurnRunning { isTurnRunning = false }
+
+        if shouldRefreshActiveList, let runtime {
+            let epoch = accountEpoch
+            let navigationAtStart = navigationRevision
+            isLoadingThreadList = true
+            threadListTask = Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let liveThreads = try await runtime.listAllThreads(archived: false).map { thread in
+                        var projected = thread
+                        projected.isPinned = self.pinnedThreadIDs.contains(thread.id)
+                        return projected
+                    }
+                    let navigationStillValid = navigationRevision == navigationAtStart
+                        || hasExplicitNewTaskSelection
+                    guard accountEpoch == epoch,
+                          !Task.isCancelled,
+                          threadListScope == .active,
+                          navigationStillValid else {
+                        if accountEpoch == epoch,
+                           threadListScope == .active,
+                           !hasExplicitNewTaskSelection {
+                            isLoadingThreadList = false
+                        }
+                        return
+                    }
+                    applyThreadList(
+                        liveThreads,
+                        scope: .active,
+                        preferredSelection: Self.welcomeThread.id
+                    )
+                } catch {
+                    guard accountEpoch == epoch,
+                          !Task.isCancelled,
+                          threadListScope == .active else { return }
+                    isLoadingThreadList = false
+                    notice = ("Connected, but tasks did not refresh", error.localizedDescription)
+                }
+            }
+        } else if shouldRefreshActiveList {
+            isLoadingThreadList = false
+        }
+
     }
 
     /// Commits debounced window-owned state before its scene is released.
@@ -1470,7 +1804,17 @@ final class OnyxAppModel: ObservableObject {
     /// cancel the pending draft write in deinit.
     func flushWindowState() {
         closeSideChat()
-        saveCurrentDraftNow()
+        saveCurrentDraftNow(mode: .synchronous)
+        saveCurrentImageDraftNow()
+    }
+
+    /// Stages state before replacing this model inside a still-open window.
+    /// Provider/model switches are interactive navigation, so they must not
+    /// synchronously serialize every saved draft on the main actor. True scene
+    /// teardown continues to use `flushWindowState()` as the durability fence.
+    func stageWindowStateForReplacement() {
+        closeSideChat()
+        saveCurrentDraftNow(mode: .background)
         saveCurrentImageDraftNow()
     }
 
@@ -1553,8 +1897,10 @@ final class OnyxAppModel: ObservableObject {
         let images = composerImages
         guard !text.isEmpty || !images.isEmpty else { return }
 
-        // Make the typed text durable before any validation or provider call.
-        // The later clear remains optimistic on a valid submission.
+        // Snapshot the exact draft before validation or any provider call.
+        // Ordinary persistence is serialized on the utility queue so the
+        // click can paint immediately; window/app teardown uses the explicit
+        // synchronous flush boundary.
         saveCurrentDraftNow()
         saveCurrentImageDraftNow()
 
@@ -1753,10 +2099,7 @@ final class OnyxAppModel: ObservableObject {
                         )
                         isTurnRunning = true
                     }
-                    if let index = threads.firstIndex(where: { $0.id == threadID }) {
-                        threads[index].status = .running
-                        threads[index].updatedAt = .now
-                    }
+                    updateThreadLifecycle(id: threadID, status: .running)
                     try await runtime.startTurn(
                         StartTurnRequest(
                             threadID: threadID,
@@ -1781,9 +2124,8 @@ final class OnyxAppModel: ObservableObject {
                 }
                 let failure = sendFailureMessage(for: error)
                 notice = failure
-                if let targetThreadID,
-                   let index = threads.firstIndex(where: { $0.id == targetThreadID }) {
-                    threads[index].status = .idle
+                if let targetThreadID {
+                    mutateThread(id: targetThreadID) { $0.status = .idle }
                 }
                 if selectedThreadID == targetThreadID
                     || (targetThreadID == nil && navigationRevision == context.navigationRevision) {
@@ -1838,10 +2180,7 @@ final class OnyxAppModel: ObservableObject {
         // Track the review before awaiting the response because app-server may
         // deliver turn notifications while `review/start` is still pending.
         reviewingThreadID = threadID
-        if let index = threads.firstIndex(where: { $0.id == threadID }) {
-            threads[index].status = .running
-            threads[index].updatedAt = .now
-        }
+        updateThreadLifecycle(id: threadID, status: .running)
         if selectedThreadID == threadID { isTurnRunning = true }
 
         Task { [weak self] in
@@ -1858,10 +2197,7 @@ final class OnyxAppModel: ObservableObject {
                     return
                 }
                 startingReviewThreadID = nil
-                if let index = threads.firstIndex(where: { $0.id == threadID }) {
-                    threads[index].status = .running
-                    threads[index].updatedAt = .now
-                }
+                updateThreadLifecycle(id: threadID, status: .running)
                 if selectedThreadID == threadID, navigationRevision == revision {
                     isTurnRunning = true
                 }
@@ -1869,9 +2205,8 @@ final class OnyxAppModel: ObservableObject {
                 guard accountEpoch == epoch, !Task.isCancelled else { return }
                 if startingReviewThreadID == threadID { startingReviewThreadID = nil }
                 if reviewingThreadID == threadID { reviewingThreadID = nil }
-                if let index = threads.firstIndex(where: { $0.id == threadID }),
-                   threads[index].status == .running {
-                    threads[index].status = originalStatus
+                if threadIndex(for: threadID).map({ threads[$0].status }) == .running {
+                    mutateThread(id: threadID) { $0.status = originalStatus }
                 }
                 if selectedThreadID == threadID {
                     isTurnRunning = originalStatus.isBusy
@@ -2022,12 +2357,16 @@ final class OnyxAppModel: ObservableObject {
     func restore(_ id: String) {
         guard isShowingArchivedThreads, let runtime else { return }
         threadListTask?.cancel()
+        navigationRevision += 1
+        let navigationAtStart = navigationRevision
         let epoch = accountEpoch
         Task { [weak self] in
             guard let self else { return }
             do {
                 try await runtime.unarchiveThread(id: id)
-                guard accountEpoch == epoch, !Task.isCancelled else { return }
+                guard accountEpoch == epoch,
+                      navigationRevision == navigationAtStart,
+                      !Task.isCancelled else { return }
                 threadListScope = .active
                 threads = [Self.welcomeThread]
                 selectedThreadID = nil
@@ -2037,10 +2376,14 @@ final class OnyxAppModel: ObservableObject {
                 isLoadingThreadList = true
 
                 let liveThreads = try await fetchThreads(in: .active)
-                guard accountEpoch == epoch, !Task.isCancelled else { return }
+                guard accountEpoch == epoch,
+                      navigationRevision == navigationAtStart,
+                      !Task.isCancelled else { return }
                 applyThreadList(liveThreads, scope: .active, preferredSelection: id)
             } catch {
-                guard accountEpoch == epoch, !Task.isCancelled else { return }
+                guard accountEpoch == epoch,
+                      navigationRevision == navigationAtStart,
+                      !Task.isCancelled else { return }
                 isLoadingThreadList = false
                 notice = ("Could not restore task", error.localizedDescription)
             }
@@ -2087,9 +2430,7 @@ final class OnyxAppModel: ObservableObject {
                 try await runtime.compactThread(id: id)
                 guard accountEpoch == epoch, !Task.isCancelled else { return }
                 if selectedThreadID == id { isTurnRunning = true }
-                if let index = threads.firstIndex(where: { $0.id == id }) {
-                    threads[index].status = .running
-                }
+                mutateThread(id: id) { $0.status = .running }
             } catch {
                 guard accountEpoch == epoch, !Task.isCancelled else { return }
                 notice = ("Could not compact task", error.localizedDescription)
@@ -2208,18 +2549,14 @@ final class OnyxAppModel: ObservableObject {
             }
         case let .threadNameChanged(threadID, name):
             guard authState.canRun, !isSigningOut else { return }
-            if let index = threads.firstIndex(where: { $0.id == threadID }) {
-                threads[index].title = name?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
-                    ?? threads[index].preview.firstNonemptyLine
+            mutateThread(id: threadID) { thread in
+                thread.title = name?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+                    ?? thread.preview.firstNonemptyLine
                     ?? "Untitled task"
             }
         case let .threadStatusChanged(threadID, status):
             guard authState.canRun, !isSigningOut else { return }
-            if let index = threads.firstIndex(where: { $0.id == threadID }) {
-                threads[index].status = status
-                threads[index].updatedAt = .now
-                sortThreadsByRecency()
-            }
+            updateThreadLifecycle(id: threadID, status: status)
             if selectedThreadID == threadID {
                 isTurnRunning = status.isBusy || isReviewActive(for: threadID)
             }
@@ -2254,11 +2591,11 @@ final class OnyxAppModel: ObservableObject {
             removeThreadFromCurrentList(threadID)
             pinnedThreadStore.remove(threadID)
             plansByThreadID.removeValue(forKey: threadID)
-            composerDrafts.removeValue(forKey: threadID)
+            updateDraftCache("", for: threadID)
             composerImageDrafts.removeValue(forKey: threadID)
             taskModelOverrides.removeValue(forKey: threadID)
             taskModelDefaults.removeValue(forKey: threadID)
-            preferences.set(composerDrafts, forKey: preferenceKey(PreferenceKey.composerDrafts))
+            persistComposerDraftCache(mode: .background)
             persistTaskModelSelections()
         case let .threadRefreshRequested(threadID):
             guard authState.canRun, !isSigningOut else { return }
@@ -2313,11 +2650,7 @@ final class OnyxAppModel: ObservableObject {
             }
         case let .turnCompleted(threadID, status):
             guard authState.canRun, !isSigningOut else { return }
-            if let index = threads.firstIndex(where: { $0.id == threadID }) {
-                threads[index].status = status
-                threads[index].updatedAt = .now
-                sortThreadsByRecency()
-            }
+            updateThreadLifecycle(id: threadID, status: status)
             activeTurnIDsByThreadID.removeValue(forKey: threadID)
             if selectedThreadID == threadID {
                 flushDeltas()
@@ -2519,16 +2852,120 @@ final class OnyxAppModel: ObservableObject {
     private func updateThread(_ thread: RuntimeThread) {
         var thread = thread
         thread.isPinned = pinnedThreadIDs.contains(thread.id)
-        if let index = threads.firstIndex(where: { $0.id == thread.id }) {
-            threads[index] = thread
-        } else {
-            threads.insert(thread, at: 0)
-        }
-        threads.sort { $0.updatedAt > $1.updatedAt }
+        upsertThreadInRecencyOrder(thread)
         if selectedThreadID == thread.id {
             isTurnRunning = thread.status.isBusy || isReviewActive(for: thread.id)
             validateSelectedReasoningEffort()
         }
+    }
+
+    private func threadIndex(for id: String) -> Int? {
+        if threadIndexCacheRevision != threadListRevision {
+            var rebuilt: [String: Int] = [:]
+            rebuilt.reserveCapacity(threads.count)
+            for (index, thread) in threads.enumerated() {
+                rebuilt[thread.id] = index
+            }
+            threadIndexByID = rebuilt
+            threadIndexCacheRevision = threadListRevision
+        }
+        return threadIndexByID[id]
+    }
+
+    /// Mutates one row while preserving the id-to-index cache. This still
+    /// publishes the user-visible lifecycle change immediately, but avoids a
+    /// second catalog scan when SwiftUI asks for the selected task/sidebar.
+    @discardableResult
+    private func mutateThread(
+        id: String,
+        _ mutation: (inout RuntimeThread) -> Void
+    ) -> RuntimeThread? {
+        guard let index = threadIndex(for: id), threads.indices.contains(index) else { return nil }
+        let previous = threads[index]
+        var updated = previous
+        mutation(&updated)
+        guard updated != previous else { return previous }
+        threads[index] = updated
+        // `didSet` invalidates every derived cache conservatively. The row's
+        // identity and position did not change, so this index remains exact.
+        threadIndexCacheRevision = threadListRevision
+        return updated
+    }
+
+    /// A lifecycle timestamp makes one task recent. Remove and binary-insert
+    /// just that task instead of sorting the complete catalog on the main
+    /// actor. Array movement is linear in the affected range; comparisons are
+    /// logarithmic and there is only one `@Published` assignment.
+    private func updateThreadLifecycle(
+        id: String,
+        status: RuntimeThreadStatus,
+        updatedAt: Date = .now
+    ) {
+        guard let sourceIndex = threadIndex(for: id), threads.indices.contains(sourceIndex) else {
+            return
+        }
+        var updated = threads[sourceIndex]
+        updated.status = status
+        updated.updatedAt = updatedAt
+        var reordered = threads
+        reordered.remove(at: sourceIndex)
+        let destinationIndex = Self.recencyInsertionIndex(for: updated, in: reordered)
+        reordered.insert(updated, at: destinationIndex)
+        threads = reordered
+        repairThreadIndexCache(
+            from: min(sourceIndex, destinationIndex),
+            through: max(sourceIndex, destinationIndex)
+        )
+    }
+
+    private func upsertThreadInRecencyOrder(_ thread: RuntimeThread) {
+        let sourceIndex = threadIndex(for: thread.id)
+        var reordered = threads
+        if let sourceIndex { reordered.remove(at: sourceIndex) }
+        let destinationIndex = Self.recencyInsertionIndex(for: thread, in: reordered)
+        reordered.insert(thread, at: destinationIndex)
+        threads = reordered
+        if let sourceIndex {
+            repairThreadIndexCache(
+                from: min(sourceIndex, destinationIndex),
+                through: max(sourceIndex, destinationIndex)
+            )
+        } else {
+            repairThreadIndexCache(from: destinationIndex, through: threads.count - 1)
+        }
+    }
+
+    private static func recencyInsertionIndex(
+        for thread: RuntimeThread,
+        in sortedThreads: [RuntimeThread]
+    ) -> Int {
+        var lower = 0
+        var upper = sortedThreads.count
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2
+            if sortedThreads[middle].updatedAt > thread.updatedAt {
+                lower = middle + 1
+            } else {
+                upper = middle
+            }
+        }
+        return lower
+    }
+
+    private func repairThreadIndexCache(from lowerBound: Int, through upperBound: Int) {
+        guard !threads.isEmpty else {
+            threadIndexByID.removeAll(keepingCapacity: true)
+            threadIndexCacheRevision = threadListRevision
+            return
+        }
+        let lowerBound = max(0, lowerBound)
+        let upperBound = min(threads.count - 1, upperBound)
+        if lowerBound <= upperBound {
+            for index in lowerBound...upperBound {
+                threadIndexByID[threads[index].id] = index
+            }
+        }
+        threadIndexCacheRevision = threadListRevision
     }
 
     private func replaceTimeline(_ items: [TimelineItem], authoritativeFor threadID: String? = nil) {
@@ -2808,10 +3245,6 @@ final class OnyxAppModel: ObservableObject {
         if changed { publishCollaborationAgents() }
     }
 
-    private func sortThreadsByRecency() {
-        threads.sort { $0.updatedAt > $1.updatedAt }
-    }
-
     private func applyPinnedThreadIDs(_ ids: Set<String>) {
         for index in threads.indices where threads[index].id != Self.welcomeThread.id {
             threads[index].isPinned = ids.contains(threads[index].id)
@@ -3033,11 +3466,11 @@ final class OnyxAppModel: ObservableObject {
             guard accountEpoch == epoch, !Task.isCancelled else { return }
             removeThreadFromCurrentList(id)
             pinnedThreadStore.remove(id)
-            composerDrafts.removeValue(forKey: id)
+            updateDraftCache("", for: id)
             composerImageDrafts.removeValue(forKey: id)
             taskModelOverrides.removeValue(forKey: id)
             taskModelDefaults.removeValue(forKey: id)
-            preferences.set(composerDrafts, forKey: preferenceKey(PreferenceKey.composerDrafts))
+            persistComposerDraftCache(mode: .background)
             persistTaskModelSelections()
         } catch {
             guard accountEpoch == epoch, !Task.isCancelled else { return }
@@ -3166,11 +3599,13 @@ final class OnyxAppModel: ObservableObject {
         respondingInteractionIDs.removeAll()
         removeAllInteractionDrafts()
         pendingRestoredSelectionID = nil
+        hasExplicitNewTaskSelection = false
         cancelledLoginID = nil
         loginAttempt = nil
         isAuthenticating = false
 
         composerDrafts.removeAll()
+        pendingComposerDraftMutations.removeAll(keepingCapacity: true)
         composerImageDrafts.removeAll()
         taskModelOverrides.removeAll()
         taskModelDefaults.removeAll()
@@ -3196,7 +3631,7 @@ final class OnyxAppModel: ObservableObject {
         notice = nil
 
         preferences.removeObject(forKey: preferenceKey(PreferenceKey.selectedThread))
-        preferences.removeObject(forKey: preferenceKey(PreferenceKey.composerDrafts))
+        removePersistedComposerDrafts(mode: .synchronous)
         preferences.removeObject(forKey: preferenceKey(PreferenceKey.taskModelOverrides))
         preferences.removeObject(forKey: preferenceKey(PreferenceKey.taskModelDefaults))
         preferences.removeObject(forKey: preferenceKey("Onyx.lastWorkspacePath"))
@@ -3319,7 +3754,7 @@ final class OnyxAppModel: ObservableObject {
 
         let followUp = composerDrafts[sourceKey] ?? ""
         let followUpImages = composerImageDrafts[sourceKey] ?? []
-        composerDrafts.removeValue(forKey: sourceKey)
+        updateDraftCache("", for: sourceKey)
         composerImageDrafts.removeValue(forKey: sourceKey)
         persistDraft(followUp, for: targetKey)
         persistImageDraft(followUpImages, for: targetKey)
@@ -3331,6 +3766,7 @@ final class OnyxAppModel: ObservableObject {
 
         navigationRevision += 1
         selectedThreadID = thread.id
+        hasExplicitNewTaskSelection = false
         preferences.set(thread.id, forKey: preferenceKey(PreferenceKey.selectedThread))
         composerDraftKey = targetKey
         composerText = followUp
@@ -3346,22 +3782,40 @@ final class OnyxAppModel: ObservableObject {
         }
 
         let isVisibleSource = composerDraftKey == provisionalKey
+        let isVisibleOrigin = composerDraftKey == context.sourceDraftKey
         if isVisibleSource {
             saveCurrentDraftNow()
             saveCurrentImageDraftNow()
         }
         let followUp = composerDrafts[provisionalKey] ?? ""
         let followUpImages = composerImageDrafts[provisionalKey] ?? []
-        composerDrafts.removeValue(forKey: provisionalKey)
+        updateDraftCache("", for: provisionalKey)
         composerImageDrafts.removeValue(forKey: provisionalKey)
 
-        let restored: String
+        let restoredAttempt: String
         if followUp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            restored = context.draftText
+            restoredAttempt = context.draftText
         } else if followUp == context.draftText {
-            restored = followUp
+            restoredAttempt = followUp
         } else {
-            restored = context.draftText + "\n\n" + followUp
+            restoredAttempt = context.draftText + "\n\n" + followUp
+        }
+        // New Task can expose the welcome composer again while start-thread is
+        // still pending. Preserve anything typed there instead of replacing it
+        // with the failed request. Keep the failed request first so both pieces
+        // remain recoverable and the existing follow-up ordering is unchanged.
+        let existingOriginDraft = if isVisibleOrigin {
+            composerText
+        } else {
+            composerDrafts[context.sourceDraftKey] ?? ""
+        }
+        let restored: String
+        if existingOriginDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            restored = restoredAttempt
+        } else if existingOriginDraft == restoredAttempt {
+            restored = existingOriginDraft
+        } else {
+            restored = restoredAttempt + "\n\n" + existingOriginDraft
         }
         persistDraft(restored, for: context.sourceDraftKey)
         persistImageDraft(mergedFailedImages(context.images, with: followUpImages), for: context.sourceDraftKey)
@@ -3370,6 +3824,9 @@ final class OnyxAppModel: ObservableObject {
            navigationRevision == context.navigationRevision,
            selectedThreadID == context.originThreadID {
             composerDraftKey = context.sourceDraftKey
+            composerText = restored
+            composerImages = composerImageDrafts[context.sourceDraftKey] ?? []
+        } else if isVisibleOrigin {
             composerText = restored
             composerImages = composerImageDrafts[context.sourceDraftKey] ?? []
         }
@@ -3429,15 +3886,19 @@ final class OnyxAppModel: ObservableObject {
         draftSaveTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(350))
             guard let self, !Task.isCancelled else { return }
-            persistDraft(text, for: key)
+            updateDraftCache(text, for: key)
+            persistComposerDraftCache(mode: .background)
             draftSaveTask = nil
         }
     }
 
-    private func saveCurrentDraftNow() {
+    private func saveCurrentDraftNow(
+        mode: OnyxComposerDraftPersistenceMode = .background
+    ) {
         draftSaveTask?.cancel()
         draftSaveTask = nil
-        persistDraft(composerText, for: composerDraftKey)
+        updateDraftCache(composerText, for: composerDraftKey)
+        persistComposerDraftCache(mode: mode)
     }
 
     private func saveCurrentImageDraftNow() {
@@ -3453,12 +3914,44 @@ final class OnyxAppModel: ObservableObject {
     }
 
     private func persistDraft(_ text: String, for key: String) {
-        if text.isEmpty {
+        updateDraftCache(text, for: key)
+        // These calls reconcile a completed/failed turn after the user-visible
+        // state has already been updated. They must not make the main actor
+        // wait for serialization of every draft in the window.
+        persistComposerDraftCache(mode: .background)
+    }
+
+    private func updateDraftCache(_ text: String, for key: String) {
+        let mutation = OnyxComposerDraftMutation.replacingDraft(text, for: key)
+        pendingComposerDraftMutations[key] = mutation
+        if case .remove = mutation {
             composerDrafts.removeValue(forKey: key)
         } else {
             composerDrafts[key] = text
         }
-        preferences.set(composerDrafts, forKey: preferenceKey(PreferenceKey.composerDrafts))
+    }
+
+    private func persistComposerDraftCache(mode: OnyxComposerDraftPersistenceMode) {
+        let mutations = Array(pendingComposerDraftMutations.values)
+        pendingComposerDraftMutations.removeAll(keepingCapacity: true)
+        composerDraftPersistenceRevision &+= 1
+        composerDraftPersistence.persistChanges(
+            mutations,
+            currentDrafts: composerDrafts,
+            forKey: preferenceKey(PreferenceKey.composerDrafts),
+            revision: composerDraftPersistenceRevision,
+            mode: mode
+        )
+    }
+
+    private func removePersistedComposerDrafts(mode: OnyxComposerDraftPersistenceMode) {
+        pendingComposerDraftMutations.removeAll(keepingCapacity: true)
+        composerDraftPersistenceRevision &+= 1
+        composerDraftPersistence.remove(
+            forKey: preferenceKey(PreferenceKey.composerDrafts),
+            revision: composerDraftPersistenceRevision,
+            mode: mode
+        )
     }
 
     private func preferenceKey(_ legacyKey: String) -> String {

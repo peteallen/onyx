@@ -300,8 +300,16 @@ struct ProviderCapabilityEvidence: Codable, Equatable, Hashable, Sendable {
         if serverAdvertisesToolUse {
             values.append("Server tools · Onyx tools unavailable")
         }
-        if values.isEmpty, isUnknown { return "Capabilities unknown" }
-        if isPartial { values.append("Partial metadata") }
+        let hasRawServerMetadata = !serverAdvertisedParameters.isEmpty
+            || !serverAdvertisedCapabilities.isEmpty
+        if values.isEmpty, isUnknown {
+            return hasRawServerMetadata
+                ? "Partial capability metadata"
+                : "Capabilities unknown"
+        }
+        if isPartial || (isUnknown && hasRawServerMetadata) {
+            values.append("Partial metadata")
+        }
         return values.isEmpty ? "Capability metadata available" : values.joined(separator: " · ")
     }
 }

@@ -1,8 +1,56 @@
+import AppKit
 import Foundation
+import SwiftUI
 import XCTest
 @testable import Onyx
 
 final class ProjectFileTreeTests: XCTestCase {
+    @MainActor
+    func testClickingFolderNameTogglesDirectory() throws {
+        let entry = ProjectFileEntry(
+            path: "/tmp/OnyxProjectFileTreeTests/Sources",
+            name: "Sources",
+            kind: .directory
+        )
+        var toggleCount = 0
+        let size = NSSize(width: 280, height: 23)
+        let hostingView = NSHostingView(
+            rootView: ProjectFileRow(
+                entry: entry,
+                depth: 0,
+                isExpanded: false,
+                onToggle: { toggleCount += 1 },
+                onPreview: {},
+                onOpen: {},
+                onReveal: {}
+            )
+            .frame(width: size.width, height: size.height)
+        )
+        hostingView.frame = NSRect(origin: .zero, size: size)
+        let window = NSWindow(
+            contentRect: hostingView.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = hostingView
+        window.orderFront(nil)
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        hostingView.layoutSubtreeIfNeeded()
+
+        // The label begins after the chevron and folder icon. This point sits
+        // squarely over "Sources" and outside the old 12-point chevron-only
+        // target, so the test regresses the interaction the user encountered.
+        try click(at: NSPoint(x: 55, y: size.height / 2), in: window)
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
+
+        XCTAssertEqual(toggleCount, 1)
+    }
+
     func testDirectoryListingUsesRealEntriesFoldersFirstAndExcludesHeavyFolders() throws {
         let fixture = try TemporaryProjectFixture()
         defer { fixture.remove() }
@@ -67,6 +115,35 @@ final class ProjectFileTreeTests: XCTestCase {
 
         XCTAssertEqual(link.kind, .symbolicLink)
         XCTAssertFalse(link.isDirectory)
+    }
+
+    @MainActor
+    private func click(at point: NSPoint, in window: NSWindow) throws {
+        let timestamp = ProcessInfo.processInfo.systemUptime
+        let down = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: point,
+            modifierFlags: [],
+            timestamp: timestamp,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 1,
+            clickCount: 1,
+            pressure: 1
+        ))
+        let up = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseUp,
+            location: point,
+            modifierFlags: [],
+            timestamp: timestamp + 0.001,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 2,
+            clickCount: 1,
+            pressure: 0
+        ))
+        window.sendEvent(down)
+        window.sendEvent(up)
     }
 }
 

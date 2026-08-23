@@ -65,6 +65,101 @@ final class OnyxAppModelRaceTests: XCTestCase {
         XCTAssertEqual(model.collaborationAgents.first?.status, .working)
     }
 
+    func testNewTaskWinsOverStartupRestorationWhileTaskListIsLoading() async {
+        let fixture = makeFixture { defaults in
+            defaults.set(Fixture.threadAID, forKey: "Onyx.selectedThreadID")
+        }
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        await fixture.runtime.prepareSuspendedActiveList()
+        model.start()
+        await fixture.runtime.waitUntilActiveListIsSuspended()
+        await waitUntil("The startup task list did not begin loading") {
+            model.selectedThreadID == Fixture.welcomeThreadID
+                && model.isLoadingThreadList
+        }
+
+        model.newTask()
+        await fixture.runtime.releaseSuspendedActiveList()
+        await waitUntil("The startup task list did not settle") {
+            !model.isLoadingThreadList
+        }
+
+        XCTAssertEqual(
+            model.selectedThreadID,
+            Fixture.welcomeThreadID,
+            "Clicking New Task must invalidate the restored startup selection."
+        )
+    }
+
+    func testNewTaskWinsOverActiveRefreshWhileTaskListIsLoading() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        model.start()
+        await waitUntil("The runtime did not finish its initial load") {
+            model.selectedThreadID == Fixture.threadAID
+                && !model.isLoadingThreadList
+        }
+
+        await fixture.runtime.prepareSuspendedActiveList()
+        await fixture.runtime.emit(.connectionChanged(.disconnected))
+        await waitUntil("The runtime did not enter the disconnected state") {
+            if case .disconnected = model.connectionState { return true }
+            return false
+        }
+        model.reconnect()
+        await fixture.runtime.waitUntilActiveListIsSuspended()
+        await waitUntil("The active refresh did not begin loading") {
+            model.isLoadingThreadList
+        }
+
+        model.newTask()
+        await fixture.runtime.releaseSuspendedActiveList()
+        await waitUntil("The active refresh did not settle") {
+            !model.isLoadingThreadList
+        }
+
+        XCTAssertEqual(
+            model.selectedThreadID,
+            Fixture.welcomeThreadID,
+            "A refresh completion must not replace an explicit New Task selection."
+        )
+    }
+
+    func testNewTaskWinsOverPendingArchivedRestore() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        model.start()
+        await waitUntil("The runtime did not finish its initial load") {
+            model.selectedThreadID == Fixture.threadAID
+                && !model.isLoadingThreadList
+        }
+        model.setThreadListScope(.archived)
+        await waitUntil("The archived task did not load") {
+            model.threadListScope == .archived
+                && model.selectedThreadID == Fixture.archivedThreadID
+        }
+
+        await fixture.runtime.prepareSuspendedUnarchive()
+        model.restore(Fixture.archivedThreadID)
+        await fixture.runtime.waitUntilUnarchiveIsSuspended()
+
+        model.newTask()
+        await fixture.runtime.releaseSuspendedUnarchive()
+        await waitUntil("New Task did not return to the active composer") {
+            model.threadListScope == .active
+                && model.selectedThreadID == Fixture.welcomeThreadID
+                && !model.isLoadingThreadList
+        }
+
+        XCTAssertEqual(model.selectedThreadID, Fixture.welcomeThreadID)
+    }
+
     func testSendRemainsBoundToThreadSelectedWhenComposerWasSubmitted() async throws {
         let fixture = makeFixture()
         defer { fixture.cleanUp() }
@@ -328,8 +423,10 @@ final class OnyxAppModelRaceTests: XCTestCase {
         XCTAssertEqual(model.composerText, Fixture.unrelatedArchivedDraft)
         XCTAssertEqual(model.timeline, [Fixture.archivedItem])
 
-        let draftsAfterCreation = fixture.defaults.dictionary(forKey: "Onyx.composerDrafts") as? [String: String]
-        XCTAssertEqual(draftsAfterCreation?[Fixture.createdThreadID], Fixture.createdThreadFollowUp)
+        await waitUntil("The created task follow-up was not persisted") {
+            let drafts = fixture.defaults.dictionary(forKey: "Onyx.composerDrafts") as? [String: String]
+            return drafts?[Fixture.createdThreadID] == Fixture.createdThreadFollowUp
+        }
 
         model.setThreadListScope(.active)
         await waitUntil("The created task did not restore its follow-up draft") {
@@ -338,8 +435,10 @@ final class OnyxAppModelRaceTests: XCTestCase {
                 && model.composerText == Fixture.createdThreadFollowUp
         }
 
-        let persistedDrafts = fixture.defaults.dictionary(forKey: "Onyx.composerDrafts") as? [String: String]
-        XCTAssertEqual(persistedDrafts?[Fixture.archivedThreadID], Fixture.unrelatedArchivedDraft)
+        await waitUntil("The archived task draft was not persisted") {
+            let drafts = fixture.defaults.dictionary(forKey: "Onyx.composerDrafts") as? [String: String]
+            return drafts?[Fixture.archivedThreadID] == Fixture.unrelatedArchivedDraft
+        }
     }
 
     func testBlockingInteractionTakesPriorityOverEarlierNonblockingQuestion() async {
@@ -897,6 +996,7 @@ final class OnyxAppModelRaceTests: XCTestCase {
 }
 
 private struct Fixture {
+    static let welcomeThreadID = "onyx:welcome"
     static let threadAID = "race-thread-A"
     static let threadBID = "race-thread-B"
     static let archivedThreadID = "race-thread-archived"
@@ -1156,6 +1256,15 @@ private actor RaceTestRuntime: AgentRuntime {
     private var suspendedReadIDs: Set<String> = []
     private var suspendedReadContinuations: [String: CheckedContinuation<Void, Never>] = [:]
     private var suspendedReadWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+    private var suspendNextActiveList = false
+    private var activeListIsSuspended = false
+    private var activeListContinuation: CheckedContinuation<Void, Never>?
+    private var activeListWaiters: [CheckedContinuation<Void, Never>] = []
+    private var restoredThreadIDs: Set<String> = []
+    private var suspendNextUnarchive = false
+    private var unarchiveIsSuspended = false
+    private var unarchiveContinuation: CheckedContinuation<Void, Never>?
+    private var unarchiveWaiters: [CheckedContinuation<Void, Never>] = []
 
     init() {
         let stream = AsyncStream.makeStream(of: AgentRuntimeEvent.self)
@@ -1186,7 +1295,21 @@ private actor RaceTestRuntime: AgentRuntime {
 
     func listThreads(limit _: Int, archived: Bool) async throws -> [RuntimeThread] {
         if archived { return [Fixture.archivedThread] }
-        return ([Fixture.threadA, Fixture.threadB] + createdThreads.values)
+        if suspendNextActiveList {
+            suspendNextActiveList = false
+            await withCheckedContinuation { continuation in
+                activeListContinuation = continuation
+                activeListIsSuspended = true
+                let waiters = activeListWaiters
+                activeListWaiters.removeAll()
+                for waiter in waiters { waiter.resume() }
+            }
+        }
+        var activeThreads = [Fixture.threadA, Fixture.threadB]
+        if restoredThreadIDs.contains(Fixture.archivedThreadID) {
+            activeThreads.append(Fixture.archivedThread)
+        }
+        return (activeThreads + createdThreads.values)
             .sorted { $0.updatedAt > $1.updatedAt }
     }
 
@@ -1254,7 +1377,19 @@ private actor RaceTestRuntime: AgentRuntime {
     func archiveThread(id: String) async throws {
         archivedThreadIDs.append(id)
     }
-    func unarchiveThread(id _: String) async throws {}
+    func unarchiveThread(id: String) async throws {
+        if suspendNextUnarchive {
+            suspendNextUnarchive = false
+            await withCheckedContinuation { continuation in
+                unarchiveContinuation = continuation
+                unarchiveIsSuspended = true
+                let waiters = unarchiveWaiters
+                unarchiveWaiters.removeAll()
+                for waiter in waiters { waiter.resume() }
+            }
+        }
+        restoredThreadIDs.insert(id)
+    }
 
     func emit(_ event: AgentRuntimeEvent) {
         eventContinuation.yield(event)
@@ -1277,6 +1412,42 @@ private actor RaceTestRuntime: AgentRuntime {
 
     func releaseSuspendedRead(for threadID: String) {
         suspendedReadContinuations.removeValue(forKey: threadID)?.resume()
+    }
+
+    func prepareSuspendedActiveList() {
+        suspendNextActiveList = true
+        activeListIsSuspended = false
+    }
+
+    func waitUntilActiveListIsSuspended() async {
+        guard !activeListIsSuspended else { return }
+        await withCheckedContinuation { continuation in
+            activeListWaiters.append(continuation)
+        }
+    }
+
+    func releaseSuspendedActiveList() {
+        activeListContinuation?.resume()
+        activeListContinuation = nil
+        activeListIsSuspended = false
+    }
+
+    func prepareSuspendedUnarchive() {
+        suspendNextUnarchive = true
+        unarchiveIsSuspended = false
+    }
+
+    func waitUntilUnarchiveIsSuspended() async {
+        guard !unarchiveIsSuspended else { return }
+        await withCheckedContinuation { continuation in
+            unarchiveWaiters.append(continuation)
+        }
+    }
+
+    func releaseSuspendedUnarchive() {
+        unarchiveContinuation?.resume()
+        unarchiveContinuation = nil
+        unarchiveIsSuspended = false
     }
 
     func recordedStartTurns() -> [StartTurnRequest] {

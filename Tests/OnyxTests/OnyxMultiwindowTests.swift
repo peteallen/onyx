@@ -72,6 +72,11 @@ final class OnyxMultiwindowTests: XCTestCase {
         host.recordModelUsage(connectionID: connection.id, modelID: first.id)
         host.recordModelUsage(connectionID: connection.id, modelID: second.id)
         host.recordModelUsage(connectionID: connection.id, modelID: second.id)
+        XCTAssertEqual(
+            host.modelUsageRevision,
+            3,
+            "Each accepted usage event should issue one narrow model-picker refresh"
+        )
         let ranked = host.rankedModelChoices(connection: connection, models: [first, second])
 
         XCTAssertEqual(ranked.map(\.model.id), ["second", "first"])

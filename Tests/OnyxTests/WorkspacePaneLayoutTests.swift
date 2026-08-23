@@ -5,6 +5,30 @@ import XCTest
 
 @MainActor
 final class WorkspacePaneLayoutTests: XCTestCase {
+    func testConversationControlsStayReadableWithoutCrampingCompactWindows() {
+        XCTAssertEqual(ConversationContentLayout.maximumComposerWidth, 760)
+        XCTAssertEqual(
+            ConversationContentLayout.horizontalInset(availableWidth: 320),
+            ConversationContentLayout.minimumHorizontalInset,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            ConversationContentLayout.horizontalInset(availableWidth: 600),
+            24,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            ConversationContentLayout.horizontalInset(availableWidth: 1_200),
+            ConversationContentLayout.maximumHorizontalInset,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            ConversationContentLayout.horizontalInset(availableWidth: .infinity),
+            ConversationContentLayout.maximumHorizontalInset,
+            accuracy: 0.001
+        )
+    }
+
     func testFreshWorkspaceKeepsInspectorOnDemandAndRestoresExplicitChoice() throws {
         let suiteName = "WorkspacePaneLayoutTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -30,8 +54,7 @@ final class WorkspacePaneLayoutTests: XCTestCase {
     }
 
     func testCompactBoundaryProtectsConversationFromTwoSidePanes() {
-        let expectedBoundary = WorkspacePaneLayout.commandRailWidth
-            + WorkspacePaneLayout.dividerWidth * 2
+        let expectedBoundary = WorkspacePaneLayout.dividerWidth * 2
             + WorkspacePaneLayout.sidebarMinimumWidth
             + WorkspacePaneLayout.inspectorMinimumWidth
             + WorkspacePaneLayout.minimumConversationWidth
@@ -132,7 +155,6 @@ final class WorkspacePaneLayoutTests: XCTestCase {
         )
 
         let center = WorkspacePaneLayout.compactBreakpoint
-            - WorkspacePaneLayout.commandRailWidth
             - WorkspacePaneLayout.dividerWidth * 2
             - sidebar
             - inspector
@@ -149,7 +171,6 @@ final class WorkspacePaneLayoutTests: XCTestCase {
         XCTAssertEqual(inspector, WorkspacePaneLayout.inspectorMaximumWidth, accuracy: 0.001)
         XCTAssertGreaterThanOrEqual(
             1_200
-                - WorkspacePaneLayout.commandRailWidth
                 - WorkspacePaneLayout.dividerWidth
                 - inspector,
             WorkspacePaneLayout.minimumConversationWidth

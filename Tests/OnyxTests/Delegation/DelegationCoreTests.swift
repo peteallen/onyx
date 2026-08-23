@@ -66,7 +66,8 @@ final class DelegationCoreTests: XCTestCase {
                     connectionID: codexConnection,
                     modelID: "gpt-5.6-codex"
                 ),
-                prompt: "Ask Codex for a repository-aware review."
+                prompt: "Ask Codex for a repository-aware review.",
+                workingDirectory: "/tmp/selected-project"
             )
         )
         _ = try await coordinator.result(for: first.jobID)
@@ -84,6 +85,7 @@ final class DelegationCoreTests: XCTestCase {
         XCTAssertEqual(child.parentAgent.model.modelID, "gpt-5.6-codex")
         XCTAssertEqual(child.lineage.rootJobID, first.jobID)
         XCTAssertEqual(child.lineage.parentJobID, first.jobID)
+        XCTAssertEqual(child.workingDirectory, "/tmp/selected-project")
         XCTAssertEqual(
             child.lineage.agents.map(\.connectionID),
             [qwenConnection, codexConnection]

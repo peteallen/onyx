@@ -228,6 +228,22 @@ struct RuntimeModel: Identifiable, Sendable, Hashable {
             }
     }
 
+    /// True only when the provider supplied no capability evidence at all.
+    /// Some vLLM catalogs expose a raw `capabilities` array without the
+    /// OpenRouter-shaped modality/parameter fields. Treating those rows as
+    /// wholly unknown made the picker contradict itself by showing both a
+    /// server-tools badge and a "Capabilities unknown" label.
+    var capabilityMetadataIsUnknown: Bool {
+        capabilityEvidence.isUnknown
+            && serverAdvertisedRequestParameters.isEmpty
+            && serverAdvertisedCapabilities.isEmpty
+    }
+
+    var capabilityMetadataIsPartial: Bool {
+        !capabilityMetadataIsUnknown
+            && (capabilityEvidence.isUnknown || capabilityEvidence.isPartial)
+    }
+
     /// Compact picker copy distinguishes remote support from client support:
     /// a provider can advertise tools without implying that Onyx can execute
     /// or approve them.

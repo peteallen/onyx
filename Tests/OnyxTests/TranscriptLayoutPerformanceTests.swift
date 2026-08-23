@@ -81,6 +81,31 @@ final class TranscriptLayoutPerformanceTests: XCTestCase {
         fixture.mutateTail(body: "Tool finished", status: .completed)
         layout()
 
+        // Regression coverage for the AppKit invalid-update crash at the
+        // activity-rollup boundary. Eight completed routine activities are
+        // represented by one collapsed collection row; appending the ninth
+        // changes that same tail group and inserts a new sibling row in one
+        // projection update. The data source must apply both mutations as one
+        // batch while the hosted SwiftUI view is laying out.
+        fixture.appendAssistant(body: "Rollup boundary", status: .completed)
+        layout()
+        for index in 0..<8 {
+            fixture.appendActivity(
+                id: "rollup-\(index)",
+                kind: index.isMultiple(of: 2) ? .command : .tool,
+                status: .completed
+            )
+            layout(width: index.isMultiple(of: 2) ? 520 : 900)
+        }
+        let eightActivityRowCount = collectionView.numberOfItems(inSection: 0)
+        fixture.appendActivity(id: "rollup-8", kind: .command, status: .completed)
+        layout(width: 720)
+        XCTAssertEqual(
+            collectionView.numberOfItems(inSection: 0),
+            eightActivityRowCount + 1,
+            "The ninth activity should add one sibling row after the bounded rollup"
+        )
+
         let contentSize = collectionView.collectionViewLayout?.collectionViewContentSize ?? .zero
         XCTAssertTrue(contentSize.width.isFinite)
         XCTAssertTrue(contentSize.height.isFinite)
@@ -90,6 +115,150 @@ final class TranscriptLayoutPerformanceTests: XCTestCase {
         XCTAssertEqual(fixture.snapshot.items[1].body, "Streaming complete")
 
         // Drain deferred follow-scroll work before releasing the AppKit host.
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
+    }
+
+    @MainActor
+    func testHostingViewSurvivesAppendPastExpandedActivityGroupBoundary() throws {
+        let fixture = TranscriptLayoutMutationFixture()
+        let hostingView = NSHostingView(
+            rootView: TranscriptLayoutMutationHarness(fixture: fixture)
+        )
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 480),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = hostingView
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+
+        func layout() {
+            hostingView.needsLayout = true
+            hostingView.layoutSubtreeIfNeeded()
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.002))
+            hostingView.layoutSubtreeIfNeeded()
+        }
+
+        layout()
+        let collectionView = try XCTUnwrap(
+            hostingView.firstDescendant(ofType: NSCollectionView.self)
+        )
+        for index in 0..<8 {
+            fixture.appendActivity(
+                id: "expanded-rollup-\(index)",
+                kind: index.isMultiple(of: 2) ? .command : .tool,
+                status: .completed
+            )
+            layout()
+        }
+        XCTAssertEqual(
+            collectionView.numberOfItems(inSection: 0),
+            2,
+            "The user message and collapsed eight-activity rollup should each occupy one row"
+        )
+
+        let collapsedGroup = try XCTUnwrap(
+            hostingView.firstDescendant(ofType: TranscriptActivityGroupView.self)
+        )
+        XCTAssertFalse(collapsedGroup.isExpanded)
+        XCTAssertTrue(collapsedGroup.accessibilityPerformPress())
+        layout()
+
+        XCTAssertEqual(
+            collectionView.numberOfItems(inSection: 0),
+            10,
+            "Opening the rollup should restore its eight child rows below the summary"
+        )
+
+        fixture.appendActivity(id: "expanded-rollup-8", kind: .command, status: .completed)
+        layout()
+
+        XCTAssertEqual(
+            collectionView.numberOfItems(inSection: 0),
+            11,
+            "The ninth activity should append beside the still-expanded bounded rollup"
+        )
+
+        // Drain deferred follow-scroll work before releasing the AppKit host.
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
+    }
+
+    @MainActor
+    func testHostingViewSurvivesCollapsedBoundaryWithInlinePendingResponse() throws {
+        let fixture = TranscriptLayoutMutationFixture()
+        fixture.isAwaitingResponse = true
+        let hostingView = NSHostingView(
+            rootView: TranscriptLayoutMutationHarness(fixture: fixture)
+        )
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 480),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = hostingView
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+
+        func layout() {
+            hostingView.needsLayout = true
+            hostingView.layoutSubtreeIfNeeded()
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.002))
+            hostingView.layoutSubtreeIfNeeded()
+        }
+
+        layout()
+        let collectionView = try XCTUnwrap(
+            hostingView.firstDescendant(ofType: NSCollectionView.self)
+        )
+        XCTAssertEqual(
+            collectionView.numberOfItems(inSection: 0),
+            2,
+            "The inline waiting row should be mounted before activity output arrives"
+        )
+
+        for index in 0..<8 {
+            fixture.appendActivity(
+                id: "pending-rollup-\(index)",
+                kind: index.isMultiple(of: 2) ? .command : .tool,
+                status: .completed
+            )
+            layout()
+        }
+        let eightActivityRowCount = collectionView.numberOfItems(inSection: 0)
+        XCTAssertEqual(
+            eightActivityRowCount,
+            3,
+            "Eight completed activities should be one rollup plus the user and waiting rows"
+        )
+
+        // The ninth activity must be inserted before the existing pending row.
+        // This is the production ordering that previously left AppKit with a
+        // stale item count and raised NSInternalInconsistencyException.
+        fixture.appendActivity(
+            id: "pending-rollup-8",
+            kind: .command,
+            status: .completed
+        )
+        layout()
+        XCTAssertEqual(collectionView.numberOfItems(inSection: 0), eightActivityRowCount + 1)
+
+        fixture.isAwaitingResponse = false
+        layout()
+        XCTAssertEqual(
+            collectionView.numberOfItems(inSection: 0),
+            eightActivityRowCount,
+            "Removing the waiting row after the boundary append must not disturb activity rows"
+        )
+
         RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
     }
 
@@ -273,9 +442,9 @@ final class TranscriptLayoutPerformanceTests: XCTestCase {
             timestamp: .now,
             detail: nil
         )
-        var completed = running
-        completed.status = .completed
-        let newItems = [completed, makeItem(id: "assistant", body: "Finished")]
+        var failed = running
+        failed.status = .failed
+        let newItems = [failed, makeItem(id: "assistant", body: "Finished")]
         var state = TranscriptLayoutState()
 
         let runningHeight = state.height(
@@ -289,21 +458,21 @@ final class TranscriptLayoutPerformanceTests: XCTestCase {
         XCTAssertEqual(update, .reloadAll)
         state.prepare(for: update, newItems: newItems)
 
-        let expectedCompletedHeight = TranscriptCellView.height(
-            for: completed,
+        let expectedFailedHeight = TranscriptCellView.height(
+            for: failed,
             width: 640,
             isExpanded: false
         )
-        let renderedCompletedHeight = state.height(
-            for: completed,
+        let renderedFailedHeight = state.height(
+            for: failed,
             width: 640,
             isExpanded: false
         ) {
-            expectedCompletedHeight
+            expectedFailedHeight
         }
 
-        XCTAssertNotEqual(runningHeight, expectedCompletedHeight)
-        XCTAssertEqual(renderedCompletedHeight, expectedCompletedHeight)
+        XCTAssertNotEqual(runningHeight, expectedFailedHeight)
+        XCTAssertEqual(renderedFailedHeight, expectedFailedHeight)
         XCTAssertEqual(state.instrumentation.measurementCount, 2)
         XCTAssertEqual(state.instrumentation.cacheHitCount, 0)
     }

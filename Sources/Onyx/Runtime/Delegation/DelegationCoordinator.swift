@@ -218,6 +218,7 @@ actor DelegationCoordinator {
             parentAgent: parentAgent,
             target: target,
             prompt: prompt,
+            workingDirectory: parent.request.workingDirectory,
             lineage: lineage
         )
     }
@@ -561,6 +562,7 @@ actor DelegationCoordinator {
         let safeOutput = DelegationOutput(
             text: DelegationSafeText.boundedOutput(output.text),
             usage: output.usage,
+            childConversationID: output.childConversationID,
             truncatedAtCharacterLimit: effectiveTruncationLimit
         )
         let result = DelegationResult(

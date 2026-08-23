@@ -149,8 +149,24 @@ final class ProviderCapabilitiesTests: XCTestCase {
         )
         XCTAssertEqual(
             model.pickerCapabilitySummary,
-            "Server tools · Onyx tools unavailable"
+            "Server tools · Onyx tools unavailable · Partial metadata"
         )
+
+        let runtimeModel = RuntimeModel(
+            id: model.id,
+            displayName: model.displayName,
+            description: model.description,
+            isDefault: true,
+            defaultReasoningEffort: nil,
+            reasoningEfforts: [],
+            inputModalities: model.capabilities.inputModalities,
+            serverAdvertisedRequestParameters: model.capabilities.supportedParameters,
+            supportedRequestParameters: model.capabilities.clientUsableParameters,
+            serverAdvertisedCapabilities: model.capabilities.serverAdvertisedCapabilities,
+            capabilityEvidence: model.capabilityEvidence
+        )
+        XCTAssertFalse(runtimeModel.capabilityMetadataIsUnknown)
+        XCTAssertTrue(runtimeModel.capabilityMetadataIsPartial)
 
         let roundTripped = try JSONDecoder().decode(
             ProviderModelDescriptor.self,

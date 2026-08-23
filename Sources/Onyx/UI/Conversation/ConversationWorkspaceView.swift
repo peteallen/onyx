@@ -16,6 +16,9 @@ struct ConversationWorkspaceView: View {
     var body: some View {
         GeometryReader { proxy in
             let sideChatLayout = SideChatPanelLayout.resolve(availableWidth: proxy.size.width)
+            let composerInset = ConversationContentLayout.horizontalInset(
+                availableWidth: proxy.size.width
+            )
 
             ZStack(alignment: .trailing) {
                 VStack(spacing: 0) {
@@ -78,9 +81,9 @@ struct ConversationWorkspaceView: View {
                             )
                         }
                     }
-                    .frame(maxWidth: 900)
-                    .padding(.horizontal, 32)
-                    .padding(.bottom, 20)
+                    .frame(maxWidth: ConversationContentLayout.maximumComposerWidth)
+                    .padding(.horizontal, composerInset)
+                    .padding(.bottom, ConversationContentLayout.bottomInset)
                 }
 
                 if model.isSideChatPresented {
@@ -93,6 +96,29 @@ struct ConversationWorkspaceView: View {
         }
         .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: model.isSideChatPresented)
         .background(OnyxTheme.canvas)
+    }
+}
+
+/// Keeps the primary conversation controls aligned with the transcript's
+/// readable measure. Insets ease down on compact windows instead of stealing
+/// a fixed 64 points from an already narrow center pane.
+enum ConversationContentLayout {
+    /// Keep the composer on the same calm reading axis as the transcript.
+    /// A much wider input surface makes the center pane feel like a form and
+    /// encourages long, hard-to-scan lines even when the window has room.
+    static let maximumComposerWidth: CGFloat = 760
+    static let bottomInset: CGFloat = 20
+    static let minimumHorizontalInset: CGFloat = 16
+    static let maximumHorizontalInset: CGFloat = 30
+
+    static func horizontalInset(availableWidth: CGFloat) -> CGFloat {
+        guard availableWidth.isFinite, availableWidth > 0 else {
+            return maximumHorizontalInset
+        }
+        return min(
+            maximumHorizontalInset,
+            max(minimumHorizontalInset, availableWidth * 0.04)
+        )
     }
 }
 
@@ -135,20 +161,20 @@ private struct ConversationHeaderView: View {
                 .accessibilityHint("Reveals the task list")
             }
 
-            Image(systemName: "folder")
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                Image(systemName: "folder")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
 
-            Text(model.selectedThread?.title ?? (model.isShowingArchivedThreads ? "Archived tasks" : "New task"))
-                .font(.system(size: 14, weight: .semibold))
-                .lineLimit(1)
-
-            if let branch = model.selectedThread?.branch {
-                Text(branch)
-                    .font(.system(size: 10.5, weight: .medium))
-                    .foregroundStyle(.tertiary)
+                Text(headerTitle)
+                    .font(.system(size: 14, weight: .semibold))
                     .lineLimit(1)
             }
+            .onyxHelp(projectContext)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Task")
+            .accessibilityValue("\(headerTitle), \(projectContext)")
 
             Spacer()
 
@@ -189,22 +215,6 @@ private struct ConversationHeaderView: View {
                     .accessibilityElement(children: .ignore)
                     .accessibilityLabel("Task status")
                     .accessibilityValue("Archived")
-            }
-
-            if !model.isShowingArchivedThreads,
-               let id = model.selectedThreadID,
-               id != "onyx:welcome" {
-                Button {
-                    model.togglePin(id)
-                } label: {
-                    Image(systemName: model.selectedThread?.isPinned == true ? "pin.fill" : "pin")
-                        .frame(width: 26, height: 26)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.borderless)
-                .onyxHelp(pinActionLabel)
-                .accessibilityLabel(pinActionLabel)
-                .accessibilityHint("Updates this task's pinned state")
             }
 
             Button {
@@ -265,8 +275,8 @@ private struct ConversationHeaderView: View {
             .onyxHelp("Task actions")
             .accessibilityLabel("Task actions")
         }
-        .padding(.horizontal, 14)
-        .frame(height: 50)
+        .padding(.horizontal, 13)
+        .frame(height: 48)
         .background(OnyxTheme.chrome)
         .overlay(alignment: .bottom) {
             Rectangle()
@@ -275,19 +285,31 @@ private struct ConversationHeaderView: View {
         }
     }
 
-    private var pinActionLabel: String {
-        model.selectedThread?.isPinned == true ? "Unpin task" : "Pin task"
+    private var headerTitle: String {
+        model.selectedThread?.title ?? (model.isShowingArchivedThreads ? "Archived tasks" : "New task")
+    }
+
+    private var projectContext: String {
+        guard let branch = model.selectedThread?.branch, !branch.isEmpty else {
+            return model.projectName
+        }
+        return "\(model.projectName) / \(branch)"
     }
 
     private func headerAction(title: String, systemImage: String, isSelected: Bool) -> some View {
-        Label(title, systemImage: systemImage)
-            .font(.system(size: 11.5, weight: .medium))
-            .foregroundStyle(isSelected ? OnyxTheme.iris : Color.secondary)
-            .padding(.horizontal, 9)
-            .frame(height: 28)
-            .background(isSelected ? OnyxTheme.iris.opacity(0.10) : Color.clear)
-            .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-            .contentShape(Rectangle())
+        ViewThatFits(in: .horizontal) {
+            Label(title, systemImage: systemImage)
+                .padding(.horizontal, 8)
+
+            Image(systemName: systemImage)
+                .frame(width: 28)
+        }
+        .font(.system(size: 11.5, weight: .medium))
+        .foregroundStyle(isSelected ? OnyxTheme.iris : Color.secondary)
+        .frame(height: 28)
+        .background(isSelected ? OnyxTheme.iris.opacity(0.10) : Color.clear)
+        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .contentShape(Rectangle())
     }
 }
 
@@ -508,8 +530,45 @@ private struct AccountAccessStrip: View {
 /// deliberately spends its available width on the model picker and keeps
 /// secondary controls discoverable behind compact icon menus.
 enum ComposerToolbarLayout {
-    static let horizontalPadding: CGFloat = 10
-    static let rowHeight: CGFloat = 36
+    static let horizontalPadding: CGFloat = 9
+    static let rowHeight: CGFloat = 34
+}
+
+/// Decides when ongoing work can yield the full message composer to a compact
+/// progress row. Keep this policy independent from the view's ephemeral
+/// expansion state so reviews, attachments, and interaction prompts cannot
+/// accidentally hide controls the user still needs.
+enum BusyComposerPresentation {
+    static let compactHeight: CGFloat = 40
+
+    static func usesCompactStrip(
+        isTurnRunning: Bool,
+        isReviewRunning: Bool,
+        isReviewStarting: Bool,
+        hasPendingInteraction: Bool,
+        draftText: String,
+        attachmentCount: Int,
+        canInterrupt: Bool,
+        isComposingNewTask: Bool,
+        userRequestedExpansion: Bool
+    ) -> Bool {
+        // While review/start is awaiting acceptance, Codex has not exposed a
+        // turn ID that interrupt can target. Keep the existing starting UI in
+        // that brief phase instead of presenting a Stop action that may fail.
+        let hasStoppableWork = (isTurnRunning || isReviewRunning) && !isReviewStarting
+        let draftIsEmpty = draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && attachmentCount == 0
+        return hasStoppableWork
+            && !hasPendingInteraction
+            && draftIsEmpty
+            && canInterrupt
+            && !isComposingNewTask
+            && !userRequestedExpansion
+    }
+
+    static func label(isReviewRunning: Bool, isReviewStarting: Bool) -> String {
+        isReviewRunning || isReviewStarting ? "Reviewing changes…" : "Working on a response…"
+    }
 }
 
 private struct ComposerView: View {
@@ -521,6 +580,8 @@ private struct ComposerView: View {
     let onSelectProviderModel: @MainActor (OnyxApplicationHost.ProviderModelChoice) -> Void
     @Environment(\.onyxWindowPresentationContext) private var windowPresentation
     @State private var textHeight: CGFloat = 46
+    @State private var userExpandedBusyComposer = false
+    @FocusState private var compactBusyStripFocused: Bool
 
     private var interactionBlocksComposer: Bool {
         model.activeUserInteraction?.isBlocking == true
@@ -534,7 +595,43 @@ private struct ComposerView: View {
                 || !model.composerImages.isEmpty)
     }
 
+    private var hasActiveWork: Bool {
+        model.isTurnRunning || model.isReviewRunning || model.isSelectedReviewStarting
+    }
+
+    private var usesCompactBusyStrip: Bool {
+        BusyComposerPresentation.usesCompactStrip(
+            isTurnRunning: model.isTurnRunning,
+            isReviewRunning: model.isReviewRunning,
+            isReviewStarting: model.isSelectedReviewStarting,
+            hasPendingInteraction: model.activeUserInteraction != nil,
+            draftText: model.composerText,
+            attachmentCount: model.composerImages.count,
+            canInterrupt: model.supports(.interruption),
+            isComposingNewTask: isComposingNewTask,
+            userRequestedExpansion: userExpandedBusyComposer
+        )
+    }
+
     var body: some View {
+        Group {
+            if usesCompactBusyStrip {
+                compactBusyStrip
+            } else {
+                expandedComposer
+            }
+        }
+        .onChange(of: hasActiveWork) { _, isActive in
+            if !isActive {
+                userExpandedBusyComposer = false
+            }
+        }
+        .onChange(of: model.selectedThreadID) { _, _ in
+            userExpandedBusyComposer = false
+        }
+    }
+
+    private var expandedComposer: some View {
         VStack(spacing: 0) {
             if !model.composerImages.isEmpty {
                 ComposerImagePreviewRow(
@@ -551,16 +648,14 @@ private struct ComposerView: View {
                 isEnabled: model.canRunAgent
                     && !interactionBlocksComposer
                     && !model.isReviewBlockingComposer,
-                onSubmit: {
-                    if canSend { model.sendComposer() }
-                },
+                onSubmit: submitComposer,
                 onPasteImages: { images in
                     model.addPastedComposerImages(images)
                 }
             )
             .frame(height: textHeight)
             .padding(.horizontal, 12)
-            .padding(.top, 4)
+            .padding(.top, 6)
 
             // ViewThatFits measures the full-label candidate at its intrinsic
             // width before falling back. This is important for arbitrary
@@ -574,15 +669,88 @@ private struct ComposerView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .frame(height: ComposerToolbarLayout.rowHeight)
             .padding(.horizontal, ComposerToolbarLayout.horizontalPadding)
-            .padding(.bottom, 8)
+            .padding(.bottom, 7)
         }
         .background(OnyxTheme.composerSurface)
-        .clipShape(RoundedRectangle(cornerRadius: 17, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 17, style: .continuous)
-                .stroke(OnyxTheme.border, lineWidth: 1)
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(OnyxTheme.border, lineWidth: OnyxTheme.hairline)
         }
-        .shadow(color: SwiftUI.Color(white: 0, opacity: 0.12), radius: 13, y: 6)
+        .shadow(color: SwiftUI.Color(white: 0, opacity: 0.08), radius: 8, y: 3)
+    }
+
+    private var compactBusyStrip: some View {
+        HStack(spacing: 8) {
+            Button(action: expandBusyComposer) {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .accessibilityHidden(true)
+
+                    Text(busyLabel)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+
+                    Spacer(minLength: 8)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            .focused($compactBusyStripFocused)
+            .onChange(of: compactBusyStripFocused) { _, isFocused in
+                if isFocused {
+                    expandBusyComposer()
+                }
+            }
+            .accessibilityLabel(busyLabel)
+            .accessibilityHint("Expands the message composer so you can write a follow-up")
+
+            Button(action: model.interrupt) {
+                Label("Stop", systemImage: "stop.fill")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .padding(.horizontal, 9)
+                    .frame(height: 26)
+                    .background(Color.primary.opacity(0.065))
+                    .clipShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .onyxHelp("Stop task")
+            .accessibilityLabel("Stop task")
+            .accessibilityHint("Interrupts the active work")
+        }
+        .padding(.leading, 12)
+        .padding(.trailing, 7)
+        .frame(height: BusyComposerPresentation.compactHeight)
+        .background(OnyxTheme.composerSurface)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(OnyxTheme.border, lineWidth: OnyxTheme.hairline)
+        }
+    }
+
+    private var busyLabel: String {
+        BusyComposerPresentation.label(
+            isReviewRunning: model.isReviewRunning,
+            isReviewStarting: model.isSelectedReviewStarting
+        )
+    }
+
+    private func expandBusyComposer() {
+        compactBusyStripFocused = false
+        userExpandedBusyComposer = true
+    }
+
+    private func submitComposer() {
+        guard canSend else { return }
+        // A submitted follow-up has finished this expansion gesture. If the
+        // task is still running, its now-empty composer can become compact
+        // again in the same update that clears the draft.
+        userExpandedBusyComposer = false
+        model.sendComposer()
     }
 
     private var isComposingNewTask: Bool {
@@ -630,14 +798,11 @@ private struct ComposerView: View {
 
     @ViewBuilder
     private var regularToolbar: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
             attachImagesButton
             regularProviderModelMenu
-            if !model.availableReasoningEfforts.isEmpty {
-                regularReasoningMenu
-            }
-            regularPermissionMenu
-            Spacer(minLength: 0)
+            Spacer(minLength: 4)
+            minimalOptionsMenu
             sendButton
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
@@ -663,11 +828,8 @@ private struct ComposerView: View {
         HStack(spacing: 8) {
             attachImagesButton
             compactProviderModelMenu
-            if !model.availableReasoningEfforts.isEmpty {
-                compactReasoningMenu
-            }
-            compactPermissionMenu
-            Spacer(minLength: 2)
+            Spacer(minLength: 4)
+            minimalOptionsMenu
             sendButton
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
@@ -678,8 +840,8 @@ private struct ComposerView: View {
         HStack(spacing: 8) {
             attachImagesButton
             minimalProviderModelMenu
+            Spacer(minLength: 4)
             minimalOptionsMenu
-            Spacer(minLength: 2)
             sendButton
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
@@ -753,13 +915,18 @@ private struct ComposerView: View {
         Menu {
             providerModelMenuContent
         } label: {
-            HStack(spacing: 4) {
+            HStack(spacing: 5) {
                 Image(systemName: "point.3.connected.trianglepath.dotted")
-                Text("\(selectedProviderName) / \(selectedModelLabel)")
+                    .foregroundStyle(.secondary)
+                Text(selectedModelLabel)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                Text("· \(selectedProviderName)")
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
                 Image(systemName: "chevron.down")
                     .font(.system(size: 8, weight: .bold))
+                    .foregroundStyle(.tertiary)
             }
             .font(.system(size: 11.5, weight: .medium))
         }
@@ -776,18 +943,20 @@ private struct ComposerView: View {
         } label: {
             HStack(spacing: 5) {
                 Image(systemName: "point.3.connected.trianglepath.dotted")
-                Text("\(selectedProviderName) / \(selectedModelLabel)")
+                    .foregroundStyle(.secondary)
+                Text(selectedModelLabel)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                    .frame(width: 100, alignment: .leading)
+                    .frame(width: 132, alignment: .leading)
                 Image(systemName: "chevron.down")
                     .font(.system(size: 8, weight: .bold))
+                    .foregroundStyle(.tertiary)
             }
             .font(.system(size: 11.5, weight: .medium))
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .menuStyle(.borderlessButton)
-        .frame(width: 120, alignment: .leading)
+        .frame(width: 164, alignment: .leading)
         .layoutPriority(1)
         .onyxHelp(isComposingNewTask ? "Choose a provider and model for this new task" : "Choose the model for the next turn")
         .accessibilityLabel("Provider and model")
@@ -822,77 +991,11 @@ private struct ComposerView: View {
         }
     }
 
-    private var regularReasoningMenu: some View {
-        Menu {
-            reasoningMenuContent
-        } label: {
-            HStack(spacing: 4) {
-                Image(systemName: "brain")
-                Text(model.selectedReasoningEffortName)
-            }
-            .font(.system(size: 11.5))
-            .foregroundStyle(.secondary)
-        }
-        .menuStyle(.borderlessButton)
-        .fixedSize(horizontal: true, vertical: false)
-        .onyxHelp("Choose reasoning effort")
-        .accessibilityLabel("Reasoning effort")
-        .accessibilityValue(model.selectedReasoningEffortName)
-    }
-
-    private var compactReasoningMenu: some View {
-        Menu {
-            reasoningMenuContent
-        } label: {
-            Image(systemName: "brain")
-                .frame(width: 28, height: 28)
-                .foregroundStyle(.secondary)
-        }
-        .menuStyle(.borderlessButton)
-        .frame(width: 28, height: 28)
-        .onyxHelp("Choose reasoning effort (currently \(model.selectedReasoningEffortName))")
-        .accessibilityLabel("Reasoning effort")
-        .accessibilityValue(model.selectedReasoningEffortName)
-    }
-
     @ViewBuilder
     private var permissionMenuContent: some View {
         Button("Read only") { model.permissionLabel = "Read only" }
         Button("Workspace") { model.permissionLabel = "Workspace" }
         Button("Full access") { model.permissionLabel = "Full access" }
-    }
-
-    private var regularPermissionMenu: some View {
-        Menu {
-            permissionMenuContent
-        } label: {
-            HStack(spacing: 4) {
-                Image(systemName: "shield")
-                Text(model.permissionLabel)
-            }
-            .font(.system(size: 11.5))
-            .foregroundStyle(.secondary)
-        }
-        .menuStyle(.borderlessButton)
-        .fixedSize(horizontal: true, vertical: false)
-        .onyxHelp("Choose task permissions")
-        .accessibilityLabel("Task permissions")
-        .accessibilityValue(model.permissionLabel)
-    }
-
-    private var compactPermissionMenu: some View {
-        Menu {
-            permissionMenuContent
-        } label: {
-            Image(systemName: "shield")
-                .frame(width: 28, height: 28)
-                .foregroundStyle(.secondary)
-        }
-        .menuStyle(.borderlessButton)
-        .frame(width: 28, height: 28)
-        .onyxHelp("Choose task permissions (currently \(model.permissionLabel))")
-        .accessibilityLabel("Task permissions")
-        .accessibilityValue(model.permissionLabel)
     }
 
     @ViewBuilder
@@ -1000,10 +1103,10 @@ private struct ComposerView: View {
                     Image(systemName: "wrench.and.screwdriver")
                         .foregroundStyle(OnyxTheme.warning)
                 }
-                if choice.model.capabilityEvidence.isUnknown {
+                if choice.model.capabilityMetadataIsUnknown {
                     Label("Capabilities unknown", systemImage: "questionmark.circle")
                         .foregroundStyle(.secondary)
-                } else if choice.model.capabilityEvidence.isPartial {
+                } else if choice.model.capabilityMetadataIsPartial {
                     Image(systemName: "questionmark.circle")
                         .foregroundStyle(.secondary)
                 }
@@ -1019,7 +1122,7 @@ private struct ComposerView: View {
     }
 }
 
-private struct ComposerImagePreviewRow: View {
+struct ComposerImagePreviewRow: View {
     let images: [ComposerImageDraft]
     let onRemove: (UUID) -> Void
 

@@ -160,9 +160,29 @@ final class TranscriptAttachmentTests: XCTestCase {
         XCTAssertEqual(cell.expansionControl.accessibilityRole(), .button)
         XCTAssertEqual(cell.expansionControl.accessibilityValue() as? String, "Collapsed")
         XCTAssertTrue(cell.expansionControl.accessibilityLabel()?.contains("Expand") == true)
+        XCTAssertEqual(cell.accessibilityValue() as? String, "Completed, Collapsed")
         XCTAssertEqual(cell.subviews.filter { $0 is TranscriptResourceLinkView }.count, 0)
         cell.frame.size.height = TranscriptCellView.height(for: item, width: 640, isExpanded: false)
         cell.layout()
+        let compactTitle = try XCTUnwrap(
+            cell.subviews
+                .compactMap { $0 as? NSTextField }
+                .first { $0.stringValue.hasPrefix("Search files") }
+        )
+        let compactTitleFont = try XCTUnwrap(
+            compactTitle.attributedStringValue.attribute(
+                .font,
+                at: 0,
+                effectiveRange: nil
+            ) as? NSFont
+        )
+        XCTAssertEqual(compactTitleFont.pointSize, 11.5, accuracy: 0.1)
+        XCTAssertLessThanOrEqual(cell.expansionControl.frame.maxX, compactTitle.frame.minX)
+        XCTAssertLessThan(
+            cell.expansionControl.frame.maxX,
+            cell.bounds.midX,
+            "Activity disclosure belongs beside its content, not in a detached right-edge column"
+        )
         let headerPoint = NSPoint(x: 120, y: cell.bounds.maxY - 8)
         XCTAssertTrue(
             cell.hitTest(headerPoint) === cell,
@@ -191,6 +211,7 @@ final class TranscriptAttachmentTests: XCTestCase {
         XCTAssertTrue(cell.isExpanded)
         XCTAssertEqual(callbacks, [true])
         XCTAssertEqual(cell.expansionControl.accessibilityValue() as? String, "Expanded")
+        XCTAssertEqual(cell.accessibilityValue() as? String, "Completed, Expanded")
         XCTAssertEqual(cell.subviews.filter { $0 is TranscriptResourceLinkView }.count, 1)
         XCTAssertTrue(
             cell.subviews.compactMap { ($0 as? NSTextField)?.stringValue }.contains(item.body),
@@ -204,7 +225,7 @@ final class TranscriptAttachmentTests: XCTestCase {
     }
 
     @MainActor
-    func testRoutineActivityShowsOnlyLiveOrExceptionalStatusWhileActionableRowsStayProminent() {
+    func testRoutineActivityKeepsLiveStatusQuietWhileExceptionalRowsStayProminent() {
         let running = TimelineItem(
             id: "running-command",
             kind: .command,
@@ -215,14 +236,62 @@ final class TranscriptAttachmentTests: XCTestCase {
             detail: nil
         )
         let runningMetrics = TranscriptCellView.metrics(for: running, width: 640, isExpanded: false)
-        XCTAssertGreaterThan(runningMetrics.statusWidth, 0)
+        XCTAssertEqual(runningMetrics.statusWidth, 0)
 
         let runningCell = TranscriptCellView(frame: NSRect(x: 0, y: 0, width: 640, height: 36))
         runningCell.configure(with: running, isExpanded: false)
+        runningCell.layoutSubtreeIfNeeded()
         let runningLabels = runningCell.subviews.compactMap { ($0 as? NSTextField)?.stringValue }
         XCTAssertTrue(runningLabels.contains("Running"))
-        XCTAssertGreaterThan(runningCell.layer?.borderWidth ?? 0, 0)
-        XCTAssertNotEqual(runningCell.layer?.backgroundColor, NSColor.clear.cgColor)
+        XCTAssertEqual(runningCell.accessibilityValue() as? String, "Running, Collapsed")
+        XCTAssertTrue(
+            runningCell.subviews
+                .compactMap { $0 as? NSTextField }
+                .first(where: { $0.stringValue == "Running" })?
+                .isHidden == true,
+            "Routine live work should not create a competing right-aligned status column"
+        )
+        XCTAssertEqual(runningCell.layer?.borderWidth, 0)
+        XCTAssertEqual(runningCell.layer?.backgroundColor, NSColor.clear.cgColor)
+        XCTAssertLessThanOrEqual(
+            TranscriptCellView.height(for: running, width: 640, isExpanded: false),
+            36,
+            "Live routine work should remain a status line, not grow into another card"
+        )
+
+        var queued = running
+        queued.status = .pending
+        let queuedCell = TranscriptCellView(frame: NSRect(x: 0, y: 0, width: 640, height: 36))
+        queuedCell.configure(with: queued, isExpanded: false)
+        XCTAssertEqual(queuedCell.accessibilityValue() as? String, "Queued, Collapsed")
+
+        var runningPlan = running
+        runningPlan.kind = .plan
+        runningPlan.title = "Plan"
+        XCTAssertGreaterThan(
+            TranscriptCellView.metrics(for: runningPlan, width: 640, isExpanded: false).statusWidth,
+            0,
+            "Non-routine live progress keeps its explicit visible status"
+        )
+
+        var failedCommand = running
+        failedCommand.body = "The build exited with status 1."
+        failedCommand.status = .failed
+        let failedCommandCell = TranscriptCellView(
+            frame: NSRect(x: 0, y: 0, width: 640, height: 56)
+        )
+        failedCommandCell.configure(with: failedCommand, isExpanded: false)
+        failedCommandCell.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(failedCommandCell.layer?.borderWidth ?? 0, 0)
+        XCTAssertNotEqual(failedCommandCell.layer?.backgroundColor, NSColor.clear.cgColor)
+        XCTAssertEqual(failedCommandCell.accessibilityValue() as? String, "Failed, Collapsed")
+        XCTAssertTrue(
+            failedCommandCell.subviews
+                .compactMap { $0 as? NSTextField }
+                .first(where: { $0.stringValue == "Failed" })?
+                .isHidden == false,
+            "Exceptional outcomes must remain visibly prominent"
+        )
 
         let failure = TimelineItem(
             id: "tool-failure",
@@ -311,7 +380,8 @@ final class TranscriptAttachmentTests: XCTestCase {
         )
         XCTAssertTrue(titleLabel.stringValue.hasSuffix("…"))
         XCTAssertLessThanOrEqual(titleLabel.attributedStringValue.size().width, titleLabel.bounds.width)
-        XCTAssertLessThanOrEqual(titleLabel.frame.maxX, cell.expansionControl.frame.minX)
+        XCTAssertLessThanOrEqual(cell.expansionControl.frame.maxX, titleLabel.frame.minX)
+        XCTAssertLessThan(cell.expansionControl.frame.maxX, cell.bounds.midX)
     }
 
     @MainActor
@@ -388,6 +458,20 @@ final class TranscriptAttachmentTests: XCTestCase {
             rendered.attribute(.font, at: text.range(of: "Built").location, effectiveRange: nil) as? NSFont
         )
         XCTAssertTrue(NSFontManager.shared.traits(of: boldFont).contains(.boldFontMask))
+
+        let bodyFont = try XCTUnwrap(
+            rendered.attribute(.font, at: text.range(of: "the preview").location, effectiveRange: nil) as? NSFont
+        )
+        XCTAssertFalse(NSFontManager.shared.traits(of: bodyFont).contains(.boldFontMask))
+
+        let paragraphStyle = try XCTUnwrap(
+            rendered.attribute(
+                .paragraphStyle,
+                at: text.range(of: "the preview").location,
+                effectiveRange: nil
+            ) as? NSParagraphStyle
+        )
+        XCTAssertEqual(paragraphStyle.lineSpacing, TranscriptMarkdownRenderer.readingLineSpacing)
 
         let codeFont = try XCTUnwrap(
             rendered.attribute(.font, at: text.range(of: "native AppKit").location, effectiveRange: nil) as? NSFont

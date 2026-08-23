@@ -6,6 +6,7 @@ import SwiftUI
 struct SideChatPanelView: View {
     @ObservedObject var model: OnyxAppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.onyxWindowPresentationContext) private var windowPresentation
     @State private var textHeight: CGFloat = 42
 
     private var canSend: Bool {
@@ -126,6 +127,15 @@ struct SideChatPanelView: View {
 
     private var composer: some View {
         VStack(spacing: 6) {
+            if !model.sideChatComposerImages.isEmpty {
+                ComposerImagePreviewRow(
+                    images: model.sideChatComposerImages,
+                    onRemove: model.removeSideChatImage
+                )
+                .padding(.horizontal, 10)
+                .padding(.top, 7)
+            }
+
             NativeComposerTextView(
                 text: $model.sideChatComposerText,
                 measuredHeight: $textHeight,
@@ -133,13 +143,28 @@ struct SideChatPanelView: View {
                 onSubmit: {
                     if canSend { model.sendSideChat() }
                 },
-                onPasteImages: { _ in }
+                onPasteImages: model.addPastedSideChatImages
             )
             .frame(height: textHeight)
             .padding(.horizontal, 10)
             .padding(.top, 7)
 
             HStack(spacing: 8) {
+                Button {
+                    model.chooseSideChatImages(window: windowPresentation.window)
+                } label: {
+                    Image(systemName: "plus")
+                        .frame(width: 24, height: 24)
+                }
+                .buttonStyle(.borderless)
+                .disabled(!model.canAttachSideChatImages)
+                .onyxHelp(
+                    model.canAttachSideChatImages
+                        ? "Attach images"
+                        : "This model does not support image input"
+                )
+                .accessibilityLabel("Attach images to side chat")
+
                 Text("\(model.sideChatModelName) · \(model.sideChatReasoningEffortName)")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.secondary)

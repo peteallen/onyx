@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import XCTest
 @testable import Onyx
@@ -103,6 +104,53 @@ final class OnyxSideChatTests: XCTestCase {
         XCTAssertEqual(model.threads, durableThreadsBefore)
         XCTAssertEqual(model.timeline, durableTimelineBefore)
         XCTAssertFalse(model.threads.contains(where: { $0.id == SideChatFixture.fork.id }))
+    }
+
+    func testPastedImageInSideChatBecomesVisibleAttachmentAndTurnInput() async throws {
+        let fixture = makeFixture(
+            capabilities: [.streaming, .interruption, .images, .ephemeralThreadForking]
+        )
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        model.start()
+        await waitUntil("Parent task did not load") {
+            model.selectedThreadID == SideChatFixture.parent.id
+        }
+        model.openSideChat()
+        await waitUntil("Fork did not open") {
+            model.sideChatThreadID == SideChatFixture.fork.id
+        }
+
+        let image = NSImage(size: NSSize(width: 12, height: 8))
+        image.lockFocus()
+        NSColor.systemPurple.setFill()
+        NSRect(x: 0, y: 0, width: 12, height: 8).fill()
+        image.unlockFocus()
+        model.addPastedSideChatImages([image])
+
+        await waitUntil("Pasted side-chat image did not finish preparing") {
+            model.sideChatComposerImages.count == 1
+        }
+        XCTAssertEqual(model.sideChatComposerImages.count, 1)
+        XCTAssertTrue(model.canSendSideChat, "An image-only side-chat message should be sendable")
+        model.sendSideChat()
+
+        await waitUntilAsync("Image turn did not reach the runtime") {
+            await fixture.runtime.startTurnRequests().count == 1
+        }
+        let requests = await fixture.runtime.startTurnRequests()
+        let request = try XCTUnwrap(requests.first)
+        XCTAssertEqual(request.inputs.count, 1)
+        guard case let .imageURL(dataURL) = request.inputs[0] else {
+            return XCTFail("Pasted side-chat image must be sent as an image input")
+        }
+        XCTAssertTrue(dataURL.hasPrefix("data:image/png;base64,"))
+        XCTAssertTrue(model.sideChatComposerImages.isEmpty)
+        XCTAssertEqual(
+            model.sideChatTimeline.last(where: { $0.kind == .userMessage })?.attachments.count,
+            1
+        )
     }
 
     func testSideChatKeepsDeltaThatArrivesBeforeMatchingItemStart() async {

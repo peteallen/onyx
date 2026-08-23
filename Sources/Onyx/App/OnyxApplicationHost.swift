@@ -134,6 +134,10 @@ final class OnyxApplicationHost: ObservableObject {
     let projectCatalogModel: ProjectCatalogModel
     let settingsModel: OnyxAppModel
     let providerSettingsModel: ProviderSettingsModel
+    /// Changes only after an accepted turn is attributed to a model. Views
+    /// observe this narrow signal to refresh the picker once, instead of
+    /// rebuilding rankings for every streamed transcript publication.
+    @Published private(set) var modelUsageRevision: UInt64 = 0
 
     private let registry: RuntimeRegistry
     private let defaultConnectionID: ProviderConnectionID
@@ -142,6 +146,12 @@ final class OnyxApplicationHost: ObservableObject {
     private let providerConversationStore: OpenAICompatibleConversationStore
     private var runtimeCoordinators: [ProviderConnectionID: SharedRuntimeCoordinator]
     private var pinnedThreadStores: [ProviderConnectionID: OnyxPinnedThreadStore]
+    /// Model choices are rendered from SwiftUI's frequently invalidated view
+    /// tree. Keep the decoded usage ledger in memory so a transcript/status
+    /// publication does not repeatedly decode the entire JSON blob just to
+    /// sort the picker. The cache is refreshed whenever this host records a
+    /// usage event (the only writer owned by the app).
+    private var modelUsageCache: [String: ModelUsageRecord]? = nil
 
     static let selectedProviderPreferenceSuffix = "selectedProviderConnectionID"
     static let modelUsagePreferenceKey = "Onyx.providerModelUsage"
@@ -272,7 +282,7 @@ final class OnyxApplicationHost: ObservableObject {
     /// model remain owned by the original provider window.
     static func transferNewTaskContext(from source: OnyxAppModel, to destination: OnyxAppModel) {
         let context = source.captureNewTaskContext()
-        source.flushWindowState()
+        source.stageWindowStateForReplacement()
         if let context {
             destination.restoreNewTaskContext(context)
         }
@@ -562,9 +572,11 @@ final class OnyxApplicationHost: ObservableObject {
         record.count += 1
         record.lastUsedAt = .now
         records[key] = record
+        modelUsageCache = records
         if let encoded = try? JSONEncoder().encode(records) {
             defaults.set(encoded, forKey: Self.modelUsagePreferenceKey)
         }
+        modelUsageRevision &+= 1
     }
 
     func modelUsage(
@@ -578,9 +590,14 @@ final class OnyxApplicationHost: ObservableObject {
     }
 
     private func modelUsageRecords() -> [String: ModelUsageRecord] {
+        if let modelUsageCache { return modelUsageCache }
         guard let data = defaults.data(forKey: Self.modelUsagePreferenceKey),
               let records = try? JSONDecoder().decode([String: ModelUsageRecord].self, from: data)
-        else { return [:] }
+        else {
+            modelUsageCache = [:]
+            return [:]
+        }
+        modelUsageCache = records
         return records
     }
 
@@ -764,6 +781,7 @@ struct OnyxWindowRootView: View {
             retaining: selection.modelCatalogs[selection.connectionID] ?? [],
             preferring: selection.model.session?.availableModels
         )
+        selection.modelRankingRevision &+= 1
         if case .connected = selection.model.connectionState,
            !selection.model.isLoadingThreadList,
            let currentConnection = loadedConnections.first(where: {
@@ -773,7 +791,7 @@ struct OnyxWindowRootView: View {
                 for: currentConnection.id,
                 providerDisplayName: currentConnection.displayName,
                 scope: selection.model.threadListScope,
-                threads: selection.model.threads
+                threads: selection.model.catalogThreads
             )
         }
         let validated = host.validatedSelection(
@@ -811,6 +829,10 @@ private struct ProviderWorkspaceSelection {
     var connectionID: ProviderConnectionID
     var availableConnections: [OnyxApplicationHost.WorkspaceConnection]
     var modelCatalogs: [ProviderConnectionID: [RuntimeModel]] = [:]
+    /// Changes only when the provider/model-picker inputs change. Keeping a
+    /// scalar key avoids deep dictionary/array comparisons during every
+    /// streamed transcript publication.
+    var modelRankingRevision: UInt64 = 0
     var pendingModelID: String?
     var pendingThreadID: String?
     var pendingThreadScope: ThreadListScope?
@@ -819,7 +841,8 @@ private struct ProviderWorkspaceSelection {
 private struct ProviderWorkspaceContent: View {
     @Binding var selection: ProviderWorkspaceSelection
     @ObservedObject private var model: OnyxAppModel
-    let host: OnyxApplicationHost
+    @ObservedObject private var host: OnyxApplicationHost
+    @State private var rankedModelChoices: [OnyxApplicationHost.ProviderModelChoice]
     let defaults: UserDefaults
     let windowReference: OnyxWindowReference
 
@@ -831,6 +854,12 @@ private struct ProviderWorkspaceContent: View {
     ) {
         _selection = selection
         _model = ObservedObject(wrappedValue: selection.wrappedValue.model)
+        _host = ObservedObject(wrappedValue: host)
+        _rankedModelChoices = State(initialValue: Self.makeRankedModelChoices(
+            host: host,
+            selection: selection.wrappedValue,
+            liveModels: selection.wrappedValue.model.session?.availableModels
+        ))
         self.host = host
         self.defaults = defaults
         self.windowReference = windowReference
@@ -860,12 +889,19 @@ private struct ProviderWorkspaceContent: View {
                 preferring: models
             )
             selection.modelCatalogs[selection.connectionID] = values
+            selection.modelRankingRevision &+= 1
             guard let pending = selection.pendingModelID,
                   values.contains(where: { $0.id == pending }) else { return }
             selection.model.selectModel(pending)
             selection.pendingModelID = nil
         }
-        .onChange(of: model.threads) { _, _ in
+        .onChange(of: selection.modelRankingRevision) { _, _ in
+            refreshRankedModelChoices(liveModels: model.session?.availableModels)
+        }
+        .onChange(of: host.modelUsageRevision) { _, _ in
+            refreshRankedModelChoices(liveModels: model.session?.availableModels)
+        }
+        .onChange(of: model.threadListRevision) { _, _ in
             selectPendingThreadIfAvailable()
         }
         .onChange(of: model.isLoadingThreadList) { _, _ in
@@ -892,11 +928,25 @@ private struct ProviderWorkspaceContent: View {
         replaceSelection(with: connectionID)
     }
 
-    private var rankedModelChoices: [OnyxApplicationHost.ProviderModelChoice] {
+    @MainActor
+    private func refreshRankedModelChoices(liveModels: [RuntimeModel]?) {
+        rankedModelChoices = Self.makeRankedModelChoices(
+            host: host,
+            selection: selection,
+            liveModels: liveModels
+        )
+    }
+
+    @MainActor
+    private static func makeRankedModelChoices(
+        host: OnyxApplicationHost,
+        selection: ProviderWorkspaceSelection,
+        liveModels: [RuntimeModel]?
+    ) -> [OnyxApplicationHost.ProviderModelChoice] {
         var catalogs = selection.modelCatalogs
         catalogs[selection.connectionID] = OnyxApplicationHost.modelCatalog(
             retaining: catalogs[selection.connectionID] ?? [],
-            preferring: model.session?.availableModels
+            preferring: liveModels
         )
         return OnyxApplicationHost.rankModelChoices(
             selection.availableConnections.flatMap { connection in
@@ -919,6 +969,7 @@ private struct ProviderWorkspaceContent: View {
             retaining: selection.modelCatalogs[choice.connection.id] ?? [],
             preferring: model.session?.availableModels
         )
+        selection.modelRankingRevision &+= 1
     }
 
     @MainActor

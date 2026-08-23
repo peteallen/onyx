@@ -1,31 +1,22 @@
 import SwiftUI
 
-struct CommandRailView: View {
+/// Low-frequency workspace controls live with the task list instead of
+/// reserving a permanent strip of window chrome. This keeps the conversation
+/// visually primary while leaving runtime state, Terminal, and Settings one
+/// click away whenever the sidebar is open.
+struct SidebarUtilityFooter: View {
     @ObservedObject var model: OnyxAppModel
-    let isSidebarVisible: Bool
-    let onToggleSidebar: () -> Void
 
     var body: some View {
-        VStack(spacing: 7) {
-            OnyxMark(size: 21)
-                .padding(.top, 14)
-                .padding(.bottom, 7)
-                .accessibilityHidden(true)
-
-            RailButton(
-                icon: "bubble.left.and.bubble.right",
-                label: "Tasks",
-                isSelected: isSidebarVisible,
-                hint: isSidebarVisible ? "Hides the task sidebar" : "Shows the task sidebar",
-                action: onToggleSidebar
+        HStack(spacing: 4) {
+            ConnectionStatus(
+                state: model.connectionState,
+                runtimeName: model.runtimeDisplayName
             )
 
-            Divider()
-                .overlay(Color.primary.opacity(0.08))
-                .padding(.horizontal, 12)
-                .padding(.vertical, 4)
+            Spacer(minLength: 8)
 
-            RailButton(
+            UtilityButton(
                 icon: "terminal",
                 label: "Terminal",
                 isSelected: model.isBottomPanelVisible,
@@ -34,18 +25,10 @@ struct CommandRailView: View {
                 model.isBottomPanelVisible.toggle()
             }
 
-            Spacer()
-
-            ConnectionGlyph(
-                state: model.connectionState,
-                runtimeName: model.runtimeDisplayName
-            )
-                .padding(.bottom, 3)
-
             SettingsLink {
                 Image(systemName: "gearshape")
-                    .font(.system(size: 14, weight: .medium))
-                    .frame(width: 34, height: 34)
+                    .font(.system(size: 12.5, weight: .medium))
+                    .frame(width: 27, height: 27)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -53,15 +36,18 @@ struct CommandRailView: View {
             .onyxHelp("Settings")
             .accessibilityLabel("Settings")
             .accessibilityHint("Opens Onyx settings")
-            .padding(.bottom, 12)
         }
-        .frame(width: WorkspacePaneLayout.commandRailWidth)
-        .frame(maxHeight: .infinity)
-        .background(OnyxTheme.rail)
+        .padding(.horizontal, 10)
+        .frame(height: 38)
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(OnyxTheme.border)
+                .frame(height: OnyxTheme.hairline)
+        }
     }
 }
 
-private struct RailButton: View {
+private struct UtilityButton: View {
     let icon: String
     let label: String
     let isSelected: Bool
@@ -71,22 +57,14 @@ private struct RailButton: View {
     var body: some View {
         Button(action: action) {
             Image(systemName: icon)
-                .font(.system(size: 14, weight: .medium))
+                .font(.system(size: 12.5, weight: .medium))
                 .symbolRenderingMode(.hierarchical)
-                .frame(width: 32, height: 32)
-                .background(isSelected ? OnyxTheme.railRaised : Color.clear)
-                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
-                .overlay(alignment: .leading) {
-                    if isSelected {
-                        Capsule()
-                            .fill(OnyxTheme.iris)
-                            .frame(width: 2, height: 14)
-                            .offset(x: -5)
-                    }
-                }
+                .frame(width: 27, height: 27)
+                .background(isSelected ? Color.primary.opacity(0.065) : Color.clear)
+                .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
         }
         .buttonStyle(.plain)
-        .foregroundStyle(isSelected ? Color.primary : Color.secondary)
+        .foregroundStyle(isSelected ? OnyxTheme.iris : Color.secondary)
         .onyxHelp(hint ?? label)
         .accessibilityLabel(label)
         .accessibilityHint(hint ?? "")
@@ -94,7 +72,7 @@ private struct RailButton: View {
     }
 }
 
-private struct ConnectionGlyph: View {
+private struct ConnectionStatus: View {
     let state: RuntimeConnectionState
     let runtimeName: String
 
@@ -108,11 +86,19 @@ private struct ConnectionGlyph: View {
     }
 
     var body: some View {
-        ZStack {
-            Circle().stroke(color.opacity(0.28), lineWidth: 4).frame(width: 20, height: 20)
-            Image(systemName: state.onyxAccessibilitySymbol)
-                .font(.system(size: 7, weight: .bold))
-                .foregroundStyle(color)
+        HStack(spacing: 6) {
+            ZStack {
+                Circle()
+                    .fill(color.opacity(0.16))
+                    .frame(width: 16, height: 16)
+                Image(systemName: state.onyxAccessibilitySymbol)
+                    .font(.system(size: 6.5, weight: .bold))
+                    .foregroundStyle(color)
+            }
+            Text(runtimeName)
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
         }
         .onyxHelp(state.onyxAccessibilityValue(runtimeName: runtimeName))
         .accessibilityElement(children: .ignore)

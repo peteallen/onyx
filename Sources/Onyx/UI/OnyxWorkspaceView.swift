@@ -95,14 +95,6 @@ struct OnyxWorkspaceView: View {
             )
 
             HStack(spacing: 0) {
-                CommandRailView(
-                    model: model,
-                    isSidebarVisible: showSidebar,
-                    onToggleSidebar: {
-                        toggleSidebar(sidebarDisplayed: showSidebar, isCompact: isCompact)
-                    }
-                )
-
                 if showSidebar {
                     TaskSidebarView(
                         model: model,
@@ -141,6 +133,7 @@ struct OnyxWorkspaceView: View {
                             onSelectProviderModel: onSelectProviderModel
                         )
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .layoutPriority(1)
 
                         if model.isInspectorVisible {
                             WorkspacePaneResizeHandle(
@@ -154,9 +147,9 @@ struct OnyxWorkspaceView: View {
                             )
                             InspectorWorkspacePane(
                                 model: model,
-                                width: inspectorWidth,
-                                isCompact: isCompact
+                                width: inspectorWidth
                             )
+                                .frame(maxHeight: .infinity, alignment: .top)
                                 .transition(reduceMotion ? .identity : .move(edge: .trailing).combined(with: .opacity))
                         }
                     }
@@ -194,10 +187,13 @@ struct OnyxWorkspaceView: View {
             projectCatalog.start(onFailure: presentProjectFailure)
             synchronizeProviderTasks()
         }
-        .onChange(of: model.threads) { _, _ in synchronizeProviderTasks() }
         .onChange(of: model.isLoadingThreadList) { _, _ in synchronizeProviderTasks() }
-        .onChange(of: model.threadListScope) { _, _ in synchronizeProviderTasks() }
-        .onChange(of: selectedProviderConnectionID) { _, _ in synchronizeProviderTasks() }
+        .onChange(of: model.threadListScope) { _, _ in
+            synchronizeProviderTasks()
+        }
+        .onChange(of: selectedProviderConnectionID) { _, _ in
+            synchronizeProviderTasks()
+        }
         .onChange(of: providerConnections) { _, connections in
             guard !connections.isEmpty else { return }
             projectCatalog.retainTaskLists(for: Set(connections.map(\.id)))
@@ -355,7 +351,7 @@ struct OnyxWorkspaceView: View {
             for: selectedProviderConnectionID,
             providerDisplayName: providerDisplayName,
             scope: model.threadListScope,
-            threads: model.threads
+            threads: model.catalogThreads
         )
     }
 
@@ -365,39 +361,18 @@ struct OnyxWorkspaceView: View {
     }
 }
 
-/// The inspector is supporting context, not a second dashboard. On roomy
-/// windows it floats as one restrained utility sheet; the sections inside stay
-/// flat so the inset does not reintroduce a stack of competing cards.
+/// The inspector is supporting context, not a second dashboard. Its Summary
+/// surface is content-sized and top-aligned; Files and Review can still use the
+/// full available height when the user explicitly opens them.
 private struct InspectorWorkspacePane: View {
     @ObservedObject var model: OnyxAppModel
     let width: CGFloat
-    let isCompact: Bool
-
-    private let inset: CGFloat = 12
 
     var body: some View {
-        Group {
-            if isCompact {
-                ContextInspectorView(model: model)
-                    .frame(width: width)
-            } else {
-                ContextInspectorView(model: model)
-                    .frame(width: max(0, width - inset * 2))
-                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 16, style: .continuous)
-                            .stroke(OnyxTheme.border, lineWidth: OnyxTheme.hairline)
-                    }
-                    .shadow(
-                        color: Color.black.opacity(0.10),
-                        radius: 12,
-                        y: 5
-                    )
-                    .padding(inset)
-            }
-        }
+        ContextInspectorView(model: model)
+            .frame(width: width)
         .frame(width: width)
-        .frame(maxHeight: .infinity, alignment: .trailing)
+        .frame(maxHeight: .infinity, alignment: .top)
         .background(OnyxTheme.canvas)
     }
 }

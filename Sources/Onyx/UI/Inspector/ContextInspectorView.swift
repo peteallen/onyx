@@ -3,8 +3,27 @@ import SwiftUI
 
 struct ContextInspectorView: View {
     @ObservedObject var model: OnyxAppModel
+    @State private var summaryContentHeight: CGFloat = 0
+
+    private let summaryMaximumHeight: CGFloat = 640
 
     var body: some View {
+        VStack(spacing: 0) {
+            inspectorTabBar
+
+            inspectorContent
+        }
+        // The pane owns the canvas/background.  Keeping this view transparent
+        // lets the summary surface size itself to its content instead of
+        // painting a full-height rounded dashboard when the task has little
+        // context to show.
+        .background(Color.clear)
+        .onChange(of: model.selectedThreadID) { _, _ in
+            summaryContentHeight = 0
+        }
+    }
+
+    private var inspectorTabBar: some View {
         VStack(spacing: 0) {
             HStack(spacing: 1) {
                 ForEach(InspectorTab.allCases) { tab in
@@ -12,7 +31,7 @@ struct ContextInspectorView: View {
                         model.inspectorTab = tab
                     } label: {
                         Label(tab.label, systemImage: tab.icon)
-                            .font(.system(size: 11.5, weight: model.inspectorTab == tab ? .semibold : .regular))
+                            .font(.system(size: 11.5, weight: model.inspectorTab == tab ? .medium : .regular))
                             .foregroundStyle(
                                 model.inspectorTab == tab
                                     ? Color.primary
@@ -23,7 +42,7 @@ struct ContextInspectorView: View {
                             .background {
                                 if model.inspectorTab == tab {
                                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                        .fill(OnyxTheme.raisedSurface)
+                                        .fill(Color.primary.opacity(0.065))
                                 }
                             }
                     }
@@ -38,37 +57,107 @@ struct ContextInspectorView: View {
             .accessibilityElement(children: .contain)
             .accessibilityLabel("Context panel sections")
 
-            ScrollView {
-                Group {
-                    switch model.inspectorTab {
-                    case .summary:
-                        SummaryInspector(model: model)
-                    case .files:
-                        FilesInspector(model: model)
-                    case .review:
-                        GitDiffViewerView(model: model)
-                    }
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 2)
+            Divider()
+                .overlay(OnyxTheme.divider)
+        }
+    }
+
+    @ViewBuilder
+    private var inspectorContent: some View {
+        switch model.inspectorTab {
+        case .summary:
+            summarySurface
+        case .files:
+            inspectorScrollableSurface {
+                FilesInspector(model: model)
+            }
+        case .review:
+            inspectorScrollableSurface {
+                GitDiffViewerView(model: model)
             }
         }
+    }
+
+    /// A regular vertical ScrollView expands to the height proposed by its
+    /// parent, even when its content is short. Measure the summary content in
+    /// its unconstrained scroll axis and give the viewport only that height
+    /// (up to a sensible cap) so a quiet task produces a compact card.
+    private var summarySurface: some View {
+        ScrollView {
+            SummaryInspector(model: model)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 4)
+                .background {
+                    GeometryReader { proxy in
+                        Color.clear
+                            .preference(
+                                key: InspectorContentHeightPreferenceKey.self,
+                                value: proxy.size.height
+                            )
+                    }
+                }
+        }
+        .scrollIndicators(.hidden)
+        .frame(height: summaryViewportHeight, alignment: .top)
         .background(OnyxTheme.inspector)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .padding(.horizontal, 10)
+        .padding(.top, 10)
+        .padding(.bottom, 10)
+        .onPreferenceChange(InspectorContentHeightPreferenceKey.self) { height in
+            guard height.isFinite,
+                  height > 0,
+                  abs(height - summaryContentHeight) > 0.5 else { return }
+            summaryContentHeight = height
+        }
+    }
+
+    private var summaryViewportHeight: CGFloat {
+        let measuredHeight = summaryContentHeight > 0 ? summaryContentHeight : 220
+        return min(max(measuredHeight, 1), summaryMaximumHeight)
+    }
+
+    @ViewBuilder
+    private func inspectorScrollableSurface<Content: View>(
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        ScrollView {
+            content()
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
+        }
+        .background(OnyxTheme.inspector)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .padding(10)
+    }
+}
+
+private struct InspectorContentHeightPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }
 
 private struct SummaryInspector: View {
     @ObservedObject var model: OnyxAppModel
-    @State private var isPlanExpanded = true
+    @State private var isTaskExpanded = false
+    @State private var isPlanExpanded = false
     @State private var isAgentsExpanded = false
     @State private var isChangesExpanded = false
-    @State private var isEnvironmentExpanded = true
+    @State private var isEnvironmentExpanded = false
     @State private var showsAllAgents = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            InspectorSection(title: "Task", icon: "checklist") {
-                InspectorValueRow(label: "Status", value: model.selectedTaskAttention.label)
+            InspectorDisclosureSection(
+                title: "Task",
+                icon: "checklist",
+                summary: model.selectedTaskAttention.label,
+                isExpanded: $isTaskExpanded,
+                accessibilityHint: "Shows runtime and model details"
+            ) {
                 InspectorValueRow(label: "Runtime", value: model.runtimeDisplayName)
                 InspectorValueRow(label: "Model", value: model.selectedModelName)
                 InspectorValueRow(label: "Reasoning", value: model.selectedReasoningEffortName)
@@ -113,11 +202,6 @@ private struct SummaryInspector: View {
         }
         .onChange(of: model.selectedThreadID) { _, _ in
             resetDisclosureState()
-        }
-        .onChange(of: model.collaborationAgents.filter { $0.status.isLive }.count) { _, liveCount in
-            if liveCount > 0 {
-                isAgentsExpanded = true
-            }
         }
     }
 
@@ -301,7 +385,7 @@ private struct SummaryInspector: View {
         InspectorDisclosureSection(
             title: "Environment",
             icon: "shippingbox",
-            summary: model.permissionLabel,
+            summary: workspaceSummary,
             isExpanded: $isEnvironmentExpanded,
             accessibilityHint: "Shows the selected workspace and access level"
         ) {
@@ -336,8 +420,19 @@ private struct SummaryInspector: View {
         return changes.count == 1 ? "1 file changed" : "\(changes.count) files changed"
     }
 
+    private var workspaceSummary: String {
+        guard workspacePath != "No project selected" else { return workspacePath }
+        let name = URL(fileURLWithPath: workspacePath).lastPathComponent
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? model.permissionLabel : name
+    }
+
     private func planSummary(for plan: RuntimePlan) -> String {
-        switch plan.timelineStatus {
+        if !plan.steps.isEmpty {
+            let completed = plan.steps.filter { $0.status == .completed }.count
+            return "\(completed) of \(plan.steps.count) complete"
+        }
+        return switch plan.timelineStatus {
         case .running: "In progress"
         case .completed: "Complete"
         case .pending: "Not started"
@@ -357,10 +452,11 @@ private struct SummaryInspector: View {
     }
 
     private func resetDisclosureState() {
-        isPlanExpanded = model.selectedPlan?.timelineStatus == .running
-        isAgentsExpanded = model.collaborationAgents.contains { $0.status.isLive }
+        isTaskExpanded = false
+        isPlanExpanded = false
+        isAgentsExpanded = false
         isChangesExpanded = false
-        isEnvironmentExpanded = true
+        isEnvironmentExpanded = false
         showsAllAgents = false
     }
 
@@ -858,7 +954,7 @@ private struct FilesInspector: View {
     }
 }
 
-private struct ProjectFileRow: View {
+struct ProjectFileRow: View {
     let entry: ProjectFileEntry
     let depth: Int
     let isExpanded: Bool
@@ -870,11 +966,27 @@ private struct ProjectFileRow: View {
     var body: some View {
         HStack(spacing: 4) {
             if entry.isDirectory {
+                // The disclosure affordance and the folder name are one
+                // interaction.  Previously only the 12-point chevron was a
+                // button, which made a normal click on the folder label look
+                // broken.  Keeping the trailing actions outside this button
+                // preserves the row menu while making the whole leading area
+                // a generous, discoverable toggle target.
                 Button(action: onToggle) {
-                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                        .font(.system(size: 8.5, weight: .semibold))
-                        .frame(width: 12, height: 20)
-                        .contentShape(Rectangle())
+                    HStack(spacing: 4) {
+                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 8.5, weight: .semibold))
+                            .frame(width: 12, height: 20)
+                        Image(systemName: icon)
+                            .frame(width: 13)
+                            .foregroundStyle(OnyxTheme.iris)
+                            .accessibilityHidden(true)
+                        Text(entry.name)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    .contentShape(Rectangle())
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .buttonStyle(.plain)
                 .onyxHelp(isExpanded ? "Collapse folder" : "Expand folder")
@@ -882,31 +994,30 @@ private struct ProjectFileRow: View {
                 .accessibilityHint("Changes which files are shown")
             } else {
                 Color.clear.frame(width: 12, height: 20)
-            }
-
-            if entry.kind == .file {
-                Button(action: onPreview) {
-                    HStack(spacing: 4) {
-                        Image(systemName: icon)
-                            .frame(width: 13)
-                            .foregroundStyle(.secondary)
-                            .accessibilityHidden(true)
-                        Text(entry.name)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
+                if entry.kind == .file {
+                    Button(action: onPreview) {
+                        HStack(spacing: 4) {
+                            Image(systemName: icon)
+                                .frame(width: 13)
+                                .foregroundStyle(.secondary)
+                                .accessibilityHidden(true)
+                            Text(entry.name)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                        .contentShape(Rectangle())
                     }
-                    .contentShape(Rectangle())
+                    .buttonStyle(.plain)
+                    .onyxHelp("Preview \(entry.name)")
+                } else {
+                    Image(systemName: icon)
+                        .frame(width: 13)
+                        .foregroundStyle(.secondary)
+                        .accessibilityHidden(true)
+                    Text(entry.name)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
-                .buttonStyle(.plain)
-                .onyxHelp("Preview \(entry.name)")
-            } else {
-                Image(systemName: icon)
-                    .frame(width: 13)
-                    .foregroundStyle(entry.isDirectory ? OnyxTheme.iris : .secondary)
-                    .accessibilityHidden(true)
-                Text(entry.name)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
             }
             Spacer(minLength: 4)
 
@@ -969,33 +1080,6 @@ private struct SourcePreviewLineView: View {
         .frame(minHeight: 18)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Line \(line.number): \(line.text)")
-    }
-}
-
-private struct InspectorSection<Content: View>: View {
-    let title: String
-    let icon: String
-    @ViewBuilder let content: Content
-
-    init(title: String, icon: String, @ViewBuilder content: () -> Content) {
-        self.title = title
-        self.icon = icon
-        self.content = content()
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Label(title, systemImage: icon)
-                .font(.system(size: 13, weight: .semibold))
-            VStack(alignment: .leading, spacing: 7) {
-                content
-            }
-            .font(.system(size: 11.5))
-            .foregroundStyle(OnyxTheme.quietText)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 2)
-        .padding(.vertical, 11)
     }
 }
 
@@ -1080,12 +1164,12 @@ private struct InspectorDisclosureSection<Content: View>: View {
             } label: {
                 HStack(spacing: 7) {
                     Label(title, systemImage: icon)
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(.system(size: 12.5, weight: .medium))
                         .foregroundStyle(Color.primary)
                     Spacer(minLength: 8)
                     if !summary.isEmpty {
                         Text(summary)
-                            .font(.system(size: 11))
+                            .font(.system(size: 10.5))
                             .foregroundStyle(OnyxTheme.quietText)
                             .lineLimit(1)
                     }

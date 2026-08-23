@@ -119,6 +119,49 @@ final class ProjectCatalogModelTests: XCTestCase {
         XCTAssertEqual(byProvider.groups[0].tasks.map(\.thread.id), ["local"])
     }
 
+    func testLargeProjectionRemainsComfortablyInteractive() {
+        // This mirrors a long-lived Codex installation: hundreds of imported
+        // project roots and thousands of tasks. Projection runs away from the
+        // UI thread, but a tight budget still prevents search results from
+        // lagging behind the user's typing.
+        // Match the real history that exposed the beachball on this machine.
+        let projectCount = 224
+        let taskCount = 4_824
+        let projects = (0..<projectCount).map { index in
+            project(
+                id: "project-\(index)",
+                path: "/work/project-\(index)",
+                name: "Project \(index)",
+                order: index
+            )
+        }
+        let tasks = (0..<taskCount).map { index in
+            let projectIndex = index % projectCount
+            return reference(thread(
+                id: "task-\(index)",
+                title: "Task \(index)",
+                // Real histories contain many tasks sharing a checkout. Keep
+                // a handful of worktrees per project so the cache path is
+                // exercised without manufacturing thousands of unique roots.
+                cwd: "/work/project-\(projectIndex)/worktree-\((index / projectCount) % 3)",
+                updatedAt: TimeInterval(index)
+            ))
+        }
+
+        let clock = ContinuousClock()
+        let start = clock.now
+        let grouping = ProjectTaskSidebarProjection.group(tasks, by: projects)
+        let elapsed = start.duration(to: clock.now)
+
+        XCTAssertEqual(grouping.taskCount, taskCount)
+        XCTAssertEqual(grouping.groups.count, projectCount)
+        XCTAssertLessThan(
+            elapsed,
+            .milliseconds(200),
+            "A routine sidebar projection exceeded the interaction budget: \(elapsed)"
+        )
+    }
+
     func testModelMutationsPublishAndPersistProjectManagementOrder() async throws {
         let location = temporaryCatalogLocation()
         defer { try? FileManager.default.removeItem(at: location.directory) }
@@ -174,6 +217,159 @@ final class ProjectCatalogModelTests: XCTestCase {
         XCTAssertEqual(model.taskReferences(for: .active).map(\.thread.id), ["active-new"])
         XCTAssertEqual(model.taskReferences(for: .active).map(\.providerDisplayName), ["Local Qwen"])
         XCTAssertEqual(model.taskReferences(for: .archived).map(\.thread.id), ["archived"])
+    }
+
+    func testSidebarProjectionRevisionChangesOnlyForMeaningfulTaskSourceChanges() {
+        let model = ProjectCatalogModel()
+        let provider = ProviderConnectionID("local.vllm")
+        let first = thread(id: "task", title: "Task", cwd: "/work/alpha")
+
+        XCTAssertEqual(model.sidebarProjectionRevision, 0)
+        model.replaceTasks(
+            for: provider,
+            providerDisplayName: "vLLM",
+            scope: .active,
+            threads: [first]
+        )
+        let firstRevision = model.sidebarProjectionRevision
+        XCTAssertGreaterThan(firstRevision, 0)
+
+        model.replaceTasks(
+            for: provider,
+            providerDisplayName: "vLLM",
+            scope: .active,
+            threads: [first]
+        )
+        XCTAssertEqual(model.sidebarProjectionRevision, firstRevision)
+
+        model.replaceTasks(
+            for: provider,
+            providerDisplayName: "vLLM",
+            scope: .active,
+            threads: [thread(id: "task-2", title: "Task 2", cwd: "/work/alpha")]
+        )
+        XCTAssertGreaterThan(model.sidebarProjectionRevision, firstRevision)
+    }
+
+    func testAsyncSidebarProjectionPublishesLatestRequestAndKeepsRowsOutOfBody() async {
+        let alpha = project(id: "alpha", path: "/work/alpha", name: "Alpha", order: 0)
+        let firstRequest = ProjectTaskSidebarProjectionRequest(
+            key: .init(
+                sourceRevision: 1,
+                scopeRawValue: ThreadListScope.active.rawValue,
+                searchText: "first",
+                liveProviderConnectionID: nil,
+                liveProviderDisplayName: nil,
+                liveProviderThreadListRevision: nil,
+                welcomeProviderConnectionID: nil,
+                welcomeProviderDisplayName: nil,
+                welcomeWorkspacePath: nil
+            ),
+            taskLists: [ProjectProviderTaskList(
+                providerConnectionID: .codexDefault,
+                providerDisplayName: "Codex",
+                scope: .active,
+                threads: [thread(id: "first", title: "First", cwd: alpha.folderPath)]
+            )],
+            projects: [alpha],
+            welcomeThread: nil
+        )
+        let latestRequest = ProjectTaskSidebarProjectionRequest(
+            key: .init(
+                sourceRevision: 1,
+                scopeRawValue: ThreadListScope.active.rawValue,
+                searchText: "second",
+                liveProviderConnectionID: nil,
+                liveProviderDisplayName: nil,
+                liveProviderThreadListRevision: nil,
+                welcomeProviderConnectionID: nil,
+                welcomeProviderDisplayName: nil,
+                welcomeWorkspacePath: nil
+            ),
+            taskLists: [ProjectProviderTaskList(
+                providerConnectionID: .codexDefault,
+                providerDisplayName: "Codex",
+                scope: .active,
+                threads: [thread(id: "second", title: "Second", cwd: alpha.folderPath)]
+            )],
+            projects: [alpha],
+            welcomeThread: nil
+        )
+
+        let projection = ProjectTaskSidebarProjectionModel()
+        projection.refresh(firstRequest)
+        projection.refresh(latestRequest)
+
+        XCTAssertFalse(
+            projection.isReady,
+            "refresh must return before projection work runs so the main actor can paint the click"
+        )
+
+        for _ in 0..<100 where !projection.isReady {
+            await Task.yield()
+        }
+
+        XCTAssertTrue(projection.isReady)
+        XCTAssertEqual(projection.grouping.groups.first?.tasks.map(\.thread.id), ["second"])
+    }
+
+    func testLiveProviderSnapshotOverridesStaleCatalogWithoutMainActorReplacement() {
+        let model = ProjectCatalogModel()
+        let provider = ProviderConnectionID("local.vllm")
+        model.replaceTasks(
+            for: provider,
+            providerDisplayName: "vLLM",
+            scope: .active,
+            threads: [thread(id: "task", title: "Old title", cwd: "/work/alpha")]
+        )
+        let cachedCatalogRevision = model.sidebarProjectionRevision
+        var liveThread = thread(
+            id: "task",
+            title: "Renamed task",
+            cwd: "/work/alpha",
+            updatedAt: 200,
+            isPinned: true
+        )
+        liveThread.status = .running
+
+        let request = model.sidebarProjectionRequest(
+            scope: .active,
+            searchText: "",
+            liveProviderConnectionID: provider,
+            liveProviderDisplayName: "Local Qwen",
+            liveProviderThreadListRevision: 42,
+            liveProviderThreads: [liveThread],
+            welcomeThread: nil,
+            welcomeProviderConnectionID: provider,
+            welcomeProviderDisplayName: "Local Qwen",
+            welcomeWorkspacePath: nil
+        )
+        let grouping = request.grouping()
+        let projected = grouping.unassigned.first?.thread
+
+        XCTAssertEqual(projected?.title, "Renamed task")
+        XCTAssertEqual(projected?.status, .running)
+        XCTAssertEqual(projected?.isPinned, true)
+        XCTAssertEqual(request.key.liveProviderThreadListRevision, 42)
+        XCTAssertEqual(
+            model.sidebarProjectionRevision,
+            cachedCatalogRevision,
+            "Reading live rows must not republish or deep-compare the cached catalog on the main actor"
+        )
+
+        let nextRequest = model.sidebarProjectionRequest(
+            scope: .active,
+            searchText: "",
+            liveProviderConnectionID: provider,
+            liveProviderDisplayName: "Local Qwen",
+            liveProviderThreadListRevision: 43,
+            liveProviderThreads: [liveThread],
+            welcomeThread: nil,
+            welcomeProviderConnectionID: provider,
+            welcomeProviderDisplayName: "Local Qwen",
+            welcomeWorkspacePath: nil
+        )
+        XCTAssertNotEqual(request.key, nextRequest.key)
     }
 
     func testTaskProjectBootstrapRequiresCompleteSourcesAndHonorsRemovalMarker() async throws {

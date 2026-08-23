@@ -91,9 +91,14 @@ struct NativeComposerTextView: NSViewRepresentable {
     }
 }
 
-fileprivate final class ComposerTextView: NSTextView {
+/// Kept internal so the native paste path can be exercised without replacing
+/// the user's process-wide clipboard in tests.
+final class ComposerTextView: NSTextView {
     var onSubmit: (() -> Void)?
     var onPasteImages: (([NSImage]) -> Void)?
+    var pastedImagesProvider: () -> [NSImage]? = {
+        ComposerPasteboardImages.images(from: .general)
+    }
     var placeholder = "" {
         didSet { needsDisplay = true }
     }
@@ -126,13 +131,69 @@ fileprivate final class ComposerTextView: NSTextView {
         needsDisplay = true
     }
     override func paste(_ sender: Any?) {
-        if let images = NSPasteboard.general.readObjects(
-            forClasses: [NSImage.self],
-            options: nil
-        ) as? [NSImage], !images.isEmpty {
+        if let images = pastedImagesProvider(), !images.isEmpty {
             onPasteImages?(images)
             return
         }
         super.pasteAsPlainText(sender)
+    }
+}
+
+/// Normalizes the image representations macOS applications commonly put on
+/// the clipboard. `readObjects(forClasses: [NSImage.self])` alone misses
+/// screenshots and browser images that expose only TIFF/PNG data or a file
+/// URL, which made paste appear to do nothing even though the clipboard
+/// visibly contained an image.
+enum ComposerPasteboardImages {
+    static func images(from pasteboard: NSPasteboard) -> [NSImage]? {
+        if let images = pasteboard.readObjects(
+            forClasses: [NSImage.self],
+            options: nil
+        ) as? [NSImage], !images.isEmpty {
+            return images
+        }
+
+        if let fileURLs = pasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        ) as? [NSURL] {
+            let images = fileURLs
+                .compactMap { value -> URL? in
+                    guard value.isFileURL else { return nil }
+                    return value as URL
+                }
+                .compactMap { NSImage(contentsOf: $0) }
+            if !images.isEmpty { return images }
+        }
+
+        return images(from: pasteboard.pasteboardItems ?? [])
+    }
+
+    static func images(from items: [NSPasteboardItem]) -> [NSImage]? {
+        let imageTypes: [NSPasteboard.PasteboardType] = [
+            .png,
+            .tiff,
+            .init("public.jpeg"),
+            .init("public.heic"),
+            .init("org.webmproject.webp"),
+        ]
+        var images: [NSImage] = []
+        for item in items {
+            if let rawFileURL = item.string(forType: .fileURL),
+               let url = URL(string: rawFileURL),
+               url.isFileURL,
+               let image = NSImage(contentsOf: url) {
+                images.append(image)
+                continue
+            }
+            for type in imageTypes where item.types.contains(type) {
+                if let data = item.data(forType: type),
+                   let image = NSImage(data: data) {
+                    images.append(image)
+                    break
+                }
+            }
+        }
+        return images.isEmpty ? nil : images
     }
 }
