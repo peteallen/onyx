@@ -2,6 +2,46 @@ import XCTest
 @testable import Onyx
 
 final class CodexRuntimeLiveTests: XCTestCase {
+    func testInstalledAppServerAcceptsEphemeralPaginatedForkWhenEnabled() async throws {
+        guard ProcessInfo.processInfo.environment["ONYX_LIVE_CODEX_TEST"] == "1" else {
+            throw XCTSkip("Set ONYX_LIVE_CODEX_TEST=1 to exercise the installed Codex runtime")
+        }
+
+        let runtime = try CodexRuntime.makeDefault()
+        do {
+            _ = try await runtime.connect()
+            let threads = try await runtime.listThreads(limit: 20, archived: false)
+            var forkedConversation: RuntimeConversation?
+            var lastFailure: (any Error)?
+
+            for thread in threads {
+                do {
+                    forkedConversation = try await runtime.forkEphemeralThread(id: thread.id)
+                    break
+                } catch let AgentRuntimeError.requestFailed(_, message)
+                    where message.localizedCaseInsensitiveContains("active writer") {
+                    lastFailure = AgentRuntimeError.protocolFailure(message)
+                    continue
+                } catch {
+                    lastFailure = error
+                    break
+                }
+            }
+
+            await runtime.disconnect()
+            if let lastFailure, forkedConversation == nil { throw lastFailure }
+            let verifiedFork = try XCTUnwrap(
+                forkedConversation,
+                "At least one recent task should support an ephemeral paginated fork"
+            )
+            XCTAssertTrue(verifiedFork.items.isEmpty)
+            XCTAssertFalse(verifiedFork.thread.id.isEmpty)
+        } catch {
+            await runtime.disconnect()
+            throw error
+        }
+    }
+
     func testInstalledAppServerConnectsAndListsThreadsWhenEnabled() async throws {
         guard ProcessInfo.processInfo.environment["ONYX_LIVE_CODEX_TEST"] == "1" else {
             throw XCTSkip("Set ONYX_LIVE_CODEX_TEST=1 to exercise the installed Codex runtime")
