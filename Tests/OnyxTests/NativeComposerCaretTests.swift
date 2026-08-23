@@ -124,7 +124,7 @@ final class NativeComposerCaretTests: XCTestCase {
             frame: NSRect(x: 0, y: 0, width: 320, height: 80)
         )
         textView.placeholder = "Describe what you want to build or change"
-        textView.font = .systemFont(ofSize: 14.5)
+        textView.font = .systemFont(ofSize: OnyxTypography.reading)
         textView.textContainerInset = NSSize(width: 2, height: 7)
         textView.textContainer?.widthTracksTextView = true
         textView.textContainer?.containerSize = NSSize(

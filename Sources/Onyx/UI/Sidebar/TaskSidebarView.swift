@@ -110,7 +110,7 @@ struct TaskSidebarView: View {
         HStack(spacing: 9) {
             VStack(alignment: .leading, spacing: 1) {
                 Text("Onyx")
-                    .font(.system(size: 14, weight: .semibold))
+                    .font(.system(size: OnyxTypography.paneTitle, weight: .semibold))
             }
             Spacer()
             Button(action: model.newTask) {
@@ -134,9 +134,8 @@ struct TaskSidebarView: View {
             .accessibilityLabel("New task")
             .accessibilityHint("Creates a new task")
         }
-        .frame(height: 44)
-        .padding(.horizontal, 13)
-        .padding(.top, 2)
+        .frame(height: OnyxWorkspaceMetrics.paneHeaderHeight)
+        .padding(.horizontal, OnyxWorkspaceMetrics.paneEdgeInset)
     }
 
     private var search: some View {
@@ -146,7 +145,7 @@ struct TaskSidebarView: View {
                 .font(.system(size: 11.5, weight: .medium))
             TextField("Search tasks", text: $model.searchText)
                 .textFieldStyle(.plain)
-                .font(.system(size: 12.5))
+                .font(.system(size: OnyxTypography.secondary))
                 .focused($isSearchFocused)
                 .accessibilityLabel("Search tasks")
                 .accessibilityHint("Filters the task list as you type")
@@ -164,7 +163,7 @@ struct TaskSidebarView: View {
             }
         }
         .padding(.horizontal, 9)
-        .frame(height: OnyxHitTarget.compact)
+        .frame(height: OnyxWorkspaceMetrics.fieldHeight)
         .background(OnyxTheme.surface)
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay {
@@ -193,7 +192,7 @@ struct TaskSidebarView: View {
     private var projectListHeader: some View {
         HStack(spacing: 6) {
             Text("Projects")
-                .font(.system(size: 11.5, weight: .medium))
+                .font(.system(size: OnyxTypography.secondary, weight: .semibold))
                 .foregroundStyle(.secondary)
             Spacer()
             if projectCatalog.isLoading {
@@ -555,7 +554,7 @@ private struct SidebarSectionLabel: View {
     var body: some View {
         HStack(spacing: 7) {
             Text(title)
-                .font(.system(size: 11.5, weight: .semibold))
+                .font(.system(size: OnyxTypography.secondary, weight: .semibold))
             Spacer()
             Text("\(count)")
                 .font(.system(size: 10, weight: .medium, design: .monospaced))
@@ -594,7 +593,7 @@ struct ProjectSidebarHeader: View {
                         .font(.system(size: 10.5, weight: .medium))
                         .foregroundStyle(isExpanded ? Color.secondary : Color.secondary.opacity(0.78))
                     Text(project.displayName)
-                        .font(.system(size: 11.5, weight: isExpanded ? .medium : .regular))
+                        .font(.system(size: OnyxTypography.navigation, weight: .medium))
                         .foregroundStyle(isExpanded ? Color.primary : Color.secondary)
                         .lineLimit(1)
                     Spacer(minLength: 4)
@@ -659,7 +658,7 @@ private struct TaskSidebarRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     Text(thread.title)
-                        .font(.system(size: 12.5, weight: isSelected ? .medium : .regular))
+                        .font(.system(size: OnyxTypography.navigation, weight: isSelected ? .medium : .regular))
                         .foregroundStyle(.primary)
                         .lineLimit(1)
                     Spacer(minLength: 4)
@@ -696,7 +695,7 @@ private struct TaskSidebarRow: View {
                         .monospacedDigit()
                         .foregroundStyle(.tertiary)
                 }
-                .font(.system(size: 10.5))
+                .font(.system(size: OnyxTypography.metadata))
                 .foregroundStyle(.secondary)
             }
         }

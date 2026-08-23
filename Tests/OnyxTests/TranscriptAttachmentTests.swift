@@ -104,6 +104,65 @@ final class TranscriptAttachmentTests: XCTestCase {
     }
 
     @MainActor
+    func testAssistantPlanAndRoutineActivityShareOneConversationAxis() {
+        let assistant = TimelineItem(
+            id: "axis-assistant",
+            kind: .assistantMessage,
+            title: nil,
+            body: "Assistant prose",
+            status: .completed,
+            timestamp: .now,
+            detail: nil
+        )
+        let plan = TimelineItem(
+            id: "axis-plan",
+            kind: .plan,
+            title: "Plan",
+            body: "[~] Align the transcript",
+            status: .running,
+            timestamp: .now,
+            detail: nil
+        )
+        let activity = TimelineItem(
+            id: "axis-activity",
+            kind: .tool,
+            title: "Inspect layout",
+            body: "Finished",
+            status: .completed,
+            timestamp: .now,
+            detail: nil
+        )
+
+        let assistantMetrics = TranscriptCellView.metrics(
+            for: assistant,
+            width: 640,
+            isExpanded: true
+        )
+        let planMetrics = TranscriptCellView.metrics(for: plan, width: 640, isExpanded: false)
+        let activityMetrics = TranscriptCellView.metrics(
+            for: activity,
+            width: 640,
+            isExpanded: false
+        )
+
+        XCTAssertEqual(assistantMetrics.contentX, OnyxWorkspaceMetrics.conversationTextInset)
+        XCTAssertEqual(planMetrics.contentX, assistantMetrics.contentX)
+        XCTAssertEqual(activityMetrics.contentX, assistantMetrics.contentX)
+
+        let planCell = TranscriptCellView(
+            frame: NSRect(
+                x: 0,
+                y: 0,
+                width: 640,
+                height: TranscriptCellView.height(for: plan, width: 640, isExpanded: false)
+            )
+        )
+        planCell.configure(with: plan, isExpanded: false)
+        planCell.layout()
+        XCTAssertLessThanOrEqual(planCell.expansionControl.frame.maxX, planMetrics.contentX)
+    }
+
+    @MainActor
     func testLatestUserMessageEditControlIsQuietButGenerousAndInvokesHandler() {
         let message = TimelineItem(
             id: "editable-user",
@@ -251,7 +310,7 @@ final class TranscriptAttachmentTests: XCTestCase {
                 effectiveRange: nil
             ) as? NSFont
         )
-        XCTAssertEqual(compactTitleFont.pointSize, 11.5, accuracy: 0.1)
+        XCTAssertEqual(compactTitleFont.pointSize, OnyxTypography.navigation, accuracy: 0.1)
         XCTAssertLessThanOrEqual(cell.expansionControl.frame.maxX, compactTitle.frame.minX)
         XCTAssertLessThan(
             cell.expansionControl.frame.maxX,
@@ -343,10 +402,10 @@ final class TranscriptAttachmentTests: XCTestCase {
         var runningPlan = running
         runningPlan.kind = .plan
         runningPlan.title = "Plan"
-        XCTAssertGreaterThan(
+        XCTAssertEqual(
             TranscriptCellView.metrics(for: runningPlan, width: 640, isExpanded: false).statusWidth,
             0,
-            "Non-routine live progress keeps its explicit visible status"
+            "Plan progress stays on its inline row instead of creating a detached status column"
         )
 
         var failedCommand = running
@@ -532,6 +591,16 @@ final class TranscriptAttachmentTests: XCTestCase {
         XCTAssertEqual(cell.layer?.borderWidth, 0)
         XCTAssertEqual(cell.layer?.backgroundColor, NSColor.clear.cgColor)
         XCTAssertEqual(cell.expansionControl.accessibilityValue() as? String, "Collapsed")
+        XCTAssertEqual(cell.accessibilityValue() as? String, "Running, Collapsed")
+        XCTAssertEqual(
+            TranscriptCellView.metrics(for: plan, width: 640, isExpanded: false).statusWidth,
+            0
+        )
+        XCTAssertEqual(
+            cell.expansionControl.contentTintColor,
+            NSColor.systemBlue.withAlphaComponent(0.84),
+            "The disclosure still carries Plan's running state after removing the text column"
+        )
 
         var oversizedPlan = plan
         oversizedPlan.body = Array(repeating: "[x] Finished", count: 300).joined(separator: "\n")
@@ -570,10 +639,20 @@ final class TranscriptAttachmentTests: XCTestCase {
             rendered.attribute(.font, at: text.range(of: "Built").location, effectiveRange: nil) as? NSFont
         )
         XCTAssertTrue(NSFontManager.shared.traits(of: boldFont).contains(.boldFontMask))
+        XCTAssertEqual(
+            boldFont.fontName,
+            NSFont.systemFont(ofSize: boldFont.pointSize, weight: .semibold).fontName
+        )
+        XCTAssertNotEqual(
+            boldFont.fontName,
+            NSFont.systemFont(ofSize: boldFont.pointSize, weight: .bold).fontName,
+            "Strong Markdown should use semibold emphasis, not full bold"
+        )
 
         let bodyFont = try XCTUnwrap(
             rendered.attribute(.font, at: text.range(of: "the preview").location, effectiveRange: nil) as? NSFont
         )
+        XCTAssertEqual(bodyFont.pointSize, OnyxTypography.reading, accuracy: 0.1)
         XCTAssertFalse(NSFontManager.shared.traits(of: bodyFont).contains(.boldFontMask))
 
         let paragraphStyle = try XCTUnwrap(
@@ -584,6 +663,12 @@ final class TranscriptAttachmentTests: XCTestCase {
             ) as? NSParagraphStyle
         )
         XCTAssertEqual(paragraphStyle.lineSpacing, TranscriptMarkdownRenderer.readingLineSpacing)
+        XCTAssertEqual(paragraphStyle.firstLineHeadIndent, 0, accuracy: 0.01)
+        XCTAssertGreaterThan(
+            paragraphStyle.headIndent,
+            0,
+            "Wrapped list lines should return under the list content instead of the bullet"
+        )
 
         let codeFont = try XCTUnwrap(
             rendered.attribute(.font, at: text.range(of: "native AppKit").location, effectiveRange: nil) as? NSFont

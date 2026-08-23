@@ -39,7 +39,7 @@ struct NativeComposerTextView: NSViewRepresentable {
         textView.isAutomaticTextReplacementEnabled = false
         textView.drawsBackground = false
         textView.textContainerInset = NSSize(width: 2, height: 7)
-        textView.font = .systemFont(ofSize: 14.5)
+        textView.font = .systemFont(ofSize: OnyxTypography.reading)
         textView.textColor = .labelColor
         textView.insertionPointColor = .controlAccentColor
         textView.isVerticallyResizable = true
@@ -141,7 +141,7 @@ final class ComposerTextView: NSTextView {
         super.draw(dirtyRect)
         guard string.isEmpty, !placeholder.isEmpty else { return }
         let attributes: [NSAttributedString.Key: Any] = [
-            .font: font ?? NSFont.systemFont(ofSize: 14.5),
+            .font: font ?? NSFont.systemFont(ofSize: OnyxTypography.reading),
             .foregroundColor: NSColor.placeholderTextColor,
         ]
         NSString(string: placeholder).draw(

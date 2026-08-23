@@ -25,42 +25,41 @@ struct ContextInspectorView: View {
     }
 
     private var inspectorTabBar: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 1) {
-                ForEach(InspectorTab.allCases) { tab in
-                    Button {
-                        model.inspectorTab = tab
-                    } label: {
+        HStack(spacing: 1) {
+            ForEach(InspectorTab.allCases) { tab in
+                Button {
+                    model.inspectorTab = tab
+                } label: {
+                    ZStack {
+                        if model.inspectorTab == tab {
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(Color.primary.opacity(0.065))
+                                .frame(height: 31)
+                        }
                         Label(tab.label, systemImage: tab.icon)
-                            .font(.system(size: 11.5, weight: model.inspectorTab == tab ? .medium : .regular))
+                            .font(.system(size: OnyxTypography.navigation, weight: model.inspectorTab == tab ? .medium : .regular))
                             .foregroundStyle(
                                 model.inspectorTab == tab
                                     ? Color.primary
                                     : OnyxTheme.inactiveControlText
                             )
-                            .frame(maxWidth: .infinity)
-                            .frame(height: 31)
-                            .contentShape(Rectangle())
-                            .background {
-                                if model.inspectorTab == tab {
-                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                        .fill(Color.primary.opacity(0.065))
-                                }
-                            }
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityAddTraits(model.inspectorTab == tab ? .isSelected : [])
-                    .accessibilityHint("Shows the \(tab.label.lowercased()) section")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(model.inspectorTab == tab ? .isSelected : [])
+                .accessibilityHint("Shows the \(tab.label.lowercased()) section")
             }
-            .padding(.horizontal, 12)
-            .padding(.top, 10)
-            .padding(.bottom, 8)
-            .accessibilityElement(children: .contain)
-            .accessibilityLabel("Context panel sections")
-
-            Divider()
-                .overlay(OnyxTheme.divider)
+        }
+        .padding(.horizontal, OnyxWorkspaceMetrics.paneEdgeInset)
+        .frame(height: OnyxWorkspaceMetrics.paneHeaderHeight)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Context panel sections")
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(OnyxTheme.divider)
+                .frame(height: OnyxTheme.hairline)
         }
     }
 
@@ -125,7 +124,7 @@ struct ContextInspectorView: View {
     ) -> some View {
         ScrollView {
             content()
-                .padding(.horizontal, 14)
+                .padding(.horizontal, 12)
                 .padding(.vertical, 12)
         }
         .background(OnyxTheme.inspector)
@@ -1182,12 +1181,12 @@ struct InspectorDisclosureSection<Content: View>: View {
             } label: {
                 HStack(spacing: 7) {
                     Label(title, systemImage: icon)
-                        .font(.system(size: 12.5, weight: .medium))
+                        .font(.system(size: OnyxTypography.navigation, weight: .medium))
                         .foregroundStyle(Color.primary)
                     Spacer(minLength: 8)
                     if !summary.isEmpty {
                         Text(summary)
-                            .font(.system(size: 10.5))
+                            .font(.system(size: OnyxTypography.metadata))
                             .foregroundStyle(OnyxTheme.quietText)
                             .lineLimit(1)
                     }

@@ -188,7 +188,7 @@ enum ConversationContentLayout {
     /// Keep the composer on the same calm reading axis as the transcript.
     /// A much wider input surface makes the center pane feel like a form and
     /// encourages long, hard-to-scan lines even when the window has room.
-    static let maximumComposerWidth: CGFloat = 760
+    static let maximumComposerWidth = OnyxWorkspaceMetrics.maximumReadingWidth
     static let bottomInset: CGFloat = 20
     static let minimumHorizontalInset: CGFloat = 14
     static let maximumHorizontalInset: CGFloat = 20
@@ -252,7 +252,7 @@ private struct ConversationHeaderView: View {
                     .accessibilityHidden(true)
 
                 Text(headerTitle)
-                    .font(.system(size: 14, weight: .semibold))
+                    .font(.system(size: OnyxTypography.paneTitle, weight: .semibold))
                     .lineLimit(1)
             }
             .onyxHelp(projectContext)
@@ -360,8 +360,8 @@ private struct ConversationHeaderView: View {
             .onyxHelp("Task actions")
             .accessibilityLabel("Task actions")
         }
-        .padding(.horizontal, 13)
-        .frame(height: 48)
+        .padding(.horizontal, OnyxWorkspaceMetrics.paneEdgeInset)
+        .frame(height: OnyxWorkspaceMetrics.paneHeaderHeight)
         .background(OnyxTheme.chrome)
         .overlay(alignment: .bottom) {
             Rectangle()
@@ -389,7 +389,7 @@ private struct ConversationHeaderView: View {
             Image(systemName: systemImage)
                 .frame(width: 28)
         }
-        .font(.system(size: 11.5, weight: .medium))
+        .font(.system(size: OnyxTypography.navigation, weight: .medium))
         .foregroundStyle(isSelected ? OnyxTheme.iris : Color.secondary)
         .frame(height: 28)
         .background(isSelected ? OnyxTheme.iris.opacity(0.10) : Color.clear)
@@ -725,7 +725,7 @@ private struct ComposerView: View {
                     images: model.composerImages,
                     onRemove: model.removeComposerImage
                 )
-                .padding(.horizontal, 12)
+                .padding(.horizontal, OnyxWorkspaceMetrics.composerInnerInset)
                 .padding(.top, 10)
             }
 
@@ -742,7 +742,7 @@ private struct ComposerView: View {
                 }
             )
             .frame(height: textHeight)
-            .padding(.horizontal, 12)
+            .padding(.horizontal, OnyxWorkspaceMetrics.composerInnerInset)
             .padding(.top, 6)
 
             // ViewThatFits measures the full-label candidate at its intrinsic
@@ -879,7 +879,7 @@ private struct ComposerView: View {
             attachImagesButton
             regularProviderModelMenu
             Spacer(minLength: 4)
-            minimalOptionsMenu
+            regularOptionsMenu
             sendButton
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
@@ -906,7 +906,7 @@ private struct ComposerView: View {
             attachImagesButton
             compactProviderModelMenu
             Spacer(minLength: 4)
-            minimalOptionsMenu
+            compactOptionsMenu
             sendButton
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
@@ -1103,6 +1103,73 @@ private struct ComposerView: View {
         }
         .menuStyle(.borderlessButton)
         .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+        .onyxHelp("Choose reasoning effort and task permissions")
+        .accessibilityLabel("Task options")
+        .accessibilityValue(
+            model.availableReasoningEfforts.isEmpty
+                ? model.permissionLabel
+                : "\(model.selectedReasoningEffortName), \(model.permissionLabel)"
+        )
+    }
+
+    /// Reasoning is a first-class model control, so keep the current choice
+    /// visible whenever the composer has enough room. The icon-only fallback
+    /// remains available to the compact toolbar through `ViewThatFits`.
+    private var regularOptionsMenu: some View {
+        Menu {
+            minimalOptionsMenuContent
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: model.availableReasoningEfforts.isEmpty
+                    ? "slider.horizontal.3"
+                    : "brain")
+                    .foregroundStyle(.secondary)
+                Text(model.availableReasoningEfforts.isEmpty
+                    ? model.permissionLabel
+                    : model.selectedReasoningEffortName)
+                    .lineLimit(1)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundStyle(.tertiary)
+            }
+            .font(.system(size: 11.5, weight: .medium))
+            .frame(minHeight: OnyxHitTarget.compact)
+            .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize(horizontal: true, vertical: false)
+        .onyxHelp("Choose reasoning effort and task permissions")
+        .accessibilityLabel("Task options")
+        .accessibilityValue(
+            model.availableReasoningEfforts.isEmpty
+                ? model.permissionLabel
+                : "\(model.selectedReasoningEffortName), \(model.permissionLabel)"
+        )
+    }
+
+    private var compactOptionsMenu: some View {
+        Menu {
+            minimalOptionsMenuContent
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: model.availableReasoningEfforts.isEmpty
+                    ? "slider.horizontal.3"
+                    : "brain")
+                    .foregroundStyle(.secondary)
+                if !model.availableReasoningEfforts.isEmpty {
+                    Text(model.selectedReasoningEffortName)
+                        .lineLimit(1)
+                }
+            }
+            .font(.system(size: 11.5, weight: .medium))
+            .frame(
+                minWidth: OnyxHitTarget.compact,
+                minHeight: OnyxHitTarget.compact
+            )
+            .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize(horizontal: true, vertical: false)
         .onyxHelp("Choose reasoning effort and task permissions")
         .accessibilityLabel("Task options")
         .accessibilityValue(

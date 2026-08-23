@@ -735,11 +735,11 @@ struct TranscriptFlowMetrics: Equatable {
     /// leaves roughly a 700-point text measure after message insets, which is
     /// comfortable at the app's 15-point reading size and aligns with the
     /// composer below it.
-    static let maximumReadableWidth: CGFloat = 760
+    static let maximumReadableWidth = OnyxWorkspaceMetrics.maximumReadingWidth
     // Keep the reading column closer to the project edge and let spare width
     // collect on the trailing side. Very narrow transition frames scale both
     // preferred gutters down before allowing a row to overflow.
-    static let preferredLeadingInset: CGFloat = 18
+    static let preferredLeadingInset = OnyxWorkspaceMetrics.transcriptOuterLeadingInset
     static let preferredTrailingInset: CGFloat = 24
     static let layoutSafetyWidth: CGFloat = 1
 
@@ -2195,7 +2195,7 @@ private final class TranscriptPendingResponseView: NSView {
 
         spinner.style = .spinning
         spinner.controlSize = .small
-        label.font = .systemFont(ofSize: 12, weight: .regular)
+        label.font = .systemFont(ofSize: OnyxTypography.navigation, weight: .regular)
         label.textColor = .secondaryLabelColor
         label.lineBreakMode = .byTruncatingTail
         label.maximumNumberOfLines = 1
@@ -2218,8 +2218,8 @@ private final class TranscriptPendingResponseView: NSView {
         // Keep the status copy on the same reading axis as assistant replies
         // and compact activity labels. The spinner sits in the quiet icon
         // gutter instead of pushing the message itself farther into the row.
-        let leading: CGFloat = 4
-        let spinnerSize: CGFloat = 16
+        let leading: CGFloat = 0
+        let spinnerSize: CGFloat = 14
         spinner.frame = NSRect(
             x: leading,
             y: floor((bounds.height - spinnerSize) / 2),
@@ -2231,9 +2231,9 @@ private final class TranscriptPendingResponseView: NSView {
             ceil(label.font?.boundingRectForFont.height ?? 16) + 4
         )
         label.frame = NSRect(
-            x: leading + 24,
+            x: OnyxWorkspaceMetrics.conversationTextInset,
             y: floor((bounds.height - labelHeight) / 2),
-            width: max(0, bounds.width - leading - 24),
+            width: max(0, bounds.width - OnyxWorkspaceMetrics.conversationTextInset),
             height: labelHeight
         )
     }
@@ -2277,7 +2277,7 @@ final class TranscriptActivityGroupView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
 
-        titleLabel.font = .systemFont(ofSize: 11.5, weight: .regular)
+        titleLabel.font = .systemFont(ofSize: OnyxTypography.navigation, weight: .regular)
         titleLabel.textColor = NSColor.secondaryLabelColor.withAlphaComponent(0.86)
         titleLabel.lineBreakMode = .byTruncatingTail
         titleLabel.maximumNumberOfLines = 1
@@ -2395,8 +2395,8 @@ final class TranscriptActivityGroupView: NSView {
         super.layout()
         // Keep disclosure next to the readable content. A detached control at
         // the far edge of every row forms a second, noisy visual column.
-        let disclosureWidth: CGFloat = 22
-        let textX: CGFloat = 27
+        let textX = OnyxWorkspaceMetrics.conversationTextInset
+        let disclosureWidth = textX
         titleLabel.frame = NSRect(
             x: textX,
             y: bounds.midY - 9,
@@ -2414,7 +2414,7 @@ final class TranscriptActivityGroupView: NSView {
             width: titleLabel.bounds.width
         )
         expansionControl.frame = NSRect(
-            x: 1,
+            x: 0,
             y: 0,
             width: disclosureWidth,
             height: bounds.height
@@ -2517,6 +2517,7 @@ enum TranscriptMarkdownRenderer {
 
     private enum BlockStyle {
         case body
+        case list
         case heading(Int)
         case quote
         case code
@@ -2576,15 +2577,21 @@ enum TranscriptMarkdownRenderer {
 
         let result = NSMutableAttributedString()
         for (index, line) in renderedLines.enumerated() {
-            if index > 0 { result.append(NSAttributedString(string: "\n", attributes: plainAttributes)) }
             result.append(line)
-        }
-        if result.length > 0 {
-            result.addAttribute(
-                .paragraphStyle,
-                value: paragraphStyle,
-                range: NSRange(location: 0, length: result.length)
-            )
+            guard index < renderedLines.count - 1 else { continue }
+            var newlineAttributes = plainAttributes
+            if line.length > 0,
+               let lineParagraphStyle = line.attribute(
+                   .paragraphStyle,
+                   at: line.length - 1,
+                   effectiveRange: nil
+               ) as? NSParagraphStyle {
+                // The paragraph separator participates in AppKit's paragraph
+                // geometry. Carry the block's own style onto it so a later
+                // line cannot flatten a list's hanging indent.
+                newlineAttributes[.paragraphStyle] = lineParagraphStyle
+            }
+            result.append(NSAttributedString(string: "\n", attributes: newlineAttributes))
         }
         return result
     }
@@ -2667,7 +2674,7 @@ enum TranscriptMarkdownRenderer {
                 marker = "☑ "
             }
             let indentation = String(repeating: "  ", count: min(4, leadingCount / 2))
-            return BlockLine(prefix: indentation + marker, content: content, style: .body)
+            return BlockLine(prefix: indentation + marker, content: content, style: .list)
         }
 
         return BlockLine(prefix: leading, content: content, style: .body)
@@ -2681,7 +2688,7 @@ enum TranscriptMarkdownRenderer {
         let font: NSFont
         let color: NSColor
         switch block.style {
-        case .body:
+        case .body, .list:
             font = baseFont
             color = textColor
         case let .heading(level):
@@ -2704,6 +2711,24 @@ enum TranscriptMarkdownRenderer {
             attributes: [.font: font, .foregroundColor: color]
         )
         line.append(inlineMarkdown(block.content, font: font, textColor: color))
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.lineBreakMode = .byWordWrapping
+        paragraphStyle.lineSpacing = readingLineSpacing
+        if case .list = block.style {
+            // The marker is real selectable text. Subsequent visual lines need
+            // to begin after that marker, not underneath it.
+            paragraphStyle.headIndent = ceil(
+                (block.prefix as NSString).size(withAttributes: [.font: font]).width
+            )
+            paragraphStyle.firstLineHeadIndent = 0
+        }
+        if line.length > 0 {
+            line.addAttribute(
+                .paragraphStyle,
+                value: paragraphStyle,
+                range: NSRange(location: 0, length: line.length)
+            )
+        }
         if case .code = block.style, line.length > 0 {
             line.addAttribute(
                 .backgroundColor,
@@ -2743,10 +2768,14 @@ enum TranscriptMarkdownRenderer {
                     range: range
                 )
             } else {
+                if intent.contains(.stronglyEmphasized) {
+                    renderedFont = .systemFont(ofSize: font.pointSize, weight: .semibold)
+                }
                 var traits: NSFontTraitMask = []
-                if intent.contains(.stronglyEmphasized) { traits.insert(.boldFontMask) }
                 if intent.contains(.emphasized) { traits.insert(.italicFontMask) }
-                if !traits.isEmpty { renderedFont = NSFontManager.shared.convert(font, toHaveTrait: traits) }
+                if !traits.isEmpty {
+                    renderedFont = NSFontManager.shared.convert(renderedFont, toHaveTrait: traits)
+                }
             }
             result.addAttribute(.font, value: renderedFont, range: range)
             if intent.contains(.strikethrough) {
@@ -2805,8 +2834,11 @@ final class TranscriptEditControl: NSButton {
 final class TranscriptCellView: NSView {
     static let maximumVisibleAttachments = TranscriptLayoutState.maximumVisibleAttachments
     static let maximumVisibleLinks = TranscriptLayoutState.maximumVisibleLinks
-    private static let messageFontSize: CGFloat = 15
+    private static let messageFontSize = OnyxTypography.reading
     private static let userBubbleHorizontalPadding: CGFloat = 14
+    /// Moving the content axis left should not make prose lines longer. Keep
+    /// the recovered space on the quiet trailing side of the reading column.
+    private static let conversationTrailingInset: CGFloat = 38
 
     private let bubbleBackground = NSView()
     private let avatar = NSTextField(labelWithString: "◆")
@@ -2858,13 +2890,13 @@ final class TranscriptCellView: NSView {
         addSubview(expansionControl)
         addSubview(editControl)
 
-        avatar.font = .systemFont(ofSize: 12, weight: .semibold)
+        avatar.font = .systemFont(ofSize: OnyxTypography.secondary, weight: .semibold)
         avatar.textColor = NSColor.systemIndigo
-        titleLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        titleLabel.font = .systemFont(ofSize: OnyxTypography.navigation, weight: .medium)
         titleLabel.lineBreakMode = .byTruncatingTail
         titleLabel.maximumNumberOfLines = 1
         titleLabel.usesSingleLineMode = true
-        summaryLabel.font = .systemFont(ofSize: 12, weight: .regular)
+        summaryLabel.font = .systemFont(ofSize: OnyxTypography.navigation, weight: .regular)
         summaryLabel.textColor = .secondaryLabelColor
         summaryLabel.lineBreakMode = .byTruncatingTail
         summaryLabel.maximumNumberOfLines = 1
@@ -3290,9 +3322,9 @@ final class TranscriptCellView: NSView {
             height: metrics.detailHeight
         )
         expansionControl.frame = NSRect(
-            x: max(0, metrics.avatarX - 1),
+            x: 0,
             y: max(0, headerTop - max(22, metrics.headerHeight) + 2),
-            width: isExpandable ? 22 : disclosureWidth,
+            width: isExpandable ? metrics.contentX : disclosureWidth,
             height: min(bounds.height, max(22, metrics.headerHeight))
         )
         avatar.isHidden = !item.kind.isActivity || isExpandable
@@ -3374,9 +3406,7 @@ final class TranscriptCellView: NSView {
         let isCollapsed = item.kind.isCollapsibleActivity && !isExpanded
         let isQuietRoutineActivity = isRoutineActivity
             && isCollapsed
-        let horizontalInset: CGFloat = isUser
-            ? userBubbleHorizontalPadding
-            : (isActivity ? (isQuietRoutineActivity ? 5 : 14) : 0)
+        let horizontalInset: CGFloat = isUser ? userBubbleHorizontalPadding : 0
         let userBubbleMaximum = min(560, width * 0.78)
         let preferredUserBubbleWidth = item.attachments.isEmpty && item.links.isEmpty
             ? item.body.preferredBubbleWidth(fontSize: messageFontSize)
@@ -3384,8 +3414,10 @@ final class TranscriptCellView: NSView {
         let userBubbleWidth = min(userBubbleMaximum, max(52, preferredUserBubbleWidth))
         let contentX: CGFloat = isUser
             ? max(0, width - userBubbleWidth) + horizontalInset
-            : (isActivity ? (isQuietRoutineActivity ? 22 : 34) + horizontalInset : 28)
-        let trailing: CGFloat = isUser ? horizontalInset : (isActivity ? horizontalInset : 28)
+            : OnyxWorkspaceMetrics.conversationTextInset
+        let trailing: CGFloat = isUser
+            ? horizontalInset
+            : Self.conversationTrailingInset
         let contentWidth = max(isUser ? 22 : 100, width - contentX - trailing)
         let title = displayTitle(for: item)
         let titleHeight: CGFloat = title.isEmpty ? 0 : 18
@@ -3474,11 +3506,12 @@ final class TranscriptCellView: NSView {
         // space and makes the row look like a log inspector. Non-routine live
         // states retain a compact textual status where it adds information.
         let showsStatus = !isRoutineActivity
+            && item.kind != .plan
             && item.kind != .error
             && item.status != .completed
         let statusWidth: CGFloat = isActivity && titleHeight > 0 && showsStatus ? 48 : 0
         return Metrics(
-            avatarX: isActivity ? (isQuietRoutineActivity ? 4 : 14) : 0,
+            avatarX: 0,
             contentX: contentX,
             contentWidth: contentWidth,
             top: top,
@@ -3701,7 +3734,7 @@ final class TranscriptCellView: NSView {
             return NSAttributedString(
                 string: title,
                 attributes: [
-                    .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+                    .font: NSFont.systemFont(ofSize: OnyxTypography.navigation, weight: .semibold),
                     .foregroundColor: NSColor.labelColor,
                 ]
             )
@@ -3724,7 +3757,7 @@ final class TranscriptCellView: NSView {
             return NSAttributedString(
                 string: title.isEmpty ? summary : title,
                 attributes: [
-                    .font: NSFont.systemFont(ofSize: 11.5, weight: .regular),
+                    .font: NSFont.systemFont(ofSize: OnyxTypography.navigation, weight: .regular),
                     .foregroundColor: NSColor.secondaryLabelColor.withAlphaComponent(0.86),
                 ]
             )
@@ -3733,7 +3766,7 @@ final class TranscriptCellView: NSView {
         let headline = NSMutableAttributedString(
             string: title,
             attributes: [
-                .font: NSFont.systemFont(ofSize: 11.5, weight: .regular),
+                .font: NSFont.systemFont(ofSize: OnyxTypography.navigation, weight: .regular),
                 .foregroundColor: NSColor.secondaryLabelColor.withAlphaComponent(0.86),
             ]
         )
@@ -3741,7 +3774,7 @@ final class TranscriptCellView: NSView {
             NSAttributedString(
                 string: "  ·  \(summary)",
                 attributes: [
-                    .font: NSFont.systemFont(ofSize: 11.5, weight: .regular),
+                    .font: NSFont.systemFont(ofSize: OnyxTypography.navigation, weight: .regular),
                     // Failure output is the useful part of this compact row.
                     // Keep it readable while the small red disclosure conveys
                     // severity; ordinary implementation output stays quieter.

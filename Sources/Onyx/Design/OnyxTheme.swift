@@ -108,6 +108,33 @@ enum OnyxHitTarget {
     static let splitter: CGFloat = 11
 }
 
+/// A deliberately small type scale for the primary workspace.
+///
+/// Keeping these roles shared prevents half-point drift between SwiftUI chrome
+/// and the AppKit transcript/composer. Weight still belongs to the semantic
+/// use (for example, a selected task may become medium), while size comes from
+/// one of these five roles.
+enum OnyxTypography {
+    static let reading: CGFloat = 15
+    static let paneTitle: CGFloat = 14
+    static let navigation: CGFloat = 12.5
+    static let secondary: CGFloat = 12
+    static let metadata: CGFloat = 10.5
+}
+
+/// Shared workspace geometry. The app can remain visually compact while its
+/// major panes, reading column, and controls land on the same rhythm.
+enum OnyxWorkspaceMetrics {
+    static let paneHeaderHeight: CGFloat = 48
+    static let paneEdgeInset: CGFloat = 12
+    static let fieldHeight: CGFloat = 32
+    static let regularGap: CGFloat = 8
+    static let maximumReadingWidth: CGFloat = 760
+    static let transcriptOuterLeadingInset: CGFloat = 18
+    static let conversationTextInset: CGFloat = 18
+    static let composerInnerInset: CGFloat = 12
+}
+
 struct OnyxMark: View {
     var size: CGFloat = 28
 

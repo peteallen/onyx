@@ -500,6 +500,22 @@ final class TranscriptLayoutPerformanceTests: XCTestCase {
             "Assistant response status"
         )
         XCTAssertEqual(pendingView.accessibilityValue() as? String, "Working")
+        pendingView.layoutSubtreeIfNeeded()
+        let waitingLabel = try XCTUnwrap(
+            pendingView.subviews
+                .compactMap { $0 as? NSTextField }
+                .first(where: { $0.stringValue == "Working" })
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(waitingLabel.font).pointSize,
+            OnyxTypography.navigation,
+            accuracy: 0.1
+        )
+        XCTAssertEqual(
+            waitingLabel.frame.minX,
+            OnyxWorkspaceMetrics.conversationTextInset,
+            accuracy: 0.1
+        )
         RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
     }
 
@@ -803,6 +819,14 @@ final class TranscriptLayoutPerformanceTests: XCTestCase {
     func testWideTranscriptKeepsTheLeadingGutterTight() {
         let metrics = TranscriptFlowMetrics(collectionWidth: 1_200)
 
+        XCTAssertEqual(
+            TranscriptFlowMetrics.maximumReadableWidth,
+            OnyxWorkspaceMetrics.maximumReadingWidth
+        )
+        XCTAssertEqual(
+            TranscriptFlowMetrics.preferredLeadingInset,
+            OnyxWorkspaceMetrics.transcriptOuterLeadingInset
+        )
         XCTAssertEqual(
             metrics.leadingInset,
             TranscriptFlowMetrics.preferredLeadingInset,
