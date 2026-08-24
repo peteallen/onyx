@@ -330,6 +330,13 @@ codex_runtime_probe_installed_package() (
   local output_file="$probe_root/output.jsonl"
   local error_file="$probe_root/error.log"
   /bin/mkdir -m 700 -p "$codex_home"
+  # Create the redirected files before starting the asynchronous helper. The
+  # child normally creates them as part of its redirection, but the verifier
+  # can reach the first read before the background job gets scheduled. With
+  # `set -e`, a missing file would abort the probe instead of waiting for the
+  # initialize response.
+  : >| "$output_file"
+  : >| "$error_file"
   # The helper reports a canonical path (`/private/var/...` on macOS), while
   # TMPDIR and mktemp often spell that same location as `/var/...`. Compare
   # like with like so the probe tests isolation instead of a system alias.

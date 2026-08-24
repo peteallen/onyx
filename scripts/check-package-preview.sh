@@ -222,6 +222,23 @@ runtime_common_text="$(<"$runtime_common_script")"
 [[ "$runtime_common_text" == *'ONYX_CODEX_RUNTIME_ARCHIVE_ARM64'* ]]
 [[ "$runtime_common_text" == *'ONYX_CODEX_RUNTIME_ARCHIVE_X86_64'* ]]
 [[ "$runtime_common_text" == *'contains a symlink, hard link, or unsupported entry'* ]]
+# The async app-server probe must create its redirected files itself before it
+# starts the helper. Otherwise the polling reader can win the scheduling race
+# and abort under `set -e` because output.jsonl does not exist yet.
+runtime_output_precreate_line="$(/usr/bin/awk \
+  'index($0, ": >| \"$output_file\"") { print NR; exit }' "$runtime_common_script")"
+runtime_error_precreate_line="$(/usr/bin/awk \
+  'index($0, ": >| \"$error_file\"") { print NR; exit }' "$runtime_common_script")"
+runtime_probe_launch_line="$(/usr/bin/awk \
+  '/local probe_pid=\$!/ { print NR; exit }' "$runtime_common_script")"
+runtime_probe_read_line="$(/usr/bin/awk \
+  '/done < "\$output_file"/ { print NR; exit }' "$runtime_common_script")"
+[[ "$runtime_output_precreate_line" == <1-> && \
+   "$runtime_error_precreate_line" == <1-> && \
+   "$runtime_probe_launch_line" == <1-> && "$runtime_probe_read_line" == <1-> ]]
+[[ "$runtime_output_precreate_line" -lt "$runtime_probe_launch_line" && \
+   "$runtime_error_precreate_line" -lt "$runtime_probe_launch_line" && \
+   "$runtime_probe_launch_line" -lt "$runtime_probe_read_line" ]]
 [[ "$(/usr/bin/plutil -extract version raw -o - "$runtime_manifest")" == "0.149.0" ]]
 [[ "$(/usr/bin/plutil -extract artifacts.0.target raw -o - "$runtime_manifest")" == \
   "aarch64-apple-darwin" ]]
