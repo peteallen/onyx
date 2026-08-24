@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 @main
@@ -5,6 +6,11 @@ struct OnyxApp: App {
     @StateObject private var host: OnyxApplicationHost
 
     init() {
+        // Onyx's product baseline is the restrained near-black workspace.
+        // Set the AppKit appearance as well as SwiftUI's color scheme because
+        // the transcript and composer are native AppKit surfaces whose
+        // dynamic colors resolve from the window appearance.
+        NSApplication.shared.appearance = NSAppearance(named: .darkAqua)
         _host = StateObject(wrappedValue: OnyxApplicationHost())
     }
 
@@ -14,6 +20,7 @@ struct OnyxApp: App {
                 windowID: windowID,
                 host: host
             )
+            .preferredColorScheme(.dark)
         }
         defaultValue: { WorkspaceWindowID() }
         .defaultSize(width: 1_380, height: 860)
@@ -28,6 +35,7 @@ struct OnyxApp: App {
                 providerModel: host.providerSettingsModel
             )
                 .frame(width: 900, height: 680)
+                .preferredColorScheme(.dark)
                 .task { host.settingsModel.start() }
         }
     }
@@ -274,7 +282,7 @@ private struct OnyxSettingsView: View {
                     .foregroundStyle(.secondary)
             }
             Section("Appearance") {
-                Text("Onyx follows the system appearance and uses its mineral accent only for focus, selection, and live activity.")
+                Text("Onyx uses a restrained near-black appearance and reserves its mineral accent for focus, selection, and live activity.")
                     .foregroundStyle(.secondary)
             }
         }

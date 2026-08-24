@@ -1591,6 +1591,10 @@ private struct OnyxWindowConfigurator: NSViewRepresentable {
     private func configure(_ window: NSWindow?) {
         guard let window else { return }
         windowReference.window = window
+        // Keep the native transcript/composer aligned with the SwiftUI dark
+        // baseline. This is explicit because dynamic NSColor values otherwise
+        // follow the user's system appearance independently of the root view.
+        window.appearance = NSAppearance(named: .darkAqua)
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.isMovableByWindowBackground = false

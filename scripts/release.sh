@@ -33,12 +33,12 @@ Options:
   -h, --help                     Show this help.
 
 Unsigned local release:
-  scripts/release.sh 0.1.0
+  scripts/release.sh 0.1.1
 
 Developer ID signed and notarized release:
   ONYX_CODESIGN_IDENTITY='Developer ID Application: Example (TEAMID)' \
   ONYX_NOTARIZE=1 ONYX_NOTARY_PROFILE=onyx-notary \
-  scripts/release.sh 0.1.0
+  scripts/release.sh 0.1.1
 
 See scripts/create-dmg.sh --help for supported notarization credentials.
 EOF
@@ -126,7 +126,7 @@ if (( ${#positional[@]} == 2 )); then
 fi
 
 [[ "$version" =~ '^[0-9]+[.][0-9]+[.][0-9]+$' ]] || \
-  die "VERSION must contain exactly three numeric components (for example, 0.1.0)"
+  die "VERSION must contain exactly three numeric components (for example, 0.1.1)"
 [[ -n "$build_number" ]] || build_number="$(/bin/date -u +%Y%m%d%H%M)"
 [[ "$build_number" =~ '^[0-9]+([.][0-9]+){0,2}$' ]] || \
   die "build number must contain one to three numeric components"

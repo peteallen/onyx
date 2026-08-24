@@ -10,6 +10,25 @@ final class CodexTypedUserInteractionTests: XCTestCase {
         )
     }
 
+    func testHandshakeAdvertisesCurrentOnyxReleaseVersion() throws {
+        let infoPlist = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("support/Info.plist")
+        let data = try Data(contentsOf: infoPlist)
+        let plist = try XCTUnwrap(
+            PropertyListSerialization.propertyList(from: data, format: nil)
+                as? [String: Any]
+        )
+        let releaseVersion = try XCTUnwrap(plist["CFBundleShortVersionString"] as? String)
+
+        XCTAssertEqual(
+            CodexAppServerHandshake.initializeParams["clientInfo"]?["version"],
+            .string(releaseVersion)
+        )
+    }
+
     func testModernCommandApprovalProjectsTypedPromptAndWritesStableDecision() async throws {
         let request = AppServerRequest(
             id: .string("command-request"),

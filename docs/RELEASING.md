@@ -14,11 +14,11 @@ non-expiring release assets.
 There are two supported ways to cut a release:
 
 1. **Actions → Release → Run workflow:** choose the `main` branch and enter the
-   three-part version from `support/Info.plist` (for example, `0.1.0`). The
+   three-part version from `support/Info.plist` (for example, `0.1.1`). The
    workflow verifies that the selected commit is still the current `main` head,
-   runs the complete test/package path, and creates `v0.1.0` at that exact SHA.
+   runs the complete test/package path, and creates `v0.1.1` at that exact SHA.
 2. **Push a semver tag:** after the same checks have passed locally, push a new
-   tag such as `v0.1.0`. The tag-triggered path verifies that the tag points at
+   tag such as `v0.1.1`. The tag-triggered path verifies that the tag points at
    the event commit before publishing.
 
 The workflow refuses to move an existing tag or replace a mismatched release. A
@@ -50,14 +50,14 @@ scripts/fetch-codex-runtime.sh --architectures universal
 ```
 
 ```bash
-scripts/release.sh 0.1.0
+scripts/release.sh 0.1.1
 ```
 
 This builds a universal Apple Silicon + Intel release in an isolated staging
 directory, embeds the pinned Codex app-server helper, and creates:
 
-- `dist-release/Onyx-0.1.0-macOS.dmg`
-- `dist-release/Onyx-0.1.0-macOS.dmg.sha256`
+- `dist-release/Onyx-0.1.1-macOS.dmg`
+- `dist-release/Onyx-0.1.1-macOS.dmg.sha256`
 
 The app is ad-hoc signed and the DMG is unsigned when no Developer ID identity
 is configured. That is useful for local testing, but users will see the normal
@@ -91,11 +91,11 @@ universal build.
 To verify a downloaded artifact independently:
 
 ```bash
-(cd dist-release && /usr/bin/shasum -a 256 -c Onyx-0.1.0-macOS.dmg.sha256)
-scripts/verify-dmg.sh dist-release/Onyx-0.1.0-macOS.dmg \
+(cd dist-release && /usr/bin/shasum -a 256 -c Onyx-0.1.1-macOS.dmg.sha256)
+scripts/verify-dmg.sh dist-release/Onyx-0.1.1-macOS.dmg \
   --app-name Onyx.app \
   --bundle-id app.onyx.agent \
-  --version 0.1.0 \
+  --version 0.1.1 \
   --require-universal
 ```
 
@@ -111,7 +111,7 @@ then use its exact Keychain identity when building:
 
 ```bash
 ONYX_CODESIGN_IDENTITY='Developer ID Application: Example (TEAMID)' \
-scripts/release.sh 0.1.0
+scripts/release.sh 0.1.1
 ```
 
 That enables the hardened runtime and timestamps both the app and the disk
@@ -127,7 +127,7 @@ xcrun notarytool store-credentials onyx-notary \
 ONYX_CODESIGN_IDENTITY='Developer ID Application: Example (TEAMID)' \
 ONYX_NOTARIZE=1 \
 ONYX_NOTARY_PROFILE=onyx-notary \
-scripts/release.sh 0.1.0
+scripts/release.sh 0.1.1
 ```
 
 `create-dmg.sh` also supports App Store Connect API-key credentials and direct
