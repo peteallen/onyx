@@ -423,7 +423,7 @@ struct TaskSidebarView: View {
             canMoveUp: projectCatalog.canMoveProject(id: group.id, offset: -1),
             canMoveDown: projectCatalog.canMoveProject(id: group.id, offset: 1),
             toggleExpanded: { toggleProjectDisclosure(group.id) },
-            newTask: { model.selectWorkspace(group.project.folderPath) },
+            newTask: { model.newTask(inWorkspace: group.project.folderPath) },
             rename: { beginRenameProject(group.project) },
             moveUp: {
                 Task {
@@ -632,6 +632,28 @@ struct ProjectSidebarHeader: View {
     let moveUp: () -> Void
     let moveDown: () -> Void
     let remove: () -> Void
+    var quickCreateVisibility: ProjectSidebarQuickCreateVisibility = .automatic
+
+    @State private var isHovering = false
+    @FocusState private var focusedAction: FocusTarget?
+
+    private enum FocusTarget: Hashable {
+        case project
+        case newTask
+    }
+
+    /// Keep the quick-create affordance in the row's layout even while it is
+    /// quiet. That prevents the project title and task count from shifting
+    /// under the pointer when the pointer enters the row. It becomes visible
+    /// for both pointer hover and keyboard focus, while hit testing remains
+    /// disabled until it is discoverable.
+    private var showsNewTaskAction: Bool {
+        ProjectSidebarHeaderPresentation.showsNewTaskAction(
+            isHovering: isHovering,
+            isFocused: focusedAction != nil,
+            visibility: quickCreateVisibility
+        )
+    }
 
     var body: some View {
         HStack(spacing: 6) {
@@ -653,7 +675,7 @@ struct ProjectSidebarHeader: View {
                         .font(.system(size: OnyxTypography.metadata, weight: .medium, design: .monospaced))
                         .foregroundStyle(.tertiary)
                 }
-                .frame(minHeight: OnyxHitTarget.compact)
+                .frame(maxWidth: .infinity, minHeight: OnyxHitTarget.compact, alignment: .leading)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -663,6 +685,27 @@ struct ProjectSidebarHeader: View {
                 "\(isExpanded ? "Expanded" : "Collapsed"), \(taskCount) \(taskCount == 1 ? "task" : "tasks")"
             )
             .accessibilityHint(isExpanded ? "Collapses this project" : "Expands this project")
+            .focused($focusedAction, equals: .project)
+
+            Button(action: newTask) {
+                Image(systemName: "plus")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                    .background {
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .fill(Color.primary.opacity(showsNewTaskAction ? 0.07 : 0))
+                    }
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .opacity(showsNewTaskAction ? 1 : 0)
+            .allowsHitTesting(showsNewTaskAction)
+            .focused($focusedAction, equals: .newTask)
+            .onyxHelp("New task in \(project.displayName)")
+            .accessibilityLabel("New task in \(project.displayName)")
+            .accessibilityHint("Starts a blank task in this project")
+            .animation(.easeOut(duration: 0.12), value: showsNewTaskAction)
 
             Menu {
                 Button("New Task in \(project.displayName)", action: newTask)
@@ -688,10 +731,35 @@ struct ProjectSidebarHeader: View {
             .accessibilityLabel("Manage \(project.displayName)")
             .accessibilityHint("Create a task, rename, reorder, or remove this project")
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.leading, 9)
         .padding(.trailing, 2)
         .padding(.bottom, 3)
+        .onHover { isHovering = $0 }
     }
+}
+
+/// Presentation rules for the project-row quick-create affordance live in a
+/// small value type so interaction geometry can be regression-tested without
+/// needing to depend on SwiftUI's transient hover state.
+enum ProjectSidebarHeaderPresentation {
+    static let newTaskHitTarget: CGFloat = OnyxHitTarget.compact
+
+    static func showsNewTaskAction(
+        isHovering: Bool,
+        isFocused: Bool,
+        visibility: ProjectSidebarQuickCreateVisibility = .automatic
+    ) -> Bool {
+        visibility == .visible || isHovering || isFocused
+    }
+}
+
+/// Normal app rows follow hover/focus. Snapshot and hosted pointer tests can
+/// pin the action visible so they exercise the exact hit region without
+/// synthesizing process-global pointer movement.
+enum ProjectSidebarQuickCreateVisibility {
+    case automatic
+    case visible
 }
 
 private struct TaskSidebarRow: View {

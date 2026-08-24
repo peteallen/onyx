@@ -99,6 +99,39 @@ final class AgentRuntimeDelegationExecutorTests: XCTestCase {
         XCTAssertTrue(starts.isEmpty)
     }
 
+    func testRuntimeBridgeFailsWhenProviderCompletesWithoutAnswerText() async throws {
+        // Reasoning-only responses can reach an idle terminal state without
+        // producing assistant prose. A delegated tool result must never turn
+        // that into a successful blank response to the parent Codex task.
+        let runtime = ScriptedDelegationRuntime(
+            connectionName: connection.rawValue,
+            behavior: .respond("   ")
+        )
+        let executor = AgentRuntimeDelegationExecutor(
+            connectionID: connection,
+            runtime: runtime,
+            supportedModelIDs: [modelID]
+        )
+
+        do {
+            _ = try await executor.execute(
+                makeRequest(id: "empty-answer"),
+                reportProgress: { _ in }
+            )
+            XCTFail("Expected an empty delegated answer to fail")
+        } catch let error as DelegationExecutorError {
+            XCTAssertEqual(
+                error,
+                .execution("The delegated turn completed without an answer.")
+            )
+        }
+
+        // The child is app-created work with no usable result, so the bridge
+        // must clean it up instead of leaving an orphaned task behind.
+        let deleted = await runtime.deletedThreadIDs()
+        XCTAssertEqual(deleted, ["child-thread"])
+    }
+
     func testRuntimeBridgeCancellationInterruptsAndRemovesItsChild() async throws {
         let runtime = ScriptedDelegationRuntime(
             connectionName: connection.rawValue,

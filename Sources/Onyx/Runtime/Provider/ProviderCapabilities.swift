@@ -137,7 +137,13 @@ struct ProviderCapabilitySet: Codable, Equatable, Hashable, Sendable {
         self.inputModalities = inputModalities
         self.outputModalities = outputModalities
         self.supportedParameters = supportedParameters
-        self.reasoningEfforts = reasoningEfforts
+        // Model catalogs are provider-controlled input.  vLLM/OpenAI
+        // compatible servers occasionally include padded or repeated effort
+        // names; retain the first advertised order while removing values that
+        // could never be sent as a useful request parameter.  Keeping this
+        // normalization at the capability boundary means persisted catalogs,
+        // picker choices, and request negotiation all agree on the same set.
+        self.reasoningEfforts = Self.normalizedReasoningEfforts(reasoningEfforts)
         self.serverAdvertisedCapabilities = Self.normalizedServerCapabilities(
             serverAdvertisedCapabilities
         )
@@ -223,6 +229,15 @@ struct ProviderCapabilitySet: Codable, Equatable, Hashable, Sendable {
     }
 
     private static func normalizedServerCapabilities(_ values: [String]) -> [String] {
+        var seen: Set<String> = []
+        return values.compactMap { rawValue in
+            let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty, seen.insert(value).inserted else { return nil }
+            return value
+        }
+    }
+
+    private static func normalizedReasoningEfforts(_ values: [String]) -> [String] {
         var seen: Set<String> = []
         return values.compactMap { rawValue in
             let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -555,9 +570,11 @@ struct ProviderModelDescriptor: Identifiable, Codable, Equatable, Hashable, Send
             // OpenRouter uses `context_length`. Keep one provider-neutral
             // context field and prefer the canonical OpenRouter value when a
             // router includes both.
-            contextLength: value["context_length"]?.intValue
-                ?? value["max_model_len"]?.intValue,
-            maxCompletionTokens: value["top_provider"]?["max_completion_tokens"]?.intValue
+            contextLength: Self.positiveMetadataInteger(value["context_length"])
+                ?? Self.positiveMetadataInteger(value["max_model_len"]),
+            maxCompletionTokens: Self.positiveMetadataInteger(
+                value["top_provider"]?["max_completion_tokens"]
+            )
         )
         return descriptor.applyingKnownModelProfile()
     }
@@ -580,6 +597,24 @@ struct ProviderModelDescriptor: Identifiable, Codable, Equatable, Hashable, Send
             guard let raw = value.stringValue else { return nil }
             return T(rawValue: raw)
         })
+    }
+
+    /// Provider metadata is untrusted JSON.  Do not use a plain `Int(...)`
+    /// conversion for floating-point values here: a malformed or adversarial
+    /// `/models` response can contain a non-finite or out-of-range number and
+    /// otherwise trap the process while the picker is loading.  Capability
+    /// limits are meaningful only as positive integral values, so reject
+    /// everything else and keep the model usable with an unknown limit.
+    private static func positiveMetadataInteger(_ value: JSONValue?) -> Int? {
+        switch value {
+        case let .integer(number) where number > 0:
+            number
+        case let .number(number)
+            where number.isFinite && number > 0 && number.rounded() == number:
+            Int(exactly: number)
+        default:
+            nil
+        }
     }
 
     /// Older cached catalogs predate explicit evidence flags. Preserve

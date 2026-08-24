@@ -59,6 +59,13 @@ final class CodexProjectionTests: XCTestCase {
             "Projecting history must preserve the server's task recency"
         )
         XCTAssertEqual(conversation.items.map(\.kind), [.userMessage, .assistantMessage, .command])
+        XCTAssertEqual(conversation.turns.map(\.id), ["turn-1"])
+        XCTAssertEqual(
+            conversation.turns[0].items.map(\.id),
+            ["user-1", "agent-1", "command-1"],
+            "The flat transcript and the provider turn must share the same item boundary"
+        )
+        XCTAssertEqual(conversation.turns[0].status, .completed)
         XCTAssertEqual(
             conversation.items.map(\.timestamp),
             Array(repeating: Date(timeIntervalSince1970: 1_787_385_601), count: 3),
@@ -66,6 +73,51 @@ final class CodexProjectionTests: XCTestCase {
         )
         XCTAssertEqual(conversation.items[0].body, "Make it fast")
         XCTAssertEqual(conversation.items[2].title, "swift test")
+    }
+
+    func testConversationProjectionPreservesMultipleTurnBoundaries() throws {
+        let value = try JSONDecoder().decode(JSONValue.self, from: Data(#"""
+        {
+          "thread": {
+            "id": "thread-boundaries",
+            "updatedAt": 1787385660,
+            "turns": [
+              {
+                "id": "turn-old",
+                "status": "completed",
+                "startedAt": 1787385601,
+                "items": [
+                  { "id": "old-user", "type": "userMessage", "text": "First" },
+                  { "id": "old-assistant", "type": "agentMessage", "text": "Done" }
+                ]
+              },
+              {
+                "id": "turn-new",
+                "status": "inProgress",
+                "startedAt": 1787385661,
+                "items": [
+                  { "id": "new-user", "type": "userMessage", "text": "Second" },
+                  { "id": "new-command", "type": "commandExecution", "command": ["swift", "test"], "status": "inProgress" }
+                ]
+              }
+            ]
+          }
+        }
+        """#.utf8))
+
+        let conversation = try CodexProjection.conversation(from: value)
+
+        XCTAssertEqual(conversation.turns.map(\.id), ["turn-old", "turn-new"])
+        XCTAssertEqual(
+            conversation.turns.map { $0.items.map(\.id) },
+            [["old-user", "old-assistant"], ["new-user", "new-command"]]
+        )
+        XCTAssertEqual(conversation.turns.map(\.status), [.completed, .inProgress])
+        XCTAssertEqual(
+            conversation.items.map(\.id),
+            ["old-user", "old-assistant", "new-user", "new-command"]
+        )
+        XCTAssertEqual(conversation.turns[1].items[1].status, .running)
     }
 
     func testProjectsStringValuedApprovalID() throws {
@@ -87,6 +139,104 @@ final class CodexProjectionTests: XCTestCase {
             return XCTFail("Expected a command approval interaction")
         }
         XCTAssertEqual(approval.command, "swift test")
+    }
+
+    func testProjectsOneStableTurnFailureInFullAndPaginatedHistory() throws {
+        let failedTurn = JSONValue.object([
+            "id": .string("failed-turn-7"),
+            "status": .string("failed"),
+            "startedAt": .integer(1_787_385_601),
+            "completedAt": .integer(1_787_385_607),
+            "error": .object([
+                "message": .string("The provider stopped before returning an answer."),
+            ]),
+            "items": .array([
+                .object([
+                    "type": .string("userMessage"),
+                    "id": .string("failed-user-7"),
+                    "text": .string("Build the site"),
+                ]),
+            ]),
+        ])
+        let full = try CodexProjection.conversation(from: .object([
+            "thread": .object([
+                "id": .string("failed-thread"),
+                "preview": .string("Build the site"),
+                "turns": .array([failedTurn]),
+            ]),
+        ]))
+        let page = try CodexProjection.historyPage(
+            from: .object(["data": .array([failedTurn])]),
+            direction: .descending
+        )
+
+        let fullFailure = try XCTUnwrap(full.items.last)
+        let paginatedFailure = try XCTUnwrap(page.turns.first?.items.last)
+        XCTAssertEqual(full.items.filter { $0.kind == .error }.count, 1)
+        XCTAssertEqual(page.turns.first?.items.filter { $0.kind == .error }.count, 1)
+        XCTAssertEqual(full.turns.map(\.id), ["failed-turn-7"])
+        XCTAssertEqual(full.turns.first?.items, full.items)
+        XCTAssertEqual(fullFailure.id, "codex-turn-error:failed-turn-7")
+        XCTAssertEqual(paginatedFailure.id, fullFailure.id)
+        XCTAssertEqual(fullFailure.kind, .error)
+        XCTAssertEqual(fullFailure.status, .failed)
+        XCTAssertEqual(fullFailure.title, "Response failed")
+        XCTAssertEqual(fullFailure.body, "The provider stopped before returning an answer.")
+        XCTAssertEqual(paginatedFailure, fullFailure)
+    }
+
+    func testTurnFailureProjectionBoundsStringValuedError() throws {
+        let turn = try XCTUnwrap(CodexProjection.conversationTurn(from: .object([
+            "id": .string("bounded-failure"),
+            "status": .string("failed"),
+            "error": .string("Failure: " + String(repeating: "too much detail ", count: 300)),
+            "items": .array([]),
+        ])))
+
+        let failure = try XCTUnwrap(turn.items.first)
+        XCTAssertEqual(failure.id, "codex-turn-error:bounded-failure")
+        XCTAssertEqual(failure.kind, .error)
+        XCTAssertEqual(failure.body.count, 2_001)
+        XCTAssertTrue(failure.body.hasSuffix("…"))
+    }
+
+    func testFailedTurnWithoutServerErrorStillProjectsOneStableFailure() throws {
+        let turn = try XCTUnwrap(CodexProjection.conversationTurn(from: .object([
+            "id": .string("missing-error"),
+            "status": .string("failed"),
+            "items": .array([]),
+        ])))
+
+        let failure = try XCTUnwrap(turn.items.first)
+        XCTAssertEqual(failure.id, "codex-turn-error:missing-error")
+        XCTAssertEqual(failure.kind, .error)
+        XCTAssertEqual(failure.status, .failed)
+        XCTAssertEqual(
+            failure.body,
+            "The provider stopped before completing this response."
+        )
+        XCTAssertEqual(failure.timestamp, .distantPast)
+    }
+
+    func testFailedTurnDoesNotDuplicateAnExistingErrorItem() throws {
+        let turn = try XCTUnwrap(CodexProjection.conversationTurn(from: .object([
+            "id": .string("existing-error"),
+            "status": .string("failed"),
+            "error": .object([
+                "message": .string("Duplicate metadata"),
+            ]),
+            "items": .array([
+                .object([
+                    "id": .string("server-error"),
+                    "type": .string("error"),
+                    "message": .string("Useful server failure"),
+                ]),
+            ]),
+        ])))
+
+        XCTAssertEqual(turn.items.count, 1)
+        XCTAssertEqual(turn.items.first?.id, "server-error")
+        XCTAssertEqual(turn.items.first?.body, "Useful server failure")
     }
 
     func testCollapsesDynamicToolEnvelopeIntoReadableOutput() throws {
@@ -245,6 +395,37 @@ final class CodexProjectionTests: XCTestCase {
         XCTAssertEqual(projected.attachments[0].source, .dataURL(dataURL))
         XCTAssertEqual(projected.attachments[1].source, .localFilePath("/tmp/reference.png"))
         XCTAssertFalse(projected.body.contains("iVBOR"))
+    }
+
+    func testImageOnlyUserProjectionKeepsBodyEmptyButPreservesLiteralText() {
+        let dataURL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+
+        func project(text: String?) -> TimelineItem {
+            var parts: [JSONValue] = []
+            if let text {
+                parts.append(.object([
+                    "type": .string("text"),
+                    "text": .string(text),
+                ]))
+            }
+            parts.append(.object([
+                "type": .string("image"),
+                "url": .string(dataURL),
+            ]))
+            return CodexProjection.timelineItem(from: .object([
+                "type": .string("userMessage"),
+                "id": .string("image-only-body"),
+                "content": .array(parts),
+            ]))
+        }
+
+        let imageOnly = project(text: nil)
+        XCTAssertEqual(imageOnly.body, "")
+        XCTAssertEqual(imageOnly.attachments.count, 1)
+
+        let literal = project(text: "[Image attachment]")
+        XCTAssertEqual(literal.body, "[Image attachment]")
+        XCTAssertEqual(literal.attachments.count, 1)
     }
 
     func testChangedStreamingAttachmentSourceReceivesANewCacheRevision() throws {

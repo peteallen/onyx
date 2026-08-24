@@ -23,6 +23,7 @@ struct OpenAICompatibleChatResponse: Sendable, Equatable {
         /// presence so hidden provider thinking cannot leak through this
         /// transport abstraction or be retained by the runtime.
         let hasReasoning: Bool
+        let toolCalls: [OpenAICompatibleChatToolCall]
         let finishReason: String?
     }
 
@@ -41,10 +42,17 @@ struct OpenAICompatibleChatStreamChunk: Sendable, Equatable {
             let role: String?
             let content: String?
             let hasReasoning: Bool
+            /// Raw fragments from this SSE chunk. Function arguments are
+            /// commonly split at arbitrary byte-safe string boundaries.
+            let toolCalls: [OpenAICompatibleChatToolCallDelta]
         }
 
         let index: Int
         let delta: Delta
+        /// Complete snapshots accumulated for this choice through the current
+        /// chunk. Callers should wait for a terminal `tool_calls` finish reason
+        /// before executing them.
+        let toolCalls: [OpenAICompatibleChatToolCall]
         let finishReason: String?
     }
 
@@ -52,6 +60,113 @@ struct OpenAICompatibleChatStreamChunk: Sendable, Equatable {
     let model: String?
     let choices: [Choice]
     let usage: OpenAICompatibleChatUsage?
+}
+
+/// A single streamed fragment for one function call. Identity and function
+/// fields are optional because providers generally send them only on the first
+/// chunk; the numeric index is the stable accumulation key.
+struct OpenAICompatibleChatToolCallDelta: Sendable, Equatable {
+    let index: Int
+    let id: String?
+    let name: String?
+    let arguments: String?
+}
+
+/// Accumulates fragmented function calls independently for every response
+/// choice and tool-call index. It never parses the arguments string as JSON:
+/// models can produce invalid arguments and the later execution boundary must
+/// validate them against the advertised schema.
+struct OpenAICompatibleChatToolCallAccumulator: Sendable {
+    private struct PartialCall: Sendable {
+        var id: String?
+        var name: String?
+        var arguments = ""
+        var sawArguments = false
+    }
+
+    private var partialCalls: [Int: [Int: PartialCall]] = [:]
+
+    mutating func accumulate(
+        _ chunk: OpenAICompatibleChatStreamChunk
+    ) throws -> OpenAICompatibleChatStreamChunk {
+        var choices: [OpenAICompatibleChatStreamChunk.Choice] = []
+        choices.reserveCapacity(chunk.choices.count)
+        for choice in chunk.choices {
+            var byIndex = partialCalls[choice.index] ?? [:]
+            for delta in choice.delta.toolCalls {
+                var partial = byIndex[delta.index] ?? PartialCall()
+                try Self.merge(delta.id, into: &partial.id)
+                try Self.merge(delta.name, into: &partial.name)
+                if let arguments = delta.arguments {
+                    partial.arguments += arguments
+                    partial.sawArguments = true
+                }
+                byIndex[delta.index] = partial
+            }
+            partialCalls[choice.index] = byIndex
+            choices.append(
+                .init(
+                    index: choice.index,
+                    delta: choice.delta,
+                    toolCalls: try Self.completedCalls(from: byIndex, requireComplete: false),
+                    finishReason: choice.finishReason
+                )
+            )
+        }
+        return OpenAICompatibleChatStreamChunk(
+            id: chunk.id,
+            model: chunk.model,
+            choices: choices,
+            usage: chunk.usage
+        )
+    }
+
+    /// Validates that every started call has the identity, name, and argument
+    /// string required to continue the Chat Completions tool loop.
+    func finalize() throws -> [Int: [OpenAICompatibleChatToolCall]] {
+        var result: [Int: [OpenAICompatibleChatToolCall]] = [:]
+        result.reserveCapacity(partialCalls.count)
+        for (choiceIndex, calls) in partialCalls {
+            result[choiceIndex] = try Self.completedCalls(
+                from: calls,
+                requireComplete: true
+            )
+        }
+        return result
+    }
+
+    private static func merge(
+        _ fragment: String?,
+        into accumulated: inout String?
+    ) throws {
+        guard let fragment else { return }
+        if let accumulated, accumulated != fragment {
+            throw OpenAICompatibleChatTransportError.malformedStreamEvent
+        }
+        accumulated = fragment
+    }
+
+    private static func completedCalls(
+        from partials: [Int: PartialCall],
+        requireComplete: Bool
+    ) throws -> [OpenAICompatibleChatToolCall] {
+        try partials.keys.sorted().compactMap { index in
+            guard let partial = partials[index],
+                  let id = partial.id,
+                  let name = partial.name,
+                  partial.sawArguments else {
+                if requireComplete {
+                    throw OpenAICompatibleChatTransportError.malformedStreamEvent
+                }
+                return nil
+            }
+            return OpenAICompatibleChatToolCall(
+                id: id,
+                name: name,
+                arguments: partial.arguments
+            )
+        }
+    }
 }
 
 enum OpenAICompatibleChatStreamEvent: Sendable, Equatable {
@@ -237,14 +352,18 @@ struct OpenAICompatibleChatTransport: Sendable {
                 }
 
                 var parser = OpenAICompatibleSSEParser()
+                var toolCallAccumulator = OpenAICompatibleChatToolCallAccumulator()
                 var sawDone = false
                 streamLoop: for try await byte in bytes {
                     try Task.checkCancellation()
                     for payload in try parser.append(byte) {
                         switch try Self.decodeStreamPayload(payload, redacting: secret) {
                         case let .chunk(chunk):
-                            pair.continuation.yield(.chunk(chunk))
+                            pair.continuation.yield(
+                                .chunk(try toolCallAccumulator.accumulate(chunk))
+                            )
                         case .done:
+                            _ = try toolCallAccumulator.finalize()
                             sawDone = true
                             pair.continuation.yield(.completed)
                             break streamLoop
@@ -256,8 +375,11 @@ struct OpenAICompatibleChatTransport: Sendable {
                     for payload in try parser.finish() {
                         switch try Self.decodeStreamPayload(payload, redacting: secret) {
                         case let .chunk(chunk):
-                            pair.continuation.yield(.chunk(chunk))
+                            pair.continuation.yield(
+                                .chunk(try toolCallAccumulator.accumulate(chunk))
+                            )
                         case .done:
+                            _ = try toolCallAccumulator.finalize()
                             sawDone = true
                             pair.continuation.yield(.completed)
                         }
@@ -349,6 +471,10 @@ struct OpenAICompatibleChatTransport: Sendable {
                 role: message["role"]?.stringValue,
                 content: Self.optionalString(message["content"]),
                 hasReasoning: Self.containsReasoning(in: message),
+                toolCalls: try Self.completeToolCalls(
+                    from: message["tool_calls"],
+                    malformedAs: .malformedResponse
+                ),
                 finishReason: Self.optionalString(value["finish_reason"])
             )
         }
@@ -398,8 +524,10 @@ struct OpenAICompatibleChatTransport: Sendable {
                 delta: .init(
                     role: delta["role"]?.stringValue,
                     content: optionalString(delta["content"]),
-                    hasReasoning: containsReasoning(in: delta)
+                    hasReasoning: containsReasoning(in: delta),
+                    toolCalls: try toolCallDeltas(from: delta["tool_calls"])
                 ),
+                toolCalls: [],
                 finishReason: optionalString(value["finish_reason"])
             )
         }
@@ -420,6 +548,91 @@ struct OpenAICompatibleChatTransport: Sendable {
             completionTokens: value["completion_tokens"]?.intValue,
             totalTokens: value["total_tokens"]?.intValue
         )
+    }
+
+    private static func completeToolCalls(
+        from value: JSONValue?,
+        malformedAs error: OpenAICompatibleChatTransportError
+    ) throws -> [OpenAICompatibleChatToolCall] {
+        guard let value else { return [] }
+        if value == .null { return [] }
+        guard let values = value.arrayValue else { throw error }
+        return try values.map { call in
+            guard let object = call.objectValue,
+                  isFunctionType(object["type"]),
+                  let id = strictString(object["id"]),
+                  let function = object["function"]?.objectValue,
+                  let name = strictString(function["name"]),
+                  let arguments = strictString(function["arguments"]) else {
+                throw error
+            }
+            return OpenAICompatibleChatToolCall(
+                id: id,
+                name: name,
+                arguments: arguments
+            )
+        }
+    }
+
+    private static func toolCallDeltas(
+        from value: JSONValue?
+    ) throws -> [OpenAICompatibleChatToolCallDelta] {
+        guard let value else { return [] }
+        if value == .null { return [] }
+        guard let values = value.arrayValue else {
+            throw OpenAICompatibleChatTransportError.malformedStreamEvent
+        }
+        return try values.map { call in
+            guard let object = call.objectValue,
+                  let index = object["index"]?.intValue,
+                  isFunctionType(object["type"]) else {
+                throw OpenAICompatibleChatTransportError.malformedStreamEvent
+            }
+            let function: [String: JSONValue]
+            if let value = object["function"] {
+                guard let object = value.objectValue else {
+                    throw OpenAICompatibleChatTransportError.malformedStreamEvent
+                }
+                function = object
+            } else {
+                function = [:]
+            }
+            return OpenAICompatibleChatToolCallDelta(
+                index: index,
+                id: try optionalStrictString(
+                    object["id"],
+                    malformedAs: .malformedStreamEvent
+                ),
+                name: try optionalStrictString(
+                    function["name"],
+                    malformedAs: .malformedStreamEvent
+                ),
+                arguments: try optionalStrictString(
+                    function["arguments"],
+                    malformedAs: .malformedStreamEvent
+                )
+            )
+        }
+    }
+
+    private static func isFunctionType(_ value: JSONValue?) -> Bool {
+        guard let value else { return true }
+        return strictString(value) == "function"
+    }
+
+    private static func strictString(_ value: JSONValue?) -> String? {
+        guard case let .string(value)? = value else { return nil }
+        return value
+    }
+
+    private static func optionalStrictString(
+        _ value: JSONValue?,
+        malformedAs error: OpenAICompatibleChatTransportError
+    ) throws -> String? {
+        guard let value else { return nil }
+        if value == .null { return nil }
+        guard let value = strictString(value) else { throw error }
+        return value
     }
 
     private static func optionalString(_ value: JSONValue?) -> String? {

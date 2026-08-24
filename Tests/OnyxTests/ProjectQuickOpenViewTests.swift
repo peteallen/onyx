@@ -41,9 +41,17 @@ final class ProjectQuickOpenViewTests: XCTestCase {
 
         let clock = ContinuousClock()
         let startedAt = clock.now
+        let paintDeadline = startedAt.advanced(by: .milliseconds(100))
         hostingView.layoutSubtreeIfNeeded()
-        pumpMainRunLoop(for: 0.015)
-        hostingView.layoutSubtreeIfNeeded()
+        // SwiftUI usually mounts the field in the first synchronous layout.
+        // Only service another AppKit render pass when the host genuinely
+        // deferred that mount. An unconditional run-loop pump makes the
+        // benchmark charge unrelated executor scheduling on busy CI hosts.
+        while hostingView.firstDescendantTextField(withPlaceholder: "Quick Open") == nil,
+              clock.now < paintDeadline {
+            pumpMainRunLoop(for: 0.001)
+            hostingView.layoutSubtreeIfNeeded()
+        }
         let paintElapsed = startedAt.duration(to: clock.now)
 
         XCTAssertLessThan(

@@ -4,6 +4,213 @@ import XCTest
 @testable import Onyx
 
 final class CodexRuntimeLaunchConfigurationTests: XCTestCase {
+    func testProductionRegistersResponsesProviderWithoutChangingDefaultAuthentication() throws {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        _ = try fixture.installHelper()
+        let provider = CodexRuntimeModelProviderBinding(
+            id: "onyx-proxy-fixture",
+            baseURL: URL(string: "http://127.0.0.1:54321/v1")!,
+            apiKey: "disposable-secret",
+            stateIdentifier: "provider-state-fixture"
+        )
+
+        let configuration = try CodexRuntimeLaunchConfiguration.production(
+            bundleURL: fixture.bundleURL,
+            userApplicationSupportURL: fixture.applicationSupportURL,
+            inheritedEnvironment: [
+                "PATH": "/usr/bin",
+                CodexRuntimeLaunchConfiguration.customProviderAPIKeyEnvironmentKey: "stale-secret",
+            ],
+            modelProvider: provider
+        )
+
+        XCTAssertEqual(configuration.modelProviderID, provider.id)
+        XCTAssertEqual(
+            configuration.codexHomeURL,
+            fixture.applicationSupportURL
+                .appendingPathComponent(
+                    "Onyx/Codex/Providers/provider-state-fixture",
+                    isDirectory: true
+                )
+                .standardizedFileURL
+        )
+        XCTAssertEqual(
+            configuration.processEnvironment["CODEX_HOME"],
+            configuration.codexHomeURL.path
+        )
+        XCTAssertEqual(
+            configuration.processEnvironment[
+                CodexRuntimeLaunchConfiguration.customProviderAPIKeyEnvironmentKey
+            ],
+            "disposable-secret"
+        )
+        XCTAssertEqual(
+            Array(configuration.processArguments.suffix(12)),
+            [
+                "-c", "model_providers.onyx-proxy-fixture.name=\"Onyx Custom Provider\"",
+                "-c", "model_providers.onyx-proxy-fixture.base_url=\"http://127.0.0.1:54321/v1\"",
+                "-c", "model_providers.onyx-proxy-fixture.env_key=\"ONYX_CODEX_CUSTOM_PROVIDER_API_KEY\"",
+                "-c", "model_providers.onyx-proxy-fixture.wire_api=\"responses\"",
+                "-c", "model_providers.onyx-proxy-fixture.requires_openai_auth=false",
+                "-c", "model_providers.onyx-proxy-fixture.stream_max_retries=0",
+            ]
+        )
+        XCTAssertFalse(configuration.processArguments.contains { $0.contains("disposable-secret") })
+        XCTAssertTrue(configuration.processArguments.contains("forced_login_method=\"chatgpt\""))
+    }
+
+    func testCustomProviderIDMustBeOneBoundedBareConfigKey() throws {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        _ = try fixture.installHelper()
+        let invalidIdentifiers = [
+            "",
+            ".",
+            "nested.provider",
+            "nested/provider",
+            "nested\\provider",
+            " provider",
+            "provider\"quoted",
+            "prøvider",
+            String(repeating: "a", count: 129),
+        ]
+
+        for identifier in invalidIdentifiers {
+            XCTAssertThrowsError(
+                try CodexRuntimeLaunchConfiguration.production(
+                    bundleURL: fixture.bundleURL,
+                    userApplicationSupportURL: fixture.applicationSupportURL,
+                    modelProvider: CodexRuntimeModelProviderBinding(
+                        id: identifier,
+                        baseURL: URL(string: "http://127.0.0.1:54321/v1")!,
+                        apiKey: "disposable-secret",
+                        stateIdentifier: "provider-state-fixture"
+                    )
+                ),
+                "Expected rejection for provider ID \(identifier.debugDescription)"
+            ) { error in
+                guard case AgentRuntimeError.runtimeStateUnavailable = error else {
+                    return XCTFail("Unexpected error: \(error)")
+                }
+            }
+        }
+    }
+
+    func testCustomProviderStateIdentifierMustBeOneBoundedOpaquePathComponent() throws {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        _ = try fixture.installHelper()
+        let invalidIdentifiers = [
+            "",
+            ".",
+            "..",
+            "nested/provider",
+            "nested\\provider",
+            " provider",
+            "provider.state",
+            "prøvider",
+            String(repeating: "a", count: 129),
+        ]
+
+        for stateIdentifier in invalidIdentifiers {
+            let provider = CodexRuntimeModelProviderBinding(
+                id: "onyx-custom",
+                baseURL: URL(string: "http://127.0.0.1:54321/v1")!,
+                apiKey: "disposable-secret",
+                stateIdentifier: stateIdentifier
+            )
+            XCTAssertThrowsError(
+                try CodexRuntimeLaunchConfiguration.production(
+                    bundleURL: fixture.bundleURL,
+                    userApplicationSupportURL: fixture.applicationSupportURL,
+                    modelProvider: provider
+                ),
+                "Expected rejection for state identifier \(stateIdentifier.debugDescription)"
+            ) { error in
+                guard case AgentRuntimeError.runtimeStateUnavailable = error else {
+                    return XCTFail("Unexpected error: \(error)")
+                }
+            }
+        }
+    }
+
+    func testProviderStateRotationPreservesOldHomeAndSameIdentifierReusesIt() throws {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        _ = try fixture.installHelper()
+        let firstProvider = CodexRuntimeModelProviderBinding(
+            id: "onyx-custom-before",
+            baseURL: URL(string: "http://127.0.0.1:54321/v1")!,
+            apiKey: "first-secret",
+            stateIdentifier: "scope-before"
+        )
+        let firstConfiguration = try CodexRuntimeLaunchConfiguration.production(
+            bundleURL: fixture.bundleURL,
+            userApplicationSupportURL: fixture.applicationSupportURL,
+            modelProvider: firstProvider
+        )
+        try firstConfiguration.prepareStateDirectory()
+        let markerURL = firstConfiguration.codexHomeURL.appendingPathComponent("retained.marker")
+        try Data("retained".utf8).write(to: markerURL)
+
+        let reusedConfiguration = try CodexRuntimeLaunchConfiguration.production(
+            bundleURL: fixture.bundleURL,
+            userApplicationSupportURL: fixture.applicationSupportURL,
+            modelProvider: CodexRuntimeModelProviderBinding(
+                id: "onyx-custom-renamed",
+                baseURL: URL(string: "http://127.0.0.1:65432/v1")!,
+                apiKey: "replacement-secret",
+                stateIdentifier: "scope-before"
+            )
+        )
+        XCTAssertEqual(reusedConfiguration.codexHomeURL, firstConfiguration.codexHomeURL)
+
+        let rotatedConfiguration = try CodexRuntimeLaunchConfiguration.production(
+            bundleURL: fixture.bundleURL,
+            userApplicationSupportURL: fixture.applicationSupportURL,
+            modelProvider: CodexRuntimeModelProviderBinding(
+                id: "onyx-custom-after",
+                baseURL: URL(string: "http://127.0.0.1:65432/v1")!,
+                apiKey: "replacement-secret",
+                stateIdentifier: "scope-after"
+            )
+        )
+        try rotatedConfiguration.prepareStateDirectory()
+
+        XCTAssertNotEqual(rotatedConfiguration.codexHomeURL, firstConfiguration.codexHomeURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: markerURL.path))
+        XCTAssertEqual(permissions(at: firstConfiguration.codexHomeURL), 0o700)
+        XCTAssertEqual(permissions(at: rotatedConfiguration.codexHomeURL), 0o700)
+        XCTAssertEqual(
+            permissions(at: rotatedConfiguration.codexHomeURL.deletingLastPathComponent()),
+            0o700
+        )
+    }
+
+    func testDefaultLaunchDoesNotInheritOrRegisterCustomProvider() throws {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        _ = try fixture.installHelper()
+
+        let configuration = try CodexRuntimeLaunchConfiguration.production(
+            bundleURL: fixture.bundleURL,
+            userApplicationSupportURL: fixture.applicationSupportURL,
+            inheritedEnvironment: [
+                CodexRuntimeLaunchConfiguration.customProviderAPIKeyEnvironmentKey: "stale-secret",
+            ]
+        )
+
+        XCTAssertNil(configuration.modelProviderID)
+        XCTAssertNil(
+            configuration.processEnvironment[
+                CodexRuntimeLaunchConfiguration.customProviderAPIKeyEnvironmentKey
+            ]
+        )
+        XCTAssertFalse(configuration.processArguments.contains { $0.contains("model_providers") })
+        XCTAssertEqual(configuration.processArguments, CodexRuntimeLaunchConfiguration.defaultArguments)
+    }
+
     func testProductionUsesOnlyBundledStandaloneServerAndPrivateCodexHome() throws {
         let fixture = try makeFixture()
         defer { fixture.cleanup() }
@@ -377,6 +584,22 @@ final class CodexRuntimeLaunchConfigurationTests: XCTestCase {
         XCTAssertEqual(stops, 1)
     }
 
+    func testRuntimeAcceptsEquivalentPrivateTmpCodexHomeAlias() async throws {
+        let suffix = "OnyxAliasCodex-\(UUID().uuidString)/Codex"
+        let expectedHome = URL(
+            fileURLWithPath: "/tmp/\(suffix)",
+            isDirectory: true
+        )
+        let reportedHome = "/private/tmp/\(suffix)"
+        let transport = CodexHomeReportingTransport(reportedHome: reportedHome)
+        let runtime = CodexRuntime(client: transport, expectedCodexHomeURL: expectedHome)
+
+        _ = try await runtime.connect()
+        await runtime.disconnect()
+        let stops = await transport.stopCount()
+        XCTAssertEqual(stops, 1)
+    }
+
     private func permissions(at url: URL) -> Int {
         let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
         return (attributes?[.posixPermissions] as? NSNumber)?.intValue ?? -1
@@ -401,6 +624,47 @@ private actor CodexHomeMismatchTransport: CodexAppServerTransport {
 
     func stop() async { stops += 1 }
     func request(method _: String, params _: JSONValue) async throws -> JSONValue { .object([:]) }
+    func respond(id _: RuntimeRequestID, result _: JSONValue) async throws {}
+    func stopCount() -> Int { stops }
+}
+
+private actor CodexHomeReportingTransport: CodexAppServerTransport {
+    nonisolated let events: AsyncStream<AppServerEvent> = {
+        let stream = AsyncStream.makeStream(of: AppServerEvent.self)
+        stream.continuation.finish()
+        return stream.stream
+    }()
+
+    private let reportedHome: String
+    private var stops = 0
+
+    init(reportedHome: String) {
+        self.reportedHome = reportedHome
+    }
+
+    func start() async throws -> AppServerConnection {
+        AppServerConnection(
+            generation: 1,
+            initializeResponse: .object(["codexHome": .string(reportedHome)])
+        )
+    }
+
+    func stop() async { stops += 1 }
+
+    func request(method: String, params _: JSONValue) async throws -> JSONValue {
+        switch method {
+        case "account/read":
+            return .object([
+                "account": .null,
+                "requiresOpenaiAuth": .bool(false),
+            ])
+        case "model/list":
+            return .object(["data": .array([])])
+        default:
+            return .object([:])
+        }
+    }
+
     func respond(id _: RuntimeRequestID, result _: JSONValue) async throws {}
     func stopCount() -> Int { stops }
 }

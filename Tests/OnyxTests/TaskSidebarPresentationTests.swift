@@ -202,15 +202,44 @@ final class TaskSidebarPresentationTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(OnyxHitTarget.splitter, 10)
     }
 
+    func testProjectQuickCreateAppearsForHoverOrKeyboardFocus() {
+        XCTAssertFalse(
+            ProjectSidebarHeaderPresentation.showsNewTaskAction(
+                isHovering: false,
+                isFocused: false
+            )
+        )
+        XCTAssertTrue(
+            ProjectSidebarHeaderPresentation.showsNewTaskAction(
+                isHovering: true,
+                isFocused: false
+            )
+        )
+        XCTAssertTrue(
+            ProjectSidebarHeaderPresentation.showsNewTaskAction(
+                isHovering: false,
+                isFocused: true
+            )
+        )
+        XCTAssertTrue(
+            ProjectSidebarHeaderPresentation.showsNewTaskAction(
+                isHovering: true,
+                isFocused: true
+            )
+        )
+        XCTAssertGreaterThanOrEqual(ProjectSidebarHeaderPresentation.newTaskHitTarget, 32)
+    }
+
     @MainActor
-    func testClickingProjectNameTogglesTheWholeProjectHeader() throws {
+    func testProjectHeaderQuickCreateAndDisclosureTargetsDoNotOverlap() throws {
         let project = ProjectCatalogRecord(
-            id: ProjectID("hit-target-project"),
-            folderPath: "/tmp/hit-target-project",
+            id: ProjectID("quick-create-project"),
+            folderPath: "/tmp/quick-create-project",
             displayName: "Onyx",
             order: 0
         )
         var toggleCount = 0
+        var newTaskCount = 0
         let size = NSSize(width: 280, height: 36)
         let hostingView = NSHostingView(
             rootView: ProjectSidebarHeader(
@@ -220,7 +249,62 @@ final class TaskSidebarPresentationTests: XCTestCase {
                 canMoveUp: false,
                 canMoveDown: false,
                 toggleExpanded: { toggleCount += 1 },
-                newTask: {},
+                newTask: { newTaskCount += 1 },
+                rename: {},
+                moveUp: {},
+                moveDown: {},
+                remove: {},
+                quickCreateVisibility: .visible
+            )
+            .frame(width: size.width, height: size.height)
+        )
+        hostingView.frame = NSRect(origin: .zero, size: size)
+        let window = NSWindow(
+            contentRect: hostingView.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.acceptsMouseMovedEvents = true
+        window.contentView = hostingView
+        window.orderFront(nil)
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        hostingView.layoutSubtreeIfNeeded()
+
+        // The flexible project-name button leaves the 32 pt quick-create
+        // target immediately before the trailing management menu.
+        let quickCreatePoint = NSPoint(x: size.width - 56, y: size.height / 2)
+        try click(at: quickCreatePoint, in: window)
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
+
+        XCTAssertEqual(newTaskCount, 1)
+        XCTAssertEqual(toggleCount, 0)
+    }
+
+    @MainActor
+    func testClickingProjectNameTogglesTheWholeProjectHeader() throws {
+        let project = ProjectCatalogRecord(
+            id: ProjectID("hit-target-project"),
+            folderPath: "/tmp/hit-target-project",
+            displayName: "Onyx",
+            order: 0
+        )
+        var toggleCount = 0
+        var newTaskCount = 0
+        let size = NSSize(width: 280, height: 36)
+        let hostingView = NSHostingView(
+            rootView: ProjectSidebarHeader(
+                project: project,
+                taskCount: 4,
+                isExpanded: false,
+                canMoveUp: false,
+                canMoveDown: false,
+                toggleExpanded: { toggleCount += 1 },
+                newTask: { newTaskCount += 1 },
                 rename: {},
                 moveUp: {},
                 moveDown: {},
@@ -250,6 +334,7 @@ final class TaskSidebarPresentationTests: XCTestCase {
         RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
 
         XCTAssertEqual(toggleCount, 1)
+        XCTAssertEqual(newTaskCount, 0)
     }
 
     @MainActor
@@ -280,4 +365,5 @@ final class TaskSidebarPresentationTests: XCTestCase {
         window.sendEvent(down)
         window.sendEvent(up)
     }
+
 }

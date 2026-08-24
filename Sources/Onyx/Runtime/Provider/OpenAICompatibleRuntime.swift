@@ -14,6 +14,9 @@ enum OpenAICompatibleRuntimeError: LocalizedError, Equatable, Sendable {
     case emptyTurnInput
     case emptyConversationName
     case conversationNotFound(String)
+    case turnNotFound(String)
+    case turnIsNotLatest(String)
+    case conversationHistoryChanged(String)
     case activeTurn(String)
 
     var errorDescription: String? {
@@ -36,6 +39,12 @@ enum OpenAICompatibleRuntimeError: LocalizedError, Equatable, Sendable {
             "A provider conversation name cannot be empty."
         case let .conversationNotFound(id):
             "The provider conversation could not be found: \(id)"
+        case let .turnNotFound(id):
+            "The provider conversation turn could not be found: \(id)"
+        case let .turnIsNotLatest(id):
+            "The provider conversation changed before turn \(id) could be replaced."
+        case let .conversationHistoryChanged(id):
+            "The provider conversation changed before a new response could start: \(id)"
         case let .activeTurn(id):
             "Conversation \(id) already has a response in progress."
         }
@@ -62,6 +71,9 @@ actor OpenAICompatibleRuntime: AgentRuntime {
     private let session: URLSession
     private let eventContinuation: AsyncStream<AgentRuntimeEvent>.Continuation
     private let beforeDisconnectedTurnCleanup: (@Sendable () async -> Void)?
+    /// Test seam at the cross-runtime history boundary. Production leaves this
+    /// nil; the durable compare-and-append below remains the actual guard.
+    private let beforeTurnHistoryCommit: (@Sendable () async -> Void)?
 
     private var connection: ProviderConnectionRecord?
     private var transport: OpenAICompatibleChatTransport?
@@ -72,6 +84,11 @@ actor OpenAICompatibleRuntime: AgentRuntime {
     private var connectionAttempt: ConnectionAttempt?
     private var activeTurns: [String: ActiveTurn] = [:]
     private var startingTurns: Set<String> = []
+    /// App-owned history replacement is a writer operation even while its
+    /// atomic file transaction is suspended on another actor. Reserve the
+    /// thread across that await so another window cannot start or delete a
+    /// turn and then receive stale post-revert metadata.
+    private var revertingThreads: Set<String> = []
     private var interruptedThreads: Set<String> = []
 
     private struct ActiveTurn: Sendable {
@@ -129,7 +146,8 @@ actor OpenAICompatibleRuntime: AgentRuntime {
         credentialStore: any CredentialStore = KeychainCredentialStore(),
         conversationStore: OpenAICompatibleConversationStore = OpenAICompatibleConversationStore(),
         session: URLSession? = nil,
-        beforeDisconnectedTurnCleanup: (@Sendable () async -> Void)? = nil
+        beforeDisconnectedTurnCleanup: (@Sendable () async -> Void)? = nil,
+        beforeTurnHistoryCommit: (@Sendable () async -> Void)? = nil
     ) {
         self.connectionID = connectionID
         self.connectionStore = connectionStore
@@ -137,6 +155,7 @@ actor OpenAICompatibleRuntime: AgentRuntime {
         self.conversationStore = conversationStore
         self.session = session ?? Self.makeDefaultSession()
         self.beforeDisconnectedTurnCleanup = beforeDisconnectedTurnCleanup
+        self.beforeTurnHistoryCommit = beforeTurnHistoryCommit
         let stream = AsyncStream.makeStream(of: AgentRuntimeEvent.self)
         events = stream.stream
         eventContinuation = stream.continuation
@@ -240,6 +259,9 @@ actor OpenAICompatibleRuntime: AgentRuntime {
         let interruptedTurns = activeTurns
         activeTurns.removeAll()
         interruptedThreads.removeAll()
+        // Keep any in-flight history replacement reservation until its store
+        // transaction returns. Clearing it here would let a reconnect append
+        // a new turn while the stale operation can still commit its suffix.
         connected = false
         transport = nil
         connection = nil
@@ -373,6 +395,71 @@ actor OpenAICompatibleRuntime: AgentRuntime {
         try await readThread(id: id)
     }
 
+    /// This provider's durable history is app-owned, so replacing its suffix
+    /// is an atomic local transaction rather than a remote best-effort edit.
+    /// That gives edit/retry the same no-duplication semantics as Codex while
+    /// retaining the provider boundary and endpoint-scoped transcript.
+    func revertThread(id: String, beforeTurnID: String) async throws -> RuntimeThreadRevertResult {
+        try await ensureConnected()
+        let generation = connectionGeneration
+        guard let scopeID = connection?.conversationScopeID else {
+            throw OpenAICompatibleRuntimeError.notConnected
+        }
+        guard activeTurns[id] == nil,
+              !startingTurns.contains(id),
+              !revertingThreads.contains(id) else {
+            throw OpenAICompatibleRuntimeError.activeTurn(id)
+        }
+        revertingThreads.insert(id)
+        defer { revertingThreads.remove(id) }
+
+        let conversation: OpenAICompatibleStoredConversation
+        do {
+            conversation = try await conversationStore.update(
+                connectionID: connectionID,
+                id: id,
+                scopeID: scopeID
+            ) { conversation in
+                // A settings edit can replace this runtime actor without
+                // rotating the conversation scope. Its in-memory reservation
+                // cannot protect against that replacement appending a newer
+                // turn, so make the destructive boundary conditional on the
+                // latest durable snapshot as well.
+                guard conversation.turnGroups.last?.id == beforeTurnID else {
+                    if conversation.turnGroups.contains(where: { $0.id == beforeTurnID }) {
+                        throw OpenAICompatibleRuntimeError.turnIsNotLatest(beforeTurnID)
+                    }
+                    throw OpenAICompatibleRuntimeError.turnNotFound(beforeTurnID)
+                }
+                guard let cutIndex = conversation.messageIndex(
+                    startingTurnID: beforeTurnID
+                ) else {
+                    throw OpenAICompatibleRuntimeError.turnNotFound(beforeTurnID)
+                }
+                conversation.messages.removeSubrange(cutIndex...)
+                conversation.status = conversation.messages.contains(where: {
+                    $0.status == .running
+                }) ? .running : (conversation.messages.last?.status == .failed ? .failed : .idle)
+                conversation.updatedAt = .now
+            }
+        } catch let error as OpenAICompatibleConversationStoreError {
+            if case .conversationNotFound = error {
+                throw OpenAICompatibleRuntimeError.conversationNotFound(id)
+            }
+            throw error
+        }
+        guard connected, generation == connectionGeneration else {
+            throw OpenAICompatibleRuntimeError.notConnected
+        }
+        let thread = conversation.runtimeThread(kind: kind)
+        eventContinuation.yield(.threadUpdated(thread))
+        return RuntimeThreadRevertResult(
+            thread: thread,
+            turnsBackwardsCursor: nil,
+            itemsBackwardsCursor: nil
+        )
+    }
+
     func startThread(_ request: StartThreadRequest) async throws -> RuntimeThread {
         try await ensureConnected()
         let generation = connectionGeneration
@@ -421,7 +508,7 @@ actor OpenAICompatibleRuntime: AgentRuntime {
         guard let scopeID = connection?.conversationScopeID else {
             throw OpenAICompatibleRuntimeError.notConnected
         }
-        guard !startingTurns.contains(id) else {
+        guard !startingTurns.contains(id), !revertingThreads.contains(id) else {
             throw OpenAICompatibleRuntimeError.activeTurn(id)
         }
         if let active = activeTurns.removeValue(forKey: id) {
@@ -447,7 +534,8 @@ actor OpenAICompatibleRuntime: AgentRuntime {
         let generation = connectionGeneration
         guard !request.inputs.isEmpty else { throw OpenAICompatibleRuntimeError.emptyTurnInput }
         guard activeTurns[request.threadID] == nil,
-              !startingTurns.contains(request.threadID) else {
+              !startingTurns.contains(request.threadID),
+              !revertingThreads.contains(request.threadID) else {
             throw OpenAICompatibleRuntimeError.activeTurn(request.threadID)
         }
         startingTurns.insert(request.threadID)
@@ -503,22 +591,36 @@ actor OpenAICompatibleRuntime: AgentRuntime {
         let resolvedUserParts = chatRequest.messages.last?.parts.map(
             OpenAICompatibleStoredMessage.ContentPart.init
         ) ?? [.text(userText)]
+        let turnID = "turn:\(UUID().uuidString.lowercased())"
         let userMessage = OpenAICompatibleStoredMessage(
+            turnID: turnID,
             role: .user,
             text: userText,
             contentParts: resolvedUserParts,
             status: .completed
         )
         let assistantMessage = OpenAICompatibleStoredMessage(
+            turnID: turnID,
             role: .assistant,
             text: "",
             status: .running
         )
+        await beforeTurnHistoryCommit?()
         let updated = try await conversationStore.update(
             connectionID: connectionID,
             id: request.threadID,
             scopeID: record.conversationScopeID
         ) { latest in
+            // A second runtime can read this history, suspend, and then resume
+            // after another window has reverted or appended a turn. Build the
+            // outbound request from one snapshot and append only if that exact
+            // message history is still authoritative. Otherwise stale context
+            // must never reach the provider.
+            guard latest.messages == existing.messages else {
+                throw OpenAICompatibleRuntimeError.conversationHistoryChanged(
+                    request.threadID
+                )
+            }
             // `activeTurns` is the authoritative in-process reservation. A
             // prior process or a failed final persistence can leave the disk
             // record marked running; recover that stale marker transactionally
@@ -555,7 +657,6 @@ actor OpenAICompatibleRuntime: AgentRuntime {
             throw OpenAICompatibleRuntimeError.notConnected
         }
 
-        let turnID = "turn:\(UUID().uuidString.lowercased())"
         eventContinuation.yield(.threadUpdated(updated.runtimeThread(kind: kind)))
         eventContinuation.yield(.turnStarted(threadID: request.threadID, turnID: turnID))
         eventContinuation.yield(.itemStarted(
@@ -622,6 +723,9 @@ actor OpenAICompatibleRuntime: AgentRuntime {
         guard let scopeID = connection?.conversationScopeID else {
             throw OpenAICompatibleRuntimeError.notConnected
         }
+        guard !revertingThreads.contains(id) else {
+            throw OpenAICompatibleRuntimeError.activeTurn(id)
+        }
         let normalized = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else { throw OpenAICompatibleRuntimeError.emptyConversationName }
         let title = String(normalized.prefix(200))
@@ -661,6 +765,9 @@ actor OpenAICompatibleRuntime: AgentRuntime {
         let generation = connectionGeneration
         guard let scopeID = connection?.conversationScopeID else {
             throw OpenAICompatibleRuntimeError.notConnected
+        }
+        guard !revertingThreads.contains(id) else {
+            throw OpenAICompatibleRuntimeError.activeTurn(id)
         }
         let conversation: OpenAICompatibleStoredConversation
         do {
@@ -1013,7 +1120,11 @@ actor OpenAICompatibleRuntime: AgentRuntime {
                 requiresAuthentication: bearerToken == nil
             )
         }
-        var capabilities: RuntimeCapabilities = [.threadArchiving, .threadDeletion]
+        var capabilities: RuntimeCapabilities = [
+            .threadArchiving,
+            .threadDeletion,
+            .threadHistoryRevert,
+        ]
         let transportCapabilities = record.map(effectiveTransportCapabilities) ?? []
         if transportCapabilities.contains(.streaming) {
             capabilities.insert(.streaming)

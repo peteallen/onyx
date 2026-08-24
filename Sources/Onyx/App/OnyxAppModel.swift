@@ -162,6 +162,11 @@ struct TranscriptPresentationSnapshot: Equatable, Sendable {
 final class OnyxAppModel: ObservableObject {
     @Published var connectionState: RuntimeConnectionState = .disconnected
     @Published var session: RuntimeSession?
+    /// Protocol compatibility can be disproved after an adaptive task is
+    /// already visible. Keep that evidence outside the provider's immutable
+    /// task/model snapshots so a later thread refresh cannot accidentally
+    /// re-enable the rejected action in this window.
+    private var downgradedRuntimeCapabilities: RuntimeCapabilities = []
     @Published var authState = RuntimeAuthState.signedOut
     @Published var loginAttempt: RuntimeLoginStart?
     @Published var isAuthenticating = false
@@ -220,6 +225,7 @@ final class OnyxAppModel: ObservableObject {
     /// durable history prefix. Keeping this separate from ordinary agent work
     /// prevents a double-click from issuing the destructive operation twice.
     @Published private(set) var isPreparingLatestMessageEdit = false
+    @Published private(set) var isPreparingFailedResponseRetry = false
     @Published var isTurnRunning = false
     @Published private(set) var reviewingThreadID: String?
     @Published private(set) var startingReviewThreadID: String?
@@ -411,6 +417,12 @@ final class OnyxAppModel: ObservableObject {
         let provisionalDraftKey: String?
         let originThreadID: String?
         let isNewThread: Bool
+        /// A user-owned presentation row created at the synchronous send
+        /// boundary. Existing tasks paint it before any resume/read can
+        /// suspend, while new tasks retain it until their provider thread ID
+        /// exists. The provider event later replaces this stable optimistic
+        /// row with its authoritative user item.
+        let optimisticUserItem: TimelineItem?
         let cwd: String?
         let wasTurnRunning: Bool
         let modelID: String?
@@ -431,6 +443,21 @@ final class OnyxAppModel: ObservableObject {
         let workspacePath: String?
         let reasoningEffort: String?
         let permissionLabel: String
+    }
+
+    /// Exact window-owned input state carried across a same-provider runtime
+    /// replacement. Unlike an ordinary provider switch, replacing stale
+    /// credentials must not discard a draft attached to an existing task.
+    struct RuntimeReplacementContext: Equatable, Sendable {
+        let selectedThreadID: String?
+        let threadListScope: ThreadListScope
+        let composerDraftKey: String
+        let composerText: String
+        /// Image drafts are intentionally session-only, so carry every task's
+        /// in-memory attachments across a runtime generation replacement. Text
+        /// drafts are synchronously persisted before capture and reload from
+        /// the shared window namespace; image bytes never touch UserDefaults.
+        let composerImageDrafts: [String: [ComposerImageDraft]]
     }
 
     private enum PreferenceKey {
@@ -770,8 +797,35 @@ final class OnyxAppModel: ObservableObject {
         latestEditableUserMessage?.message.id
     }
 
+    /// A failed latest turn can be retried directly. The operation uses the
+    /// same provider-owned revert boundary as editing, so the failed response
+    /// and original prompt are removed before one replacement send begins.
+    var retryableFailedUserMessageID: String? {
+        failedLatestUserMessage?.message.id
+    }
+
+    /// Retry is presented beside the failed response the user is looking at,
+    /// while the action resolves back to the user message in that same turn.
+    var retryableFailedResponseItemID: String? {
+        return failedLatestUserMessage?.turn.items.last(where: {
+            $0.kind == .assistantMessage || $0.kind == .error
+        })?.id
+    }
+
+    func retryUserMessageID(forFailedResponseItemID itemID: String) -> String? {
+        guard let candidate = failedLatestUserMessage,
+              candidate.turn.items.contains(where: { $0.id == itemID }) else { return nil }
+        return candidate.message.id
+    }
+
     var isPreparingLatestMessageEditForSelectedThread: Bool {
         selectedThreadID.map(isPreparingLatestMessageEdit(for:)) == true
+    }
+
+    var isPreparingFailedResponseRetryForSelectedThread: Bool {
+        isPreparingFailedResponseRetry
+            && selectedThreadID != nil
+            && selectedThreadID == latestMessageEditThreadID
     }
 
     private func isPreparingLatestMessageEdit(for threadID: String) -> Bool {
@@ -786,14 +840,12 @@ final class OnyxAppModel: ObservableObject {
     private var latestEditableUserMessage: EditableUserMessage? {
         guard canRunAgent,
               supports(.threadHistoryRevert),
-              !isPreparingLatestMessageEdit,
               !isLoadingThread,
               !isShowingArchivedThreads,
               let thread = selectedThread,
               thread.id != Self.welcomeThread.id,
               selectedThreadID == thread.id,
-              composerText.isEmpty,
-              composerImages.isEmpty,
+              !isPreparingLatestMessageEdit(for: thread.id),
               !isTurnRunning,
               !thread.status.isBusy,
               !isReviewActive(for: thread.id),
@@ -811,6 +863,12 @@ final class OnyxAppModel: ObservableObject {
               timeline.last(where: { $0.kind == .userMessage })?.id == message.id
         else { return nil }
         return EditableUserMessage(turn: turn, message: message)
+    }
+
+    private var failedLatestUserMessage: EditableUserMessage? {
+        guard let candidate = latestEditableUserMessage,
+              candidate.turn.status == .failed else { return nil }
+        return candidate
     }
 
     var activeUserInteraction: RuntimeUserInteraction? {
@@ -988,7 +1046,18 @@ final class OnyxAppModel: ObservableObject {
     }
 
     func supports(_ capability: RuntimeCapabilities) -> Bool {
-        session?.capabilities.contains(capability) == true
+        guard downgradedRuntimeCapabilities.intersection(capability).isEmpty else {
+            return false
+        }
+        if let thread = selectedThread,
+           thread.id != Self.welcomeThread.id,
+           let capabilities = thread.taskCapabilities {
+            return capabilities.contains(capability)
+        }
+        if let capabilities = selectedRuntimeModel?.taskCapabilities {
+            return capabilities.contains(capability)
+        }
+        return session?.capabilities.contains(capability) == true
     }
 
     var canAttachImages: Bool {
@@ -2050,6 +2119,33 @@ final class OnyxAppModel: ObservableObject {
         saveCurrentImageDraftNow()
     }
 
+    /// Provider settings can retire this model's immutable runtime while its
+    /// window stays open. Snapshot the visible task/draft directly so the fresh
+    /// model does not depend on a debounced persistence write winning a race.
+    func captureRuntimeReplacementContext() -> RuntimeReplacementContext {
+        closeSideChat()
+        saveCurrentDraftNow(mode: .synchronous)
+        saveCurrentImageDraftNow()
+        return RuntimeReplacementContext(
+            selectedThreadID: pendingRestoredSelectionID ?? selectedThreadID,
+            threadListScope: threadListScope,
+            composerDraftKey: composerDraftKey,
+            composerText: composerText,
+            composerImageDrafts: composerImageDrafts
+        )
+    }
+
+    func restoreRuntimeReplacementContext(_ context: RuntimeReplacementContext) {
+        guard context.threadListScope == threadListScope else { return }
+        composerDrafts[context.composerDraftKey] = context.composerText
+        composerImageDrafts = context.composerImageDrafts
+        composerDraftKey = context.composerDraftKey
+        composerText = context.composerText
+        composerImages = context.composerImageDrafts[context.composerDraftKey] ?? []
+        pendingRestoredSelectionID = context.selectedThreadID
+        hasExplicitNewTaskSelection = context.selectedThreadID == Self.welcomeThread.id
+    }
+
     func setThreadListScope(_ scope: ThreadListScope) {
         guard scope != threadListScope, runtime != nil else { return }
         closeSideChat()
@@ -2130,12 +2226,29 @@ final class OnyxAppModel: ObservableObject {
         }
     }
 
+    /// Starts a genuinely blank task from a project's quick-create action.
+    /// Choosing a folder in the welcome composer intentionally preserves that
+    /// draft; clicking a project's plus button is a different, explicit New
+    /// Task command and must never carry the previous welcome draft with it.
+    func newTask(inWorkspace path: String) {
+        newTask()
+        rememberWorkspace(path)
+    }
+
     func sendComposer() {
-        guard !isPreparingLatestMessageEditForSelectedThread else { return }
+        _ = submitComposer()
+    }
+
+    /// Returns true once the send has synchronously captured and cleared its
+    /// input. Retry uses this acceptance boundary so a provider-state change
+    /// cannot erase the original prompt after history was already reverted.
+    @discardableResult
+    private func submitComposer() -> Bool {
+        guard !isPreparingLatestMessageEditForSelectedThread else { return false }
         let draftText = composerText
         let text = draftText.trimmingCharacters(in: .whitespacesAndNewlines)
         let images = composerImages
-        guard !text.isEmpty || !images.isEmpty else { return }
+        guard !text.isEmpty || !images.isEmpty else { return false }
 
         // Snapshot the exact draft before validation or any provider call.
         // Ordinary persistence is serialized on the utility queue so the
@@ -2149,49 +2262,49 @@ final class OnyxAppModel: ObservableObject {
                 "Too many images",
                 "Keep up to \(ComposerImageValidator.maximumCount) attachments and try again. Your draft is still here."
             )
-            return
+            return false
         }
 
-        guard !isSelectedThreadArchived else { return }
+        guard !isSelectedThreadArchived else { return false }
         guard !isReviewBlockingComposer else {
             notice = (
                 "Review is still running",
                 "Wait for the code review to finish or stop it before sending another message. Your draft is still here."
             )
-            return
+            return false
         }
         guard let runtime else {
             notice = (
                 "\(runtimeDisplayName) is unavailable",
                 startupError?.localizedDescription ?? "Onyx could not start the configured runtime. Your draft is still here."
             )
-            return
+            return false
         }
         guard activeUserInteraction?.isBlocking != true else {
             notice = (
                 "Answer the pending request first",
                 "\(runtimeDisplayName) is waiting for your response before this task can continue."
             )
-            return
+            return false
         }
         guard canRunAgent else {
             notice = (
                 "Sign in to continue",
                 signInRequiredDetail
             )
-            return
+            return false
         }
         guard images.isEmpty || canAttachImages else {
             notice = (
                 "Images are not available",
                 "The selected runtime cannot receive these attachments. Remove them or switch runtimes; your draft is still here."
             )
-            return
+            return false
         }
         if selectedThreadID == nil || selectedThreadID == Self.welcomeThread.id {
             guard draftWorkspacePath != nil else {
                 notice = ("Choose a project", "Select the folder Onyx should work in before starting a task.")
-                return
+                return false
             }
         }
 
@@ -2206,6 +2319,11 @@ final class OnyxAppModel: ObservableObject {
         let sourceDraftKey = composerDraftKey
         let provisionalDraftKey = isNewThread ? "onyx:pending:\(UUID().uuidString)" : nil
         let inputs: [RuntimeTurnInput] = (text.isEmpty ? [] : [.text(text)]) + images.map(\.input)
+        let optimisticUserItem = contextOptimisticUserItem(
+            text: text,
+            images: images,
+            wasTurnRunning: originThread.map(\.status.isBusy) ?? isTurnRunning
+        )
         let context = SendContext(
             draftText: draftText,
             text: text,
@@ -2215,6 +2333,7 @@ final class OnyxAppModel: ObservableObject {
             provisionalDraftKey: provisionalDraftKey,
             originThreadID: originThreadID,
             isNewThread: isNewThread,
+            optimisticUserItem: optimisticUserItem,
             cwd: isNewThread ? draftWorkspacePath : originThread?.cwd,
             wasTurnRunning: originThread.map(\.status.isBusy) ?? isTurnRunning,
             // Capture the resolved default as well as an explicit picker
@@ -2246,6 +2365,16 @@ final class OnyxAppModel: ObservableObject {
         // clears the composer, including while a new thread or an existing
         // conversation is still being resumed by the provider.
         isTurnRunning = true
+        if !isNewThread,
+           let threadID = originThreadID,
+           let optimisticUserItem,
+           selectedThreadID == threadID {
+            pendingUserItemByThreadID[threadID] = optimisticUserItem
+            if !timeline.contains(where: { $0.id == optimisticUserItem.id }) {
+                appendTimeline(optimisticUserItem)
+            }
+            updateThreadLifecycle(id: threadID, status: .running)
+        }
 
         Task { [weak self] in
             guard let self else { return }
@@ -2336,18 +2465,12 @@ final class OnyxAppModel: ObservableObject {
 
                     if selectedThreadID == threadID,
                        (createdThread || navigationRevision == context.navigationRevision) {
-                        let optimisticUserItem = TimelineItem(
-                            id: "optimistic:\(UUID().uuidString)",
-                            kind: .userMessage,
-                            title: nil,
-                            body: context.text,
-                            status: .completed,
-                            timestamp: .now,
-                            detail: nil,
-                            attachments: context.images.map(\.timelineAttachment)
-                        )
-                        pendingUserItemByThreadID[threadID] = optimisticUserItem
-                        appendTimeline(optimisticUserItem)
+                        if let optimisticUserItem = context.optimisticUserItem {
+                            pendingUserItemByThreadID[threadID] = optimisticUserItem
+                            if !timeline.contains(where: { $0.id == optimisticUserItem.id }) {
+                                appendTimeline(optimisticUserItem)
+                            }
+                        }
                         isTurnRunning = true
                     }
                     updateThreadLifecycle(id: threadID, status: .running)
@@ -2367,6 +2490,19 @@ final class OnyxAppModel: ObservableObject {
                 }
             } catch {
                 guard accountEpoch == context.accountEpoch, !Task.isCancelled else { return }
+                // Existing tasks paint their user turn before the provider
+                // resumes history or accepts `turn/start`. If either of those
+                // pre-acceptance steps fails, the draft is restored below but
+                // the presentation row must not remain as if the provider
+                // received it. The helper is fenced by the exact pending item
+                // identity (and any authoritative turn-start notification),
+                // so a late provider event cannot erase the real user item.
+                if !context.isNewThread {
+                    removePendingOptimisticUserItem(
+                        context.optimisticUserItem,
+                        for: targetThreadID ?? context.originThreadID
+                    )
+                }
                 if context.isNewThread, !createdThread {
                     restoreFailedNewTaskSend(context)
                 } else {
@@ -2394,6 +2530,65 @@ final class OnyxAppModel: ObservableObject {
                     )
                 }
             }
+        }
+        return true
+    }
+
+    private func contextOptimisticUserItem(
+        text: String,
+        images: [ComposerImageDraft],
+        wasTurnRunning: Bool
+    ) -> TimelineItem? {
+        guard !wasTurnRunning else { return nil }
+        return TimelineItem(
+            id: "optimistic:\(UUID().uuidString)",
+            kind: .userMessage,
+            title: nil,
+            body: text,
+            status: .completed,
+            timestamp: .now,
+            detail: nil,
+            attachments: images.map(\.timelineAttachment)
+        )
+    }
+
+    /// Remove one user-owned optimistic row after a send fails before the
+    /// provider accepts its turn. Matching the exact item ID matters: two
+    /// consecutive prompts may have identical text, and an authoritative
+    /// provider item can already have replaced the optimistic row by the
+    /// time a request reports an error.
+    private func removePendingOptimisticUserItem(
+        _ item: TimelineItem?,
+        for threadID: String?
+    ) {
+        guard let item,
+              let threadID,
+              pendingUserItemByThreadID[threadID]?.id == item.id
+        else { return }
+
+        // A turn-start event is the provider's acceptance boundary. Keep the
+        // optimistic row when that event raced with a request failure; the
+        // reducer will replace it with an authoritative item when available.
+        guard activeTurnIDsByThreadID[threadID] == nil else { return }
+
+        pendingUserItemByThreadID.removeValue(forKey: threadID)
+
+        // The selected task owns the visible timeline. A send can fail after
+        // the user navigates elsewhere, in which case only the pending map
+        // needs clearing; the other task's visible rows must remain untouched.
+        if selectedThreadID == threadID,
+           let index = timeline.firstIndex(where: { $0.id == item.id }) {
+            var visibleItems = timeline
+            visibleItems.remove(at: index)
+            transcriptSnapshot.replaceAll(with: visibleItems)
+        }
+
+        // A turn-start notification may have inserted the pending item into
+        // the conversation projection before the request failed. Remove only
+        // this exact optimistic identity; authoritative items use provider
+        // IDs and are therefore preserved.
+        for index in loadedConversationTurns.indices {
+            loadedConversationTurns[index].items.removeAll { $0.id == item.id }
         }
     }
 
@@ -2585,15 +2780,68 @@ final class OnyxAppModel: ObservableObject {
         }
     }
 
+    /// Retries the latest failed turn without asking the user to reconstruct
+    /// or duplicate its prompt. The provider suffix is removed first, then the
+    /// original text and attachments are sent exactly once through the normal
+    /// composer path. If reversion cannot be confirmed, the message remains in
+    /// the composer and the existing safety lock prevents an ambiguous resend.
+    func beginRetryLatestFailedResponse(messageID: String, window: NSWindow?) {
+        guard let candidate = failedLatestUserMessage,
+              candidate.message.id == messageID else { return }
+        if preferences.bool(
+            forKey: preferenceKey(PreferenceKey.acknowledgedHistoryEditWarning)
+        ) {
+            retryLatestFailedResponse(messageID: messageID)
+            return
+        }
+        guard let window else {
+            notice = (
+                "Could not show the retry warning",
+                "Try again after the task window is fully visible. The failed response was not retried."
+            )
+            return
+        }
+        let epoch = accountEpoch
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Retry this message?"
+        alert.informativeText = "This removes the failed turn from conversation history and sends the message again. Changes already made to files in your project are not reverted and may be repeated."
+        alert.addButton(withTitle: "Retry Message")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            Task { @MainActor [weak self] in
+                guard let self, accountEpoch == epoch else { return }
+                preferences.set(
+                    true,
+                    forKey: preferenceKey(PreferenceKey.acknowledgedHistoryEditWarning)
+                )
+                retryLatestFailedResponse(messageID: messageID)
+            }
+        }
+    }
+
+    func retryLatestFailedResponse(messageID: String) {
+        guard let candidate = failedLatestUserMessage,
+              candidate.message.id == messageID else { return }
+        editLatestUserMessage(expectedMessageID: messageID, sendAfterRevert: true)
+    }
+
     /// Executes the already-confirmed native history operation. Kept internal
     /// so model tests can exercise the provider boundary without presenting a
     /// modal sheet.
-    func editLatestUserMessage(expectedMessageID: String? = nil) {
+    func editLatestUserMessage(
+        expectedMessageID: String? = nil,
+        sendAfterRevert: Bool = false
+    ) {
         guard let candidate = latestEditableUserMessage,
               expectedMessageID == nil || candidate.message.id == expectedMessageID,
               let threadID = selectedThreadID,
               let runtime else { return }
 
+        // The provider projection supplies the exact text body. Image-only
+        // turns are represented by an empty body plus attachments, while a
+        // user who literally typed "[Image attachment]" keeps that text.
         let originalText = candidate.message.body
         let originalImages = Self.composerImages(from: candidate.message.attachments)
         let epoch = accountEpoch
@@ -2603,6 +2851,7 @@ final class OnyxAppModel: ObservableObject {
         latestMessageEditThreadID = threadID
         latestMessageEditRequiresReloadThreadID = nil
         isPreparingLatestMessageEdit = true
+        isPreparingFailedResponseRetry = sendAfterRevert
 
         Task { [weak self] in
             guard let self else { return }
@@ -2630,7 +2879,11 @@ final class OnyxAppModel: ObservableObject {
                 else {
                     // The provider operation already succeeded. Preserve the
                     // editable message as this task's draft even if the user
-                    // navigated away while the request was in flight.
+                    // navigated away while the request was in flight. Keep
+                    // the original task locked until its authoritative reopen
+                    // confirms the post-revert history; otherwise a delayed
+                    // callback could unlock a task whose visible transcript is
+                    // still from before the destructive operation.
                     restoreFailedSend(originalText, for: threadID)
                     restoreFailedImages(originalImages, for: threadID)
                     if selectedThreadID == threadID {
@@ -2643,6 +2896,9 @@ final class OnyxAppModel: ObservableObject {
                             latestMessageEditRequiresReloadThreadID = threadID
                             shouldFinishEdit = false
                         }
+                    } else {
+                        latestMessageEditRequiresReloadThreadID = threadID
+                        shouldFinishEdit = false
                     }
                     return
                 }
@@ -2682,8 +2938,47 @@ final class OnyxAppModel: ObservableObject {
                 // The composer remains responsive while the provider works.
                 // Merge anything typed or pasted during that interval instead
                 // of silently replacing it with the restored message.
-                restoreFailedSend(originalText, for: threadID)
-                restoreFailedImages(originalImages, for: threadID)
+                if sendAfterRevert {
+                    // `sendComposer` intentionally refuses writer work while
+                    // the revert lock is held. Release only this confirmed
+                    // generation, then dispatch through the ordinary send path
+                    // so Retry receives the same validation and immediate
+                    // waiting feedback as a manual submission.
+                    finishLatestMessageEdit(generation: editGeneration)
+                    shouldFinishEdit = false
+                    let laterDraft = composerText
+                    let laterImages = composerImages
+                    composerText = originalText
+                    composerImages = originalImages
+                    let accepted = submitComposer()
+                    if accepted {
+                        composerText = laterDraft
+                        composerImages = laterImages
+                        saveCurrentDraftNow()
+                        saveCurrentImageDraftNow()
+                    } else {
+                        let mergedText = laterDraft.trimmingCharacters(
+                            in: .whitespacesAndNewlines
+                        ).isEmpty
+                            ? originalText
+                            : (originalText.isEmpty
+                                ? laterDraft
+                                : "\(originalText)\n\n\(laterDraft)")
+                        composerText = mergedText
+                        composerImages = originalImages + laterImages.filter { image in
+                            !originalImages.contains(where: { $0.input == image.input })
+                        }
+                        saveCurrentDraftNow()
+                        saveCurrentImageDraftNow()
+                        notice = (
+                            "Could not retry this message",
+                            "The task history was reverted, but the provider was not ready to accept the retry. Your message and later draft are back in the composer."
+                        )
+                    }
+                } else {
+                    restoreFailedSend(originalText, for: threadID)
+                    restoreFailedImages(originalImages, for: threadID)
+                }
             } catch {
                 guard accountEpoch == epoch, !Task.isCancelled else { return }
                 let operationError = error
@@ -2731,6 +3026,7 @@ final class OnyxAppModel: ObservableObject {
     private func finishLatestMessageEdit(generation: UInt64) {
         guard latestMessageEditGeneration == generation else { return }
         isPreparingLatestMessageEdit = false
+        isPreparingFailedResponseRetry = false
         latestMessageEditThreadID = nil
         latestMessageEditRequiresReloadThreadID = nil
     }
@@ -2738,6 +3034,7 @@ final class OnyxAppModel: ObservableObject {
     private func invalidateLatestMessageEdit() {
         latestMessageEditGeneration &+= 1
         isPreparingLatestMessageEdit = false
+        isPreparingFailedResponseRetry = false
         latestMessageEditThreadID = nil
         latestMessageEditRequiresReloadThreadID = nil
     }
@@ -2765,18 +3062,75 @@ final class OnyxAppModel: ObservableObject {
     }
 
     private func downgradeRuntimeCapabilities(_ unavailable: RuntimeCapabilities) {
-        guard let session,
-              !session.capabilities.intersection(unavailable).isEmpty else { return }
+        var newlyUnavailable = unavailable
+        newlyUnavailable.subtract(downgradedRuntimeCapabilities)
+        guard !newlyUnavailable.isEmpty else { return }
+        downgradedRuntimeCapabilities.formUnion(newlyUnavailable)
+
+        // Adaptive sessions intentionally keep execution capability on the
+        // selected task/model rather than the provider-wide session. Mask all
+        // three projections: checking only `session.capabilities` would leave
+        // the edit/pagination control enabled on an already-open agent task.
+        let projectedThreads = threads.map(applyingRuntimeCapabilityDowngrades)
+        if projectedThreads != threads {
+            threads = projectedThreads
+        }
+        if let session {
+            self.session = applyingRuntimeCapabilityDowngrades(to: session)
+        }
+    }
+
+    private func applyingRuntimeCapabilityDowngrades(
+        to thread: RuntimeThread
+    ) -> RuntimeThread {
+        guard var capabilities = thread.taskCapabilities,
+              !capabilities.intersection(downgradedRuntimeCapabilities).isEmpty else {
+            return thread
+        }
+        capabilities.subtract(downgradedRuntimeCapabilities)
+        var projected = thread
+        projected.taskCapabilities = capabilities
+        return projected
+    }
+
+    private func applyingRuntimeCapabilityDowngrades(
+        to model: RuntimeModel
+    ) -> RuntimeModel {
+        guard var capabilities = model.taskCapabilities,
+              !capabilities.intersection(downgradedRuntimeCapabilities).isEmpty else {
+            return model
+        }
+        capabilities.subtract(downgradedRuntimeCapabilities)
+        return RuntimeModel(
+            id: model.id,
+            displayName: model.displayName,
+            description: model.description,
+            isDefault: model.isDefault,
+            defaultReasoningEffort: model.defaultReasoningEffort,
+            reasoningEfforts: model.reasoningEfforts,
+            inputModalities: model.inputModalities,
+            serverAdvertisedRequestParameters: model.serverAdvertisedRequestParameters,
+            supportedRequestParameters: model.supportedRequestParameters,
+            serverAdvertisedCapabilities: model.serverAdvertisedCapabilities,
+            capabilityEvidence: model.capabilityEvidence,
+            executionMode: model.executionMode,
+            taskCapabilities: capabilities
+        )
+    }
+
+    private func applyingRuntimeCapabilityDowngrades(
+        to session: RuntimeSession
+    ) -> RuntimeSession {
         var capabilities = session.capabilities
-        capabilities.subtract(unavailable)
-        self.session = RuntimeSession(
+        capabilities.subtract(downgradedRuntimeCapabilities)
+        return RuntimeSession(
             runtime: session.runtime,
             displayName: session.displayName,
             accountLabel: session.accountLabel,
             planLabel: session.planLabel,
             auth: session.auth,
             availableLoginMethods: session.availableLoginMethods,
-            availableModels: session.availableModels,
+            availableModels: session.availableModels.map(applyingRuntimeCapabilityDowngrades),
             capabilities: capabilities
         )
     }
@@ -3044,6 +3398,22 @@ final class OnyxAppModel: ObservableObject {
             }
         case let .runtimeCapabilitiesDowngraded(capabilities):
             downgradeRuntimeCapabilities(capabilities)
+        case let .runtimeModelsUpdated(models):
+            guard let session else { return }
+            self.session = applyingRuntimeCapabilityDowngrades(to: RuntimeSession(
+                runtime: session.runtime,
+                displayName: session.displayName,
+                accountLabel: session.accountLabel,
+                planLabel: session.planLabel,
+                auth: session.auth,
+                availableLoginMethods: session.availableLoginMethods,
+                availableModels: models,
+                capabilities: session.capabilities
+            ))
+            if selectedModelID == nil || !models.contains(where: { $0.id == selectedModelID }) {
+                selectedModelID = models.first(where: \.isDefault)?.id ?? models.first?.id
+            }
+            validateSelectedReasoningEffort()
         case let .accountUpdated(updatedAuth):
             if isSideChatPresented, updatedAuth != authState {
                 closeSideChat()
@@ -3392,6 +3762,7 @@ final class OnyxAppModel: ObservableObject {
         case let .userInteractionRequested(interaction): interaction.threadID
         case .connectionChanged,
              .runtimeCapabilitiesDowngraded,
+             .runtimeModelsUpdated,
              .accountUpdated,
              .loginCompleted,
              .userInteractionResolved,
@@ -3683,7 +4054,7 @@ final class OnyxAppModel: ObservableObject {
             conversation: conversation,
             visibleItems: visibleItems,
             earlierSource: earlierSource,
-            chronologicalTurns: [],
+            chronologicalTurns: conversation.turns,
             resumedThread: resumedThread
         )
     }
@@ -4671,6 +5042,7 @@ final class OnyxAppModel: ObservableObject {
         removeAllInteractionDrafts()
         pendingRestoredSelectionID = nil
         hasExplicitNewTaskSelection = false
+        downgradedRuntimeCapabilities = []
         cancelledLoginID = nil
         loginAttempt = nil
         isAuthenticating = false
@@ -4714,7 +5086,7 @@ final class OnyxAppModel: ObservableObject {
            !updatedSession.capabilities.contains(.ephemeralThreadForking) {
             closeSideChat()
         }
-        session = updatedSession
+        session = applyingRuntimeCapabilityDowngrades(to: updatedSession)
         authState = updatedSession.auth
         if updatedSession.auth.isSignedIn { loginAttempt = nil }
 
@@ -5058,38 +5430,43 @@ final class OnyxAppModel: ObservableObject {
         let deltas = pendingDeltas
         pendingDeltas.removeAll(keepingCapacity: true)
 
+        let selectedDeltas = deltas.compactMap { key, delta -> TranscriptDeltaFlushPlan.Delta? in
+            guard key.threadID == selectedThreadID, !delta.isEmpty else { return nil }
+            return TranscriptDeltaFlushPlan.Delta(itemID: key.itemID, text: delta)
+        }
+        // `itemCompleted` also drains the coalescing buffer. Keep that common
+        // no-op path constant-time when another thread owns the buffered
+        // events (or when the buffer was already consumed by a history read).
+        guard !selectedDeltas.isEmpty else { return }
+        let flushPlan = TranscriptDeltaFlushPlan.make(
+            items: timeline,
+            deltas: selectedDeltas
+        )
         var changedIndices = IndexSet()
-        var appendedItems: [TimelineItem] = []
-        for (key, delta) in deltas where !delta.isEmpty && key.threadID == selectedThreadID {
-            if let index = timeline.firstIndex(where: { $0.id == key.itemID }) {
-                changedIndices.insert(index)
-            } else {
-                appendedItems.append(
-                    TimelineItem(
-                        id: key.itemID,
-                        kind: .assistantMessage,
-                        title: nil,
-                        body: delta,
-                        status: .running,
-                        timestamp: .now,
-                        detail: nil
-                    )
-                )
-            }
+        for update in flushPlan.existingUpdates {
+            changedIndices.insert(update.index)
         }
 
         if !changedIndices.isEmpty {
+            let existingUpdates = flushPlan.existingUpdates
             mutateTimelineRows(changedIndices) { items in
-                for (key, delta) in deltas
-                where !delta.isEmpty && key.threadID == selectedThreadID {
-                    if let index = items.firstIndex(where: { $0.id == key.itemID }) {
-                        items[index].body += delta
-                    }
+                for update in existingUpdates where items.indices.contains(update.index) {
+                    items[update.index].body += update.text
                 }
             }
         }
-        for item in appendedItems {
-            appendTimeline(item)
+        for update in flushPlan.appendedUpdates {
+            appendTimeline(
+                TimelineItem(
+                    id: update.itemID,
+                    kind: .assistantMessage,
+                    title: nil,
+                    body: update.text,
+                    status: .running,
+                    timestamp: .now,
+                    detail: nil
+                )
+            )
         }
     }
 }

@@ -316,6 +316,140 @@ final class OpenAICompatibleRuntimeTests: XCTestCase {
         XCTAssertFalse(conversation.items.contains { $0.body.contains("hidden") })
     }
 
+    func testFailedProviderTurnCanBeRevertedThenRetriedWithoutDuplicateHistory() async throws {
+        let location = try makeTemporaryDirectory(prefix: "OpenAICompatibleRuntimeRetry")
+        defer { try? FileManager.default.removeItem(at: location) }
+        let connection = try makeFixtureConnection(id: "fixture.retry")
+        let connectionStore = ProviderConnectionStore(
+            storage: InMemoryProviderConnectionStorage()
+        )
+        try await connectionStore.upsert(connection)
+        let conversationStore = OpenAICompatibleConversationStore(
+            fileURL: location.appendingPathComponent("conversations.json")
+        )
+        let requestCount = LockedCounter()
+        RuntimeFixtureURLProtocol.configure { request in
+            guard request.url?.path != "/v1/models" else {
+                return .json(body: "{\"data\":[{\"id\":\"fixture-model\"}]}")
+            }
+            let attempt = requestCount.increment()
+            if attempt == 1 {
+                return .eventStream(body: """
+                data: {"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}
+
+                data: [DONE]
+
+                """)
+            }
+            return .eventStream(body: """
+            data: {"choices":[{"index":0,"delta":{"content":"Recovered answer"},"finish_reason":"stop"}]}
+
+            data: [DONE]
+
+            """)
+        }
+        let runtime = makeRuntime(
+            connection: connection,
+            connectionStore: connectionStore,
+            conversationStore: conversationStore
+        )
+        let connected = try await runtime.connect()
+        XCTAssertTrue(connected.capabilities.contains(.threadHistoryRevert))
+        let thread = try await runtime.startThread(StartThreadRequest(cwd: "/tmp"))
+
+        _ = await collectThroughPostTurnBarrier(runtime: runtime, threadID: thread.id) {
+            try await runtime.startTurn(
+                StartTurnRequest(threadID: thread.id, text: "Build the page")
+            )
+        }
+        let failed = try await runtime.readThread(id: thread.id)
+        let failedTurn = try XCTUnwrap(failed.turns.last)
+        XCTAssertEqual(failedTurn.status, .failed)
+        XCTAssertEqual(failedTurn.items.first?.body, "Build the page")
+
+        _ = try await runtime.revertThread(id: thread.id, beforeTurnID: failedTurn.id)
+        let reverted = try await runtime.readThread(id: thread.id)
+        XCTAssertTrue(reverted.items.isEmpty)
+        XCTAssertTrue(reverted.turns.isEmpty)
+
+        _ = await collectThroughPostTurnBarrier(runtime: runtime, threadID: thread.id) {
+            try await runtime.startTurn(
+                StartTurnRequest(threadID: thread.id, text: "Build the page")
+            )
+        }
+        let retried = try await runtime.readThread(id: thread.id)
+        XCTAssertEqual(
+            retried.items.filter { $0.kind == .userMessage }.map(\.body),
+            ["Build the page"]
+        )
+        XCTAssertEqual(retried.items.last?.body, "Recovered answer")
+        XCTAssertEqual(retried.turns.count, 1)
+    }
+
+    func testLegacyFailedEmptyTurnCanBeRevertedAndRetriedWithoutDuplicateHistory() async throws {
+        let location = try makeTemporaryDirectory(prefix: "OpenAICompatibleLegacyRetry")
+        defer { try? FileManager.default.removeItem(at: location) }
+        let connection = try makeFixtureConnection(id: "fixture.legacy-retry")
+        let connectionStore = ProviderConnectionStore(storage: InMemoryProviderConnectionStorage())
+        try await connectionStore.upsert(connection)
+        let conversationStore = OpenAICompatibleConversationStore(
+            fileURL: location.appendingPathComponent("conversations.json")
+        )
+        var legacy = try await conversationStore.create(
+            connectionID: connection.id,
+            title: "Legacy failed task",
+            cwd: "/tmp",
+            modelID: "fixture-model",
+            scopeID: connection.conversationScopeID
+        )
+        legacy.status = .failed
+        legacy.messages = [
+            OpenAICompatibleStoredMessage(id: "legacy-user", role: .user, text: "Build the page"),
+            OpenAICompatibleStoredMessage(
+                id: "legacy-assistant",
+                role: .assistant,
+                text: "",
+                status: .failed,
+                detail: "The provider completed without returning an answer."
+            ),
+        ]
+        try await conversationStore.upsert(legacy)
+        RuntimeFixtureURLProtocol.configure { request in
+            guard request.url?.path != "/v1/models" else {
+                return .json(body: "{\"data\":[{\"id\":\"fixture-model\"}]}")
+            }
+            return .eventStream(body: """
+            data: {"choices":[{"index":0,"delta":{"content":"Recovered"},"finish_reason":"stop"}]}
+
+            data: [DONE]
+
+            """)
+        }
+        let runtime = makeRuntime(
+            connection: connection,
+            connectionStore: connectionStore,
+            conversationStore: conversationStore
+        )
+        _ = try await runtime.connect()
+
+        let before = try await runtime.readThread(id: legacy.id)
+        XCTAssertEqual(before.turns.map(\.id), ["turn:legacy-user"])
+        _ = try await runtime.revertThread(
+            id: legacy.id,
+            beforeTurnID: "turn:legacy-user"
+        )
+        _ = await collectThroughPostTurnBarrier(runtime: runtime, threadID: legacy.id) {
+            try await runtime.startTurn(
+                StartTurnRequest(threadID: legacy.id, text: "Build the page")
+            )
+        }
+        let retried = try await runtime.readThread(id: legacy.id)
+        XCTAssertEqual(retried.items.filter { $0.kind == .userMessage }.map(\.body), [
+            "Build the page",
+        ])
+        XCTAssertEqual(retried.items.last?.body, "Recovered")
+    }
+
     func testLegacyEmptyTransportCapabilitiesRemainUsable() async throws {
         let location = try makeTemporaryDirectory(prefix: "OpenAICompatibleRuntimeLegacyTransport")
         defer { try? FileManager.default.removeItem(at: location) }
@@ -348,7 +482,10 @@ final class OpenAICompatibleRuntimeTests: XCTestCase {
         XCTAssertTrue(snapshot.capabilities.contains(.interruption))
         XCTAssertTrue(snapshot.capabilities.contains(.usage))
         XCTAssertFalse(snapshot.capabilities.contains(.threadHistoryPagination))
-        XCTAssertFalse(snapshot.capabilities.contains(.threadHistoryRevert))
+        XCTAssertTrue(
+            snapshot.capabilities.contains(.threadHistoryRevert),
+            "App-owned provider history supports atomic latest-turn edit and retry"
+        )
 
         do {
             _ = try await runtime.resumeThread(
@@ -869,6 +1006,383 @@ final class OpenAICompatibleRuntimeTests: XCTestCase {
             conversation.items.filter { $0.kind == .userMessage }.count,
             1
         )
+    }
+
+    func testRevertReservationSpansPersistenceAwaitAndBlocksConflictingWriters() async throws {
+        let location = try makeTemporaryDirectory(prefix: "OpenAICompatibleRuntimeRevertReservation")
+        defer { try? FileManager.default.removeItem(at: location) }
+        let connection = try makeFixtureConnection(id: "fixture.revert-reservation")
+        let connectionStore = ProviderConnectionStore(storage: InMemoryProviderConnectionStorage())
+        try await connectionStore.upsert(connection)
+
+        let gate = PersistenceGate()
+        let conversationStore = OpenAICompatibleConversationStore(
+            fileURL: location.appendingPathComponent("conversations.json"),
+            beforePersist: { _ in gate.waitIfArmed() }
+        )
+        var conversation = try await conversationStore.create(
+            connectionID: connection.id,
+            title: "Revert reservation",
+            cwd: "/tmp",
+            modelID: "fixture-model",
+            scopeID: connection.conversationScopeID
+        )
+        let turnID = "turn:revert-reservation"
+        conversation.messages = [
+            OpenAICompatibleStoredMessage(
+                id: "revert-user",
+                turnID: turnID,
+                role: .user,
+                text: "Remove this turn"
+            ),
+            OpenAICompatibleStoredMessage(
+                id: "revert-assistant",
+                turnID: turnID,
+                role: .assistant,
+                text: "Old answer"
+            ),
+        ]
+        try await conversationStore.upsert(conversation)
+
+        RuntimeFixtureURLProtocol.configure { request in
+            guard request.url?.path == "/v1/models" else {
+                return .eventStream(body: "data: [DONE]\n\n")
+            }
+            return .json(body: "{\"data\":[{\"id\":\"fixture-model\"}]}")
+        }
+        let runtime = makeRuntime(
+            connection: connection,
+            connectionStore: connectionStore,
+            conversationStore: conversationStore
+        )
+        _ = try await runtime.connect()
+
+        let conversationID = conversation.id
+        gate.arm()
+        let revert = Task { () throws -> Void in
+            _ = try await runtime.revertThread(id: conversationID, beforeTurnID: turnID)
+        }
+        await gate.waitUntilEntered()
+
+        do {
+            try await runtime.startTurn(
+                StartTurnRequest(threadID: conversationID, text: "replacement")
+            )
+            XCTFail("A replacement turn must wait for the history transaction")
+        } catch {
+            XCTAssertEqual(error as? OpenAICompatibleRuntimeError, .activeTurn(conversationID))
+        }
+        do {
+            try await runtime.deleteThread(id: conversationID)
+            XCTFail("Deletion must not race an in-flight history replacement")
+        } catch {
+            XCTAssertEqual(error as? OpenAICompatibleRuntimeError, .activeTurn(conversationID))
+        }
+        do {
+            try await runtime.renameThread(id: conversationID, name: "raced rename")
+            XCTFail("Rename must not publish over an in-flight history replacement")
+        } catch {
+            XCTAssertEqual(error as? OpenAICompatibleRuntimeError, .activeTurn(conversationID))
+        }
+        do {
+            try await runtime.archiveThread(id: conversationID)
+            XCTFail("Archive must not publish over an in-flight history replacement")
+        } catch {
+            XCTAssertEqual(error as? OpenAICompatibleRuntimeError, .activeTurn(conversationID))
+        }
+        do {
+            _ = try await runtime.revertThread(
+                id: conversationID,
+                beforeTurnID: turnID
+            )
+            XCTFail("A second history replacement must not overlap the first")
+        } catch {
+            XCTAssertEqual(error as? OpenAICompatibleRuntimeError, .activeTurn(conversationID))
+        }
+
+        gate.release()
+        _ = try await revert.value
+
+        let revertedRecord = try await conversationStore.conversation(
+            connectionID: connection.id,
+            id: conversationID,
+            scopeID: connection.conversationScopeID
+        )
+        let reverted = try XCTUnwrap(revertedRecord)
+        XCTAssertTrue(reverted.messages.isEmpty)
+        XCTAssertEqual(reverted.status, .idle)
+
+        // Once the transaction and its reservation have both settled, a new
+        // turn is accepted normally rather than being stranded behind stale
+        // in-memory state.
+        try await runtime.startTurn(
+            StartTurnRequest(threadID: conversationID, text: "replacement")
+        )
+        await runtime.disconnect()
+    }
+
+    func testRevertRejectsStaleBoundaryAfterReplacementRuntimeAppendsNewTurn() async throws {
+        let location = try makeTemporaryDirectory(prefix: "OpenAICompatibleRuntimeStaleRevert")
+        defer { try? FileManager.default.removeItem(at: location) }
+        let connection = try makeFixtureConnection(id: "fixture.stale-revert")
+        let connectionStore = ProviderConnectionStore(storage: InMemoryProviderConnectionStorage())
+        try await connectionStore.upsert(connection)
+        let conversationStore = OpenAICompatibleConversationStore(
+            fileURL: location.appendingPathComponent("conversations.json")
+        )
+        var conversation = try await conversationStore.create(
+            connectionID: connection.id,
+            title: "Stale revert",
+            cwd: "/tmp",
+            modelID: "fixture-model",
+            scopeID: connection.conversationScopeID
+        )
+        let originalTurnID = "turn:original"
+        conversation.messages = [
+            OpenAICompatibleStoredMessage(
+                id: "original-user",
+                turnID: originalTurnID,
+                role: .user,
+                text: "Original prompt"
+            ),
+            OpenAICompatibleStoredMessage(
+                id: "original-assistant",
+                turnID: originalTurnID,
+                role: .assistant,
+                text: "Original answer"
+            ),
+        ]
+        try await conversationStore.upsert(conversation)
+
+        RuntimeFixtureURLProtocol.configure { request in
+            guard request.url?.path == "/v1/models" else {
+                return .eventStream(body: "data: [DONE]\n\n")
+            }
+            return .json(body: "{\"data\":[{\"id\":\"fixture-model\"}]}")
+        }
+        let runtime = makeRuntime(
+            connection: connection,
+            connectionStore: connectionStore,
+            conversationStore: conversationStore
+        )
+        _ = try await runtime.connect()
+
+        let replacementTurnID = "turn:replacement-runtime"
+        _ = try await conversationStore.update(
+            connectionID: connection.id,
+            id: conversation.id,
+            scopeID: connection.conversationScopeID
+        ) { latest in
+            latest.messages.append(OpenAICompatibleStoredMessage(
+                id: "replacement-user",
+                turnID: replacementTurnID,
+                role: .user,
+                text: "Newer prompt"
+            ))
+            latest.messages.append(OpenAICompatibleStoredMessage(
+                id: "replacement-assistant",
+                turnID: replacementTurnID,
+                role: .assistant,
+                text: "Newer answer"
+            ))
+        }
+
+        do {
+            _ = try await runtime.revertThread(
+                id: conversation.id,
+                beforeTurnID: originalTurnID
+            )
+            XCTFail("A stale runtime must not erase a newer durable turn")
+        } catch {
+            XCTAssertEqual(
+                error as? OpenAICompatibleRuntimeError,
+                .turnIsNotLatest(originalTurnID)
+            )
+        }
+
+        let preserved = try await conversationStore.conversation(
+            connectionID: connection.id,
+            id: conversation.id,
+            scopeID: connection.conversationScopeID
+        )
+        XCTAssertEqual(try XCTUnwrap(preserved).turnGroups.map(\.id), [
+            originalTurnID,
+            replacementTurnID,
+        ])
+    }
+
+    func testReplacementRuntimeCannotSendHistoryReadBeforeAnotherRuntimeRevertsIt() async throws {
+        let location = try makeTemporaryDirectory(prefix: "OpenAICompatibleRuntimeStaleStart")
+        defer { try? FileManager.default.removeItem(at: location) }
+        let connection = try makeFixtureConnection(id: "fixture.stale-start")
+        let connectionStore = ProviderConnectionStore(storage: InMemoryProviderConnectionStorage())
+        try await connectionStore.upsert(connection)
+        let conversationStore = OpenAICompatibleConversationStore(
+            fileURL: location.appendingPathComponent("conversations.json")
+        )
+        var conversation = try await conversationStore.create(
+            connectionID: connection.id,
+            title: "Stale start",
+            cwd: "/tmp",
+            modelID: "fixture-model",
+            scopeID: connection.conversationScopeID
+        )
+        let originalTurnID = "turn:original"
+        conversation.messages = [
+            OpenAICompatibleStoredMessage(
+                id: "original-user",
+                turnID: originalTurnID,
+                role: .user,
+                text: "Context that will be removed"
+            ),
+            OpenAICompatibleStoredMessage(
+                id: "original-assistant",
+                turnID: originalTurnID,
+                role: .assistant,
+                text: "Old answer"
+            ),
+        ]
+        try await conversationStore.upsert(conversation)
+        let conversationID = conversation.id
+
+        let chatRequests = LockedCounter()
+        RuntimeFixtureURLProtocol.configure { request in
+            guard request.url?.path == "/v1/models" else {
+                _ = chatRequests.increment()
+                return .eventStream(body: "data: [DONE]\n\n")
+            }
+            return .json(body: "{\"data\":[{\"id\":\"fixture-model\"}]}")
+        }
+        let historyCommitGate = AsyncRuntimeGate()
+        let revertingRuntime = makeRuntime(
+            connection: connection,
+            connectionStore: connectionStore,
+            conversationStore: conversationStore
+        )
+        let replacementRuntime = makeRuntime(
+            connection: connection,
+            connectionStore: connectionStore,
+            conversationStore: conversationStore,
+            beforeTurnHistoryCommit: { await historyCommitGate.wait() }
+        )
+        _ = try await revertingRuntime.connect()
+        _ = try await replacementRuntime.connect()
+
+        let staleStart = Task {
+            try await replacementRuntime.startTurn(
+                StartTurnRequest(threadID: conversationID, text: "Use the latest context")
+            )
+        }
+        await historyCommitGate.waitUntilEntered()
+        _ = try await revertingRuntime.revertThread(
+            id: conversationID,
+            beforeTurnID: originalTurnID
+        )
+        await historyCommitGate.release()
+
+        do {
+            try await staleStart.value
+            XCTFail("A runtime must not send history that another runtime already reverted")
+        } catch {
+            XCTAssertEqual(
+                error as? OpenAICompatibleRuntimeError,
+                .conversationHistoryChanged(conversationID)
+            )
+        }
+        XCTAssertEqual(chatRequests.currentValue, 0)
+        let preserved = try await conversationStore.conversation(
+            connectionID: connection.id,
+            id: conversationID,
+            scopeID: connection.conversationScopeID
+        )
+        XCTAssertTrue(try XCTUnwrap(preserved).messages.isEmpty)
+    }
+
+    func testDisconnectDuringRevertDoesNotPublishStaleStateAndReconnectCanRetry() async throws {
+        let location = try makeTemporaryDirectory(prefix: "OpenAICompatibleRuntimeRevertDisconnect")
+        defer { try? FileManager.default.removeItem(at: location) }
+        let connection = try makeFixtureConnection(id: "fixture.revert-disconnect")
+        let connectionStore = ProviderConnectionStore(storage: InMemoryProviderConnectionStorage())
+        try await connectionStore.upsert(connection)
+
+        let gate = PersistenceGate()
+        let conversationStore = OpenAICompatibleConversationStore(
+            fileURL: location.appendingPathComponent("conversations.json"),
+            beforePersist: { _ in gate.waitIfArmed() }
+        )
+        var conversation = try await conversationStore.create(
+            connectionID: connection.id,
+            title: "Disconnect during revert",
+            cwd: "/tmp",
+            modelID: "fixture-model",
+            scopeID: connection.conversationScopeID
+        )
+        let turnID = "turn:revert-disconnect"
+        conversation.messages = [
+            OpenAICompatibleStoredMessage(
+                id: "disconnect-user",
+                turnID: turnID,
+                role: .user,
+                text: "Retry after disconnect"
+            ),
+            OpenAICompatibleStoredMessage(
+                id: "disconnect-assistant",
+                turnID: turnID,
+                role: .assistant,
+                text: "Old answer"
+            ),
+        ]
+        try await conversationStore.upsert(conversation)
+
+        RuntimeFixtureURLProtocol.configure { request in
+            guard request.url?.path == "/v1/models" else {
+                return .eventStream(body: "data: [DONE]\n\n")
+            }
+            return .json(body: "{\"data\":[{\"id\":\"fixture-model\"}]}")
+        }
+        let runtime = makeRuntime(
+            connection: connection,
+            connectionStore: connectionStore,
+            conversationStore: conversationStore
+        )
+        _ = try await runtime.connect()
+
+        let conversationID = conversation.id
+        gate.arm()
+        let revert = Task { () throws -> Void in
+            _ = try await runtime.revertThread(id: conversationID, beforeTurnID: turnID)
+        }
+        await gate.waitUntilEntered()
+
+        // Disconnect invalidates the generation while the file transaction is
+        // still suspended. The revert may finish its local write, but it must
+        // not publish that stale snapshot as current connected state.
+        await runtime.disconnect()
+        gate.release()
+        do {
+            _ = try await revert.value
+            XCTFail("A revert that crossed disconnect must not report success")
+        } catch {
+            XCTAssertEqual(error as? OpenAICompatibleRuntimeError, .notConnected)
+        }
+
+        let committedRevert = try await conversationStore.conversation(
+            connectionID: connection.id,
+            id: conversationID,
+            scopeID: connection.conversationScopeID
+        )
+        XCTAssertTrue(
+            try XCTUnwrap(committedRevert).messages.isEmpty,
+            "The atomic local revert must commit even though its connected-generation result is stale"
+        )
+
+        // The reservation is released by the completed stale operation. A
+        // fresh connection can therefore start a replacement turn normally.
+        _ = try await runtime.connect()
+        try await runtime.startTurn(
+            StartTurnRequest(threadID: conversationID, text: "Retry after disconnect")
+        )
+        await runtime.disconnect()
     }
 
     func testDisconnectInvalidatesTurnStartBeforeItsDurableWriteCommits() async throws {
@@ -1677,7 +2191,8 @@ final class OpenAICompatibleRuntimeTests: XCTestCase {
         connection: ProviderConnectionRecord,
         connectionStore: ProviderConnectionStore,
         conversationStore: OpenAICompatibleConversationStore,
-        beforeDisconnectedTurnCleanup: (@Sendable () async -> Void)? = nil
+        beforeDisconnectedTurnCleanup: (@Sendable () async -> Void)? = nil,
+        beforeTurnHistoryCommit: (@Sendable () async -> Void)? = nil
     ) -> OpenAICompatibleRuntime {
         OpenAICompatibleRuntime(
             connectionID: connection.id,
@@ -1685,7 +2200,8 @@ final class OpenAICompatibleRuntimeTests: XCTestCase {
             credentialStore: InMemoryCredentialStore(),
             conversationStore: conversationStore,
             session: makeFixtureSession(),
-            beforeDisconnectedTurnCleanup: beforeDisconnectedTurnCleanup
+            beforeDisconnectedTurnCleanup: beforeDisconnectedTurnCleanup,
+            beforeTurnHistoryCommit: beforeTurnHistoryCommit
         )
     }
 
@@ -1956,6 +2472,20 @@ private final class RequestPathSequenceCapture: @unchecked Sendable {
     }
 }
 
+private final class LockedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    var currentValue: Int { lock.withLock { value } }
+
+    func increment() -> Int {
+        lock.withLock {
+            value += 1
+            return value
+        }
+    }
+}
+
 private final class RuntimeFixtureURLProtocol: URLProtocol, @unchecked Sendable {
     struct Stub: @unchecked Sendable {
         let statusCode: Int
@@ -2021,12 +2551,13 @@ private final class RuntimeFixtureURLProtocol: URLProtocol, @unchecked Sendable 
             httpVersion: nil,
             headerFields: ["Content-Type": stub.contentType]
         )!
-        let deliver: @Sendable () -> Void = { [weak self] in
-            guard let self else { return }
-            self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            if !stub.body.isEmpty { self.client?.urlProtocol(self, didLoad: stub.body) }
-            if stub.finishes { self.client?.urlProtocolDidFinishLoading(self) }
-        }
+        let delivery = RuntimeFixtureDelivery(
+            target: self,
+            response: response,
+            body: stub.body,
+            finishes: stub.finishes
+        )
+        let deliver: @Sendable () -> Void = { delivery.perform() }
         if let gate = stub.gate {
             DispatchQueue.global().async {
                 gate.waitUntilReleased()
@@ -2043,4 +2574,37 @@ private final class RuntimeFixtureURLProtocol: URLProtocol, @unchecked Sendable 
     }
 
     override func stopLoading() {}
+}
+
+/// `DispatchQueue` requires a sendable closure under Swift 6. Keep the
+/// URLProtocol's deliberately weak, test-only callback behind one explicitly
+/// audited wrapper instead of capturing the Foundation subclass directly.
+private final class RuntimeFixtureDelivery: @unchecked Sendable {
+    private weak var target: RuntimeFixtureURLProtocol?
+    private let response: HTTPURLResponse
+    private let body: Data
+    private let finishes: Bool
+
+    init(
+        target: RuntimeFixtureURLProtocol,
+        response: HTTPURLResponse,
+        body: Data,
+        finishes: Bool
+    ) {
+        self.target = target
+        self.response = response
+        self.body = body
+        self.finishes = finishes
+    }
+
+    func perform() {
+        guard let target else { return }
+        target.client?.urlProtocol(
+            target,
+            didReceive: response,
+            cacheStoragePolicy: .notAllowed
+        )
+        if !body.isEmpty { target.client?.urlProtocol(target, didLoad: body) }
+        if finishes { target.client?.urlProtocolDidFinishLoading(target) }
+    }
 }

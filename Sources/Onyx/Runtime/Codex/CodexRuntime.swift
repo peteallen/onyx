@@ -20,12 +20,19 @@ actor CodexRuntime: AgentRuntime {
     private let eventContinuation: AsyncStream<AgentRuntimeEvent>.Continuation
     private let client: any CodexAppServerTransport
     private let expectedCodexHomeURL: URL?
+    private let modelProviderID: String?
     private let dynamicToolHandler: (any CodexDynamicToolHandler)?
     private var appServerTask: Task<Void, Never>?
     private var connectionAttempt: Task<RuntimeSession, any Error>?
     private var connectionGeneration: UInt64 = 0
     private var activeTransportGeneration: UInt64?
     private var activeTurnIDs: [String: String] = [:]
+    private struct PendingTurnFailure {
+        let turnID: String
+        let message: String
+    }
+
+    private var pendingTurnFailuresByThreadID: [String: PendingTurnFailure] = [:]
     private var pendingUserInteractions: [RuntimeRequestID: AppServerRequest] = [:]
     private struct DynamicToolTask {
         let token: UUID
@@ -63,6 +70,11 @@ actor CodexRuntime: AgentRuntime {
     private var quarantinedEphemeralThreadIDs: Set<String> = []
     private var bufferedThreadLifecycleEvents: [BufferedThreadLifecycleEvent] = []
     private var cachedModels: [RuntimeModel] = []
+    /// `account/updated` intentionally omits `requiresOpenaiAuth`; only
+    /// `account/read` owns that provider-level contract. Retain the last
+    /// authoritative value so a signed-in notification cannot make ChatGPT
+    /// authentication look optional (or make a custom no-auth lane require it).
+    private var cachedRequiresAuthentication: Bool?
     /// Older user-selected binaries can reject newer protocol methods even
     /// though the adapter knows how to call them. Remember that evidence for
     /// the life of this runtime so reconnect/account refresh does not re-offer a
@@ -84,6 +96,7 @@ actor CodexRuntime: AgentRuntime {
                 }
             ),
             expectedCodexHomeURL: launchConfiguration.codexHomeURL,
+            modelProviderID: launchConfiguration.modelProviderID,
             dynamicToolHandler: dynamicToolHandler
         )
     }
@@ -91,10 +104,12 @@ actor CodexRuntime: AgentRuntime {
     init(
         client: any CodexAppServerTransport,
         expectedCodexHomeURL: URL? = nil,
+        modelProviderID: String? = nil,
         dynamicToolHandler: (any CodexDynamicToolHandler)? = nil
     ) {
         self.client = client
         self.expectedCodexHomeURL = expectedCodexHomeURL
+        self.modelProviderID = modelProviderID
         self.dynamicToolHandler = dynamicToolHandler
         let stream = AsyncStream.makeStream(of: AgentRuntimeEvent.self)
         events = stream.stream
@@ -110,9 +125,12 @@ actor CodexRuntime: AgentRuntime {
     }
 
     static func makeDefault(
+        modelProvider: CodexRuntimeModelProviderBinding? = nil,
         dynamicToolHandler: (any CodexDynamicToolHandler)? = nil
     ) throws -> CodexRuntime {
-        let configuration = try CodexRuntimeLaunchConfiguration.production()
+        let configuration = try CodexRuntimeLaunchConfiguration.production(
+            modelProvider: modelProvider
+        )
         return CodexRuntime(
             launchConfiguration: configuration,
             dynamicToolHandler: dynamicToolHandler
@@ -122,11 +140,13 @@ actor CodexRuntime: AgentRuntime {
     static func makeDevelopmentInstalled(
         explicitExecutableURL: URL? = nil,
         codexHomeURL: URL? = nil,
+        modelProvider: CodexRuntimeModelProviderBinding? = nil,
         dynamicToolHandler: (any CodexDynamicToolHandler)? = nil
     ) throws -> CodexRuntime {
         let configuration = try CodexRuntimeLaunchConfiguration.developmentInstalled(
             explicitExecutableURL: explicitExecutableURL,
-            codexHomeURL: codexHomeURL
+            codexHomeURL: codexHomeURL,
+            modelProvider: modelProvider
         )
         return CodexRuntime(
             launchConfiguration: configuration,
@@ -176,8 +196,10 @@ actor CodexRuntime: AgentRuntime {
             guard connectionGeneration == generation else { throw error }
             connected = false
             activeTransportGeneration = nil
+            cachedRequiresAuthentication = nil
             connectionAttempt = nil
             activeTurnIDs.removeAll()
+            pendingTurnFailuresByThreadID.removeAll()
             pendingUserInteractions.removeAll()
             cancelDynamicToolTasks()
             resetEphemeralThreadBoundary()
@@ -195,9 +217,39 @@ actor CodexRuntime: AgentRuntime {
                 "Codex app-server did not confirm Onyx's private data folder."
             )
         }
-        guard reportedCodexHome == expectedCodexHomeURL.path else {
+        guard Self.macOSAliasNormalizedPath(reportedCodexHome)
+            == Self.macOSAliasNormalizedPath(expectedCodexHomeURL.path) else {
             throw AgentRuntimeError.protocolFailure(
                 "Codex app-server refused Onyx's private data folder."
+            )
+        }
+    }
+
+    private static func macOSAliasNormalizedPath(_ path: String) -> String {
+        let standardized = URL(fileURLWithPath: path, isDirectory: true)
+            .standardizedFileURL.path
+        // `/tmp`, `/var`, and `/etc` are stable macOS aliases into `/private`.
+        // Foundation does not resolve a missing descendant through those
+        // aliases, which is exactly when app-server can report the canonical
+        // spelling before Onyx's expected URL has been materialized.
+        for alias in ["/tmp", "/var", "/etc"] {
+            if standardized == alias || standardized.hasPrefix(alias + "/") {
+                return "/private" + standardized
+            }
+        }
+        return standardized
+    }
+
+    private func validateBoundProviderOwnership(
+        in result: JSONValue,
+        operation: String
+    ) throws {
+        guard let modelProviderID else { return }
+        let thread = result["thread"] ?? result
+        guard let returnedProviderID = thread["modelProvider"]?.stringValue,
+              returnedProviderID == modelProviderID else {
+            throw AgentRuntimeError.protocolFailure(
+                "Codex app-server did not confirm the custom-provider task returned by \(operation)."
             )
         }
     }
@@ -209,7 +261,9 @@ actor CodexRuntime: AgentRuntime {
         connectionAttempt = nil
         activeTransportGeneration = nil
         connected = false
+        cachedRequiresAuthentication = nil
         activeTurnIDs.removeAll()
+        pendingTurnFailuresByThreadID.removeAll()
         pendingUserInteractions.removeAll()
         cancelDynamicToolTasks()
         resetEphemeralThreadBoundary()
@@ -340,15 +394,22 @@ actor CodexRuntime: AgentRuntime {
             "sourceKinds": .array([.string("appServer"), .string("cli"), .string("vscode")]),
         ]
         if let cursor { params["cursor"] = .string(cursor) }
+        if let modelProviderID {
+            params["modelProviders"] = .array([.string(modelProviderID)])
+        }
         let result = try await client.request(
             method: "thread/list",
             params: .object(params)
         )
         let values = result["data"]?.arrayValue ?? result["threads"]?.arrayValue ?? result.arrayValue ?? []
-        let threads = values
-            .filter { $0["ephemeral"]?.boolValue != true }
-            .compactMap(CodexProjection.thread(from:))
-            .sorted { $0.updatedAt > $1.updatedAt }
+        var threads: [RuntimeThread] = []
+        for value in values where value["ephemeral"]?.boolValue != true {
+            try validateBoundProviderOwnership(in: value, operation: "thread/list")
+            if let thread = CodexProjection.thread(from: value) {
+                threads.append(thread)
+            }
+        }
+        threads.sort { $0.updatedAt > $1.updatedAt }
         return (threads, result["nextCursor"]?.stringValue)
     }
 
@@ -360,6 +421,7 @@ actor CodexRuntime: AgentRuntime {
                 "includeTurns": .bool(true),
             ])
         )
+        try validateBoundProviderOwnership(in: result, operation: "thread/read")
         let conversation = try CodexProjection.conversation(from: result)
         rememberDynamicToolParentContext(from: conversation.thread)
         return conversation
@@ -380,6 +442,7 @@ actor CodexRuntime: AgentRuntime {
                 "includeTurns": .bool(false),
             ])
         )
+        try validateBoundProviderOwnership(in: metadataResult, operation: "thread/read")
         var conversation = try CodexProjection.conversation(from: metadataResult)
         rememberDynamicToolParentContext(from: conversation.thread)
         let page = try await listThreadHistory(id: id, page: request)
@@ -397,6 +460,7 @@ actor CodexRuntime: AgentRuntime {
             method: "thread/resume",
             params: .object(["threadId": .string(id)])
         )
+        try validateBoundProviderOwnership(in: result, operation: "thread/resume")
         let threadValue = result["thread"] ?? result
         let activeTurnID = threadValue["turns"]?.arrayValue?.last(where: { turn in
             turn["status"]?.stringValue?.lowercased() == "inprogress"
@@ -429,6 +493,7 @@ actor CodexRuntime: AgentRuntime {
                 ]),
             ])
         )
+        try validateBoundProviderOwnership(in: result, operation: "thread/resume")
 
         var conversation = try CodexProjection.conversation(from: result)
         rememberDynamicToolParentContext(from: conversation.thread)
@@ -495,6 +560,7 @@ actor CodexRuntime: AgentRuntime {
             }
             throw error
         }
+        try validateBoundProviderOwnership(in: result, operation: "thread/revert")
         guard let thread = CodexProjection.thread(from: result["thread"] ?? result) else {
             throw AgentRuntimeError.missingField("thread/revert.thread.id")
         }
@@ -515,11 +581,13 @@ actor CodexRuntime: AgentRuntime {
             "approvalPolicy": .string(codexApprovalPolicy(request.approvalPolicy)),
         ]
         if let model = request.model { params["model"] = .string(model) }
+        if let modelProviderID { params["modelProvider"] = .string(modelProviderID) }
         if let dynamicToolHandler {
             let definition = await dynamicToolHandler.dynamicToolDefinition()
             params["dynamicTools"] = .array([Self.dynamicToolSpecification(definition)])
         }
         let result = try await client.request(method: "thread/start", params: .object(params))
+        try validateBoundProviderOwnership(in: result, operation: "thread/start")
         guard let thread = CodexProjection.thread(from: result["thread"] ?? result) else {
             throw AgentRuntimeError.missingField("thread.id")
         }
@@ -537,6 +605,7 @@ actor CodexRuntime: AgentRuntime {
             method: "thread/fork",
             params: .object(["threadId": .string(id)])
         )
+        try validateBoundProviderOwnership(in: result, operation: "thread/fork")
         guard let thread = CodexProjection.thread(from: result["thread"] ?? result) else {
             throw AgentRuntimeError.missingField("thread.id")
         }
@@ -581,6 +650,18 @@ actor CodexRuntime: AgentRuntime {
         }
 
         let threadValue = result["thread"] ?? result
+        do {
+            try validateBoundProviderOwnership(in: result, operation: "thread/fork")
+        } catch {
+            var correlatedIDs = pendingEphemeralForks[token]?.correlatedThreadIDs ?? []
+            if let returnedThreadID = threadValue["id"]?.stringValue {
+                correlatedIDs.insert(returnedThreadID)
+            }
+            quarantineEphemeralThreads(correlatedIDs)
+            await deleteThreadsBestEffort(correlatedIDs)
+            finishEphemeralFork(token)
+            throw error
+        }
         guard let threadID = threadValue["id"]?.stringValue else {
             let correlatedIDs = pendingEphemeralForks[token]?.correlatedThreadIDs ?? []
             quarantineEphemeralThreads(correlatedIDs)
@@ -838,6 +919,7 @@ actor CodexRuntime: AgentRuntime {
         let models = try? await modelResult
         let accountValue = account["account"]
         let requiresAuthentication = account["requiresOpenaiAuth"]?.boolValue ?? true
+        cachedRequiresAuthentication = requiresAuthentication
         let auth = authState(from: accountValue, requiresAuthentication: requiresAuthentication)
         let projectedModels = (models?["data"]?.arrayValue ?? models?["models"]?.arrayValue ?? []).compactMap { value -> RuntimeModel? in
             guard let id = value["id"]?.stringValue ?? value["model"]?.stringValue else { return nil }
@@ -959,7 +1041,9 @@ actor CodexRuntime: AgentRuntime {
             connectionAttempt = nil
             connected = false
             activeTransportGeneration = nil
+            cachedRequiresAuthentication = nil
             activeTurnIDs.removeAll()
+            pendingTurnFailuresByThreadID.removeAll()
             pendingUserInteractions.removeAll()
             cancelDynamicToolTasks()
             resetEphemeralThreadBoundary()
@@ -993,7 +1077,7 @@ actor CodexRuntime: AgentRuntime {
                 mode: authMode,
                 email: nil,
                 planLabel: params["planType"]?.stringValue,
-                requiresAuthentication: authMode == nil
+                requiresAuthentication: cachedRequiresAuthentication ?? true
             )
             eventContinuation.yield(.accountUpdated(auth))
             return
@@ -1015,6 +1099,7 @@ actor CodexRuntime: AgentRuntime {
         if let lifecycleEvent = CodexProjection.threadLifecycleEvent(from: notification) {
             if case let .threadDeleted(threadID) = lifecycleEvent {
                 activeTurnIDs.removeValue(forKey: threadID)
+                pendingTurnFailuresByThreadID.removeValue(forKey: threadID)
                 dynamicToolParentContexts.removeValue(forKey: threadID)
             }
             publishOrBufferThreadLifecycleEvent(lifecycleEvent, threadID: threadID)
@@ -1038,6 +1123,7 @@ actor CodexRuntime: AgentRuntime {
             publishOrBufferThreadLifecycleEvent(.threadUpdated(thread), threadID: startedThreadID)
         case "turn/started":
             if let turnID = params["turn"]?["id"]?.stringValue, !threadID.isEmpty {
+                pendingTurnFailuresByThreadID.removeValue(forKey: threadID)
                 activeTurnIDs[threadID] = turnID
                 eventContinuation.yield(.turnStarted(threadID: threadID, turnID: turnID))
             }
@@ -1066,10 +1152,27 @@ actor CodexRuntime: AgentRuntime {
                   let delta = params["delta"]?.stringValue else { return }
             eventContinuation.yield(.itemDelta(threadID: threadID, itemID: itemID, delta: delta))
         case "turn/completed":
+            let turn = params["turn"] ?? .null
+            let turnID = turn["id"]?.stringValue ?? activeTurnIDs[threadID]
+            let pendingFailure = pendingTurnFailuresByThreadID.removeValue(forKey: threadID)
             activeTurnIDs.removeValue(forKey: threadID)
             cancelDynamicToolTasks(threadID: threadID)
-            let rawStatus = params["turn"]?["status"]?.stringValue ?? "idle"
+            let rawStatus = turn["status"]?.stringValue ?? "idle"
             let status: RuntimeThreadStatus = rawStatus == "failed" ? .failed : .idle
+            let fallbackMessage: String? = if rawStatus == "failed",
+                                              pendingFailure?.turnID == turnID {
+                pendingFailure?.message
+            } else {
+                nil
+            }
+            if !threadID.isEmpty,
+               let failure = CodexProjection.turnFailureTimelineItem(
+                   from: turn,
+                   fallbackTurnID: turnID,
+                   fallbackMessage: fallbackMessage
+               ) {
+                eventContinuation.yield(.itemCompleted(threadID: threadID, item: failure))
+            }
             eventContinuation.yield(.turnCompleted(threadID: threadID, status: status))
         case "serverRequest/resolved":
             if let requestID = runtimeRequestID(from: params["requestId"]) {
@@ -1077,12 +1180,26 @@ actor CodexRuntime: AgentRuntime {
                 eventContinuation.yield(.userInteractionResolved(requestID))
             }
         case "error":
+            let detail = CodexProjection.turnFailureMessage(from: params)
+            if !threadID.isEmpty,
+               let turnID = params["turnId"]?.stringValue ?? activeTurnIDs[threadID],
+               let detail {
+                if params["willRetry"]?.boolValue != true,
+                   activeTurnIDs[threadID] == turnID {
+                    pendingTurnFailuresByThreadID[threadID] = PendingTurnFailure(
+                        turnID: turnID,
+                        message: detail
+                    )
+                }
+                // Turn failures are represented by the stable transcript row
+                // emitted with `turn/completed`; do not also interrupt the user
+                // with a modal notice for this same provider-owned failure.
+                return
+            }
             eventContinuation.yield(
                 .runtimeNotice(
                     title: "Codex runtime error",
-                    detail: params["error"]?["message"]?.stringValue
-                        ?? params["message"]?.stringValue
-                        ?? params.compactDescription
+                    detail: detail ?? "Codex reported an error."
                 )
             )
         default:

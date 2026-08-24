@@ -169,6 +169,34 @@ final class OnyxDelegationBrokerTests: XCTestCase {
         XCTAssertFalse(unavailable.text.contains("secret-token"))
     }
 
+    func testEmptyDelegatedAnswerBecomesBoundedBrokerFailure() async throws {
+        let runtime = BrokerScriptedRuntime(response: " \n\t ")
+        let state = BrokerTestState(
+            configurations: [configuration()],
+            runtime: runtime
+        )
+        let broker = makeBroker(state: state)
+
+        let result = try await broker.handleDynamicToolCall(
+            call(id: "empty-answer")
+        )
+        let payload = try decodePayload(result)
+
+        XCTAssertFalse(result.success)
+        XCTAssertEqual(payload["success"]?.boolValue, false)
+        XCTAssertEqual(payload["job_id"]?.stringValue, "empty-answer")
+        XCTAssertEqual(
+            payload["error_code"]?.stringValue,
+            OnyxDelegationBrokerErrorCode.executionFailed.rawValue
+        )
+        XCTAssertEqual(
+            payload["error_message"]?.stringValue,
+            "The delegated model could not complete the request."
+        )
+        XCTAssertNil(payload["text"])
+        XCTAssertNil(payload["child_conversation_id"])
+    }
+
     func testGlobalCapacityAndCancellationSurviveCoordinatorInvalidation() async throws {
         let runtime = BrokerScriptedRuntime(behavior: .blockUntilCancelled)
         let state = BrokerTestState(

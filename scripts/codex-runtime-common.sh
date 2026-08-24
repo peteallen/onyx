@@ -6,6 +6,10 @@
 
 codex_runtime_repo_root="${0:A:h:h}"
 codex_runtime_manifest="$codex_runtime_repo_root/support/codex-runtime-manifest.json"
+# Keep the manifest's trust anchor in executable source rather than in a
+# sibling file that could drift alongside it. Update this digest only when the
+# pinned upstream runtime manifest intentionally changes.
+codex_runtime_manifest_sha256="bbfe5b7446dfe3ac34d79efed391ec7d769b38c3c5932ca41795ef0b0c400ba0"
 codex_runtime_default_cache="$codex_runtime_repo_root/.artifacts/codex-runtime"
 
 codex_runtime_die() {
@@ -22,6 +26,9 @@ codex_runtime_manifest_value() {
 codex_runtime_require_manifest() {
   [[ -f "$codex_runtime_manifest" && ! -L "$codex_runtime_manifest" ]] ||
     codex_runtime_die "missing pinned runtime manifest: $codex_runtime_manifest"
+  [[ "$(/usr/bin/shasum -a 256 "$codex_runtime_manifest" | /usr/bin/awk '{print $1}')" == \
+     "$codex_runtime_manifest_sha256" ]] ||
+    codex_runtime_die "pinned runtime manifest SHA-256 mismatch"
   codex_runtime_manifest_value layoutVersion >/dev/null
 
   [[ "$(codex_runtime_manifest_value layoutVersion)" == "1" ]] ||

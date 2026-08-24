@@ -7,6 +7,7 @@ For any product, UX, UI, interaction, or perceived-performance work:
 3. Record material product decisions in the decision log so later work does not silently reverse them.
 4. Do not mark an issue **Done** until its acceptance criteria have been verified in a running build. If verification is pending, leave it **In progress**.
 5. Add newly discovered product problems to the issue log instead of relying on chat history.
+6. Treat the ledger's **Current work sequence** as the execution order. Capture brain-dump feedback there without reordering active work unless it reveals data loss, a security failure, a crash, or a direct blocker.
 
 Keep updates concise and user-facing: describe the behavior people experience, not internal implementation names.
 

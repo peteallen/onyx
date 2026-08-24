@@ -135,6 +135,56 @@ final class SharedRuntimeCoordinatorTests: XCTestCase {
         XCTAssertEqual(finalCount, 1)
     }
 
+    func testRuntimeModelUpdateReplacesCachedCatalogForLaterWindows() async throws {
+        let initial = Self.model("provider-model", executionMode: .checkingAgent)
+        let verified = Self.model("provider-model", executionMode: .agent)
+        let runtime = CoordinatorFakeRuntime(
+            connectSession: Self.session(label: "Adaptive provider", models: [initial])
+        )
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+        let events = CoordinatorEventRecorder()
+        await events.start(stream: coordinator.events)
+
+        let firstWindow = try await coordinator.connect()
+        XCTAssertEqual(firstWindow.availableModels, [initial])
+
+        runtime.emit(.runtimeModelsUpdated([verified]))
+        try await events.waitForCount(1)
+
+        let attachedLater = try await coordinator.connect()
+        XCTAssertEqual(attachedLater.availableModels, [verified])
+        let connectCallCount = await runtime.connectCallCount
+        let receivedEvents = await events.snapshot()
+        XCTAssertEqual(connectCallCount, 1)
+        XCTAssertEqual(receivedEvents, [.runtimeModelsUpdated([verified])])
+    }
+
+    func testRuntimeModelUpdateDuringConnectWinsOverOlderProviderSnapshot() async throws {
+        let connectGate = InvocationGate(isOpen: false)
+        let initial = Self.model("provider-model", executionMode: .checkingAgent)
+        let verified = Self.model("provider-model", executionMode: .agent)
+        let runtime = CoordinatorFakeRuntime(
+            connectSession: Self.session(label: "Adaptive provider", models: [initial]),
+            connectGate: connectGate
+        )
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+        let events = CoordinatorEventRecorder()
+        await events.start(stream: coordinator.events)
+
+        let connecting = Task { try await coordinator.connect() }
+        await connectGate.waitForInvocationCount(1)
+        runtime.emit(.runtimeModelsUpdated([verified]))
+        try await events.waitForCount(1)
+        await connectGate.open()
+
+        let connected = try await connecting.value
+        let attachedLater = try await coordinator.connect()
+        XCTAssertEqual(connected.availableModels, [verified])
+        XCTAssertEqual(attachedLater.availableModels, [verified])
+        let connectCallCount = await runtime.connectCallCount
+        XCTAssertEqual(connectCallCount, 1)
+    }
+
     func testPaginationCompatibilityFailureDowngradesEveryWindowAndStopsAllEntryPointRetries() async throws {
         enum EntryPoint: CaseIterable {
             case read
@@ -345,6 +395,370 @@ final class SharedRuntimeCoordinatorTests: XCTestCase {
         XCTAssertEqual(attachedLater, refreshed)
         XCTAssertEqual(finalRefreshCount, 1)
         XCTAssertEqual(finalConnectCount, 1)
+    }
+
+    func testRetirementRejectsEveryNewOperationClassBeforeDisconnectFinishes() async throws {
+        let disconnectGate = InvocationGate(isOpen: false)
+        let runtime = CoordinatorFakeRuntime(
+            disconnectGate: disconnectGate,
+            loginStartResult: Self.loginStart(loginID: "must-not-start")
+        )
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+
+        let retirement = Task { await coordinator.retire() }
+        await disconnectGate.waitForInvocationCount(1)
+
+        await assertRetiredBoundary { _ = try await coordinator.connect() }
+        await assertRetiredBoundary { _ = try await coordinator.refreshAccount() }
+        await assertRetiredBoundary {
+            _ = try await coordinator.startLogin(methodID: "chatgpt")
+        }
+        await assertRetiredBoundary { try await coordinator.cancelLogin(id: "login-1") }
+        await assertRetiredBoundary { try await coordinator.logout() }
+        await assertRetiredBoundary {
+            _ = try await coordinator.listThreads(limit: 1, archived: false)
+        }
+        await assertRetiredBoundary {
+            _ = try await coordinator.readThread(
+                id: "thread-1",
+                initialHistoryPage: RuntimeThreadHistoryPageRequest(limit: 1)
+            )
+        }
+
+        let providerCalls = await runtime.retirementSensitiveCallCounts
+        XCTAssertEqual(
+            providerCalls,
+            CoordinatorFakeRuntime.RetirementSensitiveCallCounts(disconnect: 1)
+        )
+
+        await disconnectGate.open()
+        await retirement.value
+    }
+
+    func testRetirementDropsLateProviderEventsAndFinishesEverySubscriber() async throws {
+        let disconnectGate = InvocationGate(isOpen: false)
+        let runtime = CoordinatorFakeRuntime(disconnectGate: disconnectGate)
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+        let first = CoordinatorEventRecorder()
+        let second = CoordinatorEventRecorder()
+        await first.start(stream: coordinator.events)
+        await second.start(stream: coordinator.events)
+
+        let beforeRetirement = AgentRuntimeEvent.runtimeNotice(
+            title: "Current generation",
+            detail: "visible"
+        )
+        runtime.emit(beforeRetirement)
+        try await first.waitForCount(1)
+        try await second.waitForCount(1)
+
+        let retirement = Task { await coordinator.retire() }
+        await disconnectGate.waitForInvocationCount(1)
+        runtime.emit(.runtimeNotice(title: "Retired generation", detail: "must be ignored"))
+        runtime.emit(.itemDelta(threadID: "old-thread", itemID: "old-item", delta: "stale"))
+        await disconnectGate.open()
+        await retirement.value
+        try await first.waitForFinish()
+        try await second.waitForFinish()
+
+        let firstEvents = await first.snapshot()
+        let secondEvents = await second.snapshot()
+        XCTAssertEqual(firstEvents, [beforeRetirement])
+        XCTAssertEqual(secondEvents, [beforeRetirement])
+    }
+
+    func testRetirementAbortsAFullUndrainedSubscriberQueue() async throws {
+        let runtime = CoordinatorFakeRuntime()
+        let coordinator = SharedRuntimeCoordinator(
+            runtime: runtime,
+            subscriberEventLimit: 1
+        )
+        // Keep the stream alive without starting a consumer. The first event
+        // fills its queue and the second suspends the shared source pump.
+        let stalledStream = coordinator.events
+        runtime.emit(.runtimeNotice(title: "Buffered", detail: "must be discarded"))
+        runtime.emit(.runtimeNotice(title: "Blocked", detail: "must be unblocked"))
+        for _ in 0 ..< 50 { await Task.yield() }
+
+        let retirement = Task { await coordinator.retire() }
+        try await Self.awaitCompletion(retirement)
+
+        // Retiring is a generation fence, so neither the buffered event nor
+        // the yield that was waiting for queue space may drain afterward.
+        let recorder = CoordinatorEventRecorder()
+        await recorder.start(stream: stalledStream)
+        try await recorder.waitForFinish()
+        let events = await recorder.snapshot()
+        XCTAssertEqual(events, [])
+        let disconnects = await runtime.disconnectCallCount
+        XCTAssertEqual(disconnects, 1)
+    }
+
+    func testRetirementDiscardsEventsBufferedBeforeReplacementCanObserveThem() async throws {
+        let runtime = CoordinatorFakeRuntime()
+        let coordinator = SharedRuntimeCoordinator(
+            runtime: runtime,
+            subscriberEventLimit: 4
+        )
+        let oldWindowStream = coordinator.events
+
+        runtime.emit(.runtimeNotice(title: "Old generation", detail: "queued"))
+        for _ in 0 ..< 50 { await Task.yield() }
+        await coordinator.retire()
+
+        let recorder = CoordinatorEventRecorder()
+        await recorder.start(stream: oldWindowStream)
+        try await recorder.waitForFinish()
+        let events = await recorder.snapshot()
+        XCTAssertTrue(events.isEmpty, "A retired runtime leaked a buffered event to an old window.")
+    }
+
+    func testRetirementWaitsForSuspendedTurnBeforeDisconnecting() async throws {
+        let startTurnGate = InvocationGate(isOpen: false)
+        let disconnectGate = InvocationGate(isOpen: false)
+        let runtime = CoordinatorFakeRuntime(
+            disconnectGate: disconnectGate,
+            startTurnGate: startTurnGate
+        )
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+
+        let turn = Task {
+            try await coordinator.startTurn(
+                StartTurnRequest(threadID: "thread-1", text: "Finish with the old settings")
+            )
+        }
+        await startTurnGate.waitForInvocationCount(1)
+
+        let retirement = Task { await coordinator.retire() }
+        try await waitForRetirementAdmission(coordinator)
+        await assertRetiredBoundary { _ = try await coordinator.connect() }
+        let disconnectsWhileTurnWasSuspended = await runtime.disconnectCallCount
+        XCTAssertEqual(disconnectsWhileTurnWasSuspended, 0)
+
+        await startTurnGate.open()
+        try await turn.value
+        await disconnectGate.waitForInvocationCount(1)
+        await disconnectGate.open()
+        await retirement.value
+
+        let counts = await runtime.retirementSensitiveCallCounts
+        XCTAssertEqual(counts.startTurn, 1)
+        XCTAssertEqual(counts.disconnect, 1)
+    }
+
+    func testRetirementWaitsForInFlightConnectAttempt() async throws {
+        let connectGate = InvocationGate(isOpen: false)
+        let disconnectGate = InvocationGate(isOpen: false)
+        let runtime = CoordinatorFakeRuntime(
+            connectGate: connectGate,
+            disconnectGate: disconnectGate
+        )
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+
+        let connect = Task { try await coordinator.connect() }
+        await connectGate.waitForInvocationCount(1)
+        let retirement = Task { await coordinator.retire() }
+        try await waitForRetirementAdmission(coordinator)
+        await assertRetiredBoundary {
+            _ = try await coordinator.listThreads(limit: 1, archived: false)
+        }
+        let disconnectsWhileConnectWasSuspended = await runtime.disconnectCallCount
+        XCTAssertEqual(disconnectsWhileConnectWasSuspended, 0)
+
+        await connectGate.open()
+        do {
+            _ = try await connect.value
+            XCTFail("An in-flight connection returned a session after retirement.")
+        } catch {
+            assertRetiredBoundary(error)
+        }
+        await disconnectGate.waitForInvocationCount(1)
+        await disconnectGate.open()
+        await retirement.value
+
+        let counts = await runtime.retirementSensitiveCallCounts
+        XCTAssertEqual(counts.connect, 1)
+        XCTAssertEqual(counts.disconnect, 1)
+    }
+
+    func testRetirementWaitsForInFlightRefreshAttempt() async throws {
+        let refreshGate = InvocationGate(isOpen: false)
+        let disconnectGate = InvocationGate(isOpen: false)
+        let runtime = CoordinatorFakeRuntime(
+            refreshGate: refreshGate,
+            disconnectGate: disconnectGate
+        )
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+
+        let refresh = Task { try await coordinator.refreshAccount() }
+        await refreshGate.waitForInvocationCount(1)
+        let retirement = Task { await coordinator.retire() }
+        try await waitForRetirementAdmission(coordinator)
+        await assertRetiredBoundary { _ = try await coordinator.connect() }
+        let disconnectsWhileRefreshWasSuspended = await runtime.disconnectCallCount
+        XCTAssertEqual(disconnectsWhileRefreshWasSuspended, 0)
+
+        await refreshGate.open()
+        do {
+            _ = try await refresh.value
+            XCTFail("An in-flight refresh returned a session after retirement.")
+        } catch {
+            assertRetiredBoundary(error)
+        }
+        await disconnectGate.waitForInvocationCount(1)
+        await disconnectGate.open()
+        await retirement.value
+
+        let counts = await runtime.retirementSensitiveCallCounts
+        XCTAssertEqual(counts.refresh, 1)
+        XCTAssertEqual(counts.disconnect, 1)
+    }
+
+    func testRetirementWaitsForInFlightLoginBeforeDisconnecting() async throws {
+        let loginGate = InvocationGate(isOpen: false)
+        let disconnectGate = InvocationGate(isOpen: false)
+        let loginStart = Self.loginStart(loginID: "retiring-login")
+        let runtime = CoordinatorFakeRuntime(
+            disconnectGate: disconnectGate,
+            loginStartResult: loginStart,
+            loginStartGate: loginGate
+        )
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+
+        let login = Task { try await coordinator.startLogin(methodID: loginStart.method.id) }
+        await loginGate.waitForInvocationCount(1)
+        let retirement = Task { await coordinator.retire() }
+        try await waitForRetirementAdmission(coordinator)
+        await assertRetiredBoundary { _ = try await coordinator.connect() }
+        let disconnectsWhileLoginWasSuspended = await runtime.disconnectCallCount
+        XCTAssertEqual(disconnectsWhileLoginWasSuspended, 0)
+
+        await loginGate.open()
+        do {
+            _ = try await login.value
+            XCTFail("An in-flight login crossed the retired provider boundary.")
+        } catch {
+            assertRetiredBoundary(error)
+        }
+        await disconnectGate.waitForInvocationCount(1)
+        await disconnectGate.open()
+        await retirement.value
+
+        let counts = await runtime.retirementSensitiveCallCounts
+        XCTAssertEqual(counts.startLogin, 1)
+        XCTAssertEqual(counts.cancelLogin, 1)
+        XCTAssertEqual(counts.disconnect, 1)
+    }
+
+    func testRetirementWaitsForAlreadyStartedLogoutBeforeDisconnecting() async throws {
+        let logoutGate = InvocationGate(isOpen: false)
+        let disconnectGate = InvocationGate(isOpen: false)
+        let runtime = CoordinatorFakeRuntime(
+            disconnectGate: disconnectGate,
+            logoutGate: logoutGate
+        )
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+
+        let logout = Task { try await coordinator.logout() }
+        await logoutGate.waitForInvocationCount(1)
+        let retirement = Task { await coordinator.retire() }
+        try await waitForRetirementAdmission(coordinator)
+        await assertRetiredBoundary {
+            _ = try await coordinator.listThreads(limit: 1, archived: false)
+        }
+        let disconnectsWhileLogoutWasSuspended = await runtime.disconnectCallCount
+        XCTAssertEqual(disconnectsWhileLogoutWasSuspended, 0)
+
+        await logoutGate.open()
+        try await logout.value
+        await disconnectGate.waitForInvocationCount(1)
+        await disconnectGate.open()
+        await retirement.value
+
+        let counts = await runtime.retirementSensitiveCallCounts
+        XCTAssertEqual(counts.logout, 1)
+        XCTAssertEqual(counts.disconnect, 1)
+    }
+
+    func testOperationsWaitingForLogoutRecheckRetirementBeforeCallingProvider() async throws {
+        let logoutGate = InvocationGate(isOpen: false)
+        let disconnectGate = InvocationGate(isOpen: false)
+        let runtime = CoordinatorFakeRuntime(
+            disconnectGate: disconnectGate,
+            logoutGate: logoutGate
+        )
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+
+        let logout = Task { try await coordinator.logout() }
+        await logoutGate.waitForInvocationCount(1)
+        let connect = Task { try await coordinator.connect() }
+        let refresh = Task { try await coordinator.refreshAccount() }
+        let cancellation = Task { try await coordinator.cancelLogin(id: "waiting-login") }
+        for _ in 0 ..< 20 { await Task.yield() }
+
+        let callsBeforeRetirement = await runtime.retirementSensitiveCallCounts
+        XCTAssertEqual(callsBeforeRetirement.connect, 0)
+        XCTAssertEqual(callsBeforeRetirement.refresh, 0)
+        XCTAssertEqual(callsBeforeRetirement.cancelLogin, 0)
+
+        let retirement = Task { await coordinator.retire() }
+        try await waitForRetirementAdmission(coordinator)
+        await assertRetiredBoundary {
+            _ = try await coordinator.listThreads(limit: 1, archived: false)
+        }
+        await logoutGate.open()
+        try await logout.value
+
+        do {
+            _ = try await connect.value
+            XCTFail("A connect waiting for logout crossed retirement.")
+        } catch {
+            assertRetiredBoundary(error)
+        }
+        do {
+            _ = try await refresh.value
+            XCTFail("A refresh waiting for logout crossed retirement.")
+        } catch {
+            assertRetiredBoundary(error)
+        }
+        do {
+            try await cancellation.value
+            XCTFail("A login cancellation waiting for logout crossed retirement.")
+        } catch {
+            assertRetiredBoundary(error)
+        }
+
+        await disconnectGate.waitForInvocationCount(1)
+        await disconnectGate.open()
+        await retirement.value
+        let finalCalls = await runtime.retirementSensitiveCallCounts
+        XCTAssertEqual(finalCalls.connect, 0)
+        XCTAssertEqual(finalCalls.refresh, 0)
+        XCTAssertEqual(finalCalls.cancelLogin, 0)
+    }
+
+    func testConcurrentRetirementsAndLaterDisconnectShareOneProviderDisconnect() async {
+        let disconnectGate = InvocationGate(isOpen: false)
+        let runtime = CoordinatorFakeRuntime(disconnectGate: disconnectGate)
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+
+        let first = Task { await coordinator.retire() }
+        let second = Task { await coordinator.retire() }
+        let third = Task { await coordinator.retire() }
+        await disconnectGate.waitForInvocationCount(1)
+        for _ in 0 ..< 50 { await Task.yield() }
+        let callsWhileRetirementsWerePending = await runtime.disconnectCallCount
+        XCTAssertEqual(callsWhileRetirementsWerePending, 1)
+
+        await disconnectGate.open()
+        await first.value
+        await second.value
+        await third.value
+        await coordinator.disconnect()
+        await coordinator.retire()
+
+        let finalCalls = await runtime.disconnectCallCount
+        XCTAssertEqual(finalCalls, 1)
     }
 
     func testLogoutInvalidatesCachedSessionBeforeProviderFinishes() async throws {
@@ -741,6 +1155,37 @@ final class SharedRuntimeCoordinatorTests: XCTestCase {
         XCTAssertEqual(message, "Account sign-out is in progress.", file: file, line: line)
     }
 
+    private func assertRetiredBoundary<Result>(
+        _ operation: () async throws -> Result,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        do {
+            _ = try await operation()
+            XCTFail("A provider operation crossed retirement.", file: file, line: line)
+        } catch {
+            assertRetiredBoundary(error, file: file, line: line)
+        }
+    }
+
+    private func assertRetiredBoundary(
+        _ error: any Error,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        guard case let AgentRuntimeError.requestFailed(code, message) = error else {
+            XCTFail("Expected a retired-runtime error, got \(error).", file: file, line: line)
+            return
+        }
+        XCTAssertEqual(code, -32_101, file: file, line: line)
+        XCTAssertEqual(
+            message,
+            "Provider settings changed. Reconnect using the current configuration.",
+            file: file,
+            line: line
+        )
+    }
+
     private func waitForAccountBoundary(_ coordinator: SharedRuntimeCoordinator) async -> Bool {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .seconds(2))
@@ -756,6 +1201,18 @@ final class SharedRuntimeCoordinatorTests: XCTestCase {
             await Task.yield()
         }
         return false
+    }
+
+    private func waitForRetirementAdmission(
+        _ coordinator: SharedRuntimeCoordinator
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(2))
+        while clock.now < deadline {
+            if await coordinator.isRetired { return }
+            await Task.yield()
+        }
+        throw CoordinatorEventRecorder.WaitError.timedOut
     }
 
     private static func loginStart(loginID: String) -> RuntimeLoginStart {
@@ -775,6 +1232,7 @@ final class SharedRuntimeCoordinatorTests: XCTestCase {
 
     private static func session(
         label: String,
+        models: [RuntimeModel] = [],
         capabilities: RuntimeCapabilities = []
     ) -> RuntimeSession {
         RuntimeSession(
@@ -789,13 +1247,57 @@ final class SharedRuntimeCoordinatorTests: XCTestCase {
                 requiresAuthentication: false
             ),
             availableLoginMethods: [],
-            availableModels: [],
+            availableModels: models,
             capabilities: capabilities
         )
+    }
+
+    private static func model(
+        _ id: String,
+        executionMode: RuntimeModelExecutionMode
+    ) -> RuntimeModel {
+        RuntimeModel(
+            id: id,
+            displayName: id,
+            description: nil,
+            isDefault: true,
+            defaultReasoningEffort: nil,
+            reasoningEfforts: [],
+            executionMode: executionMode,
+            taskCapabilities: executionMode == .agent ? [.tools, .terminal] : []
+        )
+    }
+
+    private static func awaitCompletion(
+        _ task: Task<Void, Never>,
+        timeout: Duration = .seconds(2)
+    ) async throws {
+        let clock = ContinuousClock()
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask { await task.value }
+            group.addTask {
+                try await clock.sleep(for: timeout)
+                throw CoordinatorEventRecorder.WaitError.timedOut
+            }
+            _ = try await group.next()
+            group.cancelAll()
+        }
     }
 }
 
 private actor CoordinatorFakeRuntime: AgentRuntime {
+    struct RetirementSensitiveCallCounts: Equatable {
+        var connect = 0
+        var disconnect = 0
+        var refresh = 0
+        var startLogin = 0
+        var cancelLogin = 0
+        var logout = 0
+        var listThreads = 0
+        var startTurn = 0
+        var history = 0
+    }
+
     nonisolated let kind = AgentRuntimeKind.local
     nonisolated var events: AsyncStream<AgentRuntimeEvent> {
         eventAccessProbe.recordAccess()
@@ -811,6 +1313,7 @@ private actor CoordinatorFakeRuntime: AgentRuntime {
     private let refreshSession: RuntimeSession
     private let connectGate: InvocationGate?
     private let refreshGate: InvocationGate?
+    private let disconnectGate: InvocationGate?
     private let logoutGate: InvocationGate?
     private let loginStartResult: RuntimeLoginStart?
     private let loginStartGate: InvocationGate?
@@ -820,11 +1323,13 @@ private actor CoordinatorFakeRuntime: AgentRuntime {
     private let historyPaginationFailureCode: Int?
     private let historyRevertFailureCode: Int?
     private(set) var connectCallCount = 0
+    private(set) var disconnectCallCount = 0
     private(set) var refreshCallCount = 0
     private(set) var logoutCallCount = 0
     private(set) var loginStartCallCount = 0
     private(set) var cancelLoginCallCount = 0
     private(set) var startTurnCallCount = 0
+    private(set) var listThreadsCallCount = 0
     private(set) var historyOperationMethods: [String] = []
     private(set) var historyRevertCallCount = 0
     private(set) var cancelledLoginIDs: [String] = []
@@ -834,6 +1339,7 @@ private actor CoordinatorFakeRuntime: AgentRuntime {
         refreshSession: RuntimeSession? = nil,
         connectGate: InvocationGate? = nil,
         refreshGate: InvocationGate? = nil,
+        disconnectGate: InvocationGate? = nil,
         logoutGate: InvocationGate? = nil,
         loginStartResult: RuntimeLoginStart? = nil,
         loginStartGate: InvocationGate? = nil,
@@ -862,6 +1368,7 @@ private actor CoordinatorFakeRuntime: AgentRuntime {
         self.refreshSession = refreshSession ?? connectSession ?? fallback
         self.connectGate = connectGate
         self.refreshGate = refreshGate
+        self.disconnectGate = disconnectGate
         self.logoutGate = logoutGate
         self.loginStartResult = loginStartResult
         self.loginStartGate = loginStartGate
@@ -885,7 +1392,10 @@ private actor CoordinatorFakeRuntime: AgentRuntime {
         return connectSession
     }
 
-    func disconnect() async {}
+    func disconnect() async {
+        disconnectCallCount += 1
+        if let disconnectGate { await disconnectGate.enter() }
+    }
 
     func startLogin(methodID _: String) async throws -> RuntimeLoginStart {
         loginStartCallCount += 1
@@ -914,7 +1424,24 @@ private actor CoordinatorFakeRuntime: AgentRuntime {
         if let logoutEvent { emit(logoutEvent) }
     }
 
-    func listThreads(limit _: Int, archived _: Bool) async throws -> [RuntimeThread] { [] }
+    func listThreads(limit _: Int, archived _: Bool) async throws -> [RuntimeThread] {
+        listThreadsCallCount += 1
+        return []
+    }
+
+    var retirementSensitiveCallCounts: RetirementSensitiveCallCounts {
+        RetirementSensitiveCallCounts(
+            connect: connectCallCount,
+            disconnect: disconnectCallCount,
+            refresh: refreshCallCount,
+            startLogin: loginStartCallCount,
+            cancelLogin: cancelLoginCallCount,
+            logout: logoutCallCount,
+            listThreads: listThreadsCallCount,
+            startTurn: startTurnCallCount,
+            history: historyOperationMethods.count
+        )
+    }
 
     func readThread(id _: String) async throws -> RuntimeConversation {
         throw AgentRuntimeError.unsupported("fake thread reading")

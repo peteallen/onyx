@@ -111,6 +111,11 @@ struct ProviderConnectionRecord: Identifiable, Codable, Equatable, Hashable, Sen
     var transportCapabilities: Set<ProviderTransportCapability>
     var discovery: ProviderConnectionDiscoveryMetadata
     var requestBehavior: OpenAICompatibleRequestBehavior
+    /// Opaque pointer to the active versioned Keychain slot. `nil` means the
+    /// record either predates slot migration (and therefore uses its legacy
+    /// stable-ID key) or is an intentional signed-out bearer connection.
+    /// This identifier is never credential material.
+    var credentialSlotID: String?
     /// Non-secret ownership token for locally persisted provider chats. It is
     /// rotated whenever the endpoint or credential identity changes so a task
     /// created for one backend can never be replayed into another backend that
@@ -127,6 +132,7 @@ struct ProviderConnectionRecord: Identifiable, Codable, Equatable, Hashable, Sen
         transportCapabilities: Set<ProviderTransportCapability> = [],
         discovery: ProviderConnectionDiscoveryMetadata = .init(),
         requestBehavior: OpenAICompatibleRequestBehavior = .init(),
+        credentialSlotID: String? = nil,
         conversationScopeID: String = ProviderConnectionRecord.makeConversationScopeID()
     ) throws {
         let normalizedID = id.rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -158,6 +164,12 @@ struct ProviderConnectionRecord: Identifiable, Codable, Equatable, Hashable, Sen
         self.transportCapabilities = transportCapabilities
         self.discovery = discovery
         self.requestBehavior = requestBehavior
+        let normalizedCredentialSlotID = credentialSlotID?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        self.credentialSlotID = normalizedCredentialSlotID?.isEmpty == false
+            ? normalizedCredentialSlotID
+            : nil
         let normalizedScopeID = conversationScopeID.trimmingCharacters(
             in: .whitespacesAndNewlines
         )
@@ -176,6 +188,7 @@ struct ProviderConnectionRecord: Identifiable, Codable, Equatable, Hashable, Sen
         case transportCapabilities
         case discovery
         case requestBehavior
+        case credentialSlotID
         case conversationScopeID
     }
 
@@ -204,6 +217,10 @@ struct ProviderConnectionRecord: Identifiable, Codable, Equatable, Hashable, Sen
                 OpenAICompatibleRequestBehavior.self,
                 forKey: .requestBehavior
             ) ?? .init(),
+            credentialSlotID: container.decodeIfPresent(
+                String.self,
+                forKey: .credentialSlotID
+            ),
             conversationScopeID: container.decodeIfPresent(
                 String.self,
                 forKey: .conversationScopeID
@@ -215,7 +232,13 @@ struct ProviderConnectionRecord: Identifiable, Codable, Equatable, Hashable, Sen
     /// It is safe to persist and avoids putting a user-entered account string
     /// or any secret in the connection document.
     var credentialKey: ProviderCredentialKey {
-        ProviderCredentialKey(connectionID: id)
+        if let credentialSlotID {
+            return ProviderCredentialKey.slot(
+                connectionID: id,
+                slotID: credentialSlotID
+            )
+        }
+        return ProviderCredentialKey.legacy(connectionID: id)
     }
 
     /// Re-applies every constructor invariant after a field-scoped mutation.
@@ -233,12 +256,17 @@ struct ProviderConnectionRecord: Identifiable, Codable, Equatable, Hashable, Sen
             transportCapabilities: transportCapabilities,
             discovery: discovery,
             requestBehavior: requestBehavior,
+            credentialSlotID: credentialSlotID,
             conversationScopeID: conversationScopeID
         )
     }
 
     static func makeConversationScopeID() -> String {
         "scope.\(UUID().uuidString.lowercased())"
+    }
+
+    static func makeCredentialSlotID() -> String {
+        "slot.\(UUID().uuidString.lowercased())"
     }
 
     /// Records created before conversation scoping decode to a deterministic

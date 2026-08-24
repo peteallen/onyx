@@ -16,7 +16,7 @@ enum AgentRuntimeKind: String, Codable, Sendable, CaseIterable {
     }
 }
 
-struct RuntimeCapabilities: OptionSet, Sendable {
+struct RuntimeCapabilities: OptionSet, Sendable, Hashable {
     let rawValue: UInt64
 
     static let streaming = Self(rawValue: 1 << 0)
@@ -47,6 +47,21 @@ struct RuntimeCapabilities: OptionSet, Sendable {
     /// The runtime can replace durable task history with the prefix before a
     /// specific turn. This does not imply that workspace file changes revert.
     static let threadHistoryRevert = Self(rawValue: 1 << 17)
+}
+
+/// How Onyx will execute a newly created task for one model. This is deliberately
+/// model-specific: a provider-wide tools bit would make chat-owned tasks appear
+/// able to edit files merely because a different model passed the agent probe.
+enum RuntimeModelExecutionMode: String, Sendable, Hashable {
+    /// Native runtimes such as Codex inherit the session's capability set.
+    case inherited
+    /// The app-owned chat adapter remains the durable backend for new tasks.
+    case chat
+    /// A bounded behavioral check is running in the background. New tasks stay
+    /// in chat while this state is unresolved and are never upgraded later.
+    case checkingAgent
+    /// The exact connection, scope, and model passed the Responses/tool probe.
+    case agent
 }
 
 struct RuntimeSession: Sendable, Equatable {
@@ -192,6 +207,11 @@ struct RuntimeModel: Identifiable, Sendable, Hashable {
     /// Distinguishes provider-advertised metadata from the conservative text
     /// baseline used when a generic `/models` response contains only an ID.
     let capabilityEvidence: ProviderCapabilityEvidence
+    /// The execution lane selected for a task created now with this model.
+    let executionMode: RuntimeModelExecutionMode
+    /// A model-specific capability projection. `nil` means the model inherits
+    /// the provider session (the behavior of native Codex models).
+    let taskCapabilities: RuntimeCapabilities?
 
     init(
         id: String,
@@ -204,7 +224,9 @@ struct RuntimeModel: Identifiable, Sendable, Hashable {
         serverAdvertisedRequestParameters: Set<ProviderRequestParameter> = [],
         supportedRequestParameters: Set<ProviderRequestParameter> = [],
         serverAdvertisedCapabilities: [String] = [],
-        capabilityEvidence: ProviderCapabilityEvidence = .advertised
+        capabilityEvidence: ProviderCapabilityEvidence = .advertised,
+        executionMode: RuntimeModelExecutionMode = .inherited,
+        taskCapabilities: RuntimeCapabilities? = nil
     ) {
         self.id = id
         self.displayName = displayName
@@ -217,6 +239,8 @@ struct RuntimeModel: Identifiable, Sendable, Hashable {
         self.supportedRequestParameters = supportedRequestParameters
         self.serverAdvertisedCapabilities = serverAdvertisedCapabilities
         self.capabilityEvidence = capabilityEvidence
+        self.executionMode = executionMode
+        self.taskCapabilities = taskCapabilities
     }
 
     var serverAdvertisesToolUse: Bool {
@@ -254,12 +278,27 @@ struct RuntimeModel: Identifiable, Sendable, Hashable {
     /// a provider can advertise tools without implying that Onyx can execute
     /// or approve them.
     var pickerCapabilitySummary: String {
-        capabilityEvidence.pickerSummary(
+        let providerSummary = capabilityEvidence.pickerSummary(
             inputModalities: inputModalities,
             reasoningEfforts: reasoningEfforts,
             serverAdvertisedParameters: serverAdvertisedRequestParameters,
             serverAdvertisedCapabilities: serverAdvertisedCapabilities
         )
+        switch executionMode {
+        case .inherited, .chat:
+            return providerSummary
+        case .checkingAgent:
+            return providerSummary + " · Checking agent tools"
+        case .agent:
+            let unavailable = "Server tools · Onyx tools unavailable"
+            if providerSummary.contains(unavailable) {
+                return providerSummary.replacingOccurrences(
+                    of: unavailable,
+                    with: "Agent tools verified"
+                )
+            }
+            return providerSummary + " · Agent tools verified"
+        }
     }
 }
 
@@ -336,6 +375,9 @@ struct RuntimeThread: Identifiable, Sendable, Hashable {
     var runtime: AgentRuntimeKind
     var model: String?
     var branch: String?
+    /// A durable adaptive provider task keeps the capabilities of its creation
+    /// lane even if a later model probe changes the new-task default.
+    var taskCapabilities: RuntimeCapabilities? = nil
 }
 
 enum TimelineItemKind: String, Sendable, Codable {
@@ -503,10 +545,19 @@ struct RuntimeCollaborationAgent: Identifiable, Sendable, Hashable {
 struct RuntimeCollaborationAgentDestination: Sendable, Hashable {
     let connectionID: ProviderConnectionID
     let threadID: String
+    /// Adaptive providers can have two isolated task namespaces behind one
+    /// visible connection. A destination retains its lane so equal provider
+    /// thread strings can never navigate to the wrong backend.
+    let lane: OpenAICompatibleTaskLane?
 
-    init(connectionID: ProviderConnectionID, threadID: String) {
+    init(
+        connectionID: ProviderConnectionID,
+        threadID: String,
+        lane: OpenAICompatibleTaskLane? = nil
+    ) {
         self.connectionID = connectionID
         self.threadID = threadID
+        self.lane = lane
     }
 
     var navigableThreadID: String? {
@@ -632,6 +683,11 @@ struct TimelineItem: Identifiable, Sendable, Hashable {
 struct RuntimeConversation: Sendable, Equatable {
     var thread: RuntimeThread
     var items: [TimelineItem]
+    /// Complete provider-owned turn boundaries when the runtime can supply
+    /// them without a cursor API. Keeping these alongside the flat transcript
+    /// lets app-owned chat providers support safe history operations without
+    /// pretending they implement remote pagination.
+    var turns: [RuntimeConversationTurn] = []
 }
 
 /// Provider-neutral direction for cursor-based history APIs. A descending
@@ -925,6 +981,10 @@ enum AgentRuntimeEvent: Sendable, Equatable {
     /// rejects history pagination). The downgrade is monotonic for the life of
     /// that shared runtime and must reach every attached window.
     case runtimeCapabilitiesDowngraded(RuntimeCapabilities)
+    /// A provider can finish model-specific compatibility work after connect.
+    /// This replaces only model metadata and never changes an existing task's
+    /// durable execution lane.
+    case runtimeModelsUpdated([RuntimeModel])
     case accountUpdated(RuntimeAuthState)
     case loginCompleted(RuntimeLoginCompletion)
     case threadUpdated(RuntimeThread)

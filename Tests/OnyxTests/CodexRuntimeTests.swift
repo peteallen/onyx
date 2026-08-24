@@ -70,6 +70,7 @@ final class CodexRuntimeTests: XCTestCase {
 
         XCTAssertEqual(threadStart.params["sandbox"]?.stringValue, "danger-full-access")
         XCTAssertEqual(threadStart.params["approvalPolicy"]?.stringValue, "never")
+        XCTAssertNil(threadStart.params["modelProvider"])
         XCTAssertEqual(turnStart.params["effort"]?.stringValue, "high")
         XCTAssertEqual(turnStart.params["approvalPolicy"]?.stringValue, "on-request")
         XCTAssertEqual(turnStart.params["sandboxPolicy"]?["type"]?.stringValue, "workspaceWrite")
@@ -94,6 +95,59 @@ final class CodexRuntimeTests: XCTestCase {
                 .object(["type": .string("text"), "text": .string("Look here")]),
             ])
         )
+    }
+
+    func testBoundProviderScopesDiscoveryAndValidatesExplicitTaskOperations() async throws {
+        let providerID = "onyx-custom-provider"
+        let transport = ProviderBoundCodexTransport(returnedProviderID: providerID)
+        let runtime = CodexRuntime(
+            client: transport,
+            modelProviderID: providerID
+        )
+
+        let listed = try await runtime.listThreads()
+        _ = try await runtime.startThread(
+            StartThreadRequest(cwd: "/tmp/onyx", model: "custom-model")
+        )
+        _ = try await runtime.readThread(id: "custom-thread")
+        _ = try await runtime.resumeThread(id: "custom-thread")
+        _ = try await runtime.forkThread(id: "custom-thread")
+        _ = try await runtime.revertThread(id: "custom-thread", beforeTurnID: "turn-1")
+        try await runtime.startTurn(
+            StartTurnRequest(
+                threadID: "started-thread",
+                inputs: [.text("Continue")],
+                model: "custom-model"
+            )
+        )
+
+        let requests = await transport.recordedRequests()
+        let threadList = try XCTUnwrap(requests.first(where: { $0.method == "thread/list" }))
+        let threadStart = try XCTUnwrap(requests.first(where: { $0.method == "thread/start" }))
+        let turnStart = try XCTUnwrap(requests.first(where: { $0.method == "turn/start" }))
+        XCTAssertEqual(listed.map(\.id), ["custom-thread"])
+        XCTAssertEqual(
+            threadList.params["modelProviders"]?.arrayValue?.compactMap(\.stringValue),
+            [providerID]
+        )
+        XCTAssertEqual(threadStart.params["modelProvider"]?.stringValue, providerID)
+        XCTAssertNil(turnStart.params["modelProvider"])
+    }
+
+    func testBoundProviderRejectsThreadReturnedForAnotherProvider() async throws {
+        let runtime = CodexRuntime(
+            client: ProviderBoundCodexTransport(returnedProviderID: "another-provider"),
+            modelProviderID: "expected-provider"
+        )
+
+        do {
+            _ = try await runtime.startThread(
+                StartThreadRequest(cwd: "/tmp/onyx", model: "custom-model")
+            )
+            XCTFail("A custom runtime must reject a task owned by another provider")
+        } catch let AgentRuntimeError.protocolFailure(message) {
+            XCTAssertTrue(message.contains("did not confirm the custom-provider task"))
+        }
     }
 
     func testInlineUncommittedReviewUsesStablePayloadAndCanBeInterrupted() async throws {
@@ -130,6 +184,75 @@ final class CodexRuntimeTests: XCTestCase {
         XCTAssertEqual(session.availableModels.first?.reasoningEfforts, ["low", "high"])
         XCTAssertTrue(session.capabilities.contains(.threadHistoryPagination))
         XCTAssertTrue(session.capabilities.contains(.threadHistoryRevert))
+    }
+
+    func testCompletedTurnPublishesFailureRowBeforeCompletionWithoutDuplicateNotice() async throws {
+        let transport = RecordingCodexTransport()
+        let runtime = CodexRuntime(client: transport)
+        let recordedEvents = Task {
+            try await collectEventsThroughTurnCompletion(
+                from: runtime.events,
+                threadID: "failed-thread"
+            )
+        }
+
+        _ = try await runtime.connect()
+        await transport.emitNotification(
+            method: "turn/started",
+            params: .object([
+                "threadId": .string("failed-thread"),
+                "turn": .object(["id": .string("failed-turn")]),
+            ])
+        )
+        await transport.emitNotification(
+            method: "error",
+            params: .object([
+                "threadId": .string("failed-thread"),
+                "turnId": .string("failed-turn"),
+                "willRetry": .bool(false),
+                "error": .object([
+                    "message": .string("The provider stopped before returning an answer."),
+                ]),
+            ])
+        )
+        await transport.emitNotification(
+            method: "turn/completed",
+            params: .object([
+                "threadId": .string("failed-thread"),
+                "turn": .object([
+                    "id": .string("failed-turn"),
+                    "status": .string("failed"),
+                    "error": .object([
+                        "message": .string("The provider stopped before returning an answer."),
+                    ]),
+                ]),
+            ])
+        )
+
+        let events = try await recordedEvents.value
+        let failures = events.compactMap { event -> TimelineItem? in
+            guard case let .itemCompleted(threadID, item) = event,
+                  threadID == "failed-thread",
+                  item.kind == .error else { return nil }
+            return item
+        }
+        XCTAssertEqual(failures.count, 1)
+        XCTAssertEqual(failures.first?.id, "codex-turn-error:failed-turn")
+        XCTAssertEqual(failures.first?.body, "The provider stopped before returning an answer.")
+        XCTAssertFalse(events.contains { event in
+            if case .runtimeNotice = event { return true }
+            return false
+        })
+        let failureIndex = try XCTUnwrap(events.firstIndex { event in
+            guard case let .itemCompleted(threadID, item) = event else { return false }
+            return threadID == "failed-thread" && item.kind == .error
+        })
+        let completionIndex = try XCTUnwrap(events.firstIndex { event in
+            guard case let .turnCompleted(threadID, status) = event else { return false }
+            return threadID == "failed-thread" && status == .failed
+        })
+        XCTAssertLessThan(failureIndex, completionIndex)
+        await runtime.disconnect()
     }
 
     func testBoundedResumeMapsInitialTurnsPageAndPresentsTranscriptChronologically() async throws {
@@ -289,6 +412,74 @@ final class CodexRuntimeTests: XCTestCase {
         XCTAssertEqual(requests.map { $0.params["limit"]?.intValue }, [100, 100, 100])
         XCTAssertEqual(requests.map { $0.params["cursor"]?.stringValue }, [nil, "page-2", "page-3"])
         XCTAssertEqual(requests.map { $0.params["archived"]?.boolValue }, [false, false, false])
+        XCTAssertTrue(requests.allSatisfy { $0.params["modelProviders"] == nil })
+    }
+}
+
+private actor ProviderBoundCodexTransport: CodexAppServerTransport {
+    struct Request: Sendable {
+        let method: String
+        let params: JSONValue
+    }
+
+    nonisolated let events: AsyncStream<AppServerEvent>
+    private let returnedProviderID: String
+    private var requests: [Request] = []
+
+    init(returnedProviderID: String) {
+        self.returnedProviderID = returnedProviderID
+        events = AsyncStream { continuation in continuation.finish() }
+    }
+
+    func start() async throws -> AppServerConnection {
+        AppServerConnection(generation: 1, initializeResponse: .object([:]))
+    }
+
+    func stop() async {}
+
+    func request(method: String, params: JSONValue) async throws -> JSONValue {
+        requests.append(Request(method: method, params: params))
+        switch method {
+        case "thread/list":
+            return .object([
+                "data": .array([thread(id: "custom-thread")]),
+            ])
+        case "thread/start":
+            return .object(["thread": thread(id: "started-thread")])
+        case "thread/read", "thread/resume":
+            return .object([
+                "thread": thread(id: params["threadId"]?.stringValue ?? "custom-thread"),
+            ])
+        case "thread/fork":
+            return .object(["thread": thread(id: "forked-thread")])
+        case "thread/revert":
+            return .object([
+                "thread": thread(id: params["threadId"]?.stringValue ?? "custom-thread"),
+            ])
+        case "turn/start":
+            return .object([
+                "turn": .object([
+                    "id": .string("started-turn"),
+                    "status": .string("inProgress"),
+                    "items": .array([]),
+                ]),
+            ])
+        default:
+            return .object([:])
+        }
+    }
+
+    func respond(id _: RuntimeRequestID, result _: JSONValue) async throws {}
+
+    func recordedRequests() -> [Request] { requests }
+
+    private func thread(id: String) -> JSONValue {
+        .object([
+            "id": .string(id),
+            "preview": .string("Custom provider task"),
+            "modelProvider": .string(returnedProviderID),
+            "turns": .array([]),
+        ])
     }
 }
 
@@ -357,14 +548,15 @@ private actor RecordingCodexTransport: CodexAppServerTransport {
     }
 
     nonisolated let events: AsyncStream<AppServerEvent>
+    private let eventContinuation: AsyncStream<AppServerEvent>.Continuation
     private var requests: [Request] = []
     private let revertFailureCode: Int?
 
     init(revertFailureCode: Int? = nil) {
         self.revertFailureCode = revertFailureCode
-        events = AsyncStream { continuation in
-            continuation.finish()
-        }
+        let stream = AsyncStream.makeStream(of: AppServerEvent.self)
+        events = stream.stream
+        eventContinuation = stream.continuation
     }
 
     func start() async throws -> AppServerConnection {
@@ -544,7 +736,50 @@ private actor RecordingCodexTransport: CodexAppServerTransport {
 
     func respond(id _: RuntimeRequestID, result _: JSONValue) async throws {}
 
+    func emitNotification(method: String, params: JSONValue) {
+        eventContinuation.yield(
+            .notification(
+                generation: 1,
+                AppServerNotification(method: method, params: params)
+            )
+        )
+    }
+
     func recordedRequests() -> [Request] {
         requests
+    }
+}
+
+private enum CodexRuntimeTestFailure: Error {
+    case eventStreamEnded
+    case timedOutWaitingForTurnCompletion
+}
+
+private func collectEventsThroughTurnCompletion(
+    from stream: AsyncStream<AgentRuntimeEvent>,
+    threadID: String
+) async throws -> [AgentRuntimeEvent] {
+    try await withThrowingTaskGroup(of: [AgentRuntimeEvent].self) { group in
+        group.addTask {
+            var events: [AgentRuntimeEvent] = []
+            for await event in stream {
+                events.append(event)
+                if case let .turnCompleted(completedThreadID, _) = event,
+                   completedThreadID == threadID {
+                    return events
+                }
+            }
+            throw CodexRuntimeTestFailure.eventStreamEnded
+        }
+        group.addTask {
+            try await Task.sleep(for: .seconds(2))
+            throw CodexRuntimeTestFailure.timedOutWaitingForTurnCompletion
+        }
+
+        guard let events = try await group.next() else {
+            throw CodexRuntimeTestFailure.eventStreamEnded
+        }
+        group.cancelAll()
+        return events
     }
 }

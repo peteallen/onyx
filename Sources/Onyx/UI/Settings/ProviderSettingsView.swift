@@ -29,7 +29,7 @@ struct ProviderSettingsView: View {
             model.updateDraftDiscoveryScope()
         }
         .onChange(of: model.draft.bearerToken) { _, _ in
-            model.updateDraftDiscoveryScope()
+            model.updateDraftBearerToken()
         }
         .onChange(of: model.draft.removeStoredCredential) { _, _ in
             model.updateDraftDiscoveryScope()

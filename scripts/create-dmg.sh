@@ -231,6 +231,7 @@ verification_arguments=(
   --bundle-id "$bundle_identifier"
   --version "$short_version"
   --build-number "$build_number"
+  --probe-runtime
 )
 app_architectures="$(/usr/bin/lipo -archs \
   "$app_path/Contents/MacOS/$(/usr/bin/plutil -extract CFBundleExecutable raw -o - "$info_plist")")"

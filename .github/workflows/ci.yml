@@ -28,6 +28,10 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Verify release automation contract
+        shell: zsh -euo pipefail {0}
+        run: scripts/check-release-automation.sh
+
       - name: Select compatible Xcode
         shell: zsh -euo pipefail {0}
         run: |
@@ -80,7 +84,12 @@ jobs:
           version="$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - support/Info.plist)"
           release_dir="$RUNNER_TEMP/onyx-ci-release"
           scripts/release.sh "$version" "$release_dir" \
-            --build-number "$GITHUB_RUN_NUMBER"
+            --build-number "$GITHUB_RUN_NUMBER" \
+            --display-name Onyx \
+            --bundle-id app.onyx.agent \
+            --architectures universal \
+            --signing-identity - \
+            --no-notarize
           (
             cd "$release_dir"
             /usr/bin/shasum -a 256 -c "Onyx-$version-macOS.dmg.sha256"

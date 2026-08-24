@@ -270,7 +270,7 @@ final class CodexAuthRuntimeTests: XCTestCase {
                         mode: .chatgpt,
                         email: nil,
                         planLabel: "team",
-                        requiresAuthentication: false
+                        requiresAuthentication: true
                     )
                 ),
                 .loginCompleted(
@@ -278,6 +278,63 @@ final class CodexAuthRuntimeTests: XCTestCase {
                         loginID: "browser-login",
                         success: false,
                         error: "The browser flow was canceled"
+                    )
+                ),
+            ]
+        )
+    }
+
+    func testAccountNotificationsPreserveNoAuthProviderContractFromAccountRead() async throws {
+        let transport = AuthCodexTransport(
+            accountResponse: .object([
+                "account": .null,
+                "requiresOpenaiAuth": .bool(false),
+            ])
+        )
+        let runtime = CodexRuntime(client: transport)
+
+        let observedEvents = try await withThrowingTaskGroup(of: [AgentRuntimeEvent].self) { group in
+            group.addTask {
+                var events: [AgentRuntimeEvent] = []
+                for await event in runtime.events {
+                    events.append(event)
+                    if events.count == 3 { return events }
+                }
+                return events
+            }
+            group.addTask {
+                try await Task.sleep(for: .seconds(2))
+                throw AuthCodexTransport.TestFailure.timedOutWaitingForEvents
+            }
+
+            _ = try await runtime.connect()
+            await transport.emitNotification(
+                method: "account/updated",
+                params: .object([
+                    "authMode": .null,
+                    "planType": .null,
+                ])
+            )
+
+            guard let firstResult = try await group.next() else {
+                throw AuthCodexTransport.TestFailure.eventStreamEnded
+            }
+            group.cancelAll()
+            return firstResult
+        }
+        await runtime.disconnect()
+
+        XCTAssertEqual(
+            observedEvents,
+            [
+                .connectionChanged(.connecting),
+                .connectionChanged(.connected("Codex")),
+                .accountUpdated(
+                    RuntimeAuthState(
+                        mode: nil,
+                        email: nil,
+                        planLabel: nil,
+                        requiresAuthentication: false
                     )
                 ),
             ]

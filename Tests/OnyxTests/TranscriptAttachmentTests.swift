@@ -252,10 +252,155 @@ final class TranscriptAttachmentTests: XCTestCase {
         cell.layout()
 
         XCTAssertFalse(cell.editControl.isHidden)
+        XCTAssertGreaterThan(
+            cell.editControl.alphaValue,
+            0,
+            "The edit action must be quietly discoverable without guessing where to hover"
+        )
         XCTAssertEqual(cell.editControl.frame.size, NSSize(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact))
         XCTAssertEqual(cell.editControl.accessibilityLabel(), "Edit last message")
         cell.editControl.performClick(nil)
         XCTAssertEqual(editCount, 1)
+    }
+
+    @MainActor
+    func testFailedMessageRetryControlIsVisibleAndInvokesHandler() {
+        let message = TimelineItem(
+            id: "failed-response",
+            kind: .error,
+            title: "Provider response failed",
+            body: "Please try this again",
+            status: .failed,
+            timestamp: .now,
+            detail: nil
+        )
+        let height = TranscriptCellView.height(
+            for: message,
+            width: 720,
+            isExpanded: true,
+            isRetryable: true
+        )
+        let cell = TranscriptCellView(frame: NSRect(x: 0, y: 0, width: 720, height: height))
+        var retryCount = 0
+        cell.configure(
+            with: message,
+            isExpanded: true,
+            isRetryable: true,
+            onRetry: { retryCount += 1 }
+        )
+        cell.layout()
+
+        XCTAssertFalse(cell.retryControl.isHidden)
+        XCTAssertEqual(cell.retryControl.frame.height, OnyxHitTarget.compact)
+        XCTAssertFalse(cell.retryControl.frame.intersects(cell.editControl.frame))
+        XCTAssertFalse(cell.retryControl.frame.intersects(cell.titleFrame))
+        XCTAssertFalse(cell.retryControl.frame.intersects(cell.bodyFrame))
+        XCTAssertFalse(cell.retryControl.frame.intersects(cell.statusFrame))
+        XCTAssertEqual(cell.retryControl.accessibilityLabel(), "Retry failed response")
+        cell.retryControl.performClick(nil)
+        XCTAssertEqual(retryCount, 1)
+    }
+
+    @MainActor
+    func testFailedResponseRetryControlFitsNarrowTranscript() {
+        let failure = TimelineItem(
+            id: "failed-response",
+            kind: .error,
+            title: "Provider response failed",
+            body: "The provider completed without returning an answer.",
+            status: .failed,
+            timestamp: .now,
+            detail: nil
+        )
+        let width: CGFloat = 180
+        let height = TranscriptCellView.height(
+            for: failure,
+            width: width,
+            isExpanded: true,
+            isRetryable: true
+        )
+        let cell = TranscriptCellView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        cell.configure(
+            with: failure,
+            isExpanded: true,
+            isEditable: false,
+            isRetryable: true,
+            onRetry: {}
+        )
+        cell.layout()
+
+        XCTAssertGreaterThanOrEqual(cell.retryControl.frame.minX, 0)
+        XCTAssertLessThanOrEqual(cell.retryControl.frame.maxX, width)
+        XCTAssertFalse(cell.retryControl.frame.intersects(cell.titleFrame))
+        XCTAssertFalse(cell.retryControl.frame.intersects(cell.bodyFrame))
+        XCTAssertFalse(cell.retryControl.frame.intersects(cell.statusFrame))
+    }
+
+    @MainActor
+    func testPartialFailedAssistantKeepsRetryBesideRatherThanOverItsAnswer() {
+        let partial = TimelineItem(
+            id: "partial-response",
+            kind: .assistantMessage,
+            title: nil,
+            body: "This is a partial answer that remains readable after the provider limit.",
+            status: .failed,
+            timestamp: .now,
+            detail: "The answer may be incomplete."
+        )
+        let width: CGFloat = 360
+        let height = TranscriptCellView.height(
+            for: partial,
+            width: width,
+            isExpanded: true,
+            isRetryable: true
+        )
+        let cell = TranscriptCellView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        cell.configure(
+            with: partial,
+            isExpanded: true,
+            isRetryable: true,
+            onRetry: {}
+        )
+        cell.layout()
+
+        XCTAssertFalse(cell.retryControl.frame.intersects(cell.bodyFrame))
+        XCTAssertLessThanOrEqual(cell.retryControl.frame.maxX, width)
+    }
+
+    @MainActor
+    func testRetryBecomingAvailableRelayoutsAnAlreadyMountedFailure() {
+        let failure = TimelineItem(
+            id: "late-retry",
+            kind: .assistantMessage,
+            title: nil,
+            body: "Partial response",
+            status: .failed,
+            timestamp: .now,
+            detail: nil
+        )
+        let width: CGFloat = 320
+        let height = TranscriptCellView.height(for: failure, width: width, isExpanded: true)
+        let cell = TranscriptCellView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        cell.configure(with: failure, isExpanded: true)
+        cell.layout()
+        XCTAssertTrue(cell.retryControl.isHidden)
+
+        cell.updateEditAction(
+            isEditable: false,
+            isRetryable: true,
+            onEdit: nil,
+            onRetry: {}
+        )
+        cell.frame.size.height = TranscriptCellView.height(
+            for: failure,
+            width: width,
+            isExpanded: true,
+            isRetryable: true
+        )
+        cell.layout()
+
+        XCTAssertFalse(cell.retryControl.isHidden)
+        XCTAssertFalse(cell.retryControl.frame.intersects(cell.bodyFrame))
     }
 
     @MainActor

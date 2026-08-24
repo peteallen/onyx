@@ -10,6 +10,7 @@ bundle_identifier="${ONYX_BUNDLE_IDENTIFIER:-app.onyx.agent}"
 volume_name=""
 signing_identity="${ONYX_CODESIGN_IDENTITY:-}"
 architectures="${ONYX_ARCHITECTURES:-universal}"
+notarize_mode="${ONYX_NOTARIZE:-0}"
 overwrite=0
 
 usage() {
@@ -25,6 +26,8 @@ Options:
   --bundle-id IDENTIFIER         Application bundle identifier.
   --volume-name NAME             Mounted DMG volume name. Defaults to "Onyx VERSION".
   --signing-identity IDENTITY    Developer ID Application identity.
+  --notarize                     Require DMG notarization (uses configured credentials).
+  --no-notarize                  Disable notarization, even when ONYX_NOTARIZE is set.
   --architectures MODE           universal (default) or native.
   --overwrite                    Replace matching existing release artifacts.
   -h, --help                     Show this help.
@@ -79,6 +82,14 @@ while (( $# > 0 )); do
       signing_identity="$2"
       shift 2
       ;;
+    --notarize)
+      notarize_mode=1
+      shift
+      ;;
+    --no-notarize)
+      notarize_mode=0
+      shift
+      ;;
     --architectures)
       require_value "$1" "${2:-}"
       architectures="$2"
@@ -121,6 +132,17 @@ fi
   die "build number must contain one to three numeric components"
 [[ "$architectures" == "native" || "$architectures" == "universal" ]] || \
   die "architectures must be native or universal"
+case "$notarize_mode" in
+  1|true)
+    notarize_mode=1
+    ;;
+  0|false)
+    notarize_mode=0
+    ;;
+  *)
+    die "ONYX_NOTARIZE must be 0, 1, false, or true"
+    ;;
+esac
 [[ -n "$volume_name" ]] || volume_name="$display_name $version"
 
 [[ "$output_dir" == /* ]] || output_dir="$PWD/$output_dir"
@@ -200,7 +222,8 @@ dmg_arguments=(
 if [[ -n "$signing_identity" ]]; then
   dmg_arguments+=(--signing-identity "$signing_identity")
 fi
-"$repo_root/scripts/create-dmg.sh" "${dmg_arguments[@]}"
+ONYX_NOTARIZE="$notarize_mode" \
+  "$repo_root/scripts/create-dmg.sh" "${dmg_arguments[@]}"
 
 (
   cd "$staged_artifact_dir"
@@ -215,7 +238,7 @@ verification_arguments=(
   --version "$version"
   --build-number "$build_number"
 )
-if [[ "${ONYX_NOTARIZE:-0}" == "1" || "${ONYX_NOTARIZE:-0}" == "true" ]]; then
+if (( notarize_mode == 1 )); then
   verification_arguments+=(--require-notarized)
 fi
 if [[ "$architectures" == "universal" ]]; then

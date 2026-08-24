@@ -793,6 +793,174 @@ final class TranscriptLayoutPerformanceTests: XCTestCase {
         RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
     }
 
+    @MainActor
+    func testHostedRetryabilityChangeReloadsRowHeightWithoutTranscriptRevisionChange() throws {
+        let responseBody = String(
+            repeating: "The provider response remains readable while the recovery action is available. ",
+            count: 14
+        )
+        let failedResponse = TimelineItem(
+            id: "retry-layout-response",
+            kind: .assistantMessage,
+            title: nil,
+            body: responseBody,
+            status: .failed,
+            timestamp: .now,
+            detail: "The provider did not finish this response."
+        )
+        let fixture = TranscriptLayoutMutationFixture()
+        fixture.snapshot = TranscriptPresentationSnapshot(
+            items: [
+                TimelineItem(
+                    id: "retry-layout-user",
+                    kind: .userMessage,
+                    title: nil,
+                    body: "Build the page.",
+                    status: .completed,
+                    timestamp: .now,
+                    detail: nil
+                ),
+                failedResponse,
+            ],
+            revision: 17
+        )
+        let host = TranscriptHostedFixture(fixture: fixture)
+        defer { host.close() }
+
+        host.layout()
+        let collectionView = try host.collectionView()
+        _ = try host.mountedView(at: 1)
+        let responsePath = IndexPath(item: 1, section: 0)
+        let initialAttributes = try XCTUnwrap(
+            collectionView.layoutAttributesForItem(at: responsePath)
+        )
+        let normalHeight = TranscriptCellView.height(
+            for: failedResponse,
+            width: initialAttributes.frame.width,
+            isExpanded: true,
+            isRetryable: false
+        )
+        XCTAssertEqual(initialAttributes.frame.height, normalHeight, accuracy: 1)
+
+        // This is intentionally a presentation-only transition: the items and
+        // transcript revision stay byte-for-byte identical. A cell update or
+        // needsLayout flag alone is not enough because the flow layout retains
+        // its previous delegate-provided row height.
+        fixture.retryableFailedResponseItemID = failedResponse.id
+        host.layout()
+
+        let retryAttributes = try XCTUnwrap(
+            collectionView.layoutAttributesForItem(at: responsePath)
+        )
+        let retryHeight = TranscriptCellView.height(
+            for: failedResponse,
+            width: retryAttributes.frame.width,
+            isExpanded: true,
+            isRetryable: true
+        )
+        XCTAssertGreaterThan(
+            retryHeight,
+            normalHeight,
+            "Reserving the Retry action should increase this wrapped failure row"
+        )
+        XCTAssertEqual(retryAttributes.frame.height, retryHeight, accuracy: 1)
+
+        let cell = try XCTUnwrap(
+            collectionView.item(at: responsePath)?.view as? TranscriptCellView
+        )
+        XCTAssertEqual(cell.frame.height, retryHeight, accuracy: 1)
+        XCTAssertFalse(cell.retryControl.isHidden)
+        XCTAssertFalse(cell.retryControl.frame.intersects(cell.bodyFrame))
+    }
+
+    @MainActor
+    func testHostedAppendCanClearRetryWithoutRetainingFailedRowHeight() throws {
+        let responseBody = String(
+            repeating: "The failed response should widen again when a follow-up starts. ",
+            count: 15
+        )
+        let failedResponse = TimelineItem(
+            id: "retry-clear-response",
+            kind: .assistantMessage,
+            title: nil,
+            body: responseBody,
+            status: .failed,
+            timestamp: .now,
+            detail: "The provider did not finish this response."
+        )
+        let fixture = TranscriptLayoutMutationFixture()
+        fixture.snapshot = TranscriptPresentationSnapshot(
+            items: [
+                TimelineItem(
+                    id: "retry-clear-user",
+                    kind: .userMessage,
+                    title: nil,
+                    body: "Build the page.",
+                    status: .completed,
+                    timestamp: .now,
+                    detail: nil
+                ),
+                failedResponse,
+            ],
+            revision: 23
+        )
+        fixture.retryableFailedResponseItemID = failedResponse.id
+        let host = TranscriptHostedFixture(fixture: fixture)
+        defer { host.close() }
+
+        host.layout()
+        let collectionView = try host.collectionView()
+        _ = try host.mountedView(at: 1)
+        let responsePath = IndexPath(item: 1, section: 0)
+        let retryAttributes = try XCTUnwrap(
+            collectionView.layoutAttributesForItem(at: responsePath)
+        )
+        let retryHeight = TranscriptCellView.height(
+            for: failedResponse,
+            width: retryAttributes.frame.width,
+            isExpanded: true,
+            isRetryable: true
+        )
+        XCTAssertEqual(retryAttributes.frame.height, retryHeight, accuracy: 1)
+
+        // A normal send publishes both changes together: Retry eligibility
+        // clears while an optimistic user row is appended. The old failure is
+        // outside that append suffix, but its presentation width still changed.
+        fixture.retryableFailedResponseItemID = nil
+        var appended = fixture.snapshot
+        appended.append(
+            TimelineItem(
+                id: "retry-clear-follow-up",
+                kind: .userMessage,
+                title: nil,
+                body: "Try a smaller version.",
+                status: .completed,
+                timestamp: .now,
+                detail: nil
+            )
+        )
+        fixture.snapshot = appended
+        host.layout()
+
+        XCTAssertEqual(collectionView.numberOfItems(inSection: 0), 3)
+        let normalAttributes = try XCTUnwrap(
+            collectionView.layoutAttributesForItem(at: responsePath)
+        )
+        let normalHeight = TranscriptCellView.height(
+            for: failedResponse,
+            width: normalAttributes.frame.width,
+            isExpanded: true,
+            isRetryable: false
+        )
+        XCTAssertLessThan(normalHeight, retryHeight)
+        XCTAssertEqual(normalAttributes.frame.height, normalHeight, accuracy: 1)
+        let cell = try XCTUnwrap(
+            collectionView.item(at: responsePath)?.view as? TranscriptCellView
+        )
+        XCTAssertEqual(cell.frame.height, normalHeight, accuracy: 1)
+        XCTAssertTrue(cell.retryControl.isHidden)
+    }
+
     func testFlowMetricsAlwaysLeaveStrictLayoutWidth() {
         for collectionWidth: CGFloat in [0, 0.5, 1, 2, 48, 320, 520, 720, 900, 1_200] {
             let metrics = TranscriptFlowMetrics(collectionWidth: collectionWidth)
@@ -1407,6 +1575,7 @@ final class TranscriptLayoutPerformanceTests: XCTestCase {
 @MainActor
 private final class TranscriptLayoutMutationFixture: ObservableObject {
     @Published var isAwaitingResponse = false
+    @Published var retryableFailedResponseItemID: String?
     @Published var snapshot = TranscriptPresentationSnapshot(
         items: [
             TimelineItem(
@@ -1604,7 +1773,8 @@ private struct TranscriptLayoutMutationHarness: View {
             items: fixture.snapshot.items,
             isAwaitingResponse: fixture.isAwaitingResponse,
             revision: fixture.snapshot.revision,
-            changeHint: fixture.snapshot.changeHint
+            changeHint: fixture.snapshot.changeHint,
+            retryableFailedResponseItemID: fixture.retryableFailedResponseItemID
         )
     }
 }

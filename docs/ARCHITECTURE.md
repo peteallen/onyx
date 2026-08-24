@@ -18,20 +18,27 @@ Native SwiftUI/AppKit presentation
  CodexRuntime        OpenAICompatibleRuntime
       |                       |
 codex app-server       /models + /chat/completions
- (stdio JSONL)              (HTTP/SSE)
+ (stdio JSONL)              (HTTP/SSE fallback)
+      :
+planned Onyx loopback Responses proxy
+      :
+compatible custom provider
 ```
 
 The registry resolves the default Codex connection. The composition host also
 resolves each app-owned OpenAI-compatible connection and keeps its runtime,
 tasks, drafts, and model identity provider-scoped.
 
-The OpenAI-compatible path includes a URL-validated, redirect-protected HTTP/SSE
-transport, Keychain-backed bearer lookup, `/models` discovery, capability
-negotiation, a provider-owned conversation store, and production model
-selection. Remote endpoints do not provide Codex's local tools, approvals,
-sandbox, or durable task lifecycle, so those controls are advertised as
-unavailable. Claude/Anthropic remains descriptor-only. See
-`PROVIDER_EXTENSIBILITY.md` for the exact boundary.
+The implemented OpenAI-compatible path includes a URL-validated,
+redirect-protected HTTP/SSE transport, Keychain-backed bearer lookup, `/models`
+discovery, capability negotiation, a provider-owned conversation store, and
+production model selection. It is currently the chat fallback and does not
+advertise local tools. The next production path routes endpoints that pass a
+bounded Responses/tool compatibility probe through the pinned app-server as a
+thread-scoped custom model provider. An Onyx-owned loopback proxy injects the
+Keychain credential upstream so neither app-server configuration nor its
+environment contains the third-party secret. Claude/Anthropic remains
+descriptor-only. See `PROVIDER_EXTENSIBILITY.md` for the exact boundary.
 
 In the current implementation, the application owns:
 
@@ -125,7 +132,9 @@ read-only execution policy and `never` approval policy. The current path sends
 only a self-contained text prompt; it does not grant the remote child Codex
 tools or local file access. Successful output is bounded and returned once as
 structured text containing the job, provider connection, model, reasoning
-effort, child conversation, and result metadata.
+effort, child conversation, and result metadata. A terminal turn with no
+non-whitespace assistant answer fails closed: the app-created child is removed
+and Codex receives a bounded failure without child-navigation metadata.
 
 Codex still records the exchange as a dynamic-tool item, but projection renders
 `onyx_delegate` as quiet collaboration activity instead of a generic noisy tool
@@ -135,8 +144,9 @@ Codex task remains in its project. Calls are bounded by global concurrency,
 duplicate call IDs are rejected, and parent interruption or runtime teardown
 cancels queued or active work.
 
-Focused protocol, broker, production-composition, projection, and navigation
-fixtures cover this path. On 2026-08-23, the opt-in live Qwen/vLLM broker test
+Focused protocol, executor, broker, production-composition, projection, and
+navigation fixtures cover this path, including answerless terminal cleanup and
+its bounded broker failure. On 2026-08-23, the opt-in live Qwen/vLLM broker test
 completed a real `medium` request, returned the bounded structured result, and
 verified that the provider-scoped child was durably persisted. The installed
 app-server also accepted the advertised dynamic tool and delivered one real

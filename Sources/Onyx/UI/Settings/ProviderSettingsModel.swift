@@ -439,13 +439,19 @@ final class ProviderSettingsModel: ObservableObject {
     let credentialStore: any CredentialStore
     let discovery: any ProviderModelDiscovery
 
-    /// The application host uses this boundary to evict any live runtime that
-    /// was created from the previous connection record. Keeping the callback
-    /// here also makes save/delete semantics testable without coupling this
-    /// settings model to workspace composition.
+    /// The host retires the old shared runtime before endpoint or credential
+    /// state changes, then evicts its tombstone after the mutation finishes.
+    /// The two-phase boundary prevents another window from creating or using a
+    /// replacement runtime against a half-mutated provider configuration.
+    var onConnectionWillMutate: (@MainActor (ProviderConnectionID) async -> Void)?
     var onConnectionMutation: (@MainActor (ProviderConnectionID) -> Void)?
 
     private var hasStarted = false
+    /// Held across every suspension point in save/delete. Main-actor
+    /// isolation alone does not serialize async methods because another
+    /// mutation can enter while the first one awaits runtime retirement or a
+    /// store operation.
+    private var isConnectionMutationInFlight = false
     private var draftRevision: UInt64 = 0
     private var catalogScope: ProviderDraftDiscoveryScope?
 
@@ -463,6 +469,7 @@ final class ProviderSettingsModel: ObservableObject {
     func start() async {
         guard !hasStarted else { return }
         hasStarted = true
+        await reconcileCredentialSlots()
         await reload()
     }
 
@@ -513,6 +520,16 @@ final class ProviderSettingsModel: ObservableObject {
         errorMessage = nil
     }
 
+    /// Entering a replacement token is an explicit alternative to Remove Key.
+    /// Clear the stale removal flag immediately so the form copy and the save
+    /// operation cannot disagree about which credential action will occur.
+    func updateDraftBearerToken() {
+        if !draft.bearerToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            draft.removeStoredCredential = false
+        }
+        updateDraftDiscoveryScope()
+    }
+
     func beginEdit(_ id: ProviderConnectionID) {
         guard let connection = connections.first(where: { $0.id == id }) else { return }
         draftRevision &+= 1
@@ -534,9 +551,13 @@ final class ProviderSettingsModel: ObservableObject {
     /// is selected. The durable JSON record never contains the token.
     @discardableResult
     func saveDraft() async -> Bool {
-        guard !isSaving, !isDiscovering else { return false }
+        guard !isConnectionMutationInFlight, !isSaving, !isDiscovering else { return false }
+        isConnectionMutationInFlight = true
         isSaving = true
-        defer { isSaving = false }
+        defer {
+            isSaving = false
+            isConnectionMutationInFlight = false
+        }
 
         let existing = connections.first(where: { $0.id == draft.id })
         let preflightRecord: ProviderConnectionRecord
@@ -547,9 +568,19 @@ final class ProviderSettingsModel: ObservableObject {
             return false
         }
 
-        let shouldAutomaticallyDiscover = existing == nil
-            || catalogScope != ProviderDraftDiscoveryScope(draft)
-            || preflightRecord.discovery.discoveredModelIDs.isEmpty
+        // A bearer connection without a Keychain value is an intentional
+        // signed-out state. Do not probe the endpoint while saving that state
+        // (and, in particular, never reuse a key the user just marked for
+        // removal). The runtime can still reopen the connection and present
+        // its explicit authentication-required state.
+        let typedToken = draft.bearerToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        let canDiscoverDraft = draft.authMode == .none
+            || !typedToken.isEmpty
+            || (draft.hasStoredCredential && !draft.removeStoredCredential)
+        let shouldAutomaticallyDiscover = canDiscoverDraft
+            && (existing == nil
+                || catalogScope != ProviderDraftDiscoveryScope(draft)
+                || preflightRecord.discovery.discoveredModelIDs.isEmpty)
         let draftDiscoveryScopeChanged = catalogScope != ProviderDraftDiscoveryScope(draft)
         var automaticDiscoveryFailed = false
         var automaticallyDiscoveredCount: Int?
@@ -571,52 +602,95 @@ final class ProviderSettingsModel: ObservableObject {
             return false
         }
 
+        await onConnectionWillMutate?(record.id)
+        defer { onConnectionMutation?(record.id) }
+
         do {
-            let previousCredential = try await credentialStore.credential(
-                for: record.credentialKey
-            )
+            let previousCredential: ProviderBearerCredential?
+            if let existing {
+                previousCredential = try await credentialStore.credential(
+                    for: existing.credentialKey
+                )
+            } else {
+                previousCredential = nil
+            }
             let endpointOrAuthChanged = existing.map {
                 $0.baseURL != record.baseURL
                     || $0.authMode != record.authMode
                     || $0.transportSecurity != record.transportSecurity
             } ?? false
-            let credentialChanged: Bool
-            if record.authMode == .bearer {
-                let typedToken = draft.bearerToken.trimmingCharacters(
-                    in: .whitespacesAndNewlines
-                )
-                let typedCredential = typedToken.isEmpty
-                    ? nil
-                    : try ProviderBearerCredential(typedToken)
-                credentialChanged = typedCredential.map { $0 != previousCredential } ?? false
+            // Compare the credential that will exist after this save, rather
+            // than only comparing a newly typed token. This catches the
+            // old-key -> no-key transition when Remove Key is selected and
+            // rotates the conversation scope before the old transcript can be
+            // reused against a signed-out/provider identity.
+            let effectiveCredential: ProviderBearerCredential?
+            if record.authMode != .bearer {
+                effectiveCredential = nil
+            } else if !typedToken.isEmpty {
+                // A typed replacement is an explicit keep/replace action,
+                // even if a stale draft flag still says Remove Key.
+                effectiveCredential = try ProviderBearerCredential(typedToken)
+            } else if draft.removeStoredCredential {
+                effectiveCredential = nil
             } else {
-                credentialChanged = previousCredential != nil
+                effectiveCredential = previousCredential
             }
+            let credentialChanged = effectiveCredential != previousCredential
             let shouldRotateConversationScope = existing != nil
                 && (endpointOrAuthChanged || credentialChanged)
-            try await updateCredential(for: record, existing: existing)
+            // A credential slot is immutable for the duration of a commit.
+            // Reuse it only when the exact credential survives unchanged;
+            // otherwise write a fresh slot before touching the JSON pointer.
+            let keepExistingSlot = effectiveCredential != nil
+                && effectiveCredential == previousCredential
+                && existing?.credentialSlotID != nil
+            let committedSlotID: String? = effectiveCredential == nil
+                ? nil
+                : keepExistingSlot
+                    ? existing?.credentialSlotID
+                    : ProviderConnectionRecord.makeCredentialSlotID()
+            var committedRecord = record
+            committedRecord.credentialSlotID = committedSlotID
+            let oldCredentialKey = existing?.credentialKey
+            let newCredentialKey = committedRecord.credentialSlotID.map {
+                ProviderCredentialKey.slot(connectionID: committedRecord.id, slotID: $0)
+            }
+            let wroteNewCredential = effectiveCredential != nil
+                && newCredentialKey != oldCredentialKey
+
+            if let effectiveCredential, let newCredentialKey, wroteNewCredential {
+                // Pre-commit phase. If this throws, the durable record and
+                // its old slot remain untouched.
+                try await credentialStore.setCredential(
+                    effectiveCredential,
+                    for: newCredentialKey
+                )
+            }
             do {
                 if existing != nil {
                     // Apply only user-editable settings to the latest stored
                     // record. Discovery can refresh its metadata concurrently;
                     // saving a form must not overwrite that newer catalog with
                     // the draft's stale copy.
-                    _ = try await connectionStore.update(id: record.id) { current in
-                        let discoveryScopeChanged = current.baseURL != record.baseURL
-                            || current.authMode != record.authMode
-                            || current.transportSecurity != record.transportSecurity
-                        current.displayName = record.displayName
-                        current.baseURL = record.baseURL
-                        current.selectedModelID = record.selectedModelID
-                        current.authMode = record.authMode
-                        current.transportSecurity = record.transportSecurity
-                        current.transportCapabilities = record.transportCapabilities
-                        current.requestBehavior = record.requestBehavior
+                    let commitRecord = committedRecord
+                    _ = try await connectionStore.update(id: commitRecord.id) { current in
+                        let discoveryScopeChanged = current.baseURL != commitRecord.baseURL
+                            || current.authMode != commitRecord.authMode
+                            || current.transportSecurity != commitRecord.transportSecurity
+                        current.displayName = commitRecord.displayName
+                        current.baseURL = commitRecord.baseURL
+                        current.selectedModelID = commitRecord.selectedModelID
+                        current.authMode = commitRecord.authMode
+                        current.transportSecurity = commitRecord.transportSecurity
+                        current.transportCapabilities = commitRecord.transportCapabilities
+                        current.requestBehavior = commitRecord.requestBehavior
+                        current.credentialSlotID = commitRecord.credentialSlotID
                         if shouldRotateConversationScope {
                             current.conversationScopeID = ProviderConnectionRecord
                                 .makeConversationScopeID()
                         }
-                        let draftDiscoveryIsNewer = record.discovery.lastSucceededAt.map { date in
+                        let draftDiscoveryIsNewer = commitRecord.discovery.lastSucceededAt.map { date in
                             date >= (current.discovery.lastSucceededAt ?? .distantPast)
                         } ?? false
                         if discoveryScopeChanged
@@ -626,33 +700,44 @@ final class ProviderSettingsModel: ObservableObject {
                             // A catalog belongs to an endpoint/auth scope. Keep
                             // the newest catalog tested in this draft, or clear
                             // the old scope's catalog when discovery failed.
-                            current.discovery = record.discovery
+                            current.discovery = commitRecord.discovery
                         }
                     }
                 } else {
-                    try await connectionStore.upsert(record)
+                    try await connectionStore.upsert(committedRecord)
                 }
             } catch {
-                await restoreCredentialAfterFailedSave(
-                    existing: existing,
-                    key: record.credentialKey,
-                    previousCredential: previousCredential
-                )
+                // The new slot is unreferenced because the pointer did not
+                // commit. Best-effort cleanup is safe; startup enumeration
+                // retries it without touching the active old slot.
+                if wroteNewCredential, let newCredentialKey {
+                    await removeCredentialBestEffort(newCredentialKey)
+                }
                 throw error
             }
-            connections = try await connectionStore.connections()
-                .sorted { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
-            selectedConnectionID = record.id
-            let savedRecord = try await connectionStore.connection(id: record.id) ?? record
-            draft = await makeDraft(for: savedRecord)
+            // JSON is now the commit point. Cleanup failures must not turn a
+            // committed save into a reported failure; the next startup sweep
+            // removes any unreferenced old slot.
+            if let oldCredentialKey,
+               oldCredentialKey != newCredentialKey {
+                await removeCredentialBestEffort(oldCredentialKey)
+            }
+            selectedConnectionID = committedRecord.id
+            let savedRecord = await committedRecordFromStore(
+                committedRecord,
+                fallbackConnections: existing.map { old in
+                    connections.map { $0.id == old.id ? committedRecord : $0 }
+                } ?? (connections + [committedRecord])
+            )
+            connections = savedRecord.connections
+            draft = await makeDraft(for: savedRecord.record)
             catalogScope = catalogScopeForLoadedDraft(draft)
-            onConnectionMutation?(record.id)
             if let automaticallyDiscoveredCount {
-                statusMessage = "Saved \(savedRecord.displayName) with \(automaticallyDiscoveredCount) model\(automaticallyDiscoveredCount == 1 ? "" : "s")."
+                statusMessage = "Saved \(savedRecord.record.displayName) with \(automaticallyDiscoveredCount) model\(automaticallyDiscoveredCount == 1 ? "" : "s")."
             } else if automaticDiscoveryFailed {
-                statusMessage = "Saved \(savedRecord.displayName). Models were not available; enter a model ID or retry discovery."
+                statusMessage = "Saved \(savedRecord.record.displayName). Models were not available; enter a model ID or retry discovery."
             } else {
-                statusMessage = "Saved \(savedRecord.displayName)."
+                statusMessage = "Saved \(savedRecord.record.displayName)."
             }
             errorMessage = nil
             return true
@@ -663,23 +748,33 @@ final class ProviderSettingsModel: ObservableObject {
     }
 
     func delete(_ id: ProviderConnectionID) async -> Bool {
+        guard !isConnectionMutationInFlight else { return false }
+        isConnectionMutationInFlight = true
+        defer { isConnectionMutationInFlight = false }
+
         do {
-            guard let removed = try await connectionStore.remove(id: id) else {
+            guard let existing = try await connectionStore.connection(id: id) else {
                 throw ProviderSettingsError.connectionNotFound
             }
-            // The durable endpoint is already gone. Evict its runtime before
-            // any best-effort Keychain cleanup so an open workspace cannot
-            // keep sending to deleted provider settings if that cleanup fails.
-            onConnectionMutation?(id)
-            if removed.authMode == .bearer {
-                try await credentialStore.removeCredential(
-                    for: ProviderCredentialKey(connectionID: id)
-                )
+            await onConnectionWillMutate?(id)
+            defer { onConnectionMutation?(id) }
+
+            let credentialKey = existing.credentialKey
+            // Commit the non-secret deletion first. A crash before this
+            // atomic JSON swap leaves the old record and active slot intact;
+            // a crash after it leaves an unreferenced slot that startup
+            // enumeration can safely remove.
+            guard try await connectionStore.remove(id: id) != nil else {
+                throw ProviderSettingsError.connectionNotFound
             }
-            connections = try await connectionStore.connections()
-                .sorted { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
+
+            // Cleanup is post-commit and therefore best effort. A Keychain
+            // failure must not report a successful durable delete as failed.
+            await removeCredentialBestEffort(credentialKey)
+            let refreshedConnections = await connectionsAfterCommittedDelete(id: id)
+            connections = refreshedConnections
             if selectedConnectionID == id {
-                if let first = connections.first {
+                if let first = refreshedConnections.first {
                     selectedConnectionID = first.id
                     draft = await makeDraft(for: first)
                     catalogScope = catalogScopeForLoadedDraft(draft)
@@ -764,6 +859,104 @@ final class ProviderSettingsModel: ObservableObject {
         beginEdit(id)
     }
 
+    /// Reconciles versioned Keychain slots against the last committed JSON
+    /// pointers. This is deliberately best effort: an unavailable Keychain
+    /// must not prevent the settings screen from loading, and a cleanup error
+    /// can be retried on the next launch.
+    private func reconcileCredentialSlots() async {
+        guard let listing = credentialStore as? any CredentialStoreKeyListing else {
+            return
+        }
+        do {
+            let durableConnections = try await connectionStore.connections()
+            let activeAccounts = Set(
+                durableConnections.map { $0.credentialKey.account }
+            )
+            let keys = try await listing.credentialKeys(
+                forService: ProviderCredentialKey.defaultService
+            )
+            for key in keys where !activeAccounts.contains(key.account) {
+                await removeCredentialBestEffort(key)
+            }
+        } catch {
+            // Keep startup usable. The durable record remains authoritative;
+            // a later launch can retry enumeration and cleanup.
+            errorMessage = userFacing(error, persistence: true)
+        }
+    }
+
+    private struct CommittedRecordResult {
+        let record: ProviderConnectionRecord
+        let connections: [ProviderConnectionRecord]
+    }
+
+    /// Reads the committed record only for UI refresh. Once the JSON write has
+    /// succeeded, failures here must not turn a durable save into a failure.
+    private func committedRecordFromStore(
+        _ committedRecord: ProviderConnectionRecord,
+        fallbackConnections: [ProviderConnectionRecord]
+    ) async -> CommittedRecordResult {
+        let fallback = mergeCommittedRecord(
+            committedRecord,
+            into: fallbackConnections
+        )
+        do {
+            let refreshed = try await connectionStore.connections()
+                .sorted {
+                    $0.displayName.localizedStandardCompare($1.displayName)
+                        == .orderedAscending
+                }
+            let record = try await connectionStore.connection(id: committedRecord.id)
+                ?? committedRecord
+            return CommittedRecordResult(record: record, connections: refreshed)
+        } catch {
+            return CommittedRecordResult(
+                record: committedRecord,
+                connections: fallback
+            )
+        }
+    }
+
+    private func connectionsAfterCommittedDelete(
+        id: ProviderConnectionID
+    ) async -> [ProviderConnectionRecord] {
+        do {
+            return try await connectionStore.connections()
+                .filter { $0.id != id }
+                .sorted {
+                    $0.displayName.localizedStandardCompare($1.displayName)
+                        == .orderedAscending
+                }
+        } catch {
+            return connections.filter { $0.id != id }
+        }
+    }
+
+    private func mergeCommittedRecord(
+        _ committedRecord: ProviderConnectionRecord,
+        into source: [ProviderConnectionRecord]
+    ) -> [ProviderConnectionRecord] {
+        var merged = source
+        if let index = merged.firstIndex(where: { $0.id == committedRecord.id }) {
+            merged[index] = committedRecord
+        } else {
+            merged.append(committedRecord)
+        }
+        return merged.sorted {
+            $0.displayName.localizedStandardCompare($1.displayName)
+                == .orderedAscending
+        }
+    }
+
+    private func removeCredentialBestEffort(_ key: ProviderCredentialKey) async {
+        do {
+            try await credentialStore.removeCredential(for: key)
+        } catch {
+            // Cleanup is deliberately non-fatal after the JSON commit. The
+            // startup enumerator will retry without exposing Keychain details.
+        }
+    }
+
     private func makeDraft(for connection: ProviderConnectionRecord) async -> ProviderConnectionDraft {
         let hasCredential: Bool
         if connection.authMode == .bearer {
@@ -802,6 +995,7 @@ final class ProviderSettingsModel: ObservableObject {
         guard !draft.trimmedBaseURL.isEmpty else {
             throw ProviderSettingsError.missingBaseURL
         }
+        let existingConnection = connections.first(where: { $0.id == draft.id })
         if draft.usesHTTP {
             guard draft.hasAllowedInsecureHTTPHost else {
                 throw ProviderSettingsError.insecureHTTPHostNotAllowed
@@ -832,14 +1026,20 @@ final class ProviderSettingsModel: ObservableObject {
         }
         if draft.authMode == .bearer {
             let token = draft.bearerToken.trimmingCharacters(in: .whitespacesAndNewlines)
-            if token.isEmpty && (!draft.hasStoredCredential || draft.removeStoredCredential) {
+            // Existing bearer records may be intentionally signed out after
+            // their Keychain item is removed. Keep the auth mode (so requests
+            // fail closed) and allow cosmetic/endpoint edits without forcing
+            // the user to invent a replacement key. A new connection, or a
+            // transition from No authentication to bearer, still requires a
+            // token.
+            let existingBearerRecord = existingConnection?.authMode == .bearer
+            if token.isEmpty && !existingBearerRecord {
                 throw ProviderSettingsError.missingBearerCredential
             }
         }
         let discovery = catalogScope == ProviderDraftDiscoveryScope(draft)
             ? draft.discovery
             : ProviderConnectionDiscoveryMetadata()
-        let existingConnection = connections.first(where: { $0.id == draft.id })
         let conversationScopeID = existingConnection?.conversationScopeID
             ?? ProviderConnectionRecord.makeConversationScopeID()
         // OpenAI-compatible chat endpoints are expected to support SSE
@@ -867,6 +1067,7 @@ final class ProviderSettingsModel: ObservableObject {
                 requestBehavior: OpenAICompatibleRequestBehavior(
                     enableThinking: draft.enableThinking ? false : nil
                 ),
+                credentialSlotID: existingConnection?.credentialSlotID,
                 conversationScopeID: conversationScopeID
             )
         } catch let error as ProviderConnectionRecordError {
@@ -910,6 +1111,8 @@ final class ProviderSettingsModel: ObservableObject {
                 requestBehavior: OpenAICompatibleRequestBehavior(
                     enableThinking: draft.enableThinking ? false : nil
                 ),
+                credentialSlotID: connections.first(where: { $0.id == draft.id })?
+                    .credentialSlotID,
                 conversationScopeID: connections.first(where: { $0.id == draft.id })?
                     .conversationScopeID ?? ProviderConnectionRecord.makeConversationScopeID()
             )
@@ -927,6 +1130,12 @@ final class ProviderSettingsModel: ObservableObject {
         let typedToken = draft.bearerToken.trimmingCharacters(in: .whitespacesAndNewlines)
         if !typedToken.isEmpty {
             return try ProviderBearerCredential(typedToken)
+        }
+        // Do not test an endpoint with a secret that the user has explicitly
+        // marked for removal. The save path treats this as a signed-out
+        // bearer record until a replacement token is entered.
+        if draft.removeStoredCredential {
+            throw ProviderSettingsError.missingBearerCredential
         }
         guard let credential = try await credentialStore.credential(for: record.credentialKey) else {
             throw ProviderSettingsError.missingBearerCredential
@@ -954,7 +1163,10 @@ final class ProviderSettingsModel: ObservableObject {
             )
         } else if draft.removeStoredCredential {
             try await credentialStore.removeCredential(for: key)
-        } else if existing?.authMode != .bearer || !draft.hasStoredCredential {
+        } else if existing?.authMode != .bearer {
+            // A new bearer connection (or a none -> bearer transition) must
+            // provide a token. An existing bearer record with no Keychain
+            // value is already signed out and may be edited without one.
             throw ProviderSettingsError.missingBearerCredential
         }
     }
@@ -976,6 +1188,26 @@ final class ProviderSettingsModel: ObservableObject {
         } catch {
             // The original save failure remains the actionable result. The UI
             // never includes Keychain payloads or raw error internals.
+        }
+    }
+
+    /// Best-effort compensation for the second half of provider deletion.
+    /// Production record writes are atomic, so a write failure retains the
+    /// existing record; restoring this snapshot retains its matching secret.
+    private func restoreCredentialAfterFailedDelete(
+        _ previousCredential: ProviderBearerCredential?,
+        key: ProviderCredentialKey
+    ) async {
+        do {
+            if let previousCredential {
+                try await credentialStore.setCredential(previousCredential, for: key)
+            } else {
+                try await credentialStore.removeCredential(for: key)
+            }
+        } catch {
+            // Preserve the original persistence failure as the actionable UI
+            // result. Credential material and recovery errors are never logged
+            // or copied into the durable provider document.
         }
     }
 

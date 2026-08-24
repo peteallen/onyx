@@ -102,6 +102,10 @@ struct SideChatPanelView: View {
                 ? .identity
                 : .move(edge: .trailing).combined(with: .opacity)
         )
+        // SwiftUI owns Escape when focus is elsewhere in the panel. The
+        // native composer forwards the same command explicitly below because
+        // NSTextView otherwise terminates it inside AppKit's responder chain.
+        .onExitCommand(perform: model.closeSideChat)
         .zIndex(2)
     }
 
@@ -157,7 +161,8 @@ struct SideChatPanelView: View {
                 onSubmit: {
                     if canSend { model.sendSideChat() }
                 },
-                onPasteImages: model.addPastedSideChatImages
+                onPasteImages: model.addPastedSideChatImages,
+                onCancel: model.closeSideChat
             )
             .frame(height: textHeight)
             .padding(.horizontal, 10)

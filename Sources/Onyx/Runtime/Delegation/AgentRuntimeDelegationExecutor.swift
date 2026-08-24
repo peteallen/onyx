@@ -355,6 +355,18 @@ struct AgentRuntimeDelegationExecutor: DelegationExecutor {
                     throw DelegationExecutorError.execution(detail)
                 }
                 if status == .idle {
+                    // A provider can spend the entire response allowance on
+                    // hidden reasoning (or otherwise emit an empty assistant
+                    // item) and still report an apparently successful idle
+                    // turn.  Returning that as a successful delegation would
+                    // make Codex receive a blank tool result and hide the
+                    // actionable failure from the user.  Delegation is
+                    // text-only, so fail closed when no answer text arrived.
+                    guard Self.nonBlank(output.text) != nil else {
+                        throw DelegationExecutorError.execution(
+                            "The delegated turn completed without an answer."
+                        )
+                    }
                     return DelegationOutput(
                         text: output.text,
                         childConversationID: threadID,

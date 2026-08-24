@@ -1,6 +1,17 @@
 import Darwin
 import Foundation
 
+struct CodexRuntimeModelProviderBinding: Sendable, Equatable {
+    let id: String
+    let baseURL: URL
+    let apiKey: String
+    /// Opaque, non-secret ownership key for this provider configuration's
+    /// durable app-server state. Composition derives it from the connection
+    /// and conversation scope; endpoint, model, and display names must never
+    /// select a state directory.
+    let stateIdentifier: String
+}
+
 struct CodexRuntimeLaunchConfiguration: Sendable, Equatable {
     static var bundledRuntimePlatformDirectory: String {
         #if arch(arm64)
@@ -25,6 +36,7 @@ struct CodexRuntimeLaunchConfiguration: Sendable, Equatable {
         "-c",
         "mcp_oauth_credentials_store=\"file\"",
     ]
+    static let customProviderAPIKeyEnvironmentKey = "ONYX_CODEX_CUSTOM_PROVIDER_API_KEY"
     /// Production inherits ordinary process settings so tools retain PATH,
     /// SSH-agent access, developer toolchains, locale, proxies, and custom
     /// runtime configuration. It removes every Codex/OpenAI/ChatGPT control by
@@ -42,12 +54,14 @@ struct CodexRuntimeLaunchConfiguration: Sendable, Equatable {
     let processArguments: [String]
     let processEnvironment: [String: String]
     let codexHomeURL: URL
+    let modelProviderID: String?
     private let stateRootURL: URL
 
     static func production(
         bundleURL: URL = Bundle.main.bundleURL,
         userApplicationSupportURL: URL? = nil,
         inheritedEnvironment: [String: String] = ProcessInfo.processInfo.environment,
+        modelProvider: CodexRuntimeModelProviderBinding? = nil,
         fileManager: FileManager = .default
     ) throws -> Self {
         let executableURL = bundleURL
@@ -78,14 +92,15 @@ struct CodexRuntimeLaunchConfiguration: Sendable, Equatable {
         let stateRootURL = applicationSupportURL.resolvingSymlinksInPath().standardizedFileURL
         return try make(
             executableURL: executableURL,
-            codexHomeURL: stateRootURL
+            baseCodexHomeURL: stateRootURL
                 .appendingPathComponent("Onyx", isDirectory: true)
                 .appendingPathComponent("Codex", isDirectory: true),
             stateRootURL: stateRootURL,
             inheritedEnvironment: inheritedEnvironment,
             fileManager: fileManager,
             usesStandaloneServerBinary: true,
-            scrubProductionCredentials: true
+            scrubProductionCredentials: true,
+            modelProvider: modelProvider
         )
     }
 
@@ -97,7 +112,8 @@ struct CodexRuntimeLaunchConfiguration: Sendable, Equatable {
         codexHomeURL: URL? = nil,
         inheritedEnvironment: [String: String] = ProcessInfo.processInfo.environment,
         fileManager: FileManager = .default,
-        applicationSupportURL: URL? = nil
+        applicationSupportURL: URL? = nil,
+        modelProvider: CodexRuntimeModelProviderBinding? = nil
     ) throws -> Self {
         let executableURL: URL
         if let explicitExecutableURL {
@@ -153,32 +169,46 @@ struct CodexRuntimeLaunchConfiguration: Sendable, Equatable {
         }
         return try make(
             executableURL: executableURL,
-            codexHomeURL: homeURL,
+            baseCodexHomeURL: homeURL,
             stateRootURL: stateRootURL,
             inheritedEnvironment: inheritedEnvironment,
             fileManager: fileManager,
             usesStandaloneServerBinary: executableURL.lastPathComponent == "codex-app-server",
-            scrubProductionCredentials: false
+            scrubProductionCredentials: false,
+            modelProvider: modelProvider
         )
     }
 
     func prepareStateDirectory(fileManager: FileManager = .default) throws {
-        let parentURL = codexHomeURL.deletingLastPathComponent()
-        if parentURL != stateRootURL {
-            try createPrivateDirectoryIfNeeded(parentURL, fileManager: fileManager)
+        let relativePath = String(codexHomeURL.path.dropFirst(stateRootURL.path.count))
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        var cursor = stateRootURL
+        for component in relativePath.split(separator: "/") {
+            cursor.appendPathComponent(String(component), isDirectory: true)
+            try createPrivateDirectoryIfNeeded(cursor, fileManager: fileManager)
         }
-        try createPrivateDirectoryIfNeeded(codexHomeURL, fileManager: fileManager)
     }
 
     private static func make(
         executableURL: URL,
-        codexHomeURL: URL,
+        baseCodexHomeURL: URL,
         stateRootURL: URL,
         inheritedEnvironment: [String: String],
         fileManager: FileManager,
         usesStandaloneServerBinary: Bool,
-        scrubProductionCredentials: Bool
+        scrubProductionCredentials: Bool,
+        modelProvider: CodexRuntimeModelProviderBinding?
     ) throws -> Self {
+        let codexHomeURL: URL
+        if let modelProvider {
+            try validateProviderID(modelProvider.id)
+            try validateProviderStateIdentifier(modelProvider.stateIdentifier)
+            codexHomeURL = baseCodexHomeURL
+                .appendingPathComponent("Providers", isDirectory: true)
+                .appendingPathComponent(modelProvider.stateIdentifier, isDirectory: true)
+        } else {
+            codexHomeURL = baseCodexHomeURL
+        }
         try validateStatePath(codexHomeURL, below: stateRootURL)
         let standardizedHome = codexHomeURL.standardizedFileURL
         var environment = inheritedEnvironment
@@ -194,16 +224,95 @@ struct CodexRuntimeLaunchConfiguration: Sendable, Equatable {
         environment.removeValue(forKey: "CODEX_SQLITE_HOME")
         environment.removeValue(forKey: "CODEX_ROLLOUT_TRACE_ROOT")
         environment.removeValue(forKey: "ONYX_CODEX_PATH")
+        environment.removeValue(forKey: customProviderAPIKeyEnvironmentKey)
         environment["CODEX_HOME"] = standardizedHome.path
+        var arguments = usesStandaloneServerBinary
+            ? defaultArguments
+            : ["app-server"] + defaultArguments
+        if let modelProvider {
+            environment[customProviderAPIKeyEnvironmentKey] = modelProvider.apiKey
+            arguments += customProviderArguments(modelProvider)
+        }
         return Self(
             executableURL: executableURL.standardizedFileURL,
-            processArguments: usesStandaloneServerBinary
-                ? defaultArguments
-                : ["app-server"] + defaultArguments,
+            processArguments: arguments,
             processEnvironment: environment,
             codexHomeURL: standardizedHome,
+            modelProviderID: modelProvider?.id,
             stateRootURL: stateRootURL.standardizedFileURL
         )
+    }
+
+    private static func customProviderArguments(
+        _ provider: CodexRuntimeModelProviderBinding
+    ) -> [String] {
+        // codex-app-server 0.149.0's command-line override parser accepts
+        // bare dotted-path components here, but treats a TOML-quoted segment
+        // as a different key. `validateProviderID` keeps this interpolation
+        // within TOML's bare-key grammar.
+        let prefix = "model_providers.\(provider.id)"
+        return [
+            "-c", "\(prefix).name=\(tomlQuoted("Onyx Custom Provider"))",
+            "-c", "\(prefix).base_url=\(tomlQuoted(provider.baseURL.absoluteString))",
+            "-c", "\(prefix).env_key=\(tomlQuoted(customProviderAPIKeyEnvironmentKey))",
+            "-c", "\(prefix).wire_api=\(tomlQuoted("responses"))",
+            "-c", "\(prefix).requires_openai_auth=false",
+            // A retry after app-server has emitted visible partial output
+            // creates another durable assistant item. Fail once and let Onyx
+            // offer an explicit retry instead of silently duplicating a turn.
+            "-c", "\(prefix).stream_max_retries=0",
+        ]
+    }
+
+    private static func validateProviderID(_ identifier: String) throws {
+        guard isBoundedBareKey(identifier) else {
+            throw AgentRuntimeError.runtimeStateUnavailable(
+                "Onyx rejected an invalid custom-provider identifier."
+            )
+        }
+    }
+
+    private static func validateProviderStateIdentifier(_ identifier: String) throws {
+        guard isBoundedBareKey(identifier) else {
+            throw AgentRuntimeError.runtimeStateUnavailable(
+                "Onyx rejected an invalid custom-provider state identifier."
+            )
+        }
+    }
+
+    private static func isBoundedBareKey(_ identifier: String) -> Bool {
+        let isSafeByte: (UInt8) -> Bool = { byte in
+            switch byte {
+            case 0x30 ... 0x39, 0x41 ... 0x5A, 0x61 ... 0x7A, 0x2D, 0x5F:
+                true
+            default:
+                false
+            }
+        }
+        return !identifier.isEmpty
+            && identifier.utf8.count <= 128
+            && identifier.utf8.allSatisfy(isSafeByte)
+    }
+
+    private static func tomlQuoted(_ value: String) -> String {
+        var result = "\""
+        for scalar in value.unicodeScalars {
+            switch scalar.value {
+            case 0x08: result += "\\b"
+            case 0x09: result += "\\t"
+            case 0x0A: result += "\\n"
+            case 0x0C: result += "\\f"
+            case 0x0D: result += "\\r"
+            case 0x22: result += "\\\""
+            case 0x5C: result += "\\\\"
+            case 0x00...0x1F, 0x7F:
+                result += String(format: "\\u%04X", scalar.value)
+            default:
+                result.unicodeScalars.append(scalar)
+            }
+        }
+        result += "\""
+        return result
     }
 
     private static func validateExecutable(

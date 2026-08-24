@@ -401,6 +401,354 @@ final class ProviderSettingsModelTests: XCTestCase {
         XCTAssertEqual(record.authMode, .none)
     }
 
+    func testRemoveStoredBearerKeySignsOutWithoutDiscoveryAndRotatesScope() async throws {
+        let descriptor = try ProviderModelDescriptor(
+            id: "model",
+            wireProtocol: .openAIChatCompletions,
+            capabilities: .init()
+        )
+        let connectionStore = ProviderConnectionStore(
+            storage: InMemoryProviderConnectionStorage()
+        )
+        let credentialStore = InMemoryCredentialStore()
+        let original = try ProviderConnectionRecord(
+            id: ProviderConnectionID("remove-key-signed-out"),
+            displayName: "Provider",
+            baseURL: URL(string: "https://api.example.test/v1")!,
+            selectedModelID: descriptor.id,
+            authMode: .bearer,
+            discovery: ProviderConnectionDiscoveryMetadata(
+                discoveredModels: [descriptor]
+            ),
+            conversationScopeID: "scope.before-remove"
+        )
+        try await connectionStore.upsert(original)
+        try await credentialStore.setCredential(
+            ProviderBearerCredential("old-token"),
+            for: original.credentialKey
+        )
+        let discovery = StubProviderModelDiscovery(models: [descriptor])
+        let model = ProviderSettingsModel(
+            connectionStore: connectionStore,
+            credentialStore: credentialStore,
+            discovery: discovery
+        )
+        await model.start()
+
+        XCTAssertTrue(model.draft.hasStoredCredential)
+        model.draft.removeStoredCredential = true
+        model.draft.bearerToken = ""
+        model.updateDraftDiscoveryScope()
+
+        let saved = await model.saveDraft()
+        XCTAssertTrue(saved)
+
+        let signedOutValue = try await connectionStore.connection(id: original.id)
+        let signedOut = try XCTUnwrap(signedOutValue)
+        XCTAssertEqual(signedOut.authMode, .bearer)
+        XCTAssertNotEqual(signedOut.conversationScopeID, original.conversationScopeID)
+        XCTAssertTrue(signedOut.discovery.discoveredModelIDs.isEmpty)
+        let removedCredential = await credentialStore.credential(for: signedOut.credentialKey)
+        XCTAssertNil(removedCredential)
+        let discoveryCallsAfterRemoval = await discovery.callCount
+        XCTAssertEqual(discoveryCallsAfterRemoval, 0)
+
+        // A signed-out bearer connection remains editable. Cosmetic changes
+        // must not force a replacement key or probe the endpoint with none.
+        model.draft.displayName = "Renamed while signed out"
+        let renamedSave = await model.saveDraft()
+        XCTAssertTrue(renamedSave, model.errorMessage ?? "no error")
+        let discoveryCallsAfterRename = await discovery.callCount
+        XCTAssertEqual(discoveryCallsAfterRename, 0)
+        let renamedValue = try await connectionStore.connection(id: original.id)
+        let renamed = try XCTUnwrap(renamedValue)
+        XCTAssertEqual(renamed.displayName, "Renamed while signed out")
+        XCTAssertEqual(renamed.authMode, .bearer)
+        let renamedCredential = await credentialStore.credential(for: renamed.credentialKey)
+        XCTAssertNil(renamedCredential)
+    }
+
+    func testNewBearerConnectionStillRequiresCredential() async throws {
+        let model = ProviderSettingsModel(
+            connectionStore: ProviderConnectionStore(
+                storage: InMemoryProviderConnectionStorage()
+            ),
+            credentialStore: InMemoryCredentialStore(),
+            discovery: StubProviderModelDiscovery()
+        )
+        model.beginAdd()
+        model.draft.displayName = "New API"
+        model.draft.baseURL = "https://api.example.test/v1"
+        model.draft.authMode = .bearer
+
+        let saved = await model.saveDraft()
+        XCTAssertFalse(saved)
+        XCTAssertEqual(model.errorMessage, ProviderSettingsError.missingBearerCredential.localizedDescription)
+    }
+
+    func testSaveWaitsForPreMutationBarrierAndRejectsOverlappingDelete() async throws {
+        let descriptor = try ProviderModelDescriptor(
+            id: "model",
+            wireProtocol: .openAIChatCompletions,
+            capabilities: .init()
+        )
+        let connectionStore = ProviderConnectionStore(
+            storage: InMemoryProviderConnectionStorage()
+        )
+        let credentialStore = InMemoryCredentialStore()
+        let original = try ProviderConnectionRecord(
+            id: ProviderConnectionID("save-mutation-barrier"),
+            displayName: "Original Provider",
+            baseURL: URL(string: "https://old.example.test/v1")!,
+            selectedModelID: descriptor.id,
+            authMode: .bearer,
+            discovery: ProviderConnectionDiscoveryMetadata(discoveredModels: [descriptor])
+        )
+        try await connectionStore.upsert(original)
+        try await credentialStore.setCredential(
+            ProviderBearerCredential("old-token"),
+            for: original.credentialKey
+        )
+
+        let model = ProviderSettingsModel(
+            connectionStore: connectionStore,
+            credentialStore: credentialStore,
+            discovery: StubProviderModelDiscovery(models: [descriptor])
+        )
+        await model.start()
+        model.draft.baseURL = "https://new.example.test/v1"
+        model.draft.bearerToken = "new-token"
+        model.updateDraftDiscoveryScope()
+
+        let barrier = SuspendedProviderMutationBarrier()
+        var didFinishMutation = false
+        model.onConnectionWillMutate = { connectionID in
+            XCTAssertEqual(connectionID, original.id)
+            await barrier.suspend()
+        }
+        model.onConnectionMutation = { connectionID in
+            XCTAssertEqual(connectionID, original.id)
+            didFinishMutation = true
+        }
+
+        let saveTask = Task { await model.saveDraft() }
+        await barrier.waitUntilStarted()
+
+        let recordWhileSuspendedValue = try await connectionStore.connection(id: original.id)
+        let recordWhileSuspended = try XCTUnwrap(recordWhileSuspendedValue)
+        XCTAssertEqual(recordWhileSuspended.baseURL, original.baseURL)
+        let credentialWhileSuspendedValue = await credentialStore.credential(for: original.credentialKey)
+        let credentialWhileSuspended = try XCTUnwrap(credentialWhileSuspendedValue)
+        XCTAssertEqual(try credentialWhileSuspended.withValue { $0 }, "old-token")
+        XCTAssertFalse(didFinishMutation)
+
+        let errorBeforeRejectedDelete = model.errorMessage
+        let statusBeforeRejectedDelete = model.statusMessage
+        let deleteResult = await model.delete(original.id)
+        XCTAssertFalse(deleteResult)
+        XCTAssertEqual(model.errorMessage, errorBeforeRejectedDelete)
+        XCTAssertEqual(model.statusMessage, statusBeforeRejectedDelete)
+
+        let recordAfterRejectedDeleteValue = try await connectionStore.connection(id: original.id)
+        let recordAfterRejectedDelete = try XCTUnwrap(recordAfterRejectedDeleteValue)
+        XCTAssertEqual(recordAfterRejectedDelete.baseURL, original.baseURL)
+        let credentialAfterRejectedDeleteValue = await credentialStore.credential(for: original.credentialKey)
+        let credentialAfterRejectedDelete = try XCTUnwrap(credentialAfterRejectedDeleteValue)
+        XCTAssertEqual(try credentialAfterRejectedDelete.withValue { $0 }, "old-token")
+
+        await barrier.resume()
+        let saveResult = await saveTask.value
+        XCTAssertTrue(saveResult)
+        XCTAssertTrue(didFinishMutation)
+
+        let savedRecordValue = try await connectionStore.connection(id: original.id)
+        let savedRecord = try XCTUnwrap(savedRecordValue)
+        XCTAssertEqual(savedRecord.baseURL.absoluteString, "https://new.example.test/v1")
+        XCTAssertNotNil(savedRecord.credentialSlotID)
+        let savedCredentialValue = await credentialStore.credential(for: savedRecord.credentialKey)
+        let savedCredential = try XCTUnwrap(savedCredentialValue)
+        XCTAssertEqual(try savedCredential.withValue { $0 }, "new-token")
+        let oldCredentialAfterSave = await credentialStore.credential(for: original.credentialKey)
+        XCTAssertNil(oldCredentialAfterSave)
+    }
+
+    func testDeleteWaitsForPreMutationBarrierAndRejectsOverlappingSave() async throws {
+        let descriptor = try ProviderModelDescriptor(
+            id: "model",
+            wireProtocol: .openAIChatCompletions,
+            capabilities: .init()
+        )
+        let connectionStore = ProviderConnectionStore(
+            storage: InMemoryProviderConnectionStorage()
+        )
+        let credentialStore = InMemoryCredentialStore()
+        let original = try ProviderConnectionRecord(
+            id: ProviderConnectionID("delete-mutation-barrier"),
+            displayName: "Original Provider",
+            baseURL: URL(string: "https://old.example.test/v1")!,
+            selectedModelID: descriptor.id,
+            authMode: .bearer,
+            discovery: ProviderConnectionDiscoveryMetadata(discoveredModels: [descriptor])
+        )
+        try await connectionStore.upsert(original)
+        try await credentialStore.setCredential(
+            ProviderBearerCredential("old-token"),
+            for: original.credentialKey
+        )
+
+        let model = ProviderSettingsModel(
+            connectionStore: connectionStore,
+            credentialStore: credentialStore,
+            discovery: StubProviderModelDiscovery(models: [descriptor])
+        )
+        await model.start()
+        model.draft.baseURL = "https://new.example.test/v1"
+        model.draft.bearerToken = "new-token"
+        model.updateDraftDiscoveryScope()
+
+        let barrier = SuspendedProviderMutationBarrier()
+        var didFinishMutation = false
+        model.onConnectionWillMutate = { connectionID in
+            XCTAssertEqual(connectionID, original.id)
+            await barrier.suspend()
+        }
+        model.onConnectionMutation = { connectionID in
+            XCTAssertEqual(connectionID, original.id)
+            didFinishMutation = true
+        }
+
+        let deleteTask = Task { await model.delete(original.id) }
+        await barrier.waitUntilStarted()
+
+        let recordWhileSuspendedValue = try await connectionStore.connection(id: original.id)
+        let recordWhileSuspended = try XCTUnwrap(recordWhileSuspendedValue)
+        XCTAssertEqual(recordWhileSuspended, original)
+        let credentialWhileSuspendedValue = await credentialStore.credential(for: original.credentialKey)
+        let credentialWhileSuspended = try XCTUnwrap(credentialWhileSuspendedValue)
+        XCTAssertEqual(try credentialWhileSuspended.withValue { $0 }, "old-token")
+        XCTAssertFalse(didFinishMutation)
+
+        let errorBeforeRejectedSave = model.errorMessage
+        let statusBeforeRejectedSave = model.statusMessage
+        let saveResult = await model.saveDraft()
+        XCTAssertFalse(saveResult)
+        XCTAssertFalse(model.isSaving)
+        XCTAssertEqual(model.errorMessage, errorBeforeRejectedSave)
+        XCTAssertEqual(model.statusMessage, statusBeforeRejectedSave)
+
+        let recordAfterRejectedSaveValue = try await connectionStore.connection(id: original.id)
+        let recordAfterRejectedSave = try XCTUnwrap(recordAfterRejectedSaveValue)
+        XCTAssertEqual(recordAfterRejectedSave, original)
+        let credentialAfterRejectedSaveValue = await credentialStore.credential(for: original.credentialKey)
+        let credentialAfterRejectedSave = try XCTUnwrap(credentialAfterRejectedSaveValue)
+        XCTAssertEqual(try credentialAfterRejectedSave.withValue { $0 }, "old-token")
+
+        await barrier.resume()
+        let deleteResult = await deleteTask.value
+        XCTAssertTrue(deleteResult)
+        XCTAssertTrue(didFinishMutation)
+        let deletedRecord = try await connectionStore.connection(id: original.id)
+        let deletedCredential = await credentialStore.credential(for: original.credentialKey)
+        XCTAssertNil(deletedRecord)
+        XCTAssertNil(deletedCredential)
+    }
+
+    func testDeleteCredentialFailureLeavesRecordAndCredentialIntact() async throws {
+        let storage = InMemoryProviderConnectionStorage()
+        let connectionStore = ProviderConnectionStore(storage: storage)
+        let credentialStore = ControllableCredentialStore()
+        let original = try ProviderConnectionRecord(
+            id: ProviderConnectionID("credential-delete-failure"),
+            displayName: "Provider",
+            baseURL: URL(string: "https://api.example.test/v1")!,
+            authMode: .bearer
+        )
+        let credential = try ProviderBearerCredential("original-token")
+        try await connectionStore.upsert(original)
+        await credentialStore.setCredential(credential, for: original.credentialKey)
+        await credentialStore.failRemovals()
+
+        let model = ProviderSettingsModel(
+            connectionStore: connectionStore,
+            credentialStore: credentialStore,
+            discovery: StubProviderModelDiscovery()
+        )
+        await model.start()
+
+        var mutationStarted = false
+        var mutationFinished = false
+        model.onConnectionWillMutate = { connectionID in
+            XCTAssertEqual(connectionID, original.id)
+            mutationStarted = true
+        }
+        model.onConnectionMutation = { connectionID in
+            XCTAssertEqual(connectionID, original.id)
+            mutationFinished = true
+        }
+
+        let deleteResult = await model.delete(original.id)
+        XCTAssertTrue(deleteResult)
+        XCTAssertTrue(mutationStarted)
+        XCTAssertTrue(mutationFinished)
+        let retainedRecord = try await connectionStore.connection(id: original.id)
+        XCTAssertNil(retainedRecord)
+        let retainedCredentialValue = await credentialStore.credential(for: original.credentialKey)
+        let retainedCredential = try XCTUnwrap(retainedCredentialValue)
+        XCTAssertEqual(retainedCredential, credential)
+        XCTAssertEqual(model.connections, [])
+        let operationCounts = await credentialStore.operationCounts()
+        XCTAssertEqual(operationCounts.sets, 1)
+        XCTAssertEqual(operationCounts.removals, 1)
+    }
+
+    func testDeleteRecordWriteFailureRestoresCredentialAndKeepsRecord() async throws {
+        let storage = FailingProviderConnectionStorage()
+        let connectionStore = ProviderConnectionStore(storage: storage)
+        let credentialStore = ControllableCredentialStore()
+        let original = try ProviderConnectionRecord(
+            id: ProviderConnectionID("record-delete-failure"),
+            displayName: "Provider",
+            baseURL: URL(string: "https://api.example.test/v1")!,
+            authMode: .bearer
+        )
+        let credential = try ProviderBearerCredential("original-token")
+        try await connectionStore.upsert(original)
+        await credentialStore.setCredential(credential, for: original.credentialKey)
+        storage.failWrites()
+
+        let model = ProviderSettingsModel(
+            connectionStore: connectionStore,
+            credentialStore: credentialStore,
+            discovery: StubProviderModelDiscovery()
+        )
+        await model.start()
+
+        var mutationStarted = false
+        var mutationFinished = false
+        model.onConnectionWillMutate = { connectionID in
+            XCTAssertEqual(connectionID, original.id)
+            mutationStarted = true
+        }
+        model.onConnectionMutation = { connectionID in
+            XCTAssertEqual(connectionID, original.id)
+            mutationFinished = true
+        }
+
+        let deleteResult = await model.delete(original.id)
+        XCTAssertFalse(deleteResult)
+        XCTAssertTrue(mutationStarted)
+        XCTAssertTrue(mutationFinished)
+        let retainedRecord = try await connectionStore.connection(id: original.id)
+        XCTAssertEqual(retainedRecord, original)
+        let restoredCredentialValue = await credentialStore.credential(for: original.credentialKey)
+        let restoredCredential = try XCTUnwrap(restoredCredentialValue)
+        XCTAssertEqual(restoredCredential, credential)
+        XCTAssertEqual(model.connections, [original])
+        let operationCounts = await credentialStore.operationCounts()
+        XCTAssertEqual(operationCounts.sets, 1)
+        XCTAssertEqual(operationCounts.removals, 0)
+    }
+
     func testInvalidURLFeedbackDoesNotEchoQuerySecrets() {
         var draft = ProviderConnectionDraft.new()
         draft.baseURL = "https://provider.example/v1?api_key=do-not-echo"
@@ -487,5 +835,92 @@ private actor SuspendedProviderModelDiscovery: ProviderModelDiscovery {
     func resume() {
         responseContinuation?.resume()
         responseContinuation = nil
+    }
+}
+
+private actor SuspendedProviderMutationBarrier {
+    private var didStart = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var resumeContinuation: CheckedContinuation<Void, Never>?
+
+    func suspend() async {
+        didStart = true
+        let waiters = startWaiters
+        startWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        await withCheckedContinuation { resumeContinuation = $0 }
+    }
+
+    func waitUntilStarted() async {
+        guard !didStart else { return }
+        await withCheckedContinuation { startWaiters.append($0) }
+    }
+
+    func resume() {
+        resumeContinuation?.resume()
+        resumeContinuation = nil
+    }
+}
+
+private enum ProviderSettingsModelInjectedFailure: Error {
+    case credentialRemoval
+    case connectionWrite
+}
+
+private actor ControllableCredentialStore: CredentialStore {
+    private var values: [ProviderCredentialKey: ProviderBearerCredential] = [:]
+    private var shouldFailRemovals = false
+    private var setCount = 0
+    private var removalCount = 0
+
+    func credential(for key: ProviderCredentialKey) -> ProviderBearerCredential? {
+        values[key]
+    }
+
+    func setCredential(
+        _ credential: ProviderBearerCredential,
+        for key: ProviderCredentialKey
+    ) {
+        setCount += 1
+        values[key] = credential
+    }
+
+    func removeCredential(for key: ProviderCredentialKey) throws {
+        removalCount += 1
+        if shouldFailRemovals {
+            throw ProviderSettingsModelInjectedFailure.credentialRemoval
+        }
+        values.removeValue(forKey: key)
+    }
+
+    func failRemovals() {
+        shouldFailRemovals = true
+    }
+
+    func operationCounts() -> (sets: Int, removals: Int) {
+        (setCount, removalCount)
+    }
+}
+
+private final class FailingProviderConnectionStorage: ProviderConnectionStorage, @unchecked Sendable {
+    private let lock = NSLock()
+    private var data: Data?
+    private var shouldFailWrites = false
+
+    func read() -> Data? {
+        lock.withLock { data }
+    }
+
+    func write(_ data: Data) throws {
+        try lock.withLock {
+            if shouldFailWrites {
+                throw ProviderSettingsModelInjectedFailure.connectionWrite
+            }
+            self.data = data
+        }
+    }
+
+    func failWrites() {
+        lock.withLock { shouldFailWrites = true }
     }
 }

@@ -9,7 +9,9 @@ struct NativeTranscriptView: NSViewControllerRepresentable {
     var revision: UInt64? = nil
     var changeHint: TranscriptCollectionUpdate.Hint? = nil
     var editableUserMessageID: String? = nil
+    var retryableFailedResponseItemID: String? = nil
     var onEditUserMessage: (String) -> Void = { _ in }
+    var onRetryFailedResponse: (String) -> Void = { _ in }
 
     func makeNSViewController(context: Context) -> TranscriptViewController {
         TranscriptViewController()
@@ -23,7 +25,9 @@ struct NativeTranscriptView: NSViewControllerRepresentable {
             revision: revision,
             changeHint: changeHint,
             editableUserMessageID: editableUserMessageID,
-            onEditUserMessage: onEditUserMessage
+            retryableFailedResponseItemID: retryableFailedResponseItemID,
+            onEditUserMessage: onEditUserMessage,
+            onRetryFailedResponse: onRetryFailedResponse
         )
     }
 }
@@ -46,9 +50,12 @@ struct TranscriptPendingResponse: Equatable {
         // transcript yet, that old welcome copy must not suppress feedback for
         // the newly accepted send.
         let hasVisibleAssistant: Bool
+        let isPreparingRetry = label == "Preparing retry…"
         if let lastUserIndex = items.lastIndex(where: { $0.kind == .userMessage }) {
             hasVisibleAssistant = items[items.index(after: lastUserIndex)...].contains {
-                $0.kind == .assistantMessage && !$0.body.isEmpty
+                $0.kind == .assistantMessage
+                    && (!isPreparingRetry || $0.status != .failed)
+                    && !$0.body.isEmpty
             }
         } else {
             hasVisibleAssistant = false
@@ -1024,7 +1031,9 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
     private var expandedItemIDs = Set<String>()
     private var hasScheduledFollowScroll = false
     private var editableUserMessageID: String?
+    private var retryableFailedResponseItemID: String?
     private var onEditUserMessage: (String) -> Void = { _ in }
+    private var onRetryFailedResponse: (String) -> Void = { _ in }
     private(set) var prependInstrumentation = TranscriptPrependInstrumentation()
     var projectionStorageMaterializationCount: Int {
         displayRows.fullMaterializationCount + activityGroups.fullMaterializationCount
@@ -1090,10 +1099,15 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         revision newRevision: UInt64? = nil,
         changeHint: TranscriptCollectionUpdate.Hint? = nil,
         editableUserMessageID newEditableUserMessageID: String? = nil,
-        onEditUserMessage newOnEditUserMessage: @escaping (String) -> Void = { _ in }
+        retryableFailedResponseItemID newRetryableFailedResponseItemID: String? = nil,
+        onEditUserMessage newOnEditUserMessage: @escaping (String) -> Void = { _ in },
+        onRetryFailedResponse newOnRetryFailedResponse: @escaping (String) -> Void = { _ in }
     ) {
+        let previousRetryableFailedResponseItemID = retryableFailedResponseItemID
         editableUserMessageID = newEditableUserMessageID
+        retryableFailedResponseItemID = newRetryableFailedResponseItemID
         onEditUserMessage = newOnEditUserMessage
+        onRetryFailedResponse = newOnRetryFailedResponse
         let shouldFollow = isNearBottom
         let oldItems = items
         var planningInstrumentation = TranscriptCollectionUpdate.PlanningInstrumentation()
@@ -1110,6 +1124,26 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
             isAwaitingResponse: isAwaitingResponse,
             label: workingLabel
         )
+        // Retryability is presentation state rather than transcript content,
+        // so the snapshot revision can remain unchanged while a mounted
+        // assistant row gains or loses its Retry action. Invalidate only the
+        // affected rows and reload them through the same collection update
+        // transaction; updating the recycled cell alone leaves the flow
+        // layout's old height cached and can clip the action or overlap text.
+        var retryActionReloadIndices = IndexSet()
+        if previousRetryableFailedResponseItemID != newRetryableFailedResponseItemID {
+            let affectedIDs = Set([
+                previousRetryableFailedResponseItemID,
+                newRetryableFailedResponseItemID,
+            ].compactMap { $0 })
+            for itemID in affectedIDs {
+                guard let index = newItems.firstIndex(where: { $0.id == itemID }) else {
+                    continue
+                }
+                retryActionReloadIndices.insert(index)
+                layoutState.invalidate(itemID: itemID)
+            }
+        }
         // Keep the old presentation row mounted while applying transcript
         // mutations.  The pending row is always the final collection item;
         // deferring this state change lets AppKit reconcile transcript inserts
@@ -1221,18 +1255,21 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         if let appendProjectionChange {
             applyAppendProjectionChange(
                 appendProjectionChange,
-                pendingResponseChange: pendingResponseChange
+                pendingResponseChange: pendingResponseChange,
+                additionalReloadIndices: retryActionReloadIndices
             )
         } else if let prependProjectionChange {
             applyPrependProjectionChange(
                 prependProjectionChange,
                 anchor: viewportAnchor,
-                pendingResponseChange: pendingResponseChange
+                pendingResponseChange: pendingResponseChange,
+                additionalReloadIndices: retryActionReloadIndices
             )
         } else if let tailProjectionChange {
             applyTailProjectionChange(
                 tailProjectionChange,
-                pendingResponseChange: pendingResponseChange
+                pendingResponseChange: pendingResponseChange,
+                additionalReloadIndices: retryActionReloadIndices
             )
         } else if groupingStructureChanged {
             collectionView.reloadData()
@@ -1240,17 +1277,22 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
             switch update {
             case .unchanged:
                 applySimpleCollectionUpdate(
-                    pendingResponseChange: pendingResponseChange
+                    pendingResponseChange: pendingResponseChange,
+                    reloadIndices: retryActionReloadIndices
                 )
             case let .tailChange(index):
+                var reloadIndices = retryActionReloadIndices
+                reloadIndices.insert(index)
                 applySimpleCollectionUpdate(
                     pendingResponseChange: pendingResponseChange,
-                    reloadIndices: IndexSet(integer: index)
+                    reloadIndices: reloadIndices
                 )
             case let .rowChanges(indices):
+                var reloadIndices = retryActionReloadIndices
+                reloadIndices.formUnion(indices)
                 applySimpleCollectionUpdate(
                     pendingResponseChange: pendingResponseChange,
-                    reloadIndices: indices
+                    reloadIndices: reloadIndices
                 )
             case .append:
                 // Handled by the incremental projection branch above.
@@ -1399,8 +1441,12 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
                 with: timelineItem,
                 isExpanded: isExpanded(timelineItem),
                 isEditable: timelineItem.id == editableUserMessageID,
+                isRetryable: timelineItem.id == retryableFailedResponseItemID,
                 onEdit: { [weak self] in
                     self?.onEditUserMessage(timelineItem.id)
+                },
+                onRetry: { [weak self] in
+                    self?.onRetryFailedResponse(timelineItem.id)
                 },
                 onToggle: { [weak self] expanded in
                     self?.setExpanded(expanded, for: timelineItem.id)
@@ -1425,6 +1471,18 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         case let .item(index):
             let item = items[index]
             let expanded = isExpanded(item)
+            let retryable = item.id == retryableFailedResponseItemID
+            if retryable {
+                return NSSize(
+                    width: width,
+                    height: TranscriptCellView.height(
+                        for: item,
+                        width: width,
+                        isExpanded: expanded,
+                        isRetryable: true
+                    )
+                )
+            }
             return NSSize(
                 width: width,
                 height: layoutState.height(for: item, width: width, isExpanded: expanded) {
@@ -1594,7 +1652,8 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
     private func applyPrependProjectionChange(
         _ change: PrependProjectionChange,
         anchor: ViewportAnchor?,
-        pendingResponseChange: PendingResponseChange
+        pendingResponseChange: PendingResponseChange,
+        additionalReloadIndices: IndexSet = []
     ) {
         guard !change.requiresReload else {
             prependInstrumentation.fullReloadCount += 1
@@ -1607,7 +1666,10 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
                 pendingResponseChange: pendingResponseChange,
                 hasUpdates: false,
                 updates: {},
-                completion: { [weak self] in self?.restoreViewport(anchor) }
+                completion: { [weak self] in
+                    self?.reloadRows(additionalReloadIndices)
+                    self?.restoreViewport(anchor)
+                }
             )
             return
         }
@@ -1623,7 +1685,12 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
                 self?.collectionView.insertItems(at: insertedPaths)
             }
         ) { [weak self] in
-            self?.restoreViewport(
+            guard let self else { return }
+            // Item indices already describe the final, prepended projection.
+            // Reload only after the structural batch settles so AppKit never
+            // receives the shifted row as both an insertion and a reload.
+            self.reloadRows(additionalReloadIndices)
+            self.restoreViewport(
                 anchor,
                 expectedDisplayIndexOffset: change.insertedDisplayCount
             )
@@ -1751,7 +1818,8 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
 
     private func applyAppendProjectionChange(
         _ change: AppendProjectionChange,
-        pendingResponseChange: PendingResponseChange
+        pendingResponseChange: PendingResponseChange,
+        additionalReloadIndices: IndexSet = []
     ) {
         applySuffixProjectionChange(
             displayStart: change.displayStart,
@@ -1759,7 +1827,8 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
             oldTailIDs: change.oldTailIDs,
             newTailIDs: change.newTailIDs,
             requiresReload: change.requiresReload,
-            pendingResponseChange: pendingResponseChange
+            pendingResponseChange: pendingResponseChange,
+            additionalReloadIndices: additionalReloadIndices
         )
     }
 
@@ -1774,7 +1843,8 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         oldTailIDs: [String],
         newTailIDs: [String],
         requiresReload: Bool,
-        pendingResponseChange: PendingResponseChange
+        pendingResponseChange: PendingResponseChange,
+        additionalReloadIndices: IndexSet = []
     ) {
         guard !requiresReload,
               oldDisplayCount == displayStart + oldTailIDs.count,
@@ -1785,11 +1855,12 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         }
 
         if oldTailIDs == newTailIDs {
-            let paths = Set(
+            var paths = Set(
                 (displayStart..<displayRows.count).map {
                     IndexPath(item: $0, section: 0)
                 }
             )
+            paths.formUnion(reloadIndexPaths(for: additionalReloadIndices))
             performCollectionBatch(
                 pendingResponseChange: pendingResponseChange,
                 hasUpdates: !paths.isEmpty
@@ -1817,9 +1888,16 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
                 IndexPath(item: $0, section: 0)
             }
         )
-        let reloadPaths = Set(
+        var reloadPaths = Set(
             (displayStart..<replacementStart).map {
                 IndexPath(item: $0, section: 0)
+            }
+        )
+        // Rows inside the replacement suffix are recreated by delete/insert;
+        // only unchanged prefix paths need the additional retry-state reload.
+        reloadPaths.formUnion(
+            reloadIndexPaths(for: additionalReloadIndices).filter {
+                $0.item < replacementStart
             }
         )
         let hasSuffixUpdates = !deletedPaths.isEmpty
@@ -1983,7 +2061,8 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
 
     private func applyTailProjectionChange(
         _ change: TailProjectionChange,
-        pendingResponseChange: PendingResponseChange
+        pendingResponseChange: PendingResponseChange,
+        additionalReloadIndices: IndexSet = []
     ) {
         applySuffixProjectionChange(
             displayStart: change.displayStart,
@@ -1991,7 +2070,8 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
             oldTailIDs: change.oldTailIDs,
             newTailIDs: change.newTailIDs,
             requiresReload: change.requiresReload,
-            pendingResponseChange: pendingResponseChange
+            pendingResponseChange: pendingResponseChange,
+            additionalReloadIndices: additionalReloadIndices
         )
     }
 
@@ -2131,8 +2211,12 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         for case let item as TranscriptCollectionItem in collectionView.visibleItems() {
             item.updateEditAction(
                 editableUserMessageID: editableUserMessageID,
+                retryableFailedResponseItemID: retryableFailedResponseItemID,
                 onEdit: { [weak self] messageID in
                     self?.onEditUserMessage(messageID)
+                },
+                onRetry: { [weak self] messageID in
+                    self?.onRetryFailedResponse(messageID)
                 }
             )
         }
@@ -2473,27 +2557,37 @@ private final class TranscriptCollectionItem: NSCollectionViewItem {
         with item: TimelineItem,
         isExpanded: Bool = true,
         isEditable: Bool = false,
+        isRetryable: Bool = false,
         onEdit: (() -> Void)? = nil,
+        onRetry: (() -> Void)? = nil,
         onToggle: ((Bool) -> Void)? = nil
     ) {
         (view as? TranscriptCellView)?.configure(
             with: item,
             isExpanded: isExpanded,
             isEditable: isEditable,
+            isRetryable: isRetryable,
             onEdit: onEdit,
+            onRetry: onRetry,
             onToggle: onToggle
         )
     }
 
     func updateEditAction(
         editableUserMessageID: String?,
-        onEdit: @escaping (String) -> Void
+        retryableFailedResponseItemID: String?,
+        onEdit: @escaping (String) -> Void,
+        onRetry: @escaping (String) -> Void
     ) {
         guard let cell = view as? TranscriptCellView else { return }
         cell.updateEditAction(
             isEditable: cell.itemID == editableUserMessageID,
+            isRetryable: cell.itemID == retryableFailedResponseItemID,
             onEdit: cell.itemID.map { messageID in
                 { onEdit(messageID) }
+            },
+            onRetry: cell.itemID.map { messageID in
+                { onRetry(messageID) }
             }
         )
     }
@@ -2863,6 +2957,10 @@ final class TranscriptCellView: NSView {
     /// the latest eligible user row is hovered or keyboard-focused, while the
     /// native button remains exposed to assistive technology.
     let editControl = TranscriptEditControl(title: "", target: nil, action: nil)
+    /// Failed turns expose a direct recovery action beside Edit. This remains
+    /// visually restrained, but unlike the pencil it is labeled and visible
+    /// without requiring the user to discover a hover-only target.
+    let retryControl = TranscriptEditControl(title: "Retry", target: nil, action: nil)
     /// A small native button whose hit area is expanded to the complete card
     /// header in `hitTest(_:)`. This gives mouse, keyboard, and VoiceOver users
     /// one consistent disclosure control without intercepting body selection or
@@ -2874,16 +2972,21 @@ final class TranscriptCellView: NSView {
     private var fullTitleAttributedText = NSAttributedString()
     private var onToggle: ((Bool) -> Void)?
     private var onEdit: (() -> Void)?
+    private var onRetry: (() -> Void)?
     private var editTrackingArea: NSTrackingArea?
     private var isPointerInside = false
     private var isEditControlFocused = false
     private var isEditable = false
+    private var isRetryable = false
     private(set) var isExpanded = true
     private var isExpandable = false
 
     var isCollapsed: Bool { isExpandable && !isExpanded }
     var canToggleExpansion: Bool { isExpandable }
     var messageBubbleFrame: NSRect { bubbleBackground.frame }
+    var titleFrame: NSRect { titleLabel.frame }
+    var bodyFrame: NSRect { bodyLabel.frame }
+    var statusFrame: NSRect { statusLabel.frame }
     var itemID: String? { item?.id }
 
     override init(frame frameRect: NSRect) {
@@ -2901,6 +3004,7 @@ final class TranscriptCellView: NSView {
         addSubview(statusLabel)
         addSubview(expansionControl)
         addSubview(editControl)
+        addSubview(retryControl)
 
         avatar.font = .systemFont(ofSize: OnyxTypography.secondary, weight: .semibold)
         avatar.textColor = NSColor.systemIndigo
@@ -2963,6 +3067,26 @@ final class TranscriptCellView: NSView {
             self?.updateEditControlVisibility()
         }
         editControl.isHidden = true
+
+        retryControl.isBordered = false
+        retryControl.bezelStyle = .regularSquare
+        retryControl.imagePosition = .imageLeading
+        retryControl.image = NSImage(
+            systemSymbolName: "arrow.clockwise",
+            accessibilityDescription: "Retry failed response"
+        )
+        retryControl.font = .systemFont(ofSize: OnyxTypography.metadata, weight: .medium)
+        retryControl.contentTintColor = .secondaryLabelColor
+        retryControl.focusRingType = .default
+        retryControl.target = self
+        retryControl.action = #selector(retryPressed(_:))
+        retryControl.toolTip = "Retry failed response"
+        retryControl.setAccessibilityRole(.button)
+        retryControl.setAccessibilityLabel("Retry failed response")
+        retryControl.setAccessibilityHelp(
+            "Removes the failed response and sends this message again"
+        )
+        retryControl.isHidden = true
     }
 
     @available(*, unavailable)
@@ -2982,7 +3106,9 @@ final class TranscriptCellView: NSView {
         with item: TimelineItem,
         isExpanded: Bool,
         isEditable: Bool = false,
+        isRetryable: Bool = false,
         onEdit: (() -> Void)? = nil,
+        onRetry: (() -> Void)? = nil,
         onToggle: ((Bool) -> Void)? = nil
     ) {
         removeMediaViews()
@@ -2991,6 +3117,7 @@ final class TranscriptCellView: NSView {
         self.isExpanded = self.isExpandable ? isExpanded : true
         self.onToggle = onToggle
         self.onEdit = onEdit
+        self.onRetry = onRetry
 
         fullTitleAttributedText = Self.headerAttributedText(for: item, isExpanded: self.isExpanded)
         titleLabel.attributedStringValue = fullTitleAttributedText
@@ -3035,7 +3162,12 @@ final class TranscriptCellView: NSView {
             rebuildMediaViews()
         }
         applyExpansionPresentation()
-        updateEditAction(isEditable: isEditable, onEdit: onEdit)
+        updateEditAction(
+            isEditable: isEditable,
+            isRetryable: isRetryable,
+            onEdit: onEdit,
+            onRetry: onRetry
+        )
     }
 
     override func prepareForReuse() {
@@ -3043,11 +3175,13 @@ final class TranscriptCellView: NSView {
         removeMediaViews()
         onToggle = nil
         onEdit = nil
+        onRetry = nil
         item = nil
         fullTitleAttributedText = NSAttributedString()
         isExpandable = false
         isExpanded = true
         isEditable = false
+        isRetryable = false
         isPointerInside = false
         isEditControlFocused = false
         updateEditControlVisibility()
@@ -3081,11 +3215,27 @@ final class TranscriptCellView: NSView {
         onEdit?()
     }
 
-    func updateEditAction(isEditable: Bool, onEdit: (() -> Void)?) {
+    @objc private func retryPressed(_ sender: NSButton) {
+        guard isRetryable else { return }
+        onRetry?()
+    }
+
+    func updateEditAction(
+        isEditable: Bool,
+        isRetryable: Bool = false,
+        onEdit: (() -> Void)?,
+        onRetry: (() -> Void)? = nil
+    ) {
+        let retryabilityChanged = self.isRetryable != isRetryable
         self.isEditable = isEditable && item?.kind == .userMessage
+        self.isRetryable = isRetryable && (item?.kind == .assistantMessage || item?.kind == .error)
         self.onEdit = self.isEditable ? onEdit : nil
+        self.onRetry = self.isRetryable ? onRetry : nil
         updateEditControlVisibility()
         updateTrackingAreas()
+        if retryabilityChanged {
+            needsLayout = true
+        }
     }
 
     override func updateTrackingAreas() {
@@ -3118,7 +3268,15 @@ final class TranscriptCellView: NSView {
     private func updateEditControlVisibility() {
         editControl.isEnabled = isEditable
         editControl.isHidden = !isEditable
-        editControl.alphaValue = isEditable && (isPointerInside || isEditControlFocused) ? 1 : 0
+        editControl.alphaValue = if !isEditable {
+            0
+        } else if isPointerInside || isEditControlFocused {
+            1
+        } else {
+            0.55
+        }
+        retryControl.isEnabled = isRetryable
+        retryControl.isHidden = !isRetryable
     }
 
     func toggleExpansion() {
@@ -3203,7 +3361,12 @@ final class TranscriptCellView: NSView {
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard isExpandable, let item else { return super.hitTest(point) }
-        let metrics = Self.metrics(for: item, width: bounds.width, isExpanded: isExpanded)
+        let metrics = Self.metrics(
+            for: item,
+            width: bounds.width,
+            isExpanded: isExpanded,
+            isRetryable: isRetryable
+        )
         let bodyTop = bounds.height - metrics.top - metrics.titleHeight - metrics.titleGap
         let headerBottom = isExpanded
             ? bodyTop
@@ -3226,7 +3389,12 @@ final class TranscriptCellView: NSView {
             return
         }
         let point = convert(event.locationInWindow, from: nil)
-        let metrics = Self.metrics(for: item, width: bounds.width, isExpanded: isExpanded)
+        let metrics = Self.metrics(
+            for: item,
+            width: bounds.width,
+            isExpanded: isExpanded,
+            isRetryable: isRetryable
+        )
         let bodyTop = bounds.height - metrics.top - metrics.titleHeight - metrics.titleGap
         let headerBottom = isExpanded ? bodyTop : bodyTop - metrics.summaryHeight
         let headerRect = NSRect(
@@ -3245,7 +3413,12 @@ final class TranscriptCellView: NSView {
     override func layout() {
         super.layout()
         guard let item else { return }
-        let metrics = Self.metrics(for: item, width: bounds.width, isExpanded: isExpanded)
+        let metrics = Self.metrics(
+            for: item,
+            width: bounds.width,
+            isExpanded: isExpanded,
+            isRetryable: isRetryable
+        )
         if item.kind == .userMessage {
             let horizontalInset = Self.userBubbleHorizontalPadding
             bubbleBackground.frame = NSRect(
@@ -3264,6 +3437,12 @@ final class TranscriptCellView: NSView {
             width: editTargetSize,
             height: editTargetSize
         )
+        retryControl.frame = NSRect(
+            x: max(0, metrics.contentX + metrics.contentWidth - 66),
+            y: max(0, bounds.height - editTargetSize),
+            width: 66,
+            height: editTargetSize
+        )
         let headerTop = bounds.height - metrics.top
         let disclosureWidth: CGFloat = isExpandable ? 18 : 0
         avatar.frame = NSRect(
@@ -3275,7 +3454,11 @@ final class TranscriptCellView: NSView {
         titleLabel.frame = NSRect(
             x: metrics.contentX,
             y: headerTop - metrics.titleHeight,
-            width: max(0, metrics.contentWidth - metrics.statusWidth - 8),
+            width: max(
+                0,
+                metrics.contentWidth - metrics.statusWidth - 8
+                    - (isRetryable ? retryControl.frame.width + 8 : 0)
+            ),
             height: metrics.titleHeight
         )
         titleLabel.attributedStringValue = Self.tailTruncatedSingleLine(
@@ -3290,6 +3473,12 @@ final class TranscriptCellView: NSView {
             width: metrics.statusWidth,
             height: min(16, metrics.titleHeight)
         )
+        if isRetryable {
+            retryControl.frame.origin.y = max(
+                0,
+                headerTop - retryControl.frame.height + 6
+            )
+        }
         let bodyTop = bounds.height - metrics.top - metrics.titleHeight - metrics.titleGap
         summaryLabel.frame = NSRect(
             x: metrics.contentX,
@@ -3300,7 +3489,10 @@ final class TranscriptCellView: NSView {
         bodyLabel.frame = NSRect(
             x: metrics.contentX,
             y: bodyTop - metrics.bodyHeight,
-            width: metrics.contentWidth,
+            width: max(
+                0,
+                metrics.contentWidth - (isRetryable ? retryControl.frame.width + 8 : 0)
+            ),
             height: metrics.bodyHeight
         )
         let attachmentTop = bodyTop - metrics.bodyHeight - metrics.attachmentGap
@@ -3376,20 +3568,43 @@ final class TranscriptCellView: NSView {
     }
 
     static func height(for item: TimelineItem, width: CGFloat, isExpanded: Bool) -> CGFloat {
-        height(for: item, width: width, isExpanded: isExpanded, boundedMedia: false)
+        height(
+            for: item,
+            width: width,
+            isExpanded: isExpanded,
+            boundedMedia: false,
+            isRetryable: false
+        )
+    }
+
+    static func height(
+        for item: TimelineItem,
+        width: CGFloat,
+        isExpanded: Bool,
+        isRetryable: Bool
+    ) -> CGFloat {
+        height(
+            for: item,
+            width: width,
+            isExpanded: isExpanded,
+            boundedMedia: false,
+            isRetryable: isRetryable
+        )
     }
 
     private static func height(
         for item: TimelineItem,
         width: CGFloat,
         isExpanded: Bool,
-        boundedMedia: Bool
+        boundedMedia: Bool,
+        isRetryable: Bool = false
     ) -> CGFloat {
         let metrics = metrics(
             for: item,
             width: width,
             isExpanded: isExpanded,
-            boundedMedia: boundedMedia
+            boundedMedia: boundedMedia,
+            isRetryable: isRetryable
         )
         return metrics.top + metrics.titleHeight + metrics.titleGap
             + metrics.summaryHeight + metrics.bodyHeight
@@ -3399,18 +3614,46 @@ final class TranscriptCellView: NSView {
     }
 
     static func metrics(for item: TimelineItem, width: CGFloat) -> Metrics {
-        metrics(for: item, width: width, isExpanded: true, boundedMedia: true)
+        metrics(
+            for: item,
+            width: width,
+            isExpanded: true,
+            boundedMedia: true,
+            isRetryable: false
+        )
     }
 
     static func metrics(for item: TimelineItem, width: CGFloat, isExpanded: Bool) -> Metrics {
-        metrics(for: item, width: width, isExpanded: isExpanded, boundedMedia: false)
+        metrics(
+            for: item,
+            width: width,
+            isExpanded: isExpanded,
+            boundedMedia: false,
+            isRetryable: false
+        )
+    }
+
+    static func metrics(
+        for item: TimelineItem,
+        width: CGFloat,
+        isExpanded: Bool,
+        isRetryable: Bool
+    ) -> Metrics {
+        metrics(
+            for: item,
+            width: width,
+            isExpanded: isExpanded,
+            boundedMedia: false,
+            isRetryable: isRetryable
+        )
     }
 
     private static func metrics(
         for item: TimelineItem,
         width: CGFloat,
         isExpanded: Bool,
-        boundedMedia: Bool
+        boundedMedia: Bool,
+        isRetryable: Bool
     ) -> Metrics {
         let isUser = item.kind == .userMessage
         let isActivity = item.kind.isActivity
@@ -3443,9 +3686,13 @@ final class TranscriptCellView: NSView {
         // Collapsed activity renders its preview in the header (routine) or
         // summary label (other collapsible kinds). Reserving a second hidden
         // body here was the reason compact rows still looked like large cards.
+        let bodyMeasurementWidth = max(
+            1,
+            contentWidth - (isRetryable ? OnyxHitTarget.compact + 42 : 0)
+        )
         var bodyHeight = isCollapsed
             ? 0
-            : bodyAttributedText(for: item).boundingHeight(width: contentWidth)
+            : bodyAttributedText(for: item).boundingHeight(width: bodyMeasurementWidth)
         if displayed.isEmpty { bodyHeight = 0 }
         // The legacy bounded estimate protects old callers from an enormous
         // speculative row. The live explicit-expanded path must retain the

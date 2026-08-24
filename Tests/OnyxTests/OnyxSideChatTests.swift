@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import SwiftUI
 import XCTest
 @testable import Onyx
 
@@ -450,6 +451,74 @@ final class OnyxSideChatTests: XCTestCase {
         XCTAssertEqual(model.timeline, [SideChatFixture.parentItem])
     }
 
+    func testEscapeFromFocusedComposerClosesAndInterruptsRunningSideChat() async throws {
+        let fixture = makeFixture(capabilities: [.streaming, .interruption, .ephemeralThreadForking])
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        model.start()
+        await waitUntil("Parent task did not load") {
+            model.selectedThreadID == SideChatFixture.parent.id
+        }
+        model.openSideChat()
+        await waitUntil("Fork did not open") { model.sideChatThreadID == SideChatFixture.fork.id }
+
+        model.sideChatComposerText = "Keep working until I press Escape"
+        model.sendSideChat()
+        await waitUntilAsync("Side-chat turn did not start") {
+            await fixture.runtime.startTurnRequests().count == 1
+        }
+
+        let size = NSSize(width: 380, height: 620)
+        let hostingView = NSHostingView(
+            rootView: SideChatPanelView(model: model)
+                .frame(width: size.width, height: size.height)
+        )
+        hostingView.frame = NSRect(origin: .zero, size: size)
+        let window = NSWindow(
+            contentRect: hostingView.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = hostingView
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+
+        hostingView.layoutSubtreeIfNeeded()
+        let composer = try XCTUnwrap(
+            hostingView.sideChatFirstDescendant(ofType: ComposerTextView.self)
+        )
+        XCTAssertTrue(window.makeFirstResponder(composer))
+
+        composer.keyDown(with: try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber,
+            context: nil,
+            characters: "\u{1b}",
+            charactersIgnoringModifiers: "\u{1b}",
+            isARepeat: false,
+            keyCode: 53
+        )))
+        XCTAssertFalse(
+            window.firstResponder === composer,
+            "Escape must leave the native responder chain before closing its hosted panel"
+        )
+
+        await waitUntil("Escape did not close the side-chat panel") {
+            !model.isSideChatPresented && model.sideChatThreadID == nil
+        }
+        await waitUntilAsync("Escape did not interrupt the ephemeral fork") {
+            await fixture.runtime.interruptRequests() == [SideChatFixture.fork.id]
+        }
+    }
+
     func testSideChatInteractionUsesFullResponseSurfaceWithoutLeakingToMainTask() async {
         let fixture = makeFixture(capabilities: [.streaming, .interruption, .approvals, .ephemeralThreadForking])
         defer { fixture.cleanUp() }
@@ -549,6 +618,18 @@ final class OnyxSideChatTests: XCTestCase {
         }
         let didMeetCondition = await condition()
         XCTAssertTrue(didMeetCondition, failureMessage)
+    }
+}
+
+private extension NSView {
+    func sideChatFirstDescendant<View: NSView>(ofType type: View.Type) -> View? {
+        if let match = self as? View { return match }
+        for subview in subviews {
+            if let match = subview.sideChatFirstDescendant(ofType: type) {
+                return match
+            }
+        }
+        return nil
     }
 }
 

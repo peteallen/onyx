@@ -2,6 +2,7 @@ import Foundation
 
 enum CodexProjection {
     private static let maximumProjectedDataURLCharacters = 24 * 1_024 * 1_024 * 4 / 3 + 512
+    private static let maximumTurnFailureCharacters = 2_000
 
     static func thread(from value: JSONValue) -> RuntimeThread? {
         guard let id = value["id"]?.stringValue else { return nil }
@@ -41,19 +42,34 @@ enum CodexProjection {
 
         let turns = threadValue["turns"]?.arrayValue ?? []
         var items: [TimelineItem] = []
+        var projectedTurns: [RuntimeConversationTurn] = []
         for turn in turns {
             let fallbackTimestamp = date(from: turn["startedAt"])
                 ?? date(from: turn["completedAt"])
-            for item in turn["items"]?.arrayValue ?? [] {
-                items.append(
+                ?? thread.updatedAt
+            if let projectedTurn = conversationTurn(
+                from: turn,
+                fallbackTimestamp: fallbackTimestamp
+            ) {
+                projectedTurns.append(projectedTurn)
+                items.append(contentsOf: projectedTurn.items)
+            } else {
+                // Keep the historical flat projection tolerant of malformed
+                // turns, even though turn-aware operations require a stable
+                // turn ID and therefore omit that turn from `turns`.
+                items.append(contentsOf: (turn["items"]?.arrayValue ?? []).map {
                     timelineItem(
-                        from: item,
+                        from: $0,
                         fallbackTimestamp: fallbackTimestamp
                     )
-                )
+                })
             }
         }
-        return RuntimeConversation(thread: thread, items: items)
+        return RuntimeConversation(
+            thread: thread,
+            items: items,
+            turns: projectedTurns
+        )
     }
 
     static func historyPage(
@@ -77,26 +93,36 @@ enum CodexProjection {
         )
     }
 
-    static func conversationTurn(from value: JSONValue) -> RuntimeConversationTurn? {
+    static func conversationTurn(
+        from value: JSONValue,
+        fallbackTimestamp inheritedFallbackTimestamp: Date? = nil
+    ) -> RuntimeConversationTurn? {
         guard let id = value["id"]?.stringValue else { return nil }
         let status = conversationTurnStatus(from: value["status"]?.stringValue)
         let startedAt = date(from: value["startedAt"])
         let completedAt = date(from: value["completedAt"])
-        let fallbackTimestamp = startedAt ?? completedAt
+        let fallbackTimestamp = startedAt ?? completedAt ?? inheritedFallbackTimestamp
         let defaultItemStatus: TimelineItemStatus = switch status {
         case .inProgress: .running
         case .failed: .failed
         case .completed, .interrupted, .unknown: .completed
         }
+        var items = (value["items"]?.arrayValue ?? []).map {
+            timelineItem(
+                from: $0,
+                defaultStatus: defaultItemStatus,
+                fallbackTimestamp: fallbackTimestamp
+            )
+        }
+        if let failure = turnFailureTimelineItem(
+            from: value,
+            fallbackTimestamp: fallbackTimestamp
+        ), !items.contains(where: { $0.kind == .error }) {
+            items.append(failure)
+        }
         return RuntimeConversationTurn(
             id: id,
-            items: (value["items"]?.arrayValue ?? []).map {
-                timelineItem(
-                    from: $0,
-                    defaultStatus: defaultItemStatus,
-                    fallbackTimestamp: fallbackTimestamp
-                )
-            },
+            items: items,
             status: status,
             itemDetail: turnItemDetail(from: value["itemsView"]?.stringValue),
             startedAt: startedAt,
@@ -114,6 +140,47 @@ enum CodexProjection {
         case let value?: .unknown(value)
         case nil: .unknown("unknown")
         }
+    }
+
+    static func turnFailureMessage(from value: JSONValue) -> String? {
+        let candidates = [
+            value["error"]?["message"]?.stringValue,
+            value["error"]?.stringValue,
+            value["message"]?.stringValue,
+        ]
+        return candidates.lazy.compactMap(boundedTurnFailureMessage).first
+    }
+
+    static func turnFailureTimelineItem(
+        from value: JSONValue,
+        fallbackTurnID: String? = nil,
+        fallbackMessage: String? = nil,
+        fallbackTimestamp: Date? = nil
+    ) -> TimelineItem? {
+        let isFailedTurn = value["status"]?.stringValue?.lowercased() == "failed"
+        guard isFailedTurn || fallbackMessage != nil,
+              let turnID = value["id"]?.stringValue ?? fallbackTurnID else { return nil }
+        let message = turnFailureMessage(from: value)
+            ?? boundedTurnFailureMessage(fallbackMessage)
+            ?? "The provider stopped before completing this response."
+        let timestamp = date(from: value["completedAt"])
+            ?? date(from: value["startedAt"])
+            ?? fallbackTimestamp
+            ?? .distantPast
+        return TimelineItem(
+            id: "codex-turn-error:\(turnID)",
+            kind: .error,
+            title: "Response failed",
+            body: message,
+            status: .failed,
+            timestamp: timestamp,
+            detail: nil
+        )
+    }
+
+    private static func boundedTurnFailureMessage(_ raw: String?) -> String? {
+        guard let raw, let safe = safeTextCandidate(raw) else { return nil }
+        return boundedText(safe, maximumCharacters: maximumTurnFailureCharacters)
     }
 
     private static func turnItemDetail(from rawValue: String?) -> RuntimeTurnItemDetail {
@@ -166,10 +233,11 @@ enum CodexProjection {
                 id: id,
                 kind: .userMessage,
                 title: nil,
-                body: firstString(
-                    messageText(from: value),
-                    attachments.isEmpty ? nil : attachmentSummary(count: attachments.count, verb: "Attached")
-                ),
+                // Attachments are rendered as native previews below the
+                // message. Keep the body as exact text evidence: image-only
+                // turns have an empty body, while a literal phrase such as
+                // "[Image attachment]" remains editable text.
+                body: messageText(from: value),
                 status: status,
                 timestamp: timestamp,
                 detail: nil,

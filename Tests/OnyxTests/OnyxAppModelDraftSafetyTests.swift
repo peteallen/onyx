@@ -881,6 +881,37 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
         XCTAssertEqual(recordedTurn?.reasoningEffort, "medium")
     }
 
+    func testCapabilityDowngradeMasksAlreadySelectedTaskProjection() async {
+        let suiteName = "OnyxAppModelDraftSafetyTests.capability-downgrade.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        var task = DraftSafetyFixture.threadA
+        task.taskCapabilities = [.streaming, .threadHistoryRevert, .tools]
+        let runtime = DraftSafetyRuntime(
+            initialThreads: [task],
+            failurePoint: .none,
+            capabilities: [.streaming, .threadHistoryRevert, .tools]
+        )
+        let model = OnyxAppModel(runtime: runtime, defaults: defaults)
+        model.start()
+
+        await waitUntil("Capability test task did not load") {
+            model.selectedThreadID == task.id && !model.isLoadingThread
+        }
+        XCTAssertTrue(model.supports(.threadHistoryRevert))
+        XCTAssertTrue(model.selectedThread?.taskCapabilities?.contains(.threadHistoryRevert) == true)
+
+        await runtime.publish(.runtimeCapabilitiesDowngraded(.threadHistoryRevert))
+
+        await waitUntil("Capability downgrade did not reach the app model") {
+            !model.supports(.threadHistoryRevert)
+        }
+        XCTAssertFalse(model.selectedThread?.taskCapabilities?.contains(.threadHistoryRevert) == true)
+        XCTAssertFalse(model.session?.capabilities.contains(.threadHistoryRevert) == true)
+    }
+
     func testNewTaskContextTransfersBetweenProviderModelsWithoutCountingUsage() async throws {
         let sourceSuiteName = "OnyxAppModelDraftSafetyTests.transfer.source.\(UUID().uuidString)"
         let targetSuiteName = "OnyxAppModelDraftSafetyTests.transfer.target.\(UUID().uuidString)"
@@ -1021,6 +1052,24 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
         )
     }
 
+    func testProjectQuickCreateStartsBlankInsteadOfReusingWelcomeDraft() async throws {
+        let fixture = makeFixture(initialThreads: [], workspacePath: nil)
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        model.start()
+        await waitUntil("The empty runtime did not show the new-task composer") {
+            model.canRunAgent && model.selectedThreadID == DraftSafetyFixture.welcomeThreadID
+        }
+
+        model.composerText = "Draft for the first project"
+        model.newTask(inWorkspace: "/tmp/second-project")
+
+        XCTAssertEqual(model.draftWorkspacePath, "/tmp/second-project")
+        XCTAssertEqual(model.selectedThreadID, DraftSafetyFixture.welcomeThreadID)
+        XCTAssertEqual(model.composerText, "")
+    }
+
     func testUnavailableRuntimeKeepsDraftVisibleAndDurable() async {
         let suiteName = "OnyxAppModelDraftSafetyTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -1141,6 +1190,46 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
             key: DraftSafetyFixture.threadB.id,
             value: draftForB
         )
+    }
+
+    func testPreAcceptanceStartFailureRemovesOnlyItsOptimisticUserRow() async {
+        let fixture = makeFixture(
+            initialThreads: [DraftSafetyFixture.threadA],
+            failurePoint: .startTurn
+        )
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        model.start()
+        await waitUntil("Thread A did not load") {
+            model.canRunAgent
+                && model.selectedThreadID == DraftSafetyFixture.threadA.id
+                && model.timeline == [DraftSafetyFixture.itemA]
+        }
+
+        let failedText = "This should return to the composer"
+        model.composerText = failedText
+        model.sendComposer()
+
+        await waitUntilAsync("The failing turn did not reach the runtime") {
+            await fixture.runtime.recordedStartTurns().count == 1
+        }
+        XCTAssertTrue(
+            model.timeline.contains(where: { $0.id.hasPrefix("optimistic:") }),
+            "The existing-task send should paint immediately while startTurn is pending."
+        )
+
+        await fixture.runtime.releaseFailure()
+        await waitUntil("The failed send did not surface an error") {
+            model.notice?.title == "Could not send"
+        }
+
+        XCTAssertFalse(
+            model.timeline.contains(where: { $0.id.hasPrefix("optimistic:") }),
+            "A send rejected before provider acceptance must not leave a user row in history."
+        )
+        XCTAssertEqual(model.timeline.first?.id, DraftSafetyFixture.itemA.id)
+        XCTAssertEqual(model.composerText, failedText)
     }
 
     func testImageOnlySendReachesRuntimeAndAppearsOptimisticallyInTimeline() async throws {
@@ -1610,6 +1699,10 @@ private actor DraftSafetyRuntime: AgentRuntime {
 
     func publishThreadDeleted(_ threadID: String) {
         continuation.yield(.threadDeleted(threadID: threadID))
+    }
+
+    func publish(_ event: AgentRuntimeEvent) {
+        continuation.yield(event)
     }
 
     func releaseFailure() {

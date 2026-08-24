@@ -161,13 +161,20 @@ final class OnyxApplicationHost: ObservableObject {
     /// observe this narrow signal to refresh the picker once, instead of
     /// rebuilding rankings for every streamed transcript publication.
     @Published private(set) var modelUsageRevision: UInt64 = 0
+    /// Advances after a provider settings transaction fully finishes. Open
+    /// windows observe this narrow signal and replace models that still retain
+    /// the permanently retired runtime generation.
+    @Published private(set) var providerRuntimeRevision: UInt64 = 0
 
     private let registry: RuntimeRegistry
     private let defaultConnectionID: ProviderConnectionID
     private let providerConnectionStore: ProviderConnectionStore
     private let providerCredentialStore: any CredentialStore
     private let providerConversationStore: OpenAICompatibleConversationStore
+    private let providerAdaptiveStateStore: OpenAICompatibleAdaptiveStateStore
     private var runtimeCoordinators: [ProviderConnectionID: SharedRuntimeCoordinator]
+    private var providerRuntimeMutationDepths: [ProviderConnectionID: Int] = [:]
+    private var providerRuntimeRevisions: [ProviderConnectionID: UInt64] = [:]
     private var pinnedThreadStores: [ProviderConnectionID: OnyxPinnedThreadStore]
     /// Model choices are rendered from SwiftUI's frequently invalidated view
     /// tree. Keep the decoded usage ledger in memory so a transcript/status
@@ -222,7 +229,8 @@ final class OnyxApplicationHost: ObservableObject {
         providerConnectionStore: ProviderConnectionStore = ProviderConnectionStore(),
         providerCredentialStore: any CredentialStore = KeychainCredentialStore(),
         providerModelDiscovery: any ProviderModelDiscovery = URLSessionProviderModelDiscovery(),
-        providerConversationStore: OpenAICompatibleConversationStore = OpenAICompatibleConversationStore()
+        providerConversationStore: OpenAICompatibleConversationStore = OpenAICompatibleConversationStore(),
+        providerAdaptiveStateStore: OpenAICompatibleAdaptiveStateStore = OpenAICompatibleAdaptiveStateStore()
     ) {
         let delegationBridge = OnyxDelegationHostBridge()
         let delegationBroker = OnyxDelegationBroker(
@@ -238,6 +246,7 @@ final class OnyxApplicationHost: ObservableObject {
         self.providerConnectionStore = providerConnectionStore
         self.providerCredentialStore = providerCredentialStore
         self.providerConversationStore = providerConversationStore
+        self.providerAdaptiveStateStore = providerAdaptiveStateStore
         self.delegationBroker = delegationBroker
         let coordinator: SharedRuntimeCoordinator?
         let resolutionError: (any Error)?
@@ -282,8 +291,11 @@ final class OnyxApplicationHost: ObservableObject {
             credentialStore: providerCredentialStore,
             discovery: providerModelDiscovery
         )
+        providerSettingsModel.onConnectionWillMutate = { [weak self] connectionID in
+            await self?.retireProviderRuntime(for: connectionID)
+        }
         providerSettingsModel.onConnectionMutation = { [weak self] connectionID in
-            self?.invalidateProviderRuntime(for: connectionID)
+            self?.evictRetiredProviderRuntime(for: connectionID)
         }
         delegationBridge.host = self
     }
@@ -329,6 +341,19 @@ final class OnyxApplicationHost: ObservableObject {
         }
     }
 
+    /// Rebinds an open window after its provider runtime was retired while
+    /// preserving the task selection and exact visible draft, including image
+    /// attachments that intentionally are not serialized into UserDefaults.
+    func makeRuntimeReplacementWindowModel(
+        for windowID: WorkspaceWindowID,
+        replacing source: OnyxAppModel
+    ) -> OnyxAppModel {
+        let context = source.captureRuntimeReplacementContext()
+        let replacement = makeWindowModel(for: windowID)
+        replacement.restoreRuntimeReplacementContext(context)
+        return replacement
+    }
+
     func selectedConnectionID(for windowID: WorkspaceWindowID) -> ProviderConnectionID {
         if let explicit = windowID.providerConnectionID { return explicit }
         let key = "\(windowID.preferenceKeyPrefix).\(Self.selectedProviderPreferenceSuffix)"
@@ -372,13 +397,7 @@ final class OnyxApplicationHost: ObservableObject {
     }
 
     func workspaceConnectionCatalog() async -> WorkspaceConnectionCatalog {
-        var values = [
-            WorkspaceConnection(
-                id: defaultConnectionID,
-                displayName: "Codex",
-                isCodex: true
-            ),
-        ]
+        var values = defaultWorkspaceConnections
         do {
             let records = try await providerConnectionStore.connections()
             values.append(contentsOf: records.map {
@@ -394,14 +413,49 @@ final class OnyxApplicationHost: ObservableObject {
         await workspaceConnectionCatalog().connections
     }
 
-    /// Returns credential-free cached catalogs for every configured provider.
-    /// This is deliberately read without connecting any runtime, so opening a
-    /// model menu never fans out network requests or provider processes.
+    /// Settings publishes its durable post-transaction snapshot before the
+    /// runtime revision advances. This synchronous projection lets an open
+    /// window distinguish a same-ID edit from deletion without waiting behind
+    /// filesystem-backed catalog work.
+    func publishedWorkspaceConnections() -> [WorkspaceConnection] {
+        defaultWorkspaceConnections + providerSettingsModel.connections.map {
+            WorkspaceConnection(id: $0.id, displayName: $0.displayName, isCodex: false)
+        }
+    }
+
+    private var defaultWorkspaceConnections: [WorkspaceConnection] {
+        [
+            WorkspaceConnection(
+                id: defaultConnectionID,
+                displayName: "Codex",
+                isCodex: true
+            ),
+        ]
+    }
+
+    /// Returns the best model catalog already available for each configured
+    /// provider. Saved discovery metadata paints immediately; a provider whose
+    /// shared adaptive runtime already exists contributes its capability-aware
+    /// session projection. Merely opening the picker must not create or connect
+    /// an otherwise unused provider runtime.
     func cachedProviderModelCatalogs() async -> [ProviderConnectionID: [RuntimeModel]] {
         guard let records = try? await providerConnectionStore.connections() else { return [:] }
-        return Dictionary(uniqueKeysWithValues: records.map { record in
-            (record.id, Self.cachedRuntimeModels(for: record))
-        })
+        var catalogs: [ProviderConnectionID: [RuntimeModel]] = [:]
+        catalogs.reserveCapacity(records.count)
+        for record in records {
+            let persisted = Self.cachedRuntimeModels(for: record)
+            guard providerRuntimeMutationDepths[record.id, default: 0] == 0,
+                  let coordinator = runtimeCoordinators[record.id],
+                  let session = try? await coordinator.connect() else {
+                catalogs[record.id] = persisted
+                continue
+            }
+            catalogs[record.id] = Self.modelCatalog(
+                retaining: persisted,
+                preferring: session.availableModels
+            )
+        }
+        return catalogs
     }
 
     fileprivate func delegationProviderConfigurations() async throws
@@ -474,28 +528,79 @@ final class OnyxApplicationHost: ObservableObject {
                 continue
             }
 
-            let providerRecord = try? await providerConnectionStore.connection(id: connection.id)
+            let providerRecord = try? await providerConnectionStore.connection(
+                id: connection.id
+            )
             let conversationScopeID = providerRecord?.conversationScopeID
                 ?? ProviderConnectionRecord.legacyConversationScopeID(for: connection.id)
             // Local provider transcripts created by older builds have no
             // scope marker. Migrate them before filtering so they remain
             // visible on the first launch, while later endpoint/credential
             // rotations keep the old scope isolated.
-            if let providerRecord {
+            if providerRecord != nil {
                 _ = try? await providerConversationStore.migrateLegacyConversations(
                     connectionID: connection.id,
-                    to: providerRecord.conversationScopeID
+                    to: conversationScopeID
                 )
             }
+            // Chat ownership alone does not require a network/runtime
+            // connection for the sidebar; only an agent owner means the
+            // merged app-server catalog must be consulted.
+            let hasAdaptiveOwners: Bool
+            do {
+                let ownerships = try await providerAdaptiveStateStore.taskOwnerships(
+                    connectionID: connection.id,
+                    conversationScopeID: conversationScopeID,
+                    lane: .agent
+                )
+                hasAdaptiveOwners = !ownerships.isEmpty
+            } catch {
+                sourceComplete = false
+                continue
+            }
+
+            if hasAdaptiveOwners {
+                // Once this provider has adaptive ownership metadata, its
+                // runtime owns the merged chat + app-server catalog. Reading
+                // the chat store directly would make agent tasks disappear on
+                // the next background/sidebar refresh.
+                let resolved = runtimeCoordinator(for: connection.id)
+                guard let coordinator = resolved.coordinator,
+                      (try? await coordinator.connect()) != nil else {
+                    sourceComplete = false
+                    continue
+                }
+                for scope in ThreadListScope.allCases {
+                    do {
+                        let threads = try await coordinator.listAllThreads(
+                            archived: scope == .archived
+                        )
+                        lists.append(ProjectProviderTaskList(
+                            providerConnectionID: connection.id,
+                            providerDisplayName: connection.displayName,
+                            scope: scope,
+                            threads: threads.map {
+                                var thread = $0
+                                thread.isPinned = pinnedIDs.contains(thread.id)
+                                return thread
+                            }
+                        ))
+                    } catch {
+                        sourceComplete = false
+                    }
+                }
+                continue
+            }
+
+            // A never-opened or pre-adaptive provider has chat history only.
+            // Read that local snapshot without connecting its endpoint; this
+            // keeps global sidebar refreshes offline and immediately paintable.
             for scope in ThreadListScope.allCases {
                 do {
                     let conversations = try await providerConversationStore.conversations(
                         connectionID: connection.id,
                         scopeID: conversationScopeID,
                         archived: scope == .archived,
-                        // Local provider history is already on disk. Do not
-                        // apply the remote UI page size to this complete
-                        // source; otherwise projects/tasks after row 100 vanish.
                         limit: Int.max
                     )
                     lists.append(ProjectProviderTaskList(
@@ -593,6 +698,59 @@ final class OnyxApplicationHost: ObservableObject {
     ) -> [RuntimeModel] {
         guard let live, !live.isEmpty else { return cached }
         return live
+    }
+
+    /// Existing adaptive tasks keep the lane recorded on the task itself. This
+    /// projection is used only while rendering that selected task: it makes a
+    /// restored agent task read as agent-capable (and a chat-owned task remain
+    /// chat-only) without changing the global catalog used to create new tasks.
+    static func taskScopedModelCatalog(
+        _ models: [RuntimeModel],
+        selectedModelID: String?,
+        taskCapabilities: RuntimeCapabilities?
+    ) -> [RuntimeModel] {
+        guard let selectedModelID = selectedModelID?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ), !selectedModelID.isEmpty,
+              let taskCapabilities else { return models }
+        let executionMode: RuntimeModelExecutionMode = taskCapabilities.contains(.tools)
+            ? .agent
+            : .chat
+        var found = false
+        var projected = models.map { model in
+            guard model.id == selectedModelID else { return model }
+            found = true
+            return RuntimeModel(
+                id: model.id,
+                displayName: model.displayName,
+                description: model.description,
+                isDefault: model.isDefault,
+                defaultReasoningEffort: model.defaultReasoningEffort,
+                reasoningEfforts: model.reasoningEfforts,
+                inputModalities: model.inputModalities,
+                serverAdvertisedRequestParameters: model.serverAdvertisedRequestParameters,
+                supportedRequestParameters: model.supportedRequestParameters,
+                serverAdvertisedCapabilities: model.serverAdvertisedCapabilities,
+                capabilityEvidence: model.capabilityEvidence,
+                executionMode: executionMode,
+                taskCapabilities: taskCapabilities
+            )
+        }
+        if !found {
+            projected.append(RuntimeModel(
+                id: selectedModelID,
+                displayName: selectedModelID,
+                description: nil,
+                isDefault: false,
+                defaultReasoningEffort: nil,
+                reasoningEfforts: [],
+                inputModalities: [.text],
+                capabilityEvidence: .unknown,
+                executionMode: executionMode,
+                taskCapabilities: taskCapabilities
+            ))
+        }
+        return projected
     }
 
     func recordModelUsage(connectionID: ProviderConnectionID, modelID: String) {
@@ -701,6 +859,15 @@ final class OnyxApplicationHost: ObservableObject {
     private func runtimeCoordinator(
         for connectionID: ProviderConnectionID
     ) -> (coordinator: SharedRuntimeCoordinator?, error: (any Error)?) {
+        guard providerRuntimeMutationDepths[connectionID, default: 0] == 0 else {
+            return (
+                nil,
+                AgentRuntimeError.requestFailed(
+                    code: -32_101,
+                    message: "Provider settings are changing. Reconnect using the current configuration."
+                )
+            )
+        }
         if let existing = runtimeCoordinators[connectionID] {
             return (existing, nil)
         }
@@ -710,11 +877,12 @@ final class OnyxApplicationHost: ObservableObject {
             if registry.connections.contains(where: { $0.id == connectionID }) {
                 runtime = try registry.resolve(connectionID)
             } else {
-                runtime = OpenAICompatibleRuntime(
+                runtime = OpenAICompatibleAdaptiveRuntime(
                     connectionID: connectionID,
                     connectionStore: providerConnectionStore,
                     credentialStore: providerCredentialStore,
-                    conversationStore: providerConversationStore
+                    conversationStore: providerConversationStore,
+                    stateStore: providerAdaptiveStateStore
                 )
             }
             let coordinator = SharedRuntimeCoordinator(runtime: runtime)
@@ -725,17 +893,39 @@ final class OnyxApplicationHost: ObservableObject {
         }
     }
 
-    /// A settings edit or deletion invalidates the endpoint, credential, and
-    /// capability snapshot captured by a live OpenAI-compatible runtime. Drop
-    /// it from the cache synchronously so the next workspace gets a fresh
-    /// adapter, then disconnect the old coordinator so already-open windows
-    /// cannot keep using the stale or deleted provider configuration.
-    private func invalidateProviderRuntime(for connectionID: ProviderConnectionID) {
-        Task { await delegationBroker.invalidate(connectionID: connectionID) }
-        guard connectionID != defaultConnectionID,
-              let coordinator = runtimeCoordinators.removeValue(forKey: connectionID)
-        else { return }
-        Task { await coordinator.disconnect() }
+    /// Retire before settings mutate. The coordinator remains cached as a
+    /// rejecting tombstone while credentials and the durable record change, so
+    /// another window cannot create a replacement runtime in the middle of the
+    /// two-part transaction.
+    private func retireProviderRuntime(for connectionID: ProviderConnectionID) async {
+        guard connectionID != defaultConnectionID else { return }
+        providerRuntimeMutationDepths[connectionID, default: 0] += 1
+        await delegationBroker.invalidate(connectionID: connectionID)
+        guard let coordinator = runtimeCoordinators[connectionID] else { return }
+        await coordinator.retire()
+    }
+
+    /// The settings model calls this on every success or failure path after a
+    /// pre-mutation retirement. A later workspace can now resolve one fresh
+    /// adapter from the final stored configuration.
+    private func evictRetiredProviderRuntime(for connectionID: ProviderConnectionID) {
+        guard connectionID != defaultConnectionID else { return }
+        let remainingDepth = max(
+            0,
+            providerRuntimeMutationDepths[connectionID, default: 1] - 1
+        )
+        if remainingDepth > 0 {
+            providerRuntimeMutationDepths[connectionID] = remainingDepth
+            return
+        }
+        providerRuntimeMutationDepths.removeValue(forKey: connectionID)
+        runtimeCoordinators.removeValue(forKey: connectionID)
+        providerRuntimeRevisions[connectionID, default: 0] &+= 1
+        providerRuntimeRevision &+= 1
+    }
+
+    func runtimeConfigurationRevision(for connectionID: ProviderConnectionID) -> UInt64 {
+        providerRuntimeRevisions[connectionID, default: 0]
     }
 
     #if DEBUG
@@ -743,6 +933,18 @@ final class OnyxApplicationHost: ObservableObject {
         _ connectionID: ProviderConnectionID
     ) -> SharedRuntimeCoordinator? {
         runtimeCoordinators[connectionID]
+    }
+
+    func beginProviderRuntimeMutationForTesting(
+        _ connectionID: ProviderConnectionID
+    ) async {
+        await retireProviderRuntime(for: connectionID)
+    }
+
+    func endProviderRuntimeMutationForTesting(
+        _ connectionID: ProviderConnectionID
+    ) {
+        evictRetiredProviderRuntime(for: connectionID)
     }
     #endif
 }
@@ -761,7 +963,7 @@ struct OnyxWindowRootView: View {
     @ObservedObject private var providerSettingsModel: ProviderSettingsModel
     @State private var selection: ProviderWorkspaceSelection
     @State private var catalogRefreshRevision: UInt64 = 0
-    private let host: OnyxApplicationHost
+    @ObservedObject private var host: OnyxApplicationHost
     private let defaults: UserDefaults
 
     @MainActor
@@ -773,9 +975,12 @@ struct OnyxWindowRootView: View {
             windowID: windowID,
             model: host.makeWindowModel(for: windowID),
             connectionID: host.selectedConnectionID(for: windowID),
+            runtimeRevision: host.runtimeConfigurationRevision(
+                for: host.selectedConnectionID(for: windowID)
+            ),
             availableConnections: []
         ))
-        self.host = host
+        _host = ObservedObject(wrappedValue: host)
         defaults = host.defaults
     }
 
@@ -786,14 +991,17 @@ struct OnyxWindowRootView: View {
             defaults: defaults,
             windowReference: windowReference
         )
-        .frame(minWidth: 860, minHeight: 620)
+        .frame(minWidth: WorkspacePaneLayout.minimumWindowWidth, minHeight: 620)
         .background(
             OnyxWindowConfigurator(
                 windowID: windowID,
                 windowReference: windowReference
             )
         )
-        .task(id: providerSettingsModel.connections) {
+        .task(id: ProviderWorkspaceCatalogRefreshIdentity(
+            connections: providerSettingsModel.connections,
+            runtimeRevision: host.providerRuntimeRevision
+        )) {
             await refreshWorkspaceCatalogs()
         }
         .onDisappear { selection.model.flushWindowState() }
@@ -814,6 +1022,7 @@ struct OnyxWindowRootView: View {
             windowID: selection.windowID,
             model: replacementModel,
             connectionID: connectionID,
+            runtimeRevision: host.runtimeConfigurationRevision(for: connectionID),
             availableConnections: selection.availableConnections,
             modelCatalogs: selection.modelCatalogs,
             pendingThreadID: nil,
@@ -826,6 +1035,27 @@ struct OnyxWindowRootView: View {
         guard !Task.isCancelled else { return }
         catalogRefreshRevision &+= 1
         let refreshRevision = catalogRefreshRevision
+
+        // A provider mutation permanently retires the old coordinator. Rebind
+        // the visible window before any store or history work can suspend so
+        // Save never leaves the composer attached to a tombstone while an
+        // unrelated catalog refresh finishes.
+        let currentRuntimeRevision = host.runtimeConfigurationRevision(
+            for: selection.connectionID
+        )
+        if currentRuntimeRevision != selection.runtimeRevision {
+            let validated = host.validatedSelection(
+                for: selection.windowID,
+                availableConnections: host.publishedWorkspaceConnections()
+            )
+            if validated == selection.connectionID {
+                replaceRetiredRuntime(revision: currentRuntimeRevision)
+            } else {
+                replaceSelection(with: validated)
+            }
+            return
+        }
+
         async let connectionCatalog = host.workspaceConnectionCatalog()
         async let catalogs = host.cachedProviderModelCatalogs()
         let (loadedConnectionCatalog, loadedCatalogs) = await (connectionCatalog, catalogs)
@@ -851,6 +1081,21 @@ struct OnyxWindowRootView: View {
             preferring: selection.model.session?.availableModels
         )
         selection.modelRankingRevision &+= 1
+        let validated = host.validatedSelection(
+            for: selection.windowID,
+            availableConnections: loadedConnections
+        )
+        if validated != selection.connectionID {
+            replaceSelection(with: validated)
+            return
+        }
+        let loadedRuntimeRevision = host.runtimeConfigurationRevision(
+            for: selection.connectionID
+        )
+        if loadedRuntimeRevision != selection.runtimeRevision {
+            replaceRetiredRuntime(revision: loadedRuntimeRevision)
+            return
+        }
         if ProviderTaskCatalogSynchronizationPolicy.shouldReplaceCachedTasks(
             connectionState: selection.model.connectionState,
             isLoadingThreadList: selection.model.isLoadingThreadList,
@@ -868,14 +1113,6 @@ struct OnyxWindowRootView: View {
                 threads: selection.model.catalogThreads
             )
         }
-        let validated = host.validatedSelection(
-            for: selection.windowID,
-            availableConnections: loadedConnections
-        )
-        if validated != selection.connectionID {
-            replaceSelection(with: validated)
-        }
-
         let cachedTaskCatalog = await host.loadProviderTaskCatalog(
             connections: loadedConnections,
             connectionSourceComplete: loadedConnectionCatalog.sourceComplete
@@ -898,6 +1135,33 @@ struct OnyxWindowRootView: View {
             preserving: protectedTask
         )
     }
+
+    @MainActor
+    private func replaceRetiredRuntime(revision: UInt64) {
+        let replacementModel = host.makeRuntimeReplacementWindowModel(
+            for: WorkspaceWindowID(
+                rawValue: selection.windowID.rawValue,
+                providerConnectionID: host.sceneProviderConnectionID(for: selection.connectionID)
+            ),
+            replacing: selection.model
+        )
+        selection = ProviderWorkspaceSelection(
+            windowID: selection.windowID,
+            model: replacementModel,
+            connectionID: selection.connectionID,
+            runtimeRevision: revision,
+            availableConnections: selection.availableConnections,
+            modelCatalogs: selection.modelCatalogs,
+            pendingModelID: selection.pendingModelID,
+            pendingThreadID: selection.pendingThreadID,
+            pendingThreadScope: selection.pendingThreadScope
+        )
+    }
+}
+
+private struct ProviderWorkspaceCatalogRefreshIdentity: Hashable {
+    let connections: [ProviderConnectionRecord]
+    let runtimeRevision: UInt64
 }
 
 /// Provider selection is window-scoped. Replacing this small container creates
@@ -908,6 +1172,7 @@ private struct ProviderWorkspaceSelection {
     let windowID: WorkspaceWindowID
     var model: OnyxAppModel
     var connectionID: ProviderConnectionID
+    var runtimeRevision: UInt64 = 0
     var availableConnections: [OnyxApplicationHost.WorkspaceConnection]
     var modelCatalogs: [ProviderConnectionID: [RuntimeModel]] = [:]
     /// Changes only when the provider/model-picker inputs change. Keeping a
@@ -967,7 +1232,10 @@ private struct ProviderWorkspaceContent: View {
         // sidebar projection, scroll position, and disclosure state while the
         // destination provider connects behind it.
         .id(ProviderWorkspaceShellIdentity.id(for: selection.windowID))
-        .task(id: selection.connectionID) {
+        .task(id: ProviderWorkspaceRuntimeIdentity(
+            connectionID: selection.connectionID,
+            runtimeRevision: selection.runtimeRevision
+        )) {
             model.start()
         }
         .onChange(of: model.session?.availableModels) { _, models in
@@ -1034,6 +1302,11 @@ private struct ProviderWorkspaceContent: View {
         catalogs[selection.connectionID] = OnyxApplicationHost.modelCatalog(
             retaining: catalogs[selection.connectionID] ?? [],
             preferring: liveModels
+        )
+        catalogs[selection.connectionID] = OnyxApplicationHost.taskScopedModelCatalog(
+            catalogs[selection.connectionID] ?? [],
+            selectedModelID: selection.model.selectedTaskModelID,
+            taskCapabilities: selection.model.selectedThread?.taskCapabilities
         )
         return OnyxApplicationHost.rankModelChoices(
             selection.availableConnections.flatMap { connection in
@@ -1146,6 +1419,7 @@ private struct ProviderWorkspaceContent: View {
             windowID: selection.windowID,
             model: replacementModel,
             connectionID: connectionID,
+            runtimeRevision: host.runtimeConfigurationRevision(for: connectionID),
             availableConnections: selection.availableConnections,
             modelCatalogs: selection.modelCatalogs,
             pendingModelID: nil,
@@ -1153,6 +1427,11 @@ private struct ProviderWorkspaceContent: View {
             pendingThreadScope: pendingThreadScope
         )
     }
+}
+
+private struct ProviderWorkspaceRuntimeIdentity: Hashable {
+    let connectionID: ProviderConnectionID
+    let runtimeRevision: UInt64
 }
 
 struct ProviderTaskNavigationPlan: Equatable {
@@ -1230,7 +1509,7 @@ private struct OnyxWindowConfigurator: NSViewRepresentable {
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.isMovableByWindowBackground = false
-        window.minSize = NSSize(width: 860, height: 620)
+        window.minSize = NSSize(width: WorkspacePaneLayout.minimumWindowWidth, height: 620)
         window.tabbingMode = .preferred
         window.setFrameAutosaveName(windowID.frameAutosaveName)
     }

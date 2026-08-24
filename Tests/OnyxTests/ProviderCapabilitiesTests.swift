@@ -2,6 +2,54 @@ import XCTest
 @testable import Onyx
 
 final class ProviderCapabilitiesTests: XCTestCase {
+    func testReasoningEffortMetadataIsTrimmedAndStableAcrossPersistence() throws {
+        let descriptor = try ProviderModelDescriptor.openRouter(from: .object([
+            "id": .string("acme/vllm-model"),
+            "reasoning": .object([
+                // Some OpenAI-compatible catalogs are assembled from a
+                // whitespace-delimited server flag and can repeat values.
+                "supported_efforts": .array([
+                    .string(" low "),
+                    .string("medium"),
+                    .string("low"),
+                    .string(""),
+                    .string("  "),
+                    .string("xhigh"),
+                ]),
+            ]),
+        ]))
+
+        XCTAssertEqual(
+            descriptor.capabilities.reasoningEfforts,
+            ["low", "medium", "xhigh"]
+        )
+        XCTAssertTrue(descriptor.capabilities.supports(.reasoningEffort("medium")))
+        XCTAssertFalse(descriptor.capabilities.supports(.reasoningEffort(" low ")))
+
+        let roundTripped = try JSONDecoder().decode(
+            ProviderModelDescriptor.self,
+            from: JSONEncoder().encode(descriptor)
+        )
+        XCTAssertEqual(roundTripped.capabilities.reasoningEfforts, ["low", "medium", "xhigh"])
+    }
+
+    func testMalformedNumericLimitsAreIgnoredInsteadOfTrappingCatalogDiscovery() throws {
+        let descriptor = try ProviderModelDescriptor.openRouter(from: .object([
+            "id": .string("acme/unsafe-metadata"),
+            // These values are valid JSON numbers but are not usable integer
+            // model limits. The parser should leave both fields unknown.
+            "max_model_len": .number(1e308),
+            "context_length": .number(3.5),
+            "top_provider": .object([
+                "max_completion_tokens": .number(-1e308),
+            ]),
+        ]))
+
+        XCTAssertNil(descriptor.contextLength)
+        XCTAssertNil(descriptor.maxCompletionTokens)
+        XCTAssertEqual(descriptor.capabilities.inputModalities, [.text])
+    }
+
     func testOpenRouterAndClaudeDescriptorsAreCredentialFreeAndUseDifferentProtocols() throws {
         let openRouter = try ProviderConnectionDescriptor.openRouter()
         let claude = try ProviderConnectionDescriptor.claude()

@@ -5,10 +5,18 @@ enum OpenAICompatibleConversationStoreError: LocalizedError, Equatable, Sendable
     case malformedDocument(String)
     case emptyConnectionID
     case emptyConversationID
+    case emptyConversationScopeID(connectionID: ProviderConnectionID, id: String)
     case emptyTitle
     case emptyModelID
     case duplicateConversation(connectionID: ProviderConnectionID, id: String)
+    case conversationScopeMismatch(
+        connectionID: ProviderConnectionID,
+        id: String,
+        existingScopeID: String?,
+        incomingScopeID: String?
+    )
     case duplicateMessageID(conversationID: String, messageID: String)
+    case duplicateTurnID(conversationID: String, turnID: String)
     case conversationNotFound(connectionID: ProviderConnectionID, id: String)
 
     var errorDescription: String? {
@@ -21,14 +29,20 @@ enum OpenAICompatibleConversationStoreError: LocalizedError, Equatable, Sendable
             "A provider conversation has an empty connection ID."
         case .emptyConversationID:
             "A provider conversation has an empty conversation ID."
+        case let .emptyConversationScopeID(connectionID, id):
+            "Conversation \(id) for provider connection \(connectionID) has an empty provider scope."
         case .emptyTitle:
             "A provider conversation title cannot be empty."
         case .emptyModelID:
             "A provider conversation model cannot be empty."
         case let .duplicateConversation(connectionID, id):
             "Conversation \(id) appears more than once for provider connection \(connectionID)."
+        case let .conversationScopeMismatch(connectionID, id, existing, incoming):
+            "Conversation \(id) for provider connection \(connectionID) belongs to scope \(existing ?? "legacy"), not \(incoming ?? "legacy")."
         case let .duplicateMessageID(conversationID, messageID):
             "Message \(messageID) appears more than once in conversation \(conversationID)."
+        case let .duplicateTurnID(conversationID, turnID):
+            "Turn \(turnID) appears in more than one place in conversation \(conversationID)."
         case let .conversationNotFound(connectionID, id):
             "Conversation \(id) does not exist for provider connection \(connectionID)."
         }
@@ -44,13 +58,18 @@ actor OpenAICompatibleConversationStore {
 
     private static let fileAccess = OpenAICompatibleConversationFileAccess.shared
     private let beforePersist: (@Sendable (OpenAICompatibleConversationSnapshot) throws -> Void)?
+    private let protectsParentDirectory: Bool
 
     init(
-        fileURL: URL = OpenAICompatibleConversationStore.defaultFileURL(),
+        fileURL: URL? = nil,
         beforePersist: (@Sendable (OpenAICompatibleConversationSnapshot) throws -> Void)? = nil
     ) {
-        self.fileURL = fileURL
+        self.fileURL = fileURL ?? Self.defaultFileURL()
         self.beforePersist = beforePersist
+        // The production store owns its Onyx application-support directory.
+        // An injected path may sit directly inside a shared fixture or caller-
+        // owned directory, so never chmod its parent as a side effect.
+        protectsParentDirectory = fileURL == nil
     }
 
     func snapshot() throws -> OpenAICompatibleConversationSnapshot {
@@ -83,18 +102,21 @@ actor OpenAICompatibleConversationStore {
         }
     }
 
-    /// Assigns legacy conversations written before provider scope isolation to
-    /// the connection's current scope. This is intentionally an explicit
-    /// migration step rather than a broad `nil` match in `conversations`:
-    /// after an endpoint or credential rotation, an old record must stay in
-    /// its previous scope and never be replayed to the replacement backend.
+    /// Assigns conversations written before provider scope isolation to the
+    /// deterministic legacy scope for this connection. A nil-scope record can
+    /// never be claimed by a later random scope: settings may rotate an
+    /// endpoint or credential before the first post-upgrade catalog load, and
+    /// adopting the old transcript then could replay it to the replacement
+    /// backend.
     @discardableResult
     func migrateLegacyConversations(
         connectionID: ProviderConnectionID,
         to scopeID: String
     ) throws -> Int {
         let normalizedScopeID = scopeID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedScopeID.isEmpty else { return 0 }
+        guard normalizedScopeID == ProviderConnectionRecord.legacyConversationScopeID(
+            for: connectionID
+        ) else { return 0 }
         return try Self.fileAccess.withLock(for: fileURL) {
             let current = try loadFromDisk()
             var candidate = current.conversations
@@ -140,7 +162,10 @@ actor OpenAICompatibleConversationStore {
         try Self.fileAccess.withLock(for: fileURL) {
             let current = try loadFromDisk()
             let record = OpenAICompatibleStoredConversation(
-                id: Self.makeConversationID(connectionID: connectionID),
+                id: Self.makeConversationID(
+                    connectionID: connectionID,
+                    scopeID: scopeID
+                ),
                 connectionID: connectionID,
                 conversationScopeID: scopeID,
                 title: title,
@@ -168,6 +193,15 @@ actor OpenAICompatibleConversationStore {
             if let index = candidate.firstIndex(where: {
                 $0.connectionID == incoming.connectionID && $0.id == incoming.id
             }) {
+                let existing = candidate[index]
+                guard existing.conversationScopeID == incoming.conversationScopeID else {
+                    throw OpenAICompatibleConversationStoreError.conversationScopeMismatch(
+                        connectionID: incoming.connectionID,
+                        id: incoming.id,
+                        existingScopeID: existing.conversationScopeID,
+                        incomingScopeID: incoming.conversationScopeID
+                    )
+                }
                 candidate[index] = incoming
             } else {
                 candidate.append(incoming)
@@ -352,11 +386,22 @@ actor OpenAICompatibleConversationStore {
 
     private func persist(_ snapshot: OpenAICompatibleConversationSnapshot) throws {
         try beforePersist?(snapshot)
+        let directory = fileURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(
-            at: fileURL.deletingLastPathComponent(),
+            at: directory,
             withIntermediateDirectories: true
         )
+        if protectsParentDirectory {
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: Int16(0o700))],
+                ofItemAtPath: directory.path
+            )
+        }
         try Self.encoder.encode(snapshot).write(to: fileURL, options: .atomic)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: Int16(0o600))],
+            ofItemAtPath: fileURL.path
+        )
     }
 
     private static func validate(_ snapshot: OpenAICompatibleConversationSnapshot) throws {
@@ -379,6 +424,13 @@ actor OpenAICompatibleConversationStore {
             }
             guard !conversation.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw OpenAICompatibleConversationStoreError.emptyConversationID
+            }
+            if let scopeID = conversation.conversationScopeID,
+               scopeID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                throw OpenAICompatibleConversationStoreError.emptyConversationScopeID(
+                    connectionID: conversation.connectionID,
+                    id: conversation.id
+                )
             }
             guard !conversation.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw OpenAICompatibleConversationStoreError.emptyTitle
@@ -411,15 +463,34 @@ actor OpenAICompatibleConversationStore {
                     )
                 }
             }
+            var turnIDs: Set<String> = []
+            for group in conversation.turnGroups {
+                guard turnIDs.insert(group.id).inserted else {
+                    throw OpenAICompatibleConversationStoreError.duplicateTurnID(
+                        conversationID: conversation.id,
+                        turnID: group.id
+                    )
+                }
+            }
         }
     }
 
-    private static func makeConversationID(connectionID: ProviderConnectionID) -> String {
-        let scoped = Data(connectionID.rawValue.utf8).base64EncodedString()
+    private static func makeConversationID(
+        connectionID: ProviderConnectionID,
+        scopeID: String?
+    ) -> String {
+        let connection = base64URL(connectionID.rawValue)
+        let scope = base64URL(
+            scopeID ?? ProviderConnectionRecord.legacyConversationScopeID(for: connectionID)
+        )
+        return "openai.\(connection).\(scope).\(UUID().uuidString.lowercased())"
+    }
+
+    private static func base64URL(_ value: String) -> String {
+        Data(value.utf8).base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
-        return "openai.\(scoped).\(UUID().uuidString.lowercased())"
     }
 
     /// Builds a user-facing repair detail without claiming a finish reason

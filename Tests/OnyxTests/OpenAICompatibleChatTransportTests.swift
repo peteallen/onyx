@@ -83,6 +83,101 @@ final class OpenAICompatibleChatTransportTests: XCTestCase {
         XCTAssertNil(payload["chat_template_kwargs"])
     }
 
+    func testNonStreamingDecodesNullContentAndMultipleToolCalls() async throws {
+        MockChatURLProtocol.configure { _ in
+            .json(
+                statusCode: 200,
+                body: #"""
+                {
+                  "id":"chatcmpl-tools",
+                  "model":"fixture-model",
+                  "choices":[{
+                    "index":0,
+                    "message":{
+                      "role":"assistant",
+                      "content":null,
+                      "tool_calls":[
+                        {
+                          "id":"call_weather",
+                          "type":"function",
+                          "function":{
+                            "name":"get_weather",
+                            "arguments":"{\"city\":\"Denver\"}"
+                          }
+                        },
+                        {
+                          "id":"call_time",
+                          "type":"function",
+                          "function":{
+                            "name":"get_time",
+                            "arguments":"{ \"zone\": \"UTC\" }"
+                          }
+                        }
+                      ]
+                    },
+                    "finish_reason":"tool_calls"
+                  }]
+                }
+                """#
+            )
+        }
+        let transport = try makeTransport()
+
+        let response = try await transport.complete(makeRequest(stream: false))
+
+        let choice = try XCTUnwrap(response.choices.first)
+        XCTAssertNil(choice.content)
+        XCTAssertEqual(choice.finishReason, "tool_calls")
+        XCTAssertEqual(
+            choice.toolCalls,
+            [
+                .init(
+                    id: "call_weather",
+                    name: "get_weather",
+                    arguments: #"{"city":"Denver"}"#
+                ),
+                .init(
+                    id: "call_time",
+                    name: "get_time",
+                    arguments: #"{ "zone": "UTC" }"#
+                ),
+            ]
+        )
+    }
+
+    func testNonStreamingRejectsMalformedToolCall() async throws {
+        MockChatURLProtocol.configure { _ in
+            .json(
+                statusCode: 200,
+                body: """
+                {
+                  "choices":[{
+                    "index":0,
+                    "message":{
+                      "role":"assistant",
+                      "content":null,
+                      "tool_calls":[{
+                        "id":"call_missing_arguments",
+                        "type":"function",
+                        "function":{"name":"get_weather"}
+                      }]
+                    },
+                    "finish_reason":"tool_calls"
+                  }]
+                }
+                """
+            )
+        }
+        let transport = try makeTransport()
+
+        do {
+            _ = try await transport.complete(makeRequest(stream: false))
+            XCTFail("Expected malformed tool call failure")
+        } catch let error as OpenAICompatibleChatTransportError {
+            XCTAssertEqual(error, .malformedResponse)
+        }
+    }
+
     func testStreamingPreservesRoleEmptyContentFinishUsageOnlyAndDoneChunks() async throws {
         let body = """
         : keepalive\r
@@ -172,6 +267,83 @@ final class OpenAICompatibleChatTransportTests: XCTestCase {
         XCTAssertEqual(chunks[3].choices[0].delta.content, "Final answer")
         XCTAssertFalse(chunks[3].choices[0].delta.hasReasoning)
         XCTAssertEqual(chunks[3].choices[0].finishReason, "stop")
+    }
+
+    func testStreamingAccumulatesFragmentedInterleavedToolCallsByIndex() async throws {
+        let body = #"""
+        data: {"id":"chatcmpl-stream-tools","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_weather","type":"function","function":{"name":"get_weather","arguments":"{\"city\":"}},{"index":1,"id":"call_time","type":"function","function":{"name":"get_time","arguments":"{\"zone\":"}}]},"finish_reason":null}]}
+
+        data: {"id":"chatcmpl-stream-tools","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\"UTC\"}"}},{"index":0,"function":{"arguments":"\"Denver\"}"}}]},"finish_reason":null}]}
+
+        data: {"id":"chatcmpl-stream-tools","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+        data: [DONE]
+
+        """#
+        MockChatURLProtocol.configure { _ in
+            .eventStream(chunks: [Data(body.utf8)])
+        }
+        let transport = try makeTransport()
+
+        var chunks: [OpenAICompatibleChatStreamChunk] = []
+        for try await event in transport.stream(makeRequest(stream: true)) {
+            if case let .chunk(chunk) = event { chunks.append(chunk) }
+        }
+
+        XCTAssertEqual(chunks.count, 3)
+        XCTAssertEqual(chunks[0].choices[0].delta.toolCalls.map(\.index), [0, 1])
+        XCTAssertEqual(
+            chunks[0].choices[0].toolCalls,
+            [
+                .init(
+                    id: "call_weather",
+                    name: "get_weather",
+                    arguments: #"{"city":"#
+                ),
+                .init(
+                    id: "call_time",
+                    name: "get_time",
+                    arguments: #"{"zone":"#
+                ),
+            ]
+        )
+
+        let expectedCalls: [OpenAICompatibleChatToolCall] = [
+            .init(
+                id: "call_weather",
+                name: "get_weather",
+                arguments: #"{"city":"Denver"}"#
+            ),
+            .init(
+                id: "call_time",
+                name: "get_time",
+                arguments: #"{"zone":"UTC"}"#
+            ),
+        ]
+        XCTAssertEqual(chunks[1].choices[0].delta.toolCalls.map(\.index), [1, 0])
+        XCTAssertEqual(chunks[1].choices[0].toolCalls, expectedCalls)
+        XCTAssertEqual(chunks[2].choices[0].finishReason, "tool_calls")
+        XCTAssertEqual(chunks[2].choices[0].toolCalls, expectedCalls)
+    }
+
+    func testStreamingRejectsIncompleteToolCallAtDoneBoundary() async throws {
+        let body = """
+        data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_incomplete","type":"function","function":{"name":"get_weather"}}]},"finish_reason":"tool_calls"}]}
+
+        data: [DONE]
+
+        """
+        MockChatURLProtocol.configure { _ in
+            .eventStream(chunks: [Data(body.utf8)])
+        }
+        let transport = try makeTransport()
+
+        do {
+            for try await _ in transport.stream(makeRequest(stream: true)) {}
+            XCTFail("Expected incomplete tool call failure")
+        } catch let error as OpenAICompatibleChatTransportError {
+            XCTAssertEqual(error, .malformedStreamEvent)
+        }
     }
 
     func testSSEParserWaitsForCompleteUTF8EventAcrossArbitraryByteBoundaries() throws {

@@ -131,10 +131,19 @@ and is available only when deleted old paths still appear in Finder.
 
 ## Releases
 
+### Download the current build
+
+The current universal macOS build is published on the public
+[Onyx Releases page](https://github.com/peteallen/onyx/releases/latest). Download
+the `.dmg` and its matching `.dmg.sha256` checksum from the latest release.
+These public builds are ad-hoc signed development distributions, so macOS may
+show an unidentified-developer warning until Developer ID signing and
+notarization are added.
+
 Create a fully verified local DMG with one command:
 
 ```bash
-scripts/release.sh 0.2.0
+scripts/release.sh 0.1.0
 ```
 
 This produces a universal Apple Silicon + Intel disk image and SHA-256 checksum
@@ -143,11 +152,14 @@ while Developer ID signing and notarization activate when their optional
 credentials are configured.
 
 GitHub Actions runs the full test and packaging path for every pull request. The
-manual Release workflow can make an artifact-only development build at any
-selected commit. Public GitHub Release publication is intentionally disabled
-until the clean-machine OAuth and cross-app isolation checklist is complete.
+Release workflow builds the same verified universal DMG, then publishes the DMG
+and checksum as a public semver release from the current `main` SHA
+or its matching `vX.Y.Z` tag. It deliberately receives no Apple signing or
+notarization secrets; the release notes identify the build as ad-hoc and
+unnotarized. Developer ID signing and notarization remain a future distribution
+upgrade, not a prerequisite for finding the current development build.
 See [docs/RELEASING.md](docs/RELEASING.md) for the exact commands, safeguards,
-and remaining release gates.
+and release safeguards.
 
 Production resolves only the pinned Codex package inside the Onyx app bundle.
 An explicit development/live-test API may use `ONYX_CODEX_PATH`, an installed

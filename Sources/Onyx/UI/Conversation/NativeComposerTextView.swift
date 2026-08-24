@@ -11,6 +11,10 @@ struct NativeComposerTextView: NSViewRepresentable {
     var canSubmit: () -> Bool = { true }
     let onSubmit: () -> Void
     let onPasteImages: ([NSImage]) -> Void
+    /// Lets a containing transient surface own Escape without changing the
+    /// durable task composer. Side Chat uses this to close its ephemeral fork
+    /// even while the native editor is first responder.
+    var onCancel: (() -> Void)? = nil
 
     private static let placeholder = "Describe what you want to build or change"
 
@@ -35,6 +39,7 @@ struct NativeComposerTextView: NSViewRepresentable {
         textView.canSubmit = canSubmit
         textView.onSubmit = onSubmit
         textView.onPasteImages = onPasteImages
+        textView.onCancel = onCancel
         textView.placeholder = Self.placeholder
         textView.setAccessibilityPlaceholderValue(Self.placeholder)
         textView.isRichText = false
@@ -63,6 +68,7 @@ struct NativeComposerTextView: NSViewRepresentable {
         textView.canSubmit = canSubmit
         textView.onSubmit = onSubmit
         textView.onPasteImages = onPasteImages
+        textView.onCancel = onCancel
         textView.placeholder = Self.placeholder
         textView.maximumTextContainerWidth = OnyxWorkspaceMetrics.maximumConversationTextWidth
         textView.isEditable = isEnabled
@@ -87,6 +93,7 @@ struct NativeComposerTextView: NSViewRepresentable {
         textView.canSubmit = { false }
         textView.onSubmit = nil
         textView.onPasteImages = nil
+        textView.onCancel = nil
         textView.onTextContainerWidthChange = nil
         textView.cancelFocusRestorationAfterSubmit()
         coordinator.textView = nil
@@ -128,6 +135,7 @@ final class ComposerTextView: NSTextView {
     var canSubmit: () -> Bool = { true }
     var onSubmit: (() -> Void)?
     var onPasteImages: (([NSImage]) -> Void)?
+    var onCancel: (() -> Void)?
     var pastedImagesProvider: () -> [NSImage]? = {
         ComposerPasteboardImages.images(from: .general)
     }
@@ -143,6 +151,7 @@ final class ComposerTextView: NSTextView {
     var onTextContainerWidthChange: (() -> Void)?
     private var consumedSubmitKeyCodes = Set<UInt16>()
     private var hasPendingSubmit = false
+    private var hasPendingCancel = false
     private var pendingSubmitKeyCode: UInt16?
     private var submitCallbackCompleted = false
     private var submitKeyWasReleased = false
@@ -232,6 +241,23 @@ final class ComposerTextView: NSTextView {
             return
         }
         super.keyDown(with: event)
+    }
+
+    override func cancelOperation(_ sender: Any?) {
+        guard let onCancel else {
+            super.cancelOperation(sender)
+            return
+        }
+        guard !hasPendingCancel else { return }
+        hasPendingCancel = true
+        // Closing a transient surface can remove this representable. Leave
+        // AppKit's responder chain while the view is still mounted, then let
+        // the Escape event unwind before SwiftUI updates the hierarchy.
+        window?.makeFirstResponder(nil)
+        DispatchQueue.main.async { [weak self] in
+            self?.hasPendingCancel = false
+            onCancel()
+        }
     }
 
     private func beginSubmitKeySequence(keyCode: UInt16) {

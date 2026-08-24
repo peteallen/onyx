@@ -69,7 +69,10 @@ final class SharedRuntimeCoordinator: AgentRuntime, @unchecked Sendable {
 
     deinit {
         eventPump.cancel()
-        eventBroadcaster.finish()
+        // Destruction is a cancellation boundary, not a graceful provider
+        // shutdown. Any event still buffered for a window belongs to this
+        // runtime generation and must not survive into a replacement.
+        eventBroadcaster.cancel()
     }
 
     func connect() async throws -> RuntimeSession {
@@ -77,8 +80,35 @@ final class SharedRuntimeCoordinator: AgentRuntime, @unchecked Sendable {
     }
 
     func disconnect() async {
-        await sessionState.invalidate()
-        await runtime.disconnect()
+        await sessionState.disconnect(using: runtime)
+    }
+
+    /// Permanently closes this coordinator before its provider configuration
+    /// is mutated. Unlike an ordinary disconnect, retirement rejects every new
+    /// operation immediately and waits for already-admitted writer calls to
+    /// leave the shared boundary before the runtime is torn down.
+    func retire() async {
+        // Admit retirement at the shared operation boundary first. This
+        // synchronously rejects later provider calls while the returned task
+        // drains work that had already crossed the boundary.
+        let retirement = await sessionState.beginRetirement(using: runtime)
+        // Fence the event generation before awaiting that drain. Provider
+        // disconnect may wait for an already-running writer, but stale UI
+        // events must not remain visible during the wait.
+        eventPump.cancel()
+        await eventEmitter.cancel()
+        await retirement.value
+        // The provider may continue yielding buffered or late lifecycle
+        // notifications after disconnect. A retired generation must never
+        // mutate windows that are already rebinding to its replacement.
+        // `cancel()` above also wakes bounded-queue producers, so a window that
+        // stopped consuming cannot hold this provider replacement open.
+    }
+
+    /// Exposes the admission boundary for deterministic lifecycle coordination
+    /// without waiting for provider teardown to finish.
+    var isRetired: Bool {
+        get async { await sessionState.hasRetired }
     }
 
     func startLogin(methodID: String) async throws -> RuntimeLoginStart {
@@ -94,7 +124,7 @@ final class SharedRuntimeCoordinator: AgentRuntime, @unchecked Sendable {
         guard accepted else {
             try? await runtime.cancelLogin(id: result.loginID)
             await sessionState.completeLoginCancellation(token, loginID: nil)
-            throw Self.accountBoundaryError
+            throw await sessionState.currentBoundaryError()
         }
         // Keep the operation counted until this method is ready to hand the
         // provider result back to its caller. Logout can then never begin
@@ -299,7 +329,7 @@ final class SharedRuntimeCoordinator: AgentRuntime, @unchecked Sendable {
         _ capability: RuntimeCapabilities,
         _ operation: @Sendable () async throws -> Result
     ) async throws -> Result {
-        guard await sessionState.isCapabilityAvailable(capability) else {
+        guard try await sessionState.isCapabilityAvailable(capability) else {
             throw AgentRuntimeError.unsupported(Self.capabilityName(capability))
         }
 
@@ -336,6 +366,10 @@ final class SharedRuntimeCoordinator: AgentRuntime, @unchecked Sendable {
         code: -32_100,
         message: "Account sign-out is in progress."
     )
+    fileprivate static let retiredBoundaryError = AgentRuntimeError.requestFailed(
+        code: -32_101,
+        message: "Provider settings changed. Reconnect using the current configuration."
+    )
 }
 
 /// Serializes acquisition of the runtime session and keeps the last successful
@@ -366,12 +400,22 @@ private actor SharedRuntimeSessionState {
         let task: Task<Void, any Error>
     }
 
+    private struct RetirementAttempt: Sendable {
+        let task: Task<Void, Never>
+    }
+
     private var cachedSession: RuntimeSession?
+    /// Model-specific compatibility work can finish after the provider's
+    /// initial connection snapshot. Retain the newest catalog for this
+    /// connection generation so a window that attaches later observes the
+    /// same execution modes as windows that consumed the live event.
+    private var availableModelsOverride: [RuntimeModel]?
     /// Protocol downgrades are runtime/binary facts rather than account facts,
     /// so they survive cached-session invalidation, logout, and reconnect for
     /// the lifetime of this coordinator.
     private var unavailableCapabilities: RuntimeCapabilities = []
     private var attempt: Attempt?
+    private var activeSessionAttempts: [UInt64: Task<RuntimeSession, any Error>] = [:]
     private var nextAttemptID: UInt64 = 0
     private var revision: UInt64 = 0
 
@@ -387,10 +431,16 @@ private actor SharedRuntimeSessionState {
     private var nextLogoutAttemptID: UInt64 = 0
     private var isLoggingOut = false
     private var signedOutBoundaryActive = false
+    private var isRetired = false
+    private var retirementAttempt: RetirementAttempt?
     private var authEventGeneration: UInt64 = 0
 
     func connect(using runtime: any AgentRuntime) async throws -> RuntimeSession {
-        await waitForLogoutIfNeeded()
+        guard !isRetired else { throw SharedRuntimeCoordinator.retiredBoundaryError }
+        if isLoggingOut {
+            await waitForLogoutIfNeeded()
+            guard !isRetired else { throw SharedRuntimeCoordinator.retiredBoundaryError }
+        }
         if let attempt {
             return try await result(of: attempt)
         }
@@ -405,11 +455,16 @@ private actor SharedRuntimeSessionState {
             task: Task { try await runtime.connect() }
         )
         self.attempt = attempt
+        activeSessionAttempts[attempt.id] = attempt.task
         return try await result(of: attempt)
     }
 
     func refresh(using runtime: any AgentRuntime) async throws -> RuntimeSession {
-        await waitForLogoutIfNeeded()
+        guard !isRetired else { throw SharedRuntimeCoordinator.retiredBoundaryError }
+        if isLoggingOut {
+            await waitForLogoutIfNeeded()
+            guard !isRetired else { throw SharedRuntimeCoordinator.retiredBoundaryError }
+        }
         // A connect handshake already includes the provider's session
         // snapshot, while simultaneous account refreshes from several windows
         // should become one provider request.
@@ -424,15 +479,27 @@ private actor SharedRuntimeSessionState {
             task: Task { try await runtime.refreshAccount() }
         )
         self.attempt = attempt
+        activeSessionAttempts[attempt.id] = attempt.task
         return try await result(of: attempt)
     }
 
     func broadcastAuthorization(for event: AgentRuntimeEvent) -> EventBroadcastAuthorization? {
+        guard !isRetired else { return nil }
         switch event {
         case .connectionChanged(.disconnected), .connectionChanged(.failed):
+            availableModelsOverride = nil
             invalidate()
             return .always
         case .connectionChanged:
+            return .always
+        case let .runtimeModelsUpdated(models):
+            availableModelsOverride = models
+            if let cachedSession {
+                self.cachedSession = replacingAvailableModels(
+                    in: cachedSession,
+                    with: models
+                )
+            }
             return .always
         case let .accountUpdated(auth):
             // Account events make an otherwise connected session snapshot
@@ -498,6 +565,7 @@ private actor SharedRuntimeSessionState {
     }
 
     func sourceFinished() {
+        availableModelsOverride = nil
         invalidate()
     }
 
@@ -506,11 +574,25 @@ private actor SharedRuntimeSessionState {
         activeLoginIDs.removeAll()
     }
 
-    func beginLoginOperation(allowWaitingForLogout: Bool = false) async throws -> LoginOperationToken {
-        if isLoggingOut, !allowWaitingForLogout {
-            throw SharedRuntimeCoordinator.accountBoundaryError
+    func disconnect(using runtime: any AgentRuntime) async {
+        if isRetired {
+            await retirementAttempt?.task.value
+            return
         }
-        await waitForLogoutIfNeeded()
+        availableModelsOverride = nil
+        invalidate()
+        await runtime.disconnect()
+    }
+
+    func beginLoginOperation(allowWaitingForLogout: Bool = false) async throws -> LoginOperationToken {
+        guard !isRetired else { throw SharedRuntimeCoordinator.retiredBoundaryError }
+        if isLoggingOut {
+            guard allowWaitingForLogout else {
+                throw SharedRuntimeCoordinator.accountBoundaryError
+            }
+            await waitForLogoutIfNeeded()
+            guard !isRetired else { throw SharedRuntimeCoordinator.retiredBoundaryError }
+        }
         nextLoginOperationID &+= 1
         let token = LoginOperationToken(id: nextLoginOperationID, revision: revision)
         activeLoginOperations.insert(token)
@@ -524,6 +606,7 @@ private actor SharedRuntimeSessionState {
         let accepted = activeLoginOperations.contains(token)
             && token.revision == revision
             && !isLoggingOut
+            && !isRetired
 
         guard accepted else {
             if loginID == nil {
@@ -554,6 +637,7 @@ private actor SharedRuntimeSessionState {
     }
 
     func beginAccountOperation() throws -> AccountOperationToken {
+        guard !isRetired else { throw SharedRuntimeCoordinator.retiredBoundaryError }
         guard accountOperationIsAllowed() else {
             throw SharedRuntimeCoordinator.accountBoundaryError
         }
@@ -578,6 +662,7 @@ private actor SharedRuntimeSessionState {
         using runtime: any AgentRuntime,
         emitBoundary: @escaping @Sendable () async -> Void
     ) async throws {
+        guard !isRetired else { throw SharedRuntimeCoordinator.retiredBoundaryError }
         let pending: LogoutAttempt
         if let logoutAttempt {
             pending = logoutAttempt
@@ -615,11 +700,49 @@ private actor SharedRuntimeSessionState {
     }
 
     func accountOperationIsAllowed() -> Bool {
-        !isLoggingOut && !signedOutBoundaryActive
+        !isRetired && !isLoggingOut && !signedOutBoundaryActive
     }
 
-    func isCapabilityAvailable(_ capability: RuntimeCapabilities) -> Bool {
-        !unavailableCapabilities.contains(capability)
+    func beginRetirement(using runtime: any AgentRuntime) -> Task<Void, Never> {
+        if let retirementAttempt {
+            return retirementAttempt.task
+        }
+
+        // Close admission before creating or awaiting any drain work. Every
+        // call that reaches this actor afterward observes a permanent retired
+        // boundary, including calls that were waiting for logout to finish.
+        isRetired = true
+        availableModelsOverride = nil
+        let sessionAttempts = Array(activeSessionAttempts.values)
+        let logoutTask = logoutAttempt?.task
+        invalidateSessionSnapshot()
+        activeLoginIDs.removeAll()
+
+        let task = Task {
+            await self.waitForAccountOperationsToDrain()
+            await self.waitForLoginOperationsToDrain()
+            for attempt in sessionAttempts {
+                _ = try? await attempt.value
+            }
+            _ = try? await logoutTask?.value
+            await runtime.disconnect()
+        }
+        let pending = RetirementAttempt(task: task)
+        retirementAttempt = pending
+        return pending.task
+    }
+
+    var hasRetired: Bool { isRetired }
+
+    func currentBoundaryError() -> AgentRuntimeError {
+        isRetired
+            ? SharedRuntimeCoordinator.retiredBoundaryError
+            : SharedRuntimeCoordinator.accountBoundaryError
+    }
+
+    func isCapabilityAvailable(_ capability: RuntimeCapabilities) throws -> Bool {
+        guard !isRetired else { throw SharedRuntimeCoordinator.retiredBoundaryError }
+        return !unavailableCapabilities.contains(capability)
     }
 
     /// Returns true only for the first observation so concurrent failing
@@ -703,8 +826,13 @@ private actor SharedRuntimeSessionState {
     private func result(of pending: Attempt) async throws -> RuntimeSession {
         do {
             let providerSession = try await pending.task.value
+            activeSessionAttempts[pending.id] = nil
+            guard !isRetired else { throw SharedRuntimeCoordinator.retiredBoundaryError }
+            let currentProviderSession = availableModelsOverride.map {
+                replacingAvailableModels(in: providerSession, with: $0)
+            } ?? providerSession
             let session = boundarySafeSession(
-                applyingCapabilityDowngrades(to: providerSession)
+                applyingCapabilityDowngrades(to: currentProviderSession)
             )
             if attempt?.id == pending.id {
                 attempt = nil
@@ -714,6 +842,7 @@ private actor SharedRuntimeSessionState {
             }
             return session
         } catch {
+            activeSessionAttempts[pending.id] = nil
             if attempt?.id == pending.id {
                 attempt = nil
             }
@@ -755,6 +884,22 @@ private actor SharedRuntimeSessionState {
             capabilities: capabilities
         )
     }
+
+    private func replacingAvailableModels(
+        in session: RuntimeSession,
+        with models: [RuntimeModel]
+    ) -> RuntimeSession {
+        RuntimeSession(
+            runtime: session.runtime,
+            displayName: session.displayName,
+            accountLabel: session.accountLabel,
+            planLabel: session.planLabel,
+            auth: session.auth,
+            availableLoginMethods: session.availableLoginMethods,
+            availableModels: models,
+            capabilities: session.capabilities
+        )
+    }
 }
 
 /// Serializes provider events and coordinator-generated account boundaries.
@@ -771,6 +916,7 @@ private actor RuntimeEventEmitter {
     private var pendingYields: [PendingYield] = []
     private var isYielding = false
     private var isFinished = false
+    private var isCancelled = false
     private var finishWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(broadcaster: RuntimeEventBroadcaster) {
@@ -799,7 +945,7 @@ private actor RuntimeEventEmitter {
     }
 
     func finish() async {
-        guard !isFinished else { return }
+        guard !isFinished, !isCancelled else { return }
         isFinished = true
         guard isYielding || !pendingYields.isEmpty else {
             broadcaster.finish()
@@ -809,6 +955,25 @@ private actor RuntimeEventEmitter {
         await withCheckedContinuation { continuation in
             finishWaiters.append(continuation)
         }
+    }
+
+    /// Aborts the current event generation immediately. Unlike `finish()`,
+    /// this intentionally drops pending and buffered events, because they may
+    /// have been authorized by the old runtime just before its retirement
+    /// boundary. It also resumes every continuation waiting on a bounded
+    /// subscriber so a stalled window cannot hold retirement open forever.
+    func cancel() {
+        isCancelled = true
+        isFinished = true
+
+        let pending = pendingYields
+        pendingYields.removeAll()
+
+        broadcaster.cancel()
+        for pendingYield in pending {
+            pendingYield.completion.resume()
+        }
+        finishCancelledEmitterIfIdle()
     }
 
     private func drainPendingYields() {
@@ -838,11 +1003,22 @@ private actor RuntimeEventEmitter {
     private func completeYield(_ completion: CheckedContinuation<Void, Never>) {
         completion.resume()
         isYielding = false
+        if isCancelled {
+            finishCancelledEmitterIfIdle()
+            return
+        }
         drainPendingYields()
     }
 
+    private func finishCancelledEmitterIfIdle() {
+        guard isCancelled, !isYielding else { return }
+        let waiters = finishWaiters
+        finishWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+
     private func finishBroadcasterIfDrained() {
-        guard isFinished, !isYielding, pendingYields.isEmpty else { return }
+        guard isFinished, !isCancelled, !isYielding, pendingYields.isEmpty else { return }
         broadcaster.finish()
         let waiters = finishWaiters
         finishWaiters.removeAll()
@@ -917,11 +1093,25 @@ private final class RuntimeEventBroadcaster: @unchecked Sendable {
         }
         isFinished = true
         let currentSubscriptions = Array(subscriptions.values)
-        subscriptions.removeAll()
         lock.unlock()
 
         for subscription in currentSubscriptions {
             subscription.finish()
+        }
+    }
+
+    /// Closes this generation without delivering any queued events. Keep the
+    /// subscription objects reachable until this pass completes so a race
+    /// with a graceful `finish()` can still clear their already-buffered rows.
+    func cancel() {
+        lock.lock()
+        let currentSubscriptions = Array(subscriptions.values)
+        subscriptions.removeAll()
+        isFinished = true
+        lock.unlock()
+
+        for subscription in currentSubscriptions {
+            subscription.cancel()
         }
     }
 

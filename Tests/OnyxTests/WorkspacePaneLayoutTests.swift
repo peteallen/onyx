@@ -111,6 +111,16 @@ final class WorkspacePaneLayoutTests: XCTestCase {
         ))
     }
 
+    func testProductionWindowMinimumFitsTheInspectorAndConversation() {
+        XCTAssertEqual(
+            WorkspacePaneLayout.minimumWindowWidth,
+            WorkspacePaneLayout.minimumConversationWidth
+                + WorkspacePaneLayout.dividerWidth
+                + WorkspacePaneLayout.inspectorMinimumWidth
+        )
+        XCTAssertGreaterThanOrEqual(WorkspacePaneLayout.minimumWindowWidth, 930)
+    }
+
     func testPaneSplittersAreWideEnoughToAcquireWithoutPixelHunting() {
         XCTAssertGreaterThanOrEqual(WorkspacePaneLayout.dividerWidth, 10)
         XCTAssertEqual(WorkspacePaneLayout.dividerWidth, OnyxHitTarget.splitter)

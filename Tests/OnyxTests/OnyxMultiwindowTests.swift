@@ -340,6 +340,129 @@ final class OnyxMultiwindowTests: XCTestCase {
         XCTAssertEqual(cached.pickerCapabilitySummary, "Reasoning · Partial metadata")
     }
 
+    func testCachedCatalogUsesExistingSharedRuntimeProjectionWithoutCreatingUnusedRuntimes() async throws {
+        let suite = makeDefaults()
+        defer { suite.cleanUp() }
+        let connectionStore = ProviderConnectionStore(
+            storage: InMemoryProviderConnectionStorage()
+        )
+        let connectionID = ProviderConnectionID("test.catalog-projection.primary")
+        let descriptor = try ProviderModelDescriptor(
+            id: "catalog-model",
+            wireProtocol: .openAIChatCompletions,
+            capabilities: ProviderCapabilitySet()
+        )
+        try await connectionStore.upsert(ProviderConnectionRecord(
+            id: connectionID,
+            displayName: "Catalog projection",
+            baseURL: URL(string: "https://catalog.example.test/v1")!,
+            selectedModelID: descriptor.id,
+            authMode: .none,
+            discovery: ProviderConnectionDiscoveryMetadata(discoveredModels: [descriptor])
+        ))
+        let projectedModel = RuntimeModel(
+            id: descriptor.id,
+            displayName: "Catalog model",
+            description: nil,
+            isDefault: true,
+            defaultReasoningEffort: nil,
+            reasoningEfforts: [],
+            executionMode: .agent,
+            taskCapabilities: [.tools, .terminal]
+        )
+        let runtime = MultiwindowFakeRuntime(
+            threads: [],
+            availableModels: [projectedModel]
+        )
+        let factoryProbe = MultiwindowFactoryProbe()
+        let registry = try RuntimeRegistry(
+            providers: [
+                RuntimeProviderDescriptor(
+                    id: .init("test.catalog-projection"),
+                    displayName: "Catalog projection"
+                ) { _ in
+                    factoryProbe.record()
+                    return runtime
+                },
+            ],
+            connections: [
+                RuntimeConnectionRegistration(
+                    id: connectionID,
+                    adapterID: .init("test.catalog-projection")
+                ),
+            ]
+        )
+        let host = OnyxApplicationHost(
+            registry: registry,
+            defaults: suite.defaults,
+            providerConnectionStore: connectionStore,
+            providerCredentialStore: InMemoryCredentialStore()
+        )
+
+        let beforeRuntimeUse = await host.cachedProviderModelCatalogs()
+        XCTAssertEqual(factoryProbe.count, 0)
+        XCTAssertEqual(beforeRuntimeUse[connectionID]?.first?.executionMode, .inherited)
+
+        _ = host.makeWindowModel(for: WorkspaceWindowID(providerConnectionID: connectionID))
+        let afterRuntimeUse = await host.cachedProviderModelCatalogs()
+
+        XCTAssertEqual(factoryProbe.count, 1)
+        XCTAssertEqual(afterRuntimeUse[connectionID], [projectedModel])
+        let connectCount = await runtime.connectCount()
+        XCTAssertEqual(connectCount, 1)
+    }
+
+    func testTaskScopedCatalogRestoresDurableLaneWithoutChangingNewTaskCatalog() {
+        let ownedModel = RuntimeModel(
+            id: "owned-model",
+            displayName: "Owned model",
+            description: nil,
+            isDefault: true,
+            defaultReasoningEffort: nil,
+            reasoningEfforts: [],
+            executionMode: .chat,
+            taskCapabilities: [.streaming]
+        )
+        let otherModel = RuntimeModel(
+            id: "other-model",
+            displayName: "Other model",
+            description: nil,
+            isDefault: false,
+            defaultReasoningEffort: nil,
+            reasoningEfforts: [],
+            executionMode: .agent,
+            taskCapabilities: [.tools]
+        )
+        let newTaskCatalog = [ownedModel, otherModel]
+
+        let restoredAgent = OnyxApplicationHost.taskScopedModelCatalog(
+            newTaskCatalog,
+            selectedModelID: ownedModel.id,
+            taskCapabilities: [.streaming, .tools, .terminal]
+        )
+        XCTAssertEqual(restoredAgent.first?.executionMode, .agent)
+        XCTAssertEqual(restoredAgent.first?.taskCapabilities, [.streaming, .tools, .terminal])
+        XCTAssertEqual(restoredAgent.last, otherModel)
+        XCTAssertEqual(newTaskCatalog.first?.executionMode, .chat)
+
+        let restoredChat = OnyxApplicationHost.taskScopedModelCatalog(
+            [otherModel],
+            selectedModelID: otherModel.id,
+            taskCapabilities: [.streaming]
+        )
+        XCTAssertEqual(restoredChat.first?.executionMode, .chat)
+        XCTAssertEqual(restoredChat.first?.taskCapabilities, [.streaming])
+
+        let missingOwnedModel = OnyxApplicationHost.taskScopedModelCatalog(
+            [otherModel],
+            selectedModelID: "missing-owned-model",
+            taskCapabilities: [.streaming, .tools]
+        )
+        XCTAssertEqual(missingOwnedModel.map(\.id), [otherModel.id, "missing-owned-model"])
+        XCTAssertEqual(missingOwnedModel.last?.executionMode, .agent)
+        XCTAssertEqual(missingOwnedModel.last?.inputModalities, [.text])
+    }
+
     func testDisconnectedEmptyLiveCatalogDoesNotEraseCachedModels() throws {
         let cached = RuntimeModel(
             id: "cached-model",
@@ -397,22 +520,114 @@ final class OnyxMultiwindowTests: XCTestCase {
         )
         let providerWindow = WorkspaceWindowID(providerConnectionID: connectionID)
 
-        _ = host.makeWindowModel(for: providerWindow)
+        let originalWindowModel = host.makeWindowModel(for: providerWindow)
         let original = try XCTUnwrap(host.cachedRuntimeCoordinatorForTesting(connectionID))
+        let draftImage = ComposerImageDraft(
+            input: .imageURL("data:image/png;base64,YQ=="),
+            displayName: "draft.png",
+            byteCount: 1
+        )
+        let hiddenTaskImage = ComposerImageDraft(
+            input: .imageURL("data:image/png;base64,Yg=="),
+            displayName: "hidden-task.png",
+            byteCount: 1
+        )
+        originalWindowModel.selectedThreadID = "task-being-edited"
+        originalWindowModel.restoreRuntimeReplacementContext(
+            OnyxAppModel.RuntimeReplacementContext(
+                selectedThreadID: "task-being-edited",
+                threadListScope: .active,
+                composerDraftKey: "task-being-edited",
+                composerText: "Keep this exact task draft",
+                composerImageDrafts: [
+                    "task-being-edited": [draftImage],
+                    "another-task": [hiddenTaskImage],
+                ]
+            )
+        )
+        XCTAssertEqual(host.runtimeConfigurationRevision(for: connectionID), 0)
 
         await host.providerSettingsModel.reload()
         host.providerSettingsModel.draft.displayName = "Edited endpoint"
         let saved = await host.providerSettingsModel.saveDraft()
         XCTAssertTrue(saved)
         XCTAssertNil(host.cachedRuntimeCoordinatorForTesting(connectionID))
+        XCTAssertEqual(host.runtimeConfigurationRevision(for: connectionID), 1)
+        await assertRetired(original)
 
-        _ = host.makeWindowModel(for: providerWindow)
+        let reboundWindowModel = host.makeRuntimeReplacementWindowModel(
+            for: providerWindow,
+            replacing: originalWindowModel
+        )
         let replacement = try XCTUnwrap(host.cachedRuntimeCoordinatorForTesting(connectionID))
         XCTAssertNotEqual(ObjectIdentifier(original), ObjectIdentifier(replacement))
+        XCTAssertEqual(
+            reboundWindowModel.captureRuntimeReplacementContext(),
+            OnyxAppModel.RuntimeReplacementContext(
+                selectedThreadID: "task-being-edited",
+                threadListScope: .active,
+                composerDraftKey: "task-being-edited",
+                composerText: "Keep this exact task draft",
+                composerImageDrafts: [
+                    "task-being-edited": [draftImage],
+                    "another-task": [hiddenTaskImage],
+                ]
+            )
+        )
 
         let deleted = await host.providerSettingsModel.delete(connectionID)
         XCTAssertTrue(deleted)
         XCTAssertNil(host.cachedRuntimeCoordinatorForTesting(connectionID))
+        XCTAssertEqual(host.runtimeConfigurationRevision(for: connectionID), 2)
+        await assertRetired(replacement)
+    }
+
+    func testProviderRuntimeMutationBlocksUncachedResolutionUntilOutermostCompletion() async throws {
+        let suite = makeDefaults()
+        defer { suite.cleanUp() }
+        let connectionStore = ProviderConnectionStore(
+            storage: InMemoryProviderConnectionStorage()
+        )
+        let connectionID = ProviderConnectionID("local.runtime-mutation-depth")
+        try await connectionStore.upsert(ProviderConnectionRecord(
+            id: connectionID,
+            displayName: "Mutating endpoint",
+            baseURL: URL(string: "https://provider.example.test/v1")!,
+            selectedModelID: "fixture-model",
+            authMode: .none,
+            transportCapabilities: [.streaming]
+        ))
+        let host = OnyxApplicationHost(
+            defaults: suite.defaults,
+            providerConnectionStore: connectionStore,
+            providerCredentialStore: InMemoryCredentialStore()
+        )
+        let providerWindow = WorkspaceWindowID(providerConnectionID: connectionID)
+        XCTAssertNil(host.cachedRuntimeCoordinatorForTesting(connectionID))
+
+        await host.beginProviderRuntimeMutationForTesting(connectionID)
+        await host.beginProviderRuntimeMutationForTesting(connectionID)
+        let blockedDuringBoth = host.makeWindowModel(for: providerWindow)
+        blockedDuringBoth.start()
+        guard case let .failed(detailDuringBoth) = blockedDuringBoth.connectionState else {
+            return XCTFail("A provider runtime resolved during overlapping settings mutations")
+        }
+        XCTAssertTrue(detailDuringBoth.contains("settings are changing"))
+        XCTAssertNil(host.cachedRuntimeCoordinatorForTesting(connectionID))
+
+        host.endProviderRuntimeMutationForTesting(connectionID)
+        XCTAssertEqual(host.runtimeConfigurationRevision(for: connectionID), 0)
+        let blockedAfterFirstCompletion = host.makeWindowModel(for: providerWindow)
+        blockedAfterFirstCompletion.start()
+        guard case .failed = blockedAfterFirstCompletion.connectionState else {
+            return XCTFail("The earlier completion released a later mutation's barrier")
+        }
+        XCTAssertNil(host.cachedRuntimeCoordinatorForTesting(connectionID))
+
+        host.endProviderRuntimeMutationForTesting(connectionID)
+        XCTAssertEqual(host.runtimeConfigurationRevision(for: connectionID), 1)
+        _ = host.makeWindowModel(for: providerWindow)
+        XCTAssertNotNil(host.cachedRuntimeCoordinatorForTesting(connectionID))
     }
 
     func testHostSeedsUnvisitedProviderTasksFromLocalStoreByScope() async throws {
@@ -425,17 +640,19 @@ final class OnyxMultiwindowTests: XCTestCase {
             storage: InMemoryProviderConnectionStorage()
         )
         let providerID = ProviderConnectionID("local.vllm.unvisited")
-        try await connectionStore.upsert(ProviderConnectionRecord(
+        let connection = try ProviderConnectionRecord(
             id: providerID,
             displayName: "Local vLLM",
             baseURL: URL(string: "https://vllm.example.test/v1")!,
             selectedModelID: "fixture-model",
             authMode: .none
-        ))
+        )
+        try await connectionStore.upsert(connection)
         let conversations = OpenAICompatibleConversationStore(fileURL: fileURL)
         _ = try await conversations.upsert(OpenAICompatibleStoredConversation(
             id: "active-task",
             connectionID: providerID,
+            conversationScopeID: connection.conversationScopeID,
             title: "Active provider task",
             cwd: "/work/active",
             modelID: "fixture-model"
@@ -443,6 +660,7 @@ final class OnyxMultiwindowTests: XCTestCase {
         _ = try await conversations.upsert(OpenAICompatibleStoredConversation(
             id: "archived-task",
             connectionID: providerID,
+            conversationScopeID: connection.conversationScopeID,
             title: "Archived provider task",
             cwd: "/work/archived",
             modelID: "fixture-model",
@@ -467,6 +685,56 @@ final class OnyxMultiwindowTests: XCTestCase {
         XCTAssertEqual(active.threads.map(\.id), ["active-task"])
         XCTAssertEqual(archived.threads.map(\.id), ["archived-task"])
         XCTAssertEqual(active.providerDisplayName, "Local vLLM")
+    }
+
+    func testHostDoesNotAdoptLegacyTasksAfterProviderScopeRotation() async throws {
+        let suite = makeDefaults()
+        defer { suite.cleanUp() }
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OnyxRotatedProviderTaskSeed-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let connectionStore = ProviderConnectionStore(
+            storage: InMemoryProviderConnectionStorage()
+        )
+        let providerID = ProviderConnectionID("local.vllm.rotated-before-migration")
+        let rotatedConnection = try ProviderConnectionRecord(
+            id: providerID,
+            displayName: "Replacement vLLM",
+            baseURL: URL(string: "https://replacement.example.test/v1")!,
+            selectedModelID: "fixture-model",
+            authMode: .none
+        )
+        XCTAssertNotEqual(
+            rotatedConnection.conversationScopeID,
+            ProviderConnectionRecord.legacyConversationScopeID(for: providerID)
+        )
+        try await connectionStore.upsert(rotatedConnection)
+        let conversations = OpenAICompatibleConversationStore(fileURL: fileURL)
+        _ = try await conversations.upsert(OpenAICompatibleStoredConversation(
+            id: "legacy-task",
+            connectionID: providerID,
+            title: "Previous endpoint task",
+            cwd: "/work/previous",
+            modelID: "fixture-model"
+        ))
+        let host = OnyxApplicationHost(
+            defaults: suite.defaults,
+            providerConnectionStore: connectionStore,
+            providerCredentialStore: InMemoryCredentialStore(),
+            providerConversationStore: conversations
+        )
+
+        let connections = await host.workspaceConnections()
+        let lists = await host.cachedProviderTaskLists(connections: connections)
+        let currentThreads = lists
+            .filter { $0.providerConnectionID == providerID }
+            .flatMap(\.threads)
+        XCTAssertTrue(currentThreads.isEmpty)
+        let retainedLegacy = try await conversations.conversation(
+            connectionID: providerID,
+            id: "legacy-task"
+        )
+        XCTAssertNil(retainedLegacy?.conversationScopeID)
     }
 
     func testHostSeedsCodexTasksEvenWhenAnotherProviderWindowRestoresFirst() async throws {
@@ -963,6 +1231,21 @@ final class OnyxMultiwindowTests: XCTestCase {
         }
         let didMeetCondition = await condition()
         XCTAssertTrue(didMeetCondition, failureMessage)
+    }
+
+    private func assertRetired(
+        _ coordinator: SharedRuntimeCoordinator,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        do {
+            _ = try await coordinator.connect()
+            XCTFail("The replaced provider runtime accepted new work", file: file, line: line)
+        } catch let AgentRuntimeError.requestFailed(code, _) {
+            XCTAssertEqual(code, -32_101, file: file, line: line)
+        } catch {
+            XCTFail("Unexpected retired-runtime error: \(error)", file: file, line: line)
+        }
     }
 
     private static let threadA = RuntimeThread(

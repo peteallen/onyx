@@ -4,6 +4,30 @@ Onyx releases are ordinary drag-to-Applications disk images. The same local
 scripts build both contributor previews and GitHub release artifacts, so CI does
 not have a separate packaging implementation that can drift from local builds.
 
+## Publish the current public release
+
+The normal download is always the public
+[latest GitHub Release](https://github.com/peteallen/onyx/releases/latest). It
+contains the universal DMG and its matching `.dmg.sha256` checksum as direct,
+non-expiring release assets.
+
+There are two supported ways to cut a release:
+
+1. **Actions → Release → Run workflow:** choose the `main` branch and enter the
+   three-part version from `support/Info.plist` (for example, `0.1.0`). The
+   workflow verifies that the selected commit is still the current `main` head,
+   runs the complete test/package path, and creates `v0.1.0` at that exact SHA.
+2. **Push a semver tag:** after the same checks have passed locally, push a new
+   tag such as `v0.1.0`. The tag-triggered path verifies that the tag points at
+   the event commit before publishing.
+
+The workflow refuses to move an existing tag or replace an existing release. It
+publishes only after the checksum and mounted DMG checks pass, and verifies the
+public release is non-draft, non-prerelease, marked latest, and contains exactly
+the expected DMG/checksum pair. The notes include the exact source commit.
+Public builds are ad-hoc signed and not notarized development distributions, so
+macOS may show an unidentified-developer warning.
+
 ## Create and verify a local release
 
 Requirements are macOS 15 or newer and Xcode 26 or newer.
@@ -16,14 +40,14 @@ scripts/fetch-codex-runtime.sh --architectures universal
 ```
 
 ```bash
-scripts/release.sh 0.2.0
+scripts/release.sh 0.1.0
 ```
 
 This builds a universal Apple Silicon + Intel release in an isolated staging
 directory, embeds the pinned Codex app-server helper, and creates:
 
-- `dist-release/Onyx-0.2.0-macOS.dmg`
-- `dist-release/Onyx-0.2.0-macOS.dmg.sha256`
+- `dist-release/Onyx-0.1.0-macOS.dmg`
+- `dist-release/Onyx-0.1.0-macOS.dmg.sha256`
 
 The app is ad-hoc signed and the DMG is unsigned when no Developer ID identity
 is configured. That is useful for local testing, but users will see the normal
@@ -40,6 +64,12 @@ It refuses to replace an existing artifact unless `--overwrite` is explicit.
 Neither the release nor verification scripts launch, install, or stop Onyx.
 The packaged app must not depend on ChatGPT/Codex being installed separately.
 
+`release.sh` accepts `--signing-identity -` and `--no-notarize` to force the
+development/ad-hoc path. CI passes both flags explicitly, so a runner's
+`ONYX_CODESIGN_IDENTITY` or `ONYX_NOTARIZE` environment cannot silently turn a
+workflow artifact into a differently signed or notarized build. Local reviewed
+release commands may instead omit those flags and opt into Developer ID signing.
+
 At first launch the app creates only
 `~/Library/Application Support/Onyx/Codex` and passes that path as
 `CODEX_HOME`; it must never read or migrate `~/.codex`.
@@ -51,13 +81,18 @@ universal build.
 To verify a downloaded artifact independently:
 
 ```bash
-(cd dist-release && /usr/bin/shasum -a 256 -c Onyx-0.2.0-macOS.dmg.sha256)
-scripts/verify-dmg.sh dist-release/Onyx-0.2.0-macOS.dmg \
+(cd dist-release && /usr/bin/shasum -a 256 -c Onyx-0.1.0-macOS.dmg.sha256)
+scripts/verify-dmg.sh dist-release/Onyx-0.1.0-macOS.dmg \
   --app-name Onyx.app \
   --bundle-id app.onyx.agent \
-  --version 0.2.0 \
+  --version 0.1.0 \
   --require-universal
 ```
+
+That independent check mounts and inspects the image but does not execute its
+helper. Add `--probe-runtime` only for an artifact built from a checkout you
+trust; local packaging uses that opt-in to prove the bundled helper initializes
+from its final mounted location.
 
 ## Developer ID signing and notarization
 
@@ -66,7 +101,7 @@ then use its exact Keychain identity when building:
 
 ```bash
 ONYX_CODESIGN_IDENTITY='Developer ID Application: Example (TEAMID)' \
-scripts/release.sh 0.2.0
+scripts/release.sh 0.1.0
 ```
 
 That enables the hardened runtime and timestamps both the app and the disk
@@ -82,7 +117,7 @@ xcrun notarytool store-credentials onyx-notary \
 ONYX_CODESIGN_IDENTITY='Developer ID Application: Example (TEAMID)' \
 ONYX_NOTARIZE=1 \
 ONYX_NOTARY_PROFILE=onyx-notary \
-scripts/release.sh 0.2.0
+scripts/release.sh 0.1.0
 ```
 
 `create-dmg.sh` also supports App Store Connect API-key credentials and direct
@@ -91,55 +126,44 @@ names. A notarized build is not moved into place until `notarytool`, stapling,
 Gatekeeper assessment of both the image and its mounted app, and the normal
 mounted-image checks all pass.
 
+Use these local signing paths only from a reviewed checkout. The public GitHub
+workflow intentionally cannot access a Developer ID private key or notarization
+credential; adding those secrets would change the trust boundary and requires a
+separate protected release design.
+
 ## GitHub Actions
 
 The `CI` workflow runs on pushes to `main`, pull requests, and manual requests.
 It runs the unit suite, exercises app-packaging failure safeguards, then builds
 and mounts an unsigned release DMG as an end-to-end packaging check.
 
-The `Release` workflow is currently artifact-only. Run **Actions → Release →
-Run workflow**, enter `0.2.0`, and it uploads the verified DMG and checksum as a
-downloadable workflow artifact. It has read-only repository permissions, no
-tag trigger, and no GitHub Release publication step.
+The `Release` workflow accepts a semver tag push or a manual dispatch from the
+current `main` head. It builds the same verified universal DMG as the local
+script, then publishes the DMG and checksum directly as a public GitHub Release.
+It has no Apple secrets and pins the Onyx display name, bundle ID, universal
+architecture, ad-hoc identity, and no-notarize mode on the command line.
 
 Release versions must use three numeric components because macOS stores them in
 `CFBundleShortVersionString`. GitHub's run number becomes `CFBundleVersion`.
-Without Apple secrets, artifact-only workflow runs remain useful development
-distributions.
+These ad-hoc releases are useful development distributions. A future Developer
+ID/notarized workflow remains a separate hardening project.
 
-Do not add tag-triggered or manual GitHub Release publication until the runtime
-verification checklist below has passed on the release candidate, including
-clean-machine OAuth and cross-app mutation isolation. Re-enabling publication
-is a separate reviewed change, not a workflow input.
+`scripts/check-release-automation.sh` enforces the public-release contract in
+both CI and the Release workflow. It checks immutable action pins, exact source
+and tag targeting, universal pinned-runtime packaging, direct DMG/checksum
+assets, non-draft postconditions, and the no-launch contract. Changing the
+publication policy therefore requires changing a visible, executable gate
+together with the workflow and this document.
 
-### Optional repository secrets
+### Automated Developer ID release gate
 
-The release workflow succeeds without secrets. Configure all values in a group
-to activate that stage; partial groups fail early instead of silently producing
-a differently signed artifact. Add them under **Settings → Secrets and
-variables → Actions** in the GitHub repository.
-
-| Secret | Purpose |
-| --- | --- |
-| `APPLE_DEVELOPER_ID_P12_BASE64` | Base64-encoded Developer ID Application `.p12` |
-| `APPLE_DEVELOPER_ID_P12_PASSWORD` | Password used when exporting the `.p12` |
-| `APPLE_DEVELOPER_ID_APPLICATION` | Exact certificate identity shown by Keychain Access |
-| `APPLE_NOTARY_APPLE_ID` | Apple developer account email |
-| `APPLE_NOTARY_TEAM_ID` | Apple Developer team identifier |
-| `APPLE_NOTARY_PASSWORD` | App-specific password for `notarytool` |
-
-The first three secrets enable Developer ID signing. The last three additionally
-enable notarization and require the signing group. The workflow imports the
-certificate into a temporary, unlocked keychain, removes the `.p12` immediately
-after import, and deletes the keychain at the end of the job.
-
-To copy a `.p12` as base64 on macOS without creating another file:
-
-```bash
-/usr/bin/base64 -i DeveloperIDApplication.p12 | /usr/bin/pbcopy
-```
-
-Paste the clipboard contents into `APPLE_DEVELOPER_ID_P12_BASE64`.
+The selectable GitHub `Release` workflow intentionally receives no Apple
+credentials. It publishes only after checking an exact `main` SHA or semver tag,
+and the resulting release is clearly labeled ad-hoc and unnotarized. A future
+signed automation path must use a protected environment and immutable trusted
+source, keep the pinned runtime manifest inside that trust boundary, and make
+signing the final isolated stage after build verification. Until then, Developer
+ID signing and notarization are local, reviewed-checkout operations only.
 
 ## Bundled Codex runtime contract
 

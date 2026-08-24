@@ -465,6 +465,45 @@ final class OnyxAppModelHistoryPaginationTests: XCTestCase {
         XCTAssertEqual(fixture.model.composerText, "User message 4")
     }
 
+    func testPendingEditOnOneTaskKeepsUnrelatedTaskEditAndRetryAvailable() async {
+        let fixture = makeFixture(
+            paginated: true,
+            supportsEditing: true,
+            latestTurnStatus: .failed,
+            suspendsRevert: true,
+            hasSecondaryThread: true
+        )
+        defer {
+            Task { await fixture.runtime.releaseRevert() }
+            fixture.cleanUp()
+        }
+
+        fixture.model.start()
+        await waitUntil("The first task did not expose Retry") {
+            fixture.model.retryableFailedUserMessageID == "turn-4-user"
+        }
+
+        fixture.model.editLatestUserMessage()
+        await fixture.runtime.waitUntilRevertRequested()
+        fixture.model.selectThread(HistoryPaginationRuntime.secondaryThread.id)
+        await waitUntil("The unrelated task did not finish loading") {
+            fixture.model.selectedThreadID == HistoryPaginationRuntime.secondaryThread.id
+                && !fixture.model.isLoadingThread
+        }
+
+        XCTAssertFalse(fixture.model.isPreparingLatestMessageEditForSelectedThread)
+        XCTAssertEqual(
+            fixture.model.latestEditableUserMessageID,
+            "turn-4-user",
+            "A task-local history lock must not hide Edit on another task"
+        )
+        XCTAssertEqual(
+            fixture.model.retryableFailedUserMessageID,
+            "turn-4-user",
+            "A task-local history lock must not hide Retry on another task"
+        )
+    }
+
     func testStaleEditCallbackCannotRevertAReplacementMessage() async {
         let fixture = makeFixture(paginated: true, supportsEditing: true)
         defer { fixture.cleanUp() }
@@ -521,15 +560,179 @@ final class OnyxAppModelHistoryPaginationTests: XCTestCase {
         )
     }
 
+    func testLatestMessageStaysEditableWithAnExistingDraftAndMergesIt() async {
+        let fixture = makeFixture(paginated: true, supportsEditing: true)
+        defer { fixture.cleanUp() }
+
+        fixture.model.start()
+        await waitUntil("The editable task did not load") {
+            fixture.model.latestEditableUserMessageID == "turn-4-user"
+        }
+        fixture.model.composerText = "Follow-up already being drafted"
+        XCTAssertEqual(
+            fixture.model.latestEditableUserMessageID,
+            "turn-4-user",
+            "Typing a follow-up must not hide the recovery affordance"
+        )
+
+        fixture.model.editLatestUserMessage()
+        await waitUntil("The previous message was not merged into the draft") {
+            fixture.model.composerText
+                == "User message 4\n\nFollow-up already being drafted"
+        }
+    }
+
+    func testFailedLatestTurnRetriesByRevertingThenSendingOnce() async {
+        let fixture = makeFixture(
+            paginated: true,
+            supportsEditing: true,
+            latestTurnStatus: .failed
+        )
+        defer { fixture.cleanUp() }
+
+        fixture.model.start()
+        await waitUntil("The failed task did not expose Retry") {
+            fixture.model.retryableFailedUserMessageID == "turn-4-user"
+        }
+
+        fixture.model.retryLatestFailedResponse(messageID: "turn-4-user")
+        await waitUntilAsync("Retry did not submit the original prompt once") {
+            await fixture.runtime.startedTurnTexts() == ["User message 4"]
+        }
+        let reverts = await fixture.runtime.revertedTurnIDs()
+        XCTAssertEqual(reverts.map(\.1), ["turn-4"])
+        XCTAssertEqual(
+            fixture.model.timeline.filter { $0.kind == .userMessage }.map(\.body),
+            ["User message 3", "User message 4"]
+        )
+    }
+
+    func testRetryPreservesDraftTypedWhileRevertWaitsAndSendsOnlyFailedPrompt() async {
+        let fixture = makeFixture(
+            paginated: true,
+            supportsEditing: true,
+            latestTurnStatus: .failed,
+            suspendsRevert: true
+        )
+        defer {
+            Task { await fixture.runtime.releaseRevert() }
+            fixture.cleanUp()
+        }
+
+        fixture.model.start()
+        await waitUntil("The failed task did not expose Retry") {
+            fixture.model.retryableFailedUserMessageID == "turn-4-user"
+        }
+        fixture.model.retryLatestFailedResponse(messageID: "turn-4-user")
+        await fixture.runtime.waitUntilRevertRequested()
+        XCTAssertTrue(fixture.model.isPreparingFailedResponseRetry)
+        fixture.model.composerText = "A separate follow-up"
+
+        await fixture.runtime.releaseRevert()
+        await waitUntilAsync("Retry did not send the exact failed prompt") {
+            await fixture.runtime.startedTurnTexts() == ["User message 4"]
+        }
+        XCTAssertEqual(fixture.model.composerText, "A separate follow-up")
+        XCTAssertFalse(fixture.model.isPreparingFailedResponseRetry)
+    }
+
+    func testRetryPreservesPreexistingDraftTextAndImages() async throws {
+        let fixture = makeFixture(
+            paginated: true,
+            supportsEditing: true,
+            latestTurnStatus: .failed
+        )
+        defer { fixture.cleanUp() }
+
+        fixture.model.start()
+        await waitUntil("The failed task did not expose Retry") {
+            fixture.model.retryableFailedUserMessageID == "turn-4-user"
+        }
+
+        fixture.model.composerText = "A draft I was already writing"
+        let laterImageView = NSImage(size: NSSize(width: 10, height: 10))
+        laterImageView.lockFocus()
+        NSColor.systemPurple.setFill()
+        NSRect(x: 0, y: 0, width: 10, height: 10).fill()
+        laterImageView.unlockFocus()
+        fixture.model.addPastedComposerImages([laterImageView])
+        await waitUntil("The preexisting draft image did not finish preparing") {
+            fixture.model.composerImages.count == 1
+        }
+        let laterImage = try XCTUnwrap(fixture.model.composerImages.first)
+        fixture.model.retryLatestFailedResponse(messageID: "turn-4-user")
+
+        await waitUntilAsync("Retry did not send the failed prompt exactly once") {
+            await fixture.runtime.startedTurnTexts() == ["User message 4"]
+        }
+        XCTAssertEqual(fixture.model.composerText, "A draft I was already writing")
+        XCTAssertEqual(fixture.model.composerImages, [laterImage])
+    }
+
+    func testNavigateAwayDuringRetryKeepsOriginalTaskLockedUntilReopen() async throws {
+        let fixture = makeFixture(
+            paginated: true,
+            supportsEditing: true,
+            latestTurnStatus: .failed,
+            suspendsRevert: true
+        )
+        defer {
+            Task { await fixture.runtime.releaseRevert() }
+            fixture.cleanUp()
+        }
+
+        fixture.model.start()
+        await waitUntil("The failed task did not expose Retry") {
+            fixture.model.retryableFailedUserMessageID == "turn-4-user"
+        }
+
+        fixture.model.retryLatestFailedResponse(messageID: "turn-4-user")
+        await fixture.runtime.waitUntilRevertRequested()
+        fixture.model.newTask()
+        XCTAssertFalse(
+            fixture.model.isPreparingLatestMessageEditForSelectedThread,
+            "An unrelated task must remain usable while Retry prepares the original task"
+        )
+
+        await fixture.runtime.releaseRevert()
+        await waitUntil("Retry navigation did not retain the original task lock") {
+            fixture.model.isPreparingLatestMessageEdit
+                && fixture.model.composerText.isEmpty
+        }
+        let startedWhileAway = await fixture.runtime.startedTurnTexts()
+        XCTAssertTrue(
+            startedWhileAway.isEmpty,
+            "Navigating away must never auto-send the Retry into either task"
+        )
+
+        let originalThread = try XCTUnwrap(
+            fixture.model.threads.first(where: { $0.id == HistoryPaginationRuntime.thread.id })
+        )
+        XCTAssertFalse(fixture.model.canForkThread(originalThread))
+        XCTAssertFalse(fixture.model.canArchiveThread(originalThread))
+
+        fixture.model.selectThread(originalThread.id)
+        await waitUntil("Reopening the original task did not reconcile Retry history") {
+            !fixture.model.isLoadingThread
+                && !fixture.model.isPreparingLatestMessageEdit
+                && fixture.model.timeline.last?.id == "turn-3-assistant"
+        }
+        XCTAssertEqual(fixture.model.composerText, "User message 4")
+        let startedAfterReopen = await fixture.runtime.startedTurnTexts()
+        XCTAssertTrue(startedAfterReopen.isEmpty)
+    }
+
     private func makeFixture(
         paginated: Bool,
         supportsEditing: Bool = false,
         paginationFailureCode: Int? = nil,
         explicitEmptyInitialPage: Bool = false,
         latestTurnUserMessageCount: Int = 1,
+        latestTurnStatus: RuntimeConversationTurnStatus = .completed,
         suspendsRevert: Bool = false,
         revertFailsAfterCommit: Bool = false,
-        reconciliationReadFails: Bool = false
+        reconciliationReadFails: Bool = false,
+        hasSecondaryThread: Bool = false
     ) -> HistoryPaginationFixture {
         let suiteName = "OnyxAppModelHistoryPaginationTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -540,9 +743,11 @@ final class OnyxAppModelHistoryPaginationTests: XCTestCase {
             paginationFailureCode: paginationFailureCode,
             explicitEmptyInitialPage: explicitEmptyInitialPage,
             latestTurnUserMessageCount: latestTurnUserMessageCount,
+            latestTurnStatus: latestTurnStatus,
             suspendsRevert: suspendsRevert,
             revertFailsAfterCommit: revertFailsAfterCommit,
-            reconciliationReadFails: reconciliationReadFails
+            reconciliationReadFails: reconciliationReadFails,
+            hasSecondaryThread: hasSecondaryThread
         )
         return HistoryPaginationFixture(
             model: OnyxAppModel(runtime: runtime, defaults: defaults),
@@ -608,6 +813,18 @@ private actor HistoryPaginationRuntime: AgentRuntime {
         model: "test-model",
         branch: nil
     )
+    nonisolated static let secondaryThread = RuntimeThread(
+        id: "history-pagination-secondary-thread",
+        title: "Another task",
+        preview: "An unrelated task",
+        cwd: "/tmp",
+        updatedAt: Date(timeIntervalSince1970: 300),
+        status: .idle,
+        isPinned: false,
+        runtime: .codex,
+        model: "test-model",
+        branch: nil
+    )
 
     private let paginated: Bool
     private let returnsInitialPage: Bool
@@ -615,8 +832,10 @@ private actor HistoryPaginationRuntime: AgentRuntime {
     private let paginationFailureCode: Int?
     private let explicitEmptyInitialPage: Bool
     private let latestTurnUserMessageCount: Int
+    private let latestTurnStatus: RuntimeConversationTurnStatus
     private let suspendsRevert: Bool
     private let revertFailsAfterCommit: Bool
+    private let hasSecondaryThread: Bool
     private var reconciliationReadFails: Bool
     private var recordedInitialRequests: [RuntimeInitialThreadHistoryPageRequest] = []
     private var recordedReadCount = 0
@@ -632,7 +851,7 @@ private actor HistoryPaginationRuntime: AgentRuntime {
     private var revertRequestWaiters: [CheckedContinuation<Void, Never>] = []
     private var revertRelease: CheckedContinuation<Void, Never>?
     private var revertWasReleased = false
-    private var historyWasReverted = false
+    private var revertedThreadIDs: Set<String> = []
 
     init(
         paginated: Bool,
@@ -641,9 +860,11 @@ private actor HistoryPaginationRuntime: AgentRuntime {
         paginationFailureCode: Int? = nil,
         explicitEmptyInitialPage: Bool = false,
         latestTurnUserMessageCount: Int = 1,
+        latestTurnStatus: RuntimeConversationTurnStatus = .completed,
         suspendsRevert: Bool = false,
         revertFailsAfterCommit: Bool = false,
-        reconciliationReadFails: Bool = false
+        reconciliationReadFails: Bool = false,
+        hasSecondaryThread: Bool = false
     ) {
         self.paginated = paginated
         self.returnsInitialPage = returnsInitialPage
@@ -651,9 +872,11 @@ private actor HistoryPaginationRuntime: AgentRuntime {
         self.paginationFailureCode = paginationFailureCode
         self.explicitEmptyInitialPage = explicitEmptyInitialPage
         self.latestTurnUserMessageCount = latestTurnUserMessageCount
+        self.latestTurnStatus = latestTurnStatus
         self.suspendsRevert = suspendsRevert
         self.revertFailsAfterCommit = revertFailsAfterCommit
         self.reconciliationReadFails = reconciliationReadFails
+        self.hasSecondaryThread = hasSecondaryThread
         events = AsyncStream { continuation in
             continuation.onTermination = { _ in }
         }
@@ -691,22 +914,22 @@ private actor HistoryPaginationRuntime: AgentRuntime {
     func disconnect() async {}
 
     func listThreads(limit _: Int, archived: Bool) async throws -> [RuntimeThread] {
-        archived ? [] : [Self.thread]
+        archived ? [] : (hasSecondaryThread ? [Self.thread, Self.secondaryThread] : [Self.thread])
     }
 
-    func readThread(id _: String) async throws -> RuntimeConversation {
+    func readThread(id: String) async throws -> RuntimeConversation {
         recordedReadCount += 1
-        return Self.fullConversation()
+        return Self.fullConversation(thread: Self.thread(for: id))
     }
 
-    func resumeThread(id _: String) async throws -> RuntimeConversation {
+    func resumeThread(id: String) async throws -> RuntimeConversation {
         recordedLegacyResumeCount += 1
-        return Self.fullConversation()
+        return Self.fullConversation(thread: Self.thread(for: id))
     }
 
-    private static func fullConversation() -> RuntimeConversation {
+    private static func fullConversation(thread: RuntimeThread) -> RuntimeConversation {
         RuntimeConversation(
-            thread: Self.thread,
+            thread: thread,
             items: (0..<400).map { index in
                 TimelineItem(
                     id: "full-\(index)",
@@ -722,7 +945,7 @@ private actor HistoryPaginationRuntime: AgentRuntime {
     }
 
     func readThread(
-        id _: String,
+        id: String,
         initialHistoryPage request: RuntimeThreadHistoryPageRequest
     ) async throws -> RuntimeThreadResumeResult {
         recordedPaginatedReadCount += 1
@@ -739,14 +962,16 @@ private actor HistoryPaginationRuntime: AgentRuntime {
                 message: "simulated pagination incompatibility"
             )
         }
-        if historyWasReverted, reconciliationReadFails {
+        if revertedThreadIDs.contains(id), reconciliationReadFails {
             throw AgentRuntimeError.protocolFailure("simulated reconciliation read failure")
         }
-        return returnsInitialPage ? initialPageResult() : Self.emptyPageResult()
+        return returnsInitialPage
+            ? initialPageResult(threadID: id)
+            : Self.emptyPageResult(thread: Self.thread(for: id))
     }
 
     func resumeThread(
-        id _: String,
+        id: String,
         initialHistoryPage request: RuntimeInitialThreadHistoryPageRequest
     ) async throws -> RuntimeThreadResumeResult {
         recordedPaginatedResumeCount += 1
@@ -757,18 +982,25 @@ private actor HistoryPaginationRuntime: AgentRuntime {
                 message: "simulated pagination incompatibility"
             )
         }
-        return returnsInitialPage ? initialPageResult() : Self.emptyPageResult()
+        return returnsInitialPage
+            ? initialPageResult(threadID: id)
+            : Self.emptyPageResult(thread: Self.thread(for: id))
     }
 
-    private func initialPageResult() -> RuntimeThreadResumeResult {
+    private func initialPageResult(threadID: String) -> RuntimeThreadResumeResult {
+        let thread = Self.thread(for: threadID)
         let turns: [RuntimeConversationTurn]
         if explicitEmptyInitialPage {
             turns = []
-        } else if historyWasReverted {
+        } else if revertedThreadIDs.contains(threadID) {
             turns = [Self.turn(3)]
         } else {
             turns = [
-                Self.turn(4, userMessageCount: latestTurnUserMessageCount),
+                Self.turn(
+                    4,
+                    userMessageCount: latestTurnUserMessageCount,
+                    status: latestTurnStatus
+                ),
                 Self.turn(3),
             ]
         }
@@ -779,16 +1011,16 @@ private actor HistoryPaginationRuntime: AgentRuntime {
             direction: .descending
         )
         return RuntimeThreadResumeResult(
-            conversation: RuntimeConversation(thread: Self.thread, items: page.chronologicalItems),
+            conversation: RuntimeConversation(thread: thread, items: page.chronologicalItems),
             initialHistoryPage: page,
             turnsBackwardsCursor: nil,
             itemsBackwardsCursor: nil
         )
     }
 
-    private static func emptyPageResult() -> RuntimeThreadResumeResult {
+    private static func emptyPageResult(thread: RuntimeThread) -> RuntimeThreadResumeResult {
         RuntimeThreadResumeResult(
-            conversation: RuntimeConversation(thread: Self.thread, items: []),
+            conversation: RuntimeConversation(thread: thread, items: []),
             initialHistoryPage: nil,
             turnsBackwardsCursor: nil,
             itemsBackwardsCursor: nil
@@ -831,12 +1063,12 @@ private actor HistoryPaginationRuntime: AgentRuntime {
                 revertRelease = continuation
             }
         }
-        historyWasReverted = true
+        revertedThreadIDs.insert(id)
         if revertFailsAfterCommit {
             throw AgentRuntimeError.protocolFailure("simulated lost revert response")
         }
         return RuntimeThreadRevertResult(
-            thread: Self.thread,
+            thread: Self.thread(for: id),
             turnsBackwardsCursor: nil,
             itemsBackwardsCursor: nil
         )
@@ -898,9 +1130,14 @@ private actor HistoryPaginationRuntime: AgentRuntime {
     func archiveThread(id _: String) async throws {}
     func unarchiveThread(id _: String) async throws {}
 
+    private nonisolated static func thread(for id: String) -> RuntimeThread {
+        id == secondaryThread.id ? secondaryThread : thread
+    }
+
     private static func turn(
         _ number: Int,
-        userMessageCount: Int = 1
+        userMessageCount: Int = 1,
+        status: RuntimeConversationTurnStatus = .completed
     ) -> RuntimeConversationTurn {
         let userItems = (0..<max(1, userMessageCount)).map { messageIndex in
             TimelineItem(
@@ -937,7 +1174,7 @@ private actor HistoryPaginationRuntime: AgentRuntime {
                     detail: nil
                 ),
             ],
-            status: .completed,
+            status: status,
             itemDetail: .full,
             startedAt: nil,
             completedAt: nil,

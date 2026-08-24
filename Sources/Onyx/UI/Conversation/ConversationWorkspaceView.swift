@@ -37,16 +37,30 @@ struct ConversationWorkspaceView: View {
                         ) {
                             NativeTranscriptView(
                                 items: model.transcriptSnapshot.items,
-                                isAwaitingResponse: (model.isTurnRunning || model.isSelectedReviewStarting)
+                                isAwaitingResponse: (model.isTurnRunning
+                                    || model.isSelectedReviewStarting
+                                    || model.isPreparingFailedResponseRetryForSelectedThread)
                                     && model.activeUserInteraction == nil,
-                                workingLabel: model.isReviewRunning || model.isSelectedReviewStarting
-                                    ? "Reviewing changes…"
-                                    : "Working on a response…",
+                                workingLabel: model.isPreparingFailedResponseRetryForSelectedThread
+                                    ? "Preparing retry…"
+                                    : (model.isReviewRunning || model.isSelectedReviewStarting
+                                        ? "Reviewing changes…"
+                                        : "Working on a response…"),
                                 revision: model.transcriptSnapshot.revision,
                                 changeHint: model.transcriptSnapshot.changeHint,
                                 editableUserMessageID: model.latestEditableUserMessageID,
+                                retryableFailedResponseItemID: model.retryableFailedResponseItemID,
                                 onEditUserMessage: { messageID in
                                     model.beginEditLatestUserMessage(
+                                        messageID: messageID,
+                                        window: windowPresentation.window
+                                    )
+                                },
+                                onRetryFailedResponse: { responseItemID in
+                                    guard let messageID = model.retryUserMessageID(
+                                        forFailedResponseItemID: responseItemID
+                                    ) else { return }
+                                    model.beginRetryLatestFailedResponse(
                                         messageID: messageID,
                                         window: windowPresentation.window
                                     )
@@ -125,7 +139,7 @@ struct ProviderExecutionScopeStrip: View {
     @ObservedObject var model: OnyxAppModel
 
     var body: some View {
-        if ProviderExecutionScopePresentation.isChatOnly(session: model.session) {
+        if !model.supports(.tools) {
             Label(
                 "Chat only — this provider can reply here, but cannot inspect or edit project files or run commands yet.",
                 systemImage: "text.bubble"
@@ -699,7 +713,7 @@ private struct ComposerView: View {
     }
 
     private var isChatOnlyProvider: Bool {
-        ProviderExecutionScopePresentation.isChatOnly(session: model.session)
+        !model.supports(.tools)
     }
 
     private var taskOptionsHelp: String {

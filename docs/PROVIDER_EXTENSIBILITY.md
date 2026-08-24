@@ -29,9 +29,8 @@ original provider and model.
   IPs with no bearer credential, discovers models through `/models`, and stores
   bearer values only through Keychain.
 - OpenAICompatibleRuntime streams chat-completions responses and persists
-  provider-owned conversation history locally. It advertises only the controls
-  the endpoint can actually support; Codex-local tools, approvals, and sandbox
-  execution are unavailable on this adapter.
+  provider-owned conversation history locally. It is the compatibility
+  fallback and advertises no local tools, approvals, or sandbox execution.
 - Cached catalogs for every configured connection load before provider
   switching, so manually selected or previously discovered vLLM models are
   directly selectable. Capability metadata is persisted without credentials;
@@ -41,7 +40,41 @@ The catalog projector and request builder remain pure discovery/encoding
 components. The Claude descriptor is configuration metadata only; there is no
 Anthropic Messages codec or runtime adapter.
 
-## Why this is not a Claude or remote-tool adapter yet
+## Full agent path for compatible Responses endpoints
+
+Bundled `codex app-server` supports a custom `modelProvider` per thread. For an
+OpenAI-compatible endpoint that passes a bounded Responses/tool probe, Onyx
+will compose that capability instead of reimplementing the Codex agent loop:
+
+```text
+Onyx CodexRuntime
+    |
+pinned codex app-server -- thread-scoped custom modelProvider
+    |
+unauthenticated literal-loopback Responses connection
+    |
+Onyx credential-injecting proxy
+    |
+configured provider Responses endpoint
+```
+
+The proxy is a credential boundary, not a second agent runtime. It reads the
+provider's bearer credential from Keychain, injects it only on the validated
+upstream request, strips sensitive headers across redirects, and avoids prompt,
+response, and credential logging. App-server owns the mature multi-round tool
+loop, workspace sandbox, approval requests, cancellation, and streamed task
+lifecycle. The existing chat runtime remains available when the exact
+endpoint/model/protocol combination fails, times out, or later loses the
+compatibility probe.
+
+A clean-home probe against bundled app-server 0.149.0 verified custom-provider
+Responses routing, app-server-supplied tool schemas, four request rounds,
+command approval, continuation after a declined call, rejection of a
+sibling-directory write, and a successful workspace write. That probe is
+architecture evidence; the production proxy and routing are not implemented
+yet.
+
+## Why the fallback is not a Claude or agent adapter
 
 AgentRuntime includes durable thread discovery/resume, Codex approvals,
 sandbox policy, local terminal/tool execution, steering, archive/fork/delete,
@@ -57,9 +90,11 @@ an explicit mapping for lifecycle features that its upstream does not provide
 conversation store, and prove live stream/error behavior.
 
 Provider request capabilities are deliberately not projected directly into
-AgentRuntime capabilities. For example, a remote model advertising tools says
-nothing about Onyx's local tool execution and approval semantics; the eventual
-adapter must prove and advertise those product-level behaviors separately.
+AgentRuntime capabilities. A remote model advertising tools says nothing about
+whether it follows the Responses tool protocol correctly. Onyx enables the
+app-server agent path only after bounded behavioral proof, and only because
+app-server—not the model catalog—supplies the sandbox, approvals, execution,
+and lifecycle semantics.
 
 Local image paths selected in the composer are revalidated, bounded, and
 resolved to image data URLs before crossing the remote endpoint boundary; the

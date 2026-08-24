@@ -8,6 +8,7 @@ struct OpenAICompatibleChatMessage: Sendable, Equatable, Hashable {
         case system
         case user
         case assistant
+        case tool
     }
 
     enum ContentPart: Sendable, Equatable, Hashable {
@@ -17,15 +18,86 @@ struct OpenAICompatibleChatMessage: Sendable, Equatable, Hashable {
 
     let role: Role
     let parts: [ContentPart]
+    /// Present only on an assistant message that asked the client to invoke
+    /// one or more functions. The arguments remain the provider's exact JSON
+    /// string; protocol decoding must not reinterpret or execute them.
+    let toolCalls: [OpenAICompatibleChatToolCall]
+    /// Present only on a tool-role message and links its result to the
+    /// assistant call that requested it.
+    let toolCallID: String?
 
     init(role: Role, text: String) {
         self.role = role
         self.parts = [.text(text)]
+        self.toolCalls = []
+        self.toolCallID = nil
     }
 
-    init(role: Role, parts: [ContentPart]) {
+    init(
+        role: Role,
+        parts: [ContentPart],
+        toolCalls: [OpenAICompatibleChatToolCall] = [],
+        toolCallID: String? = nil
+    ) {
         self.role = role
         self.parts = parts
+        self.toolCalls = toolCalls
+        self.toolCallID = toolCallID
+    }
+
+    init(
+        assistantToolCalls toolCalls: [OpenAICompatibleChatToolCall],
+        text: String? = nil
+    ) {
+        self.init(
+            role: .assistant,
+            parts: text.map { [.text($0)] } ?? [],
+            toolCalls: toolCalls
+        )
+    }
+
+    init(toolCallID: String, result: String) {
+        self.init(
+            role: .tool,
+            parts: [.text(result)],
+            toolCallID: toolCallID
+        )
+    }
+}
+
+/// One complete function call produced by a chat-completions model. The
+/// function type is implicit because this protocol slice intentionally does
+/// not support provider-hosted, filesystem, or command tools.
+struct OpenAICompatibleChatToolCall: Sendable, Equatable, Hashable {
+    let id: String
+    let name: String
+    let arguments: String
+
+    init(id: String, name: String, arguments: String) {
+        self.id = id
+        self.name = name
+        self.arguments = arguments
+    }
+}
+
+/// One function definition encoded in a chat-completions request. Parameters
+/// are retained as JSON Schema without interpreting them in the transport.
+struct OpenAICompatibleChatFunctionTool: Sendable, Equatable {
+    let name: String
+    let description: String?
+    let parameters: JSONValue
+    let strict: Bool?
+
+    init(
+        name: String,
+        description: String? = nil,
+        parameters: JSONValue,
+        strict: Bool? = nil
+    ) {
+        self.name = name
+        self.description = description
+        self.parameters = parameters
+        self.strict = strict
     }
 }
 
@@ -36,6 +108,25 @@ struct OpenAICompatibleChatRequest: Sendable, Equatable {
     let reasoningEffort: String?
     let includeStreamingUsage: Bool
     let requestBehavior: OpenAICompatibleRequestBehavior
+    let tools: [OpenAICompatibleChatFunctionTool]
+
+    init(
+        model: String,
+        messages: [OpenAICompatibleChatMessage],
+        stream: Bool,
+        reasoningEffort: String?,
+        includeStreamingUsage: Bool,
+        requestBehavior: OpenAICompatibleRequestBehavior,
+        tools: [OpenAICompatibleChatFunctionTool] = []
+    ) {
+        self.model = model
+        self.messages = messages
+        self.stream = stream
+        self.reasoningEffort = reasoningEffort
+        self.includeStreamingUsage = includeStreamingUsage
+        self.requestBehavior = requestBehavior
+        self.tools = tools
+    }
 
     enum EncodingError: LocalizedError, Sendable {
         case failed(String)
@@ -61,6 +152,9 @@ struct OpenAICompatibleChatRequest: Sendable, Equatable {
         }
         if includeStreamingUsage && stream {
             object["stream_options"] = .object(["include_usage": .bool(true)])
+        }
+        if !tools.isEmpty {
+            object["tools"] = .array(tools.map(Self.toolValue))
         }
         let enableThinking: Bool?
         if KnownOpenAICompatibleModelProfile.profile(for: model) == .qwen38,
@@ -93,33 +187,75 @@ struct OpenAICompatibleChatRequest: Sendable, Equatable {
     }
 
     private static func messageValue(_ message: OpenAICompatibleChatMessage) -> JSONValue {
-        let content: JSONValue
-        if message.parts.allSatisfy({ if case .text = $0 { true } else { false } }) {
-            content = .string(
-                message.parts.compactMap { part in
+        var object: [String: JSONValue] = [
+            "role": .string(message.role.rawValue),
+        ]
+        if message.role == .assistant, message.parts.isEmpty, !message.toolCalls.isEmpty {
+            object["content"] = .null
+        } else {
+            object["content"] = contentValue(message.parts)
+        }
+        if !message.toolCalls.isEmpty {
+            object["tool_calls"] = .array(message.toolCalls.map(toolCallValue))
+        }
+        if let toolCallID = message.toolCallID {
+            object["tool_call_id"] = .string(toolCallID)
+        }
+        return .object(object)
+    }
+
+    private static func contentValue(
+        _ parts: [OpenAICompatibleChatMessage.ContentPart]
+    ) -> JSONValue {
+        if parts.allSatisfy({ if case .text = $0 { true } else { false } }) {
+            return .string(
+                parts.compactMap { part in
                     guard case let .text(text) = part else { return nil }
                     return text
                 }.joined(separator: "\n")
             )
-        } else {
-            content = .array(message.parts.map { part in
-                switch part {
-                case let .text(text):
-                    return .object([
-                        "text": .string(text),
-                        "type": .string("text"),
-                    ])
-                case let .imageURL(url):
-                    return .object([
-                        "image_url": .object(["url": .string(url)]),
-                        "type": .string("image_url"),
-                    ])
-                }
-            })
+        }
+        return .array(parts.map { part in
+            switch part {
+            case let .text(text):
+                return .object([
+                    "text": .string(text),
+                    "type": .string("text"),
+                ])
+            case let .imageURL(url):
+                return .object([
+                    "image_url": .object(["url": .string(url)]),
+                    "type": .string("image_url"),
+                ])
+            }
+        })
+    }
+
+    private static func toolCallValue(_ call: OpenAICompatibleChatToolCall) -> JSONValue {
+        .object([
+            "id": .string(call.id),
+            "type": .string("function"),
+            "function": .object([
+                "name": .string(call.name),
+                "arguments": .string(call.arguments),
+            ]),
+        ])
+    }
+
+    private static func toolValue(_ tool: OpenAICompatibleChatFunctionTool) -> JSONValue {
+        var function: [String: JSONValue] = [
+            "name": .string(tool.name),
+            "parameters": tool.parameters,
+        ]
+        if let description = tool.description {
+            function["description"] = .string(description)
+        }
+        if let strict = tool.strict {
+            function["strict"] = .bool(strict)
         }
         return .object([
-            "content": content,
-            "role": .string(message.role.rawValue),
+            "type": .string("function"),
+            "function": .object(function),
         ])
     }
 }

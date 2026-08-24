@@ -11,6 +11,7 @@ expected_version=""
 expected_build_number=""
 require_notarized=0
 require_universal=0
+probe_runtime=0
 
 usage() {
   cat <<'EOF'
@@ -26,6 +27,7 @@ Options:
   --build-number NUMBER       Expected CFBundleVersion.
   --require-universal         Require arm64 and x86_64 executable slices.
   --require-notarized         Require a stapled ticket and Gatekeeper acceptance.
+  --probe-runtime             Start the verified bundled helper from the mounted image.
   -h, --help                  Show this help.
 EOF
 }
@@ -69,6 +71,10 @@ while (( $# > 0 )); do
       ;;
     --require-universal)
       require_universal=1
+      shift
+      ;;
+    --probe-runtime)
+      probe_runtime=1
       shift
       ;;
     -h|--help)
@@ -135,6 +141,8 @@ app_candidates=("$mount_point"/*.app(N))
 (( ${#app_candidates[@]} == 1 )) || \
   die "expected exactly one top-level .app bundle, found ${#app_candidates[@]}"
 app_path="${app_candidates[1]}"
+[[ -d "$app_path" && ! -L "$app_path" ]] || \
+  die "top-level .app payload must be a real directory, not a symbolic link"
 
 if [[ -n "$expected_app_name" && "${app_path:t}" != "$expected_app_name" ]]; then
   die "expected app '$expected_app_name', found '${app_path:t}'"
@@ -160,6 +168,25 @@ executable_path="$app_path/Contents/MacOS/$executable_name"
 [[ -x "$executable_path" ]] || \
   die "app executable is missing or not executable"
 /usr/bin/plutil -lint "$info_plist" >/dev/null
+
+verify_plist_value() {
+  local key="$1"
+  local expected="$2"
+  local label="$3"
+  [[ -n "$expected" ]] || return 0
+  local actual
+  actual="$(/usr/bin/plutil -extract "$key" raw -o - "$info_plist")"
+  [[ "$actual" == "$expected" ]] || \
+    die "$label mismatch: expected '$expected', found '$actual'"
+}
+
+# Reject the wrong product before any executable from the mounted image can
+# run. This matters especially for an ad-hoc development DMG supplied to the
+# independent verifier.
+verify_plist_value CFBundleIdentifier "$expected_bundle_identifier" "bundle identifier"
+verify_plist_value CFBundleShortVersionString "$expected_version" "version"
+verify_plist_value CFBundleVersion "$expected_build_number" "build number"
+
 executable_architectures="$(/usr/bin/lipo -archs "$executable_path")"
 if (( require_universal == 1 )); then
   [[ " $executable_architectures " == *" arm64 "* && \
@@ -200,28 +227,16 @@ if (( require_notarized == 1 )); then
   /usr/sbin/spctl --assess --type execute --verbose=2 "$app_path"
 fi
 
-# Only execute the mounted helper after its complete package, the outer app,
-# and (for public releases) Gatekeeper acceptance have all been established.
-native_architecture="$(/usr/bin/uname -m)"
-if (( ${expected_runtime_architectures[(Ie)$native_architecture]} )); then
-  native_runtime_target="$(codex_runtime_target_for_architecture "$native_architecture")"
-  codex_runtime_probe_installed_package "$runtime_root/$native_runtime_target"
+# Only execute the mounted helper when the caller explicitly opts in, and only
+# after metadata, its complete package, the outer app, and (for public
+# releases) Gatekeeper acceptance have all been established.
+if (( probe_runtime == 1 )); then
+  native_architecture="$(/usr/bin/uname -m)"
+  if (( ${expected_runtime_architectures[(Ie)$native_architecture]} )); then
+    native_runtime_target="$(codex_runtime_target_for_architecture "$native_architecture")"
+    codex_runtime_probe_installed_package "$runtime_root/$native_runtime_target"
+  fi
 fi
-
-verify_plist_value() {
-  local key="$1"
-  local expected="$2"
-  local label="$3"
-  [[ -n "$expected" ]] || return 0
-  local actual
-  actual="$(/usr/bin/plutil -extract "$key" raw -o - "$info_plist")"
-  [[ "$actual" == "$expected" ]] || \
-    die "$label mismatch: expected '$expected', found '$actual'"
-}
-
-verify_plist_value CFBundleIdentifier "$expected_bundle_identifier" "bundle identifier"
-verify_plist_value CFBundleShortVersionString "$expected_version" "version"
-verify_plist_value CFBundleVersion "$expected_build_number" "build number"
 
 print -- "DMG verification passed: $dmg_path"
 print -- "Application: ${app_path:t}"

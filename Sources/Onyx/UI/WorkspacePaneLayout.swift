@@ -22,6 +22,14 @@ enum WorkspacePaneLayout {
     static let inspectorMinimumWidth: CGFloat = 280
     static let inspectorMaximumWidth: CGFloat = 480
 
+    /// The production window must remain wide enough for its compact layout:
+    /// one supporting pane, its splitter, and the protected conversation.
+    /// The inspector has the larger intrinsic minimum, so it defines the
+    /// narrowest honest window size.
+    static let minimumWindowWidth: CGFloat = minimumConversationWidth
+        + dividerWidth
+        + inspectorMinimumWidth
+
     /// The narrowest width where both panes can occupy space without pushing
     /// the conversation below its protected width. Below this point a
     /// requested inspector temporarily takes the side-pane slot; the sidebar

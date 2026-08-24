@@ -82,11 +82,26 @@ final class ProjectCatalogProductionTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: location.directory) }
         let conversationFile = location.directory.appendingPathComponent("conversations.json")
         let providerID = ProviderConnectionID("local.catalog")
+        let connectionStore = ProviderConnectionStore(
+            storage: InMemoryProviderConnectionStorage()
+        )
+        let providerRecord = try ProviderConnectionRecord(
+            id: providerID,
+            displayName: "Local catalog",
+            baseURL: URL(string: "https://provider.example.test/v1")!,
+            selectedModelID: "fixture-model",
+            authMode: .none,
+            discovery: ProviderConnectionDiscoveryMetadata(
+                discoveredModelIDs: ["fixture-model"]
+            )
+        )
+        try await connectionStore.upsert(providerRecord)
         let conversations = OpenAICompatibleConversationStore(fileURL: conversationFile)
         for index in 0 ..< 125 {
             _ = try await conversations.upsert(OpenAICompatibleStoredConversation(
                 id: "local-" + String(index),
                 connectionID: providerID,
+                conversationScopeID: providerRecord.conversationScopeID,
                 title: "Local " + String(index),
                 cwd: "/work/local",
                 modelID: "fixture-model",
@@ -104,6 +119,7 @@ final class ProjectCatalogProductionTests: XCTestCase {
             registry: try RuntimeRegistry(providers: [], connections: []),
             defaults: defaults.defaults,
             projectCatalogStore: ProjectCatalogStore(fileURL: location.file),
+            providerConnectionStore: connectionStore,
             providerCredentialStore: InMemoryCredentialStore(),
             providerConversationStore: conversations
         )
@@ -120,6 +136,106 @@ final class ProjectCatalogProductionTests: XCTestCase {
             125
         )
         XCTAssertTrue(host.projectCatalogModel.projects.isEmpty)
+    }
+
+    func testHostLoadsMergedAdaptiveCatalogInsteadOfReplacingAgentTasksWithChatOnlyHistory() async throws {
+        let defaults = try makeDefaults()
+        defer { defaults.cleanUp() }
+        let location = temporaryLocation("adaptive-provider")
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        let providerID = ProviderConnectionID("local.catalog.adaptive")
+        let modelID = "fixture-model"
+        let connectionStore = ProviderConnectionStore(
+            storage: InMemoryProviderConnectionStorage()
+        )
+        let connection = try ProviderConnectionRecord(
+            id: providerID,
+            displayName: "Adaptive catalog",
+            baseURL: URL(string: "https://provider.example.test/v1")!,
+            selectedModelID: modelID,
+            authMode: .none,
+            discovery: ProviderConnectionDiscoveryMetadata(
+                lastAttemptedAt: Date(timeIntervalSince1970: 10),
+                lastSucceededAt: Date(timeIntervalSince1970: 11),
+                discoveredModelIDs: [modelID]
+            )
+        )
+        try await connectionStore.upsert(connection)
+
+        let conversations = OpenAICompatibleConversationStore(
+            fileURL: location.directory.appendingPathComponent("conversations.json")
+        )
+        _ = try await conversations.upsert(OpenAICompatibleStoredConversation(
+            id: "chat-task",
+            connectionID: providerID,
+            conversationScopeID: connection.conversationScopeID,
+            title: "Chat task",
+            cwd: "/work/chat",
+            modelID: modelID,
+            updatedAt: Date(timeIntervalSince1970: 20)
+        ))
+        let stateStore = OpenAICompatibleAdaptiveStateStore(
+            fileURL: location.directory.appendingPathComponent("adaptive-state.json")
+        )
+        _ = try await stateStore.recordTaskOwnership(
+            connectionID: providerID,
+            conversationScopeID: connection.conversationScopeID,
+            threadID: "chat-task",
+            lane: .chat,
+            modelID: modelID,
+            updatedAt: Date(timeIntervalSince1970: 20)
+        )
+
+        _ = try await stateStore.recordTaskOwnership(
+            connectionID: providerID,
+            conversationScopeID: connection.conversationScopeID,
+            threadID: "agent-task",
+            lane: .agent,
+            modelID: modelID,
+            updatedAt: Date(timeIntervalSince1970: 30)
+        )
+        let adaptiveRuntime = CatalogRuntime(
+            active: [
+                makeThread(id: "chat-task", path: "/work/chat"),
+                makeThread(id: "agent-task", path: "/work/agent"),
+            ],
+            archived: [],
+            failArchived: false
+        )
+        let adapterID = RuntimeAdapterID("test.catalog.adaptive")
+        let registry = try RuntimeRegistry(
+            providers: [
+                RuntimeProviderDescriptor(id: adapterID, displayName: "Adaptive catalog") { _ in
+                    adaptiveRuntime
+                },
+            ],
+            connections: [
+                RuntimeConnectionRegistration(id: providerID, adapterID: adapterID),
+            ]
+        )
+
+        let host = OnyxApplicationHost(
+            registry: registry,
+            defaults: defaults.defaults,
+            projectCatalogStore: ProjectCatalogStore(fileURL: location.file),
+            providerConnectionStore: connectionStore,
+            providerCredentialStore: InMemoryCredentialStore(),
+            providerConversationStore: conversations,
+            providerAdaptiveStateStore: stateStore
+        )
+        let catalog = await host.loadProviderTaskCatalog(connections: [
+            .init(id: providerID, displayName: "Adaptive catalog", isCodex: false),
+        ])
+
+        XCTAssertTrue(catalog.sourceComplete)
+        XCTAssertEqual(
+            catalog.lists.first(where: { $0.scope == .active })?.threads.map(\.id),
+            ["chat-task", "agent-task"]
+        )
+        XCTAssertNotNil(
+            host.cachedRuntimeCoordinatorForTesting(providerID),
+            "Provider catalog refresh must read through the shared adaptive coordinator"
+        )
     }
 
     func testWorkspaceModelListsAndOpensTaskBeyondFormerHundredRowCap() async throws {

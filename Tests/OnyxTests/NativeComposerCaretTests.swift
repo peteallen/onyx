@@ -302,6 +302,23 @@ final class NativeComposerCaretTests: XCTestCase {
         )
     }
 
+    func testCancelOperationUsesTransientSurfaceHandler() async {
+        let textView = makeTextView()
+        var cancelCount = 0
+        let cancelled = expectation(description: "Transient surface cancelled")
+        textView.onCancel = {
+            cancelCount += 1
+            cancelled.fulfill()
+        }
+
+        textView.cancelOperation(nil)
+        textView.cancelOperation(nil)
+
+        XCTAssertEqual(cancelCount, 0, "Cancel should wait until the Escape event unwinds")
+        await fulfillment(of: [cancelled], timeout: 1)
+        XCTAssertEqual(cancelCount, 1)
+    }
+
     func testSubmitDoesNotStealFocusFromAnotherControl() async throws {
         let composer = makeTextView()
         let otherEditor = makeTextView()

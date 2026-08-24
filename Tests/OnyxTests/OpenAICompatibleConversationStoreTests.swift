@@ -64,6 +64,186 @@ final class OpenAICompatibleConversationStoreTests: XCTestCase {
         XCTAssertFalse(persisted.localizedCaseInsensitiveContains("bearer"))
     }
 
+    func testGeneratedConversationIDsIncludeConnectionAndScopeOwnership() async throws {
+        let location = temporaryLocation()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        let store = OpenAICompatibleConversationStore(fileURL: location.file)
+        let connection = ProviderConnectionID("provider.scoped-ids")
+        let firstScope = "scope.first"
+        let secondScope = "scope.second"
+
+        let first = try await store.create(
+            connectionID: connection,
+            title: "First scope",
+            cwd: nil,
+            modelID: "fixture-model",
+            scopeID: firstScope
+        )
+        let second = try await store.create(
+            connectionID: connection,
+            title: "Second scope",
+            cwd: nil,
+            modelID: "fixture-model",
+            scopeID: secondScope
+        )
+
+        XCTAssertNotEqual(first.id, second.id)
+        for record in [first, second] {
+            XCTAssertTrue(record.id.hasPrefix("openai.\(Self.base64URL(connection.rawValue))."))
+        }
+        XCTAssertTrue(first.id.contains(".\(Self.base64URL(firstScope))."))
+        XCTAssertTrue(second.id.contains(".\(Self.base64URL(secondScope))."))
+        XCTAssertFalse(first.id.contains(".\(Self.base64URL(secondScope))."))
+        XCTAssertFalse(second.id.contains(".\(Self.base64URL(firstScope))."))
+    }
+
+    func testLegacyMigrationCannotAdoptHistoryIntoRotatedScope() async throws {
+        let location = temporaryLocation()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        let store = OpenAICompatibleConversationStore(fileURL: location.file)
+        let connection = ProviderConnectionID("provider.legacy-scope-rotation")
+        let legacyScope = ProviderConnectionRecord.legacyConversationScopeID(for: connection)
+        let rotatedScope = ProviderConnectionRecord.makeConversationScopeID()
+        let legacy = try await store.create(
+            connectionID: connection,
+            title: "Legacy history",
+            cwd: nil,
+            modelID: "fixture-model"
+        )
+
+        let rejected = try await store.migrateLegacyConversations(
+            connectionID: connection,
+            to: rotatedScope
+        )
+        XCTAssertEqual(rejected, 0)
+        let rotatedConversation = try await store.conversation(
+            connectionID: connection,
+            id: legacy.id,
+            scopeID: rotatedScope
+        )
+        XCTAssertNil(rotatedConversation)
+        let stillUnscoped = try await store.conversation(
+            connectionID: connection,
+            id: legacy.id
+        )
+        XCTAssertNil(stillUnscoped?.conversationScopeID)
+
+        let migrated = try await store.migrateLegacyConversations(
+            connectionID: connection,
+            to: legacyScope
+        )
+        XCTAssertEqual(migrated, 1)
+        let migratedConversation = try await store.conversation(
+            connectionID: connection,
+            id: legacy.id,
+            scopeID: legacyScope
+        )
+        XCTAssertEqual(migratedConversation?.conversationScopeID, legacyScope)
+    }
+
+    func testUpsertCannotReplaceConversationOwnedByAnotherScope() async throws {
+        let location = temporaryLocation()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        let store = OpenAICompatibleConversationStore(fileURL: location.file)
+        let connection = ProviderConnectionID("provider.scope-mismatch")
+        let originalScope = "scope.original"
+        let replacementScope = "scope.replacement"
+        let original = try await store.create(
+            connectionID: connection,
+            title: "Original title",
+            cwd: "/tmp/original",
+            modelID: "fixture-model",
+            scopeID: originalScope,
+            now: Date(timeIntervalSince1970: 1_000)
+        )
+        let replacement = OpenAICompatibleStoredConversation(
+            id: original.id,
+            connectionID: connection,
+            conversationScopeID: replacementScope,
+            title: "Replacement title",
+            cwd: "/tmp/replacement",
+            modelID: "replacement-model",
+            messages: [OpenAICompatibleStoredMessage(role: .user, text: "Replacement")]
+        )
+
+        do {
+            _ = try await store.upsert(replacement)
+            XCTFail("Expected a cross-scope overwrite to be rejected")
+        } catch {
+            XCTAssertEqual(
+                error as? OpenAICompatibleConversationStoreError,
+                .conversationScopeMismatch(
+                    connectionID: connection,
+                    id: original.id,
+                    existingScopeID: originalScope,
+                    incomingScopeID: replacementScope
+                )
+            )
+        }
+
+        let reopened = OpenAICompatibleConversationStore(fileURL: location.file)
+        let retained = try await reopened.conversation(
+            connectionID: connection,
+            id: original.id,
+            scopeID: originalScope
+        )
+        XCTAssertEqual(retained, original)
+        let leakedReplacement = try await reopened.conversation(
+            connectionID: connection,
+            id: original.id,
+            scopeID: replacementScope
+        )
+        XCTAssertNil(leakedReplacement)
+    }
+
+    func testValidationRejectsBlankConversationScope() async throws {
+        let location = temporaryLocation()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        let store = OpenAICompatibleConversationStore(fileURL: location.file)
+        let connection = ProviderConnectionID("provider.blank-scope")
+        let invalid = OpenAICompatibleStoredConversation(
+            id: "blank-scope",
+            connectionID: connection,
+            conversationScopeID: " \n\t ",
+            title: "Invalid scope",
+            modelID: "fixture-model"
+        )
+
+        do {
+            _ = try await store.upsert(invalid)
+            XCTFail("Expected a blank provider scope to be rejected")
+        } catch {
+            XCTAssertEqual(
+                error as? OpenAICompatibleConversationStoreError,
+                .emptyConversationScopeID(connectionID: connection, id: invalid.id)
+            )
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: location.file.path))
+    }
+
+    func testConversationFileUsesPrivatePermissionsWithoutChangingInjectedParent() async throws {
+        let location = temporaryLocation()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        let parent = location.file.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: Int16(0o755))],
+            ofItemAtPath: parent.path
+        )
+        let store = OpenAICompatibleConversationStore(fileURL: location.file)
+
+        _ = try await store.create(
+            connectionID: ProviderConnectionID("provider.private-history"),
+            title: "Private history",
+            cwd: nil,
+            modelID: "fixture-model",
+            scopeID: "scope.private-history"
+        )
+
+        XCTAssertEqual(permissions(at: parent), 0o755)
+        XCTAssertEqual(permissions(at: location.file), 0o600)
+    }
+
     func testInterleavedStoreActorsDoNotLoseUpdates() async throws {
         let location = temporaryLocation()
         defer { try? FileManager.default.removeItem(at: location.directory) }
@@ -201,6 +381,49 @@ final class OpenAICompatibleConversationStoreTests: XCTestCase {
         XCTAssertEqual(item.attachments.map(\.cacheIdentity), item.attachments.map(\.id))
     }
 
+    func testImageOnlyProjectionDoesNotConfuseAPlaceholderWithLiteralUserText() async throws {
+        let location = temporaryLocation()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        let store = OpenAICompatibleConversationStore(fileURL: location.file)
+        let connectionID = ProviderConnectionID("provider.image-body")
+        var conversation = try await store.create(
+            connectionID: connectionID,
+            title: "Image body",
+            cwd: nil,
+            modelID: "vision-model"
+        )
+        let image = "data:image/png;base64,AA=="
+        conversation.messages = [
+            OpenAICompatibleStoredMessage(
+                id: "literal-with-image",
+                role: .user,
+                text: "[Image attachment]",
+                contentParts: [.text("[Image attachment]"), .imageURL(image)]
+            ),
+            OpenAICompatibleStoredMessage(
+                id: "image-only",
+                role: .user,
+                text: "[Image attachment]",
+                contentParts: [.imageURL(image)]
+            ),
+        ]
+        try await store.upsert(conversation)
+
+        let reopenedRecord = try await store.conversation(
+            connectionID: connectionID,
+            id: conversation.id
+        )
+        let reopened = try XCTUnwrap(reopenedRecord)
+        let items = reopened.runtimeConversation(kind: .local).items
+        XCTAssertEqual(items.map(\.body), ["[Image attachment]", ""])
+        XCTAssertEqual(items.map { $0.attachments.count }, [1, 1])
+        XCTAssertEqual(
+            reopened.runtimeThread(kind: .local).preview,
+            "Image attachment",
+            "An image-only task should not look empty in the sidebar"
+        )
+    }
+
     func testAtomicUpdateAppliesMessageMutationWithoutDroppingConversationMetadata() async throws {
         let location = temporaryLocation()
         defer { try? FileManager.default.removeItem(at: location.directory) }
@@ -230,6 +453,56 @@ final class OpenAICompatibleConversationStoreTests: XCTestCase {
         XCTAssertEqual(updated.cwd, "/tmp/project")
         XCTAssertTrue(updated.isArchived)
         XCTAssertEqual(updated.messages[0].text, "after")
+    }
+
+    func testStoredMessagesRoundTripStableTurnIdentityAndLegacyPairsRemainGrouped() async throws {
+        let location = temporaryLocation()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        let connection = ProviderConnectionID("provider.turn-identity")
+        let store = OpenAICompatibleConversationStore(fileURL: location.file)
+        var conversation = try await store.create(
+            connectionID: connection,
+            title: "Turn identity",
+            cwd: nil,
+            modelID: "fixture-model"
+        )
+        conversation.messages = [
+            OpenAICompatibleStoredMessage(
+                id: "explicit-user",
+                turnID: "turn-explicit",
+                role: .user,
+                text: "Explicit"
+            ),
+            OpenAICompatibleStoredMessage(
+                id: "explicit-assistant",
+                turnID: "turn-explicit",
+                role: .assistant,
+                text: "Answer"
+            ),
+            OpenAICompatibleStoredMessage(id: "legacy-user", role: .user, text: "Legacy"),
+            OpenAICompatibleStoredMessage(
+                id: "legacy-assistant",
+                role: .assistant,
+                text: "Legacy answer",
+                status: .failed
+            ),
+        ]
+        try await store.upsert(conversation)
+
+        let reopenedRecord = try await OpenAICompatibleConversationStore(
+            fileURL: location.file
+        ).conversation(
+            connectionID: connection,
+            id: conversation.id
+        )
+        let reopened = try XCTUnwrap(reopenedRecord)
+        XCTAssertEqual(reopened.messages.prefix(2).compactMap(\.turnID), [
+            "turn-explicit", "turn-explicit",
+        ])
+        XCTAssertEqual(reopened.runtimeTurns.map(\.id), [
+            "turn-explicit", "turn:legacy-user",
+        ])
+        XCTAssertEqual(reopened.runtimeTurns.last?.status, .failed)
     }
 
     func testRecoveryMarksPersistedRunningTurnFailedWithoutDroppingText() async throws {
@@ -425,6 +698,75 @@ final class OpenAICompatibleConversationStoreTests: XCTestCase {
         }
     }
 
+    func testValidationRejectsReusedNoncontiguousTurnIdentity() async throws {
+        let location = temporaryLocation()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        let connection = ProviderConnectionID("provider.duplicate-turn")
+        let store = OpenAICompatibleConversationStore(fileURL: location.file)
+        var conversation = try await store.create(
+            connectionID: connection,
+            title: "Malformed turn history",
+            cwd: nil,
+            modelID: "fixture-model"
+        )
+        conversation.messages = [
+            OpenAICompatibleStoredMessage(
+                turnID: "turn-a",
+                role: .user,
+                text: "First"
+            ),
+            OpenAICompatibleStoredMessage(
+                turnID: "turn-b",
+                role: .user,
+                text: "Second"
+            ),
+            OpenAICompatibleStoredMessage(
+                turnID: "turn-a",
+                role: .assistant,
+                text: "Ambiguous suffix"
+            ),
+        ]
+
+        do {
+            _ = try await store.upsert(conversation)
+            XCTFail("Expected an ambiguous turn boundary to be rejected")
+        } catch {
+            XCTAssertEqual(
+                error as? OpenAICompatibleConversationStoreError,
+                .duplicateTurnID(conversationID: conversation.id, turnID: "turn-a")
+            )
+        }
+    }
+
+    func testValidationRejectsExplicitTurnReusedAcrossLegacyTurn() async throws {
+        let location = temporaryLocation()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        let connection = ProviderConnectionID("provider.mixed-duplicate-turn")
+        let store = OpenAICompatibleConversationStore(fileURL: location.file)
+        var conversation = try await store.create(
+            connectionID: connection,
+            title: "Mixed malformed history",
+            cwd: nil,
+            modelID: "fixture-model"
+        )
+        conversation.messages = [
+            OpenAICompatibleStoredMessage(turnID: "turn-a", role: .user, text: "First"),
+            OpenAICompatibleStoredMessage(id: "legacy-user", role: .user, text: "Legacy"),
+            OpenAICompatibleStoredMessage(id: "legacy-answer", role: .assistant, text: "Answer"),
+            OpenAICompatibleStoredMessage(turnID: "turn-a", role: .assistant, text: "Ambiguous"),
+        ]
+
+        do {
+            _ = try await store.upsert(conversation)
+            XCTFail("Expected mixed legacy history to reject a reused turn ID")
+        } catch {
+            XCTAssertEqual(
+                error as? OpenAICompatibleConversationStoreError,
+                .duplicateTurnID(conversationID: conversation.id, turnID: "turn-a")
+            )
+        }
+    }
+
     private func temporaryLocation() -> (directory: URL, file: URL) {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("OpenAICompatibleConversationStoreTests-\(UUID().uuidString)")
@@ -436,5 +778,10 @@ final class OpenAICompatibleConversationStoreTests: XCTestCase {
             .replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
+    }
+
+    private func permissions(at url: URL) -> Int {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return (attributes?[.posixPermissions] as? NSNumber)?.intValue ?? -1
     }
 }
