@@ -18,11 +18,11 @@ New hands-on feedback is added to this ledger as it arrives. It changes this seq
 
 ### RELEASE-001 — The current DMG must be publicly discoverable
 
-- **Status:** In progress
+- **Status:** Done
 - **Problem:** A successful Release workflow uploaded only a 30-day Actions artifact, so someone visiting the public repository could not find or download the current DMG from the normal Releases page.
 - **Decision:** Publish each verified semver build as a normal GitHub Release with direct universal DMG and checksum assets. Accept only an exact current `main` SHA or a matching semver tag, refuse tag/release replacement, clearly label ad-hoc/unnotarized builds, and keep a prominent latest-release link in the README.
 - **Acceptance:** A visitor can open the public repository, follow the README or Releases link, and download the current `.dmg` plus checksum without opening an Actions run or relying on an expiring archive. The release identifies its exact source commit and macOS signing status.
-- **Verification:** The workflow and executable contract now enforce exact source targeting, full test/package verification, direct two-asset publication, public/latest postconditions, and published asset digests. README and release documentation point to the public latest-release URL. The current `0.1.0` release still needs to be cut and downloaded after green CI, so this remains **In progress**.
+- **Verification:** The workflow and executable contract enforce exact source targeting, full test/package verification, direct two-asset publication, public/latest postconditions, and published asset digests. README and release documentation point to the public latest-release URL. After green CI on commit `eefd16e3e34eef3ed858948520bb597cea8a14a7`, the public `v0.1.0` release was published at <https://github.com/peteallen/onyx/releases/tag/v0.1.0>; its DMG and checksum were downloaded from the public URLs and the DMG SHA-256 matched (`63e5bcd1640794a1f630a3b618603116ee2432073ac0ed81dc933550a988b6b1). The release is public, non-draft, non-prerelease, latest, and identifies the ad-hoc/unnotarized signing status.
 
 ### UI-001 — Composer caret and placeholder are misaligned
 
