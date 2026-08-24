@@ -13,8 +13,10 @@ final class ProjectQuickOpenViewTests: XCTestCase {
                 byteCount: 1
             )
         }
-        let reader = DelayedQuickOpenReader(
-            delay: .milliseconds(180),
+        let indexGate = AsyncStream.makeStream(of: Void.self)
+        defer { indexGate.continuation.finish() }
+        let reader = GatedQuickOpenReader(
+            release: indexGate.stream,
             snapshot: ProjectSourceIndexSnapshot(
                 rootPath: "/fixture",
                 files: files,
@@ -39,31 +41,21 @@ final class ProjectQuickOpenViewTests: XCTestCase {
         let window = makeWindow(hosting: hostingView)
         defer { close(window: window) }
 
-        let clock = ContinuousClock()
-        let startedAt = clock.now
-        let paintDeadline = startedAt.advanced(by: .milliseconds(100))
         hostingView.layoutSubtreeIfNeeded()
-        // SwiftUI usually mounts the field in the first synchronous layout.
-        // Only service another AppKit render pass when the host genuinely
-        // deferred that mount. An unconditional run-loop pump makes the
-        // benchmark charge unrelated executor scheduling on busy CI hosts.
-        while hostingView.firstDescendantTextField(withPlaceholder: "Quick Open") == nil,
-              clock.now < paintDeadline {
-            pumpMainRunLoop(for: 0.001)
+        await waitUntil("Quick Open did not mount before indexing completed") {
             hostingView.layoutSubtreeIfNeeded()
-        }
-        let paintElapsed = startedAt.duration(to: clock.now)
-
-        XCTAssertLessThan(
-            paintElapsed,
-            .milliseconds(100),
-            "Quick Open must mount before the project index finishes."
-        )
-        if case .loaded = navigator.indexState {
-            XCTFail("The delayed 4,000-file index unexpectedly completed before first paint.")
+            return hostingView.firstDescendantTextField(withPlaceholder: "Quick Open") != nil
         }
         let searchField = try XCTUnwrap(
             hostingView.firstDescendantTextField(withPlaceholder: "Quick Open")
+        )
+        await waitUntil("The suspended project index did not start") {
+            navigator.indexState == .loading
+        }
+        XCTAssertEqual(
+            navigator.indexState,
+            .loading,
+            "Quick Open must be usable while the project index is still running."
         )
         // XCTest's process cannot make this borderless host key. Deliberately
         // install the field editor so the remainder exercises the same native
@@ -71,6 +63,8 @@ final class ProjectQuickOpenViewTests: XCTestCase {
         XCTAssertTrue(window.makeFirstResponder(searchField))
         XCTAssertTrue(window.firstResponder is NSTextView)
 
+        indexGate.continuation.yield()
+        indexGate.continuation.finish()
         await waitUntil("The large project index did not load") {
             if case let .loaded(snapshot) = navigator.indexState {
                 return snapshot.files.count == 4_000
@@ -78,6 +72,7 @@ final class ProjectQuickOpenViewTests: XCTestCase {
             return false
         }
 
+        let clock = ContinuousClock()
         let typingStartedAt = clock.now
         navigator.query = "file"
         hostingView.layoutSubtreeIfNeeded()
@@ -251,17 +246,18 @@ private extension NSView {
     }
 }
 
-private actor DelayedQuickOpenReader: ProjectSourceReading {
-    let delay: Duration
+private actor GatedQuickOpenReader: ProjectSourceReading {
+    let release: AsyncStream<Void>
     let snapshot: ProjectSourceIndexSnapshot
 
-    init(delay: Duration, snapshot: ProjectSourceIndexSnapshot) {
-        self.delay = delay
+    init(release: AsyncStream<Void>, snapshot: ProjectSourceIndexSnapshot) {
+        self.release = release
         self.snapshot = snapshot
     }
 
     func indexFiles(atRoot _: String) async throws -> ProjectSourceIndexSnapshot {
-        try await Task.sleep(for: delay)
+        for await _ in release { break }
+        try Task.checkCancellation()
         return snapshot
     }
 

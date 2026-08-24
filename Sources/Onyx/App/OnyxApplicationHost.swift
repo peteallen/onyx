@@ -556,6 +556,19 @@ final class OnyxApplicationHost: ObservableObject {
                 hasAdaptiveOwners = !ownerships.isEmpty
             } catch {
                 sourceComplete = false
+                // Ownership metadata is only needed to decide whether an
+                // agent catalog must be merged. If that metadata is damaged
+                // or temporarily unreadable, preserve the scoped Onyx chat
+                // rows instead of blanking this provider from the sidebar.
+                // The partial marker prevents this fallback from being
+                // mistaken for an authoritative absence of agent tasks.
+                let fallback = await loadLocalProviderTaskLists(
+                    connection: connection,
+                    conversationScopeID: conversationScopeID,
+                    pinnedIDs: pinnedIDs,
+                    scopes: ThreadListScope.allCases
+                )
+                lists.append(contentsOf: fallback.lists)
                 continue
             }
 
@@ -567,7 +580,20 @@ final class OnyxApplicationHost: ObservableObject {
                 let resolved = runtimeCoordinator(for: connection.id)
                 guard let coordinator = resolved.coordinator,
                       (try? await coordinator.connect()) != nil else {
+                    // The app-owned chat history remains useful when the
+                    // Responses/app-server lane is offline (for example, an
+                    // endpoint outage or a missing credential). Keep those
+                    // rows visible while accurately marking the merged
+                    // snapshot partial; agent-owned rows will reappear after
+                    // the next successful refresh.
                     sourceComplete = false
+                    let fallback = await loadLocalProviderTaskLists(
+                        connection: connection,
+                        conversationScopeID: conversationScopeID,
+                        pinnedIDs: pinnedIDs,
+                        scopes: ThreadListScope.allCases
+                    )
+                    lists.append(contentsOf: fallback.lists)
                     continue
                 }
                 for scope in ThreadListScope.allCases {
@@ -587,6 +613,18 @@ final class OnyxApplicationHost: ObservableObject {
                         ))
                     } catch {
                         sourceComplete = false
+                        // Preserve chat-owned rows for this scope if the
+                        // merged runtime fails after connecting. Do not read
+                        // the other scope again, which would duplicate rows
+                        // that already came from the successful app-server
+                        // response above.
+                        let fallback = await loadLocalProviderTaskLists(
+                            connection: connection,
+                            conversationScopeID: conversationScopeID,
+                            pinnedIDs: pinnedIDs,
+                            scopes: [scope]
+                        )
+                        lists.append(contentsOf: fallback.lists)
                     }
                 }
                 continue
@@ -595,34 +633,57 @@ final class OnyxApplicationHost: ObservableObject {
             // A never-opened or pre-adaptive provider has chat history only.
             // Read that local snapshot without connecting its endpoint; this
             // keeps global sidebar refreshes offline and immediately paintable.
-            for scope in ThreadListScope.allCases {
-                do {
-                    let conversations = try await providerConversationStore.conversations(
-                        connectionID: connection.id,
-                        scopeID: conversationScopeID,
-                        archived: scope == .archived,
-                        limit: Int.max
-                    )
-                    lists.append(ProjectProviderTaskList(
-                        providerConnectionID: connection.id,
-                        providerDisplayName: connection.displayName,
-                        scope: scope,
-                        threads: conversations.map {
-                            var thread = $0.runtimeThread(kind: .local)
-                            thread.isPinned = pinnedIDs.contains(thread.id)
-                            return thread
-                        }
-                    ))
-                } catch {
-                    sourceComplete = false
-                }
-            }
+            let localCatalog = await loadLocalProviderTaskLists(
+                connection: connection,
+                conversationScopeID: conversationScopeID,
+                pinnedIDs: pinnedIDs,
+                scopes: ThreadListScope.allCases
+            )
+            lists.append(contentsOf: localCatalog.lists)
+            sourceComplete = sourceComplete && localCatalog.sourceComplete
         }
 
         return ProjectProviderTaskCatalog(
             lists: lists,
             sourceComplete: sourceComplete
         )
+    }
+
+    /// Reads only Onyx-owned chat history for a configured provider. This is
+    /// deliberately separate from adaptive app-server listing so a partial
+    /// agent catalog can still paint chat rows offline without implying that
+    /// the missing agent rows are complete.
+    private func loadLocalProviderTaskLists(
+        connection: WorkspaceConnection,
+        conversationScopeID: String,
+        pinnedIDs: Set<String>,
+        scopes: [ThreadListScope]
+    ) async -> (lists: [ProjectProviderTaskList], sourceComplete: Bool) {
+        var lists: [ProjectProviderTaskList] = []
+        var sourceComplete = true
+        for scope in scopes {
+            do {
+                let conversations = try await providerConversationStore.conversations(
+                    connectionID: connection.id,
+                    scopeID: conversationScopeID,
+                    archived: scope == .archived,
+                    limit: Int.max
+                )
+                lists.append(ProjectProviderTaskList(
+                    providerConnectionID: connection.id,
+                    providerDisplayName: connection.displayName,
+                    scope: scope,
+                    threads: conversations.map {
+                        var thread = $0.runtimeThread(kind: .local)
+                        thread.isPinned = pinnedIDs.contains(thread.id)
+                        return thread
+                    }
+                ))
+            } catch {
+                sourceComplete = false
+            }
+        }
+        return (lists, sourceComplete)
     }
 
     /// Compatibility projection for callers that only need sidebar lists.
@@ -1256,8 +1317,32 @@ private struct ProviderWorkspaceContent: View {
         .onChange(of: host.modelUsageRevision) { _, _ in
             refreshRankedModelChoices(liveModels: model.session?.availableModels)
         }
+        .onChange(of: model.selectedThreadID) { _, _ in
+            // A merged sidebar can switch between chat- and agent-owned
+            // tasks without replacing this provider workspace. Rebuild the
+            // picker when that happens so taskScopedModelCatalog projects
+            // the selected task's durable execution lane (and can re-add a
+            // model that is no longer present in the provider catalog).
+            selection.modelRankingRevision &+= 1
+        }
         .onChange(of: model.threadListRevision) { _, _ in
             selectPendingThreadIfAvailable()
+        }
+        .onChange(of: model.selectedThread?.taskCapabilities) { _, _ in
+            // Selecting a merged task can initially use the sidebar's cached
+            // row. The authoritative direct read then publishes a new thread
+            // snapshot with its durable chat/agent capabilities. Rebuild the
+            // picker for that update too; otherwise a task that was briefly
+            // capability-unknown can leave the model menu on the new-task
+            // catalog after its agent lane is known. Observe only this small
+            // task-scoped value rather than every lifecycle/status list update.
+            selection.modelRankingRevision &+= 1
+        }
+        .onChange(of: model.selectedTaskModelID) { _, _ in
+            // A direct task read can also fill in the provider-recorded model
+            // after the sidebar's cached row was selected. Reproject the
+            // selected model without rebuilding on unrelated task updates.
+            selection.modelRankingRevision &+= 1
         }
         .onChange(of: model.isLoadingThreadList) { _, _ in
             selectPendingThreadIfAvailable()

@@ -238,6 +238,177 @@ final class ProjectCatalogProductionTests: XCTestCase {
         )
     }
 
+    func testAdaptiveCatalogFailureKeepsScopedChatRowsVisibleAsPartialSnapshot() async throws {
+        let defaults = try makeDefaults()
+        defer { defaults.cleanUp() }
+        let location = temporaryLocation("adaptive-offline-fallback")
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        let providerID = ProviderConnectionID("local.catalog.offline")
+        let modelID = "fixture-model"
+        let connectionStore = ProviderConnectionStore(
+            storage: InMemoryProviderConnectionStorage()
+        )
+        let connection = try ProviderConnectionRecord(
+            id: providerID,
+            displayName: "Offline adaptive catalog",
+            baseURL: URL(string: "https://provider.example.test/v1")!,
+            selectedModelID: modelID,
+            authMode: .none,
+            discovery: ProviderConnectionDiscoveryMetadata(
+                discoveredModelIDs: [modelID]
+            )
+        )
+        try await connectionStore.upsert(connection)
+
+        let conversations = OpenAICompatibleConversationStore(
+            fileURL: location.directory.appendingPathComponent("conversations.json")
+        )
+        _ = try await conversations.upsert(OpenAICompatibleStoredConversation(
+            id: "offline-chat",
+            connectionID: providerID,
+            conversationScopeID: connection.conversationScopeID,
+            title: "Offline chat remains available",
+            cwd: "/work/offline",
+            modelID: modelID,
+            updatedAt: Date(timeIntervalSince1970: 20)
+        ))
+        _ = try await conversations.upsert(OpenAICompatibleStoredConversation(
+            id: "offline-archived-chat",
+            connectionID: providerID,
+            conversationScopeID: connection.conversationScopeID,
+            title: "Offline archived chat remains available",
+            cwd: "/work/offline",
+            modelID: modelID,
+            updatedAt: Date(timeIntervalSince1970: 19),
+            isArchived: true
+        ))
+        let stateStore = OpenAICompatibleAdaptiveStateStore(
+            fileURL: location.directory.appendingPathComponent("adaptive-state.json")
+        )
+        _ = try await stateStore.recordTaskOwnership(
+            connectionID: providerID,
+            conversationScopeID: connection.conversationScopeID,
+            threadID: "agent-task",
+            lane: .agent,
+            modelID: modelID,
+            updatedAt: Date(timeIntervalSince1970: 30)
+        )
+
+        // The provider has already entered the adaptive era, but its merged
+        // runtime is unavailable. The local chat transcript must remain
+        // visible while the catalog truthfully reports that agent rows are
+        // missing and should be retried later.
+        let unavailableRuntime = CatalogRuntime(
+            active: [],
+            archived: [],
+            failArchived: false,
+            failConnect: true
+        )
+        let adapterID = RuntimeAdapterID("test.catalog.offline")
+        let registry = try RuntimeRegistry(
+            providers: [
+                RuntimeProviderDescriptor(id: adapterID, displayName: "Offline adaptive") { _ in
+                    unavailableRuntime
+                },
+            ],
+            connections: [
+                RuntimeConnectionRegistration(id: providerID, adapterID: adapterID),
+            ]
+        )
+        let host = OnyxApplicationHost(
+            registry: registry,
+            defaults: defaults.defaults,
+            projectCatalogStore: ProjectCatalogStore(fileURL: location.file),
+            providerConnectionStore: connectionStore,
+            providerCredentialStore: InMemoryCredentialStore(),
+            providerConversationStore: conversations,
+            providerAdaptiveStateStore: stateStore
+        )
+
+        let catalog = await host.loadProviderTaskCatalog(connections: [
+            .init(id: providerID, displayName: "Offline adaptive", isCodex: false),
+        ])
+
+        XCTAssertFalse(catalog.sourceComplete)
+        XCTAssertEqual(
+            catalog.lists.first(where: { $0.scope == .active })?.threads.map(\.id),
+            ["offline-chat"]
+        )
+        XCTAssertTrue(
+            catalog.lists.allSatisfy { $0.threads.allSatisfy { $0.id != "agent-task" } },
+            "Agent rows are unavailable, but their absence must not erase local chat history"
+        )
+
+        // A reconnect can succeed while one merged scope fails. The failed
+        // scope gets the same bounded local fallback without duplicating the
+        // successful scope's app-server rows.
+        await unavailableRuntime.setFailConnect(false)
+        await unavailableRuntime.setFailArchived(true)
+        let partial = await host.loadProviderTaskCatalog(connections: [
+            .init(id: providerID, displayName: "Offline adaptive", isCodex: false),
+        ])
+        XCTAssertFalse(partial.sourceComplete)
+        XCTAssertEqual(
+            partial.lists.first(where: { $0.scope == .archived })?.threads.map(\.id),
+            ["offline-archived-chat"]
+        )
+    }
+
+    func testUnreadableAdaptiveOwnershipKeepsScopedChatRowsVisibleAsPartialSnapshot() async throws {
+        let defaults = try makeDefaults()
+        defer { defaults.cleanUp() }
+        let location = temporaryLocation("adaptive-unreadable-state")
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        let providerID = ProviderConnectionID("local.catalog.unreadable-state")
+        let modelID = "fixture-model"
+        let connectionStore = ProviderConnectionStore(
+            storage: InMemoryProviderConnectionStorage()
+        )
+        let connection = try ProviderConnectionRecord(
+            id: providerID,
+            displayName: "Unreadable adaptive state",
+            baseURL: URL(string: "https://provider.example.test/v1")!,
+            selectedModelID: modelID,
+            authMode: .none
+        )
+        try await connectionStore.upsert(connection)
+
+        let conversations = OpenAICompatibleConversationStore(
+            fileURL: location.directory.appendingPathComponent("conversations.json")
+        )
+        _ = try await conversations.upsert(OpenAICompatibleStoredConversation(
+            id: "preserved-chat",
+            connectionID: providerID,
+            conversationScopeID: connection.conversationScopeID,
+            title: "Preserved chat",
+            cwd: "/work/preserved",
+            modelID: modelID,
+            updatedAt: Date(timeIntervalSince1970: 20)
+        ))
+
+        let stateURL = location.directory.appendingPathComponent("adaptive-state.json")
+        try Data("not valid adaptive state".utf8).write(to: stateURL)
+        let host = OnyxApplicationHost(
+            registry: try RuntimeRegistry(providers: [], connections: []),
+            defaults: defaults.defaults,
+            projectCatalogStore: ProjectCatalogStore(fileURL: location.file),
+            providerConnectionStore: connectionStore,
+            providerCredentialStore: InMemoryCredentialStore(),
+            providerConversationStore: conversations,
+            providerAdaptiveStateStore: OpenAICompatibleAdaptiveStateStore(fileURL: stateURL)
+        )
+
+        let catalog = await host.loadProviderTaskCatalog(connections: [
+            .init(id: providerID, displayName: "Unreadable adaptive state", isCodex: false),
+        ])
+
+        XCTAssertFalse(catalog.sourceComplete)
+        XCTAssertEqual(
+            catalog.lists.first(where: { $0.scope == .active })?.threads.map(\.id),
+            ["preserved-chat"]
+        )
+    }
+
     func testWorkspaceModelListsAndOpensTaskBeyondFormerHundredRowCap() async throws {
         let defaults = try makeDefaults()
         defer { defaults.cleanUp() }
@@ -323,23 +494,29 @@ private actor CatalogRuntime: AgentRuntime {
     private let active: [RuntimeThread]
     private let archived: [RuntimeThread]
     private var failArchived: Bool
+    private var failConnect: Bool
     private var allCalls: [Bool] = []
 
     init(
         active: [RuntimeThread],
         archived: [RuntimeThread],
-        failArchived: Bool
+        failArchived: Bool,
+        failConnect: Bool = false
     ) {
         self.active = active
         self.archived = archived
         self.failArchived = failArchived
+        self.failConnect = failConnect
         let pair = AsyncStream.makeStream(of: AgentRuntimeEvent.self)
         events = pair.stream
         eventContinuation = pair.continuation
     }
 
     func connect() async throws -> RuntimeSession {
-        RuntimeSession(
+        if failConnect {
+            throw AgentRuntimeError.protocolFailure("adaptive runtime unavailable")
+        }
+        return RuntimeSession(
             runtime: .codex,
             displayName: "Catalog test",
             accountLabel: "catalog@test",
@@ -392,6 +569,10 @@ private actor CatalogRuntime: AgentRuntime {
 
     func setFailArchived(_ value: Bool) {
         failArchived = value
+    }
+
+    func setFailConnect(_ value: Bool) {
+        failConnect = value
     }
 
     func listAllCalls() -> [Bool] {

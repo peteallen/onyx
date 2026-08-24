@@ -93,13 +93,15 @@ require_text "$release_text" "ad-hoc signed" "ad-hoc distribution disclosure"
 require_text "$release_text" "not notarized" "notarization disclosure"
 
 # Source and version gates: checkout is pinned to the event SHA, manual runs
-# are main-only, tags cannot be moved, and the tag target is checked again after
-# GitHub creates the release.
+# are main-only, tags cannot be moved, and manual tags are created atomically
+# only after the verified artifact is ready. Exact existing tags/releases may be
+# rechecked on retry but are never replaced.
 for marker in \
   'ref: ${{ github.sha }}' \
   'EVENT_NAME: ${{ github.event_name }}' \
   'SOURCE_SHA: ${{ github.sha }}' \
   'refs/heads/$DEFAULT_BRANCH' \
+  '[[ "$tag" =~ '\''^v[0-9]+[.][0-9]+[.][0-9]+$'\'' ]]' \
   'git ls-remote origin "refs/heads/$DEFAULT_BRANCH"' \
   'git ls-remote --exit-code origin "refs/tags/$tag"' \
   'git rev-parse "$tag^{commit}"' \
@@ -107,18 +109,29 @@ for marker in \
   'checked_out_sha="$(/usr/bin/git rev-parse HEAD)"'; do
   require_text "$release_text" "$marker" "immutable source/version gate '$marker'"
 done
-require_text "$release_text" 'gh release view "$tag"' \
-  "pre-existing release rejection"
+require_text "$release_text" 'gh release view "$TAG"' \
+  "exact existing-release recheck"
 require_text "$release_text" 'gh release create' "public release creation"
 require_text "$release_text" 'GH_TOKEN: ${{ github.token }}' \
   "scoped GitHub release token"
-require_text "$release_text" '--target "$SOURCE_SHA"' \
-  "manual release exact target"
+require_text "$release_text" 'git/refs' "atomic manual tag creation"
+require_text "$release_text" 'ref=refs/tags/$TAG' \
+  "manual tag source ref"
+require_text "$release_text" 'sha=$SOURCE_SHA' \
+  "manual tag source SHA"
+require_text "$release_text" 'resolve_tag_commit()' \
+  "authenticated exact tag resolution"
+require_text "$release_text" 'commits/$tag_name' \
+  "tag-to-commit dereference"
+require_text "$release_text" 'if ! gh api --method POST' \
+  "atomic tag-create race handling"
+require_text "$release_text" 'for attempt in {1..6}' \
+  "bounded tag visibility retry"
 require_text "$release_text" '--verify-tag' "tag release exact target"
 require_text "$release_text" '--latest' "latest release designation"
 require_text "$release_text" '--fail-on-no-commits' "no-empty-release guard"
-require_text "$release_text" 'isDraft,isPrerelease,assets,url' \
-  "public release postcondition query"
+require_text "$release_text" 'isDraft,isPrerelease,assets,body,url' \
+  "source-commit release postcondition query"
 require_text "$release_text" "'.isDraft')\" == \"false\"" \
   "non-draft release postcondition"
 require_text "$release_text" "'.isPrerelease')\" == \"false\"" \
@@ -130,14 +143,36 @@ require_text "$release_text" "Release must contain exactly two assets" \
   "exact asset count postcondition"
 require_text "$release_text" 'Published digest does not match' \
   "published asset digest verification"
+require_text "$release_text" 'gh release download "$TAG"' \
+  "exact-release retry asset verification"
+require_text "$release_text" 'release_reused=false' \
+  "explicit exact-release retry state"
+require_text "$release_text" 'if [[ "$release_reused" == "true" ]]; then' \
+  "separate retry asset verification"
+require_text "$release_text" 'Existing release digest does not match' \
+  "reused asset digest verification"
+require_text "$release_text" 'shasum -a 256 -c "$existing_checksum"' \
+  "reused checksum pair verification"
 require_text "$release_text" 'ARTIFACT_NAME.dmg.sha256' \
   "checksum asset name"
 require_text "$release_text" 'releases/download/' "direct public DMG URL"
 require_text "$release_text" 'GITHUB_STEP_SUMMARY' "public download summary"
-for forbidden in '--draft' 'gh release edit' 'gh release upload' '--clobber' \
+for forbidden in '--draft' '--target' 'gh release edit' 'gh release upload' '--clobber' \
   'latest/nightly' 'force push'; do
   forbid_text "$release_text" "$forbidden" "mutable release operation '$forbidden'"
 done
+
+artifact_gate_line="$(/usr/bin/awk '/Release DMG\/checksum pair is incomplete/ { print NR; exit }' "$release_workflow")"
+tag_create_line="$(/usr/bin/awk '/gh api --method POST/ { print NR; exit }' "$release_workflow")"
+[[ "$artifact_gate_line" == <1-> && "$tag_create_line" == <1-> && \
+   "$tag_create_line" -gt "$artifact_gate_line" ]] || \
+  die "manual tag creation must follow the verified artifact gate"
+require_text "$release_text" \
+  'if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then' \
+  "fresh existing-release check"
+require_text "$release_text" \
+  'gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || exit 1' \
+  "safe release-create race recovery"
 for forbidden in 'actions/upload-artifact@' 'actions/download-artifact@' \
   'retention-days:'; do
   forbid_text "$release_text" "$forbidden" "expiring workflow artifact path '$forbidden'"

@@ -82,7 +82,7 @@ jobs:
           if [[ "$EVENT_NAME" == "push" ]]; then
             tag="$GITHUB_REF_NAME"
             version="${tag#v}"
-            [[ "$tag" == v[0-9]*.[0-9]*.[0-9]* ]] || {
+            [[ "$tag" =~ '^v[0-9]+[.][0-9]+[.][0-9]+$' ]] || {
               print -u2 -- "Tag must be vX.Y.Z: $tag"
               exit 1
             }
@@ -91,10 +91,6 @@ jobs:
               print -u2 -- "Tag $tag does not point at $SOURCE_SHA (found $tag_commit)."
               exit 1
             }
-            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-              print -u2 -- "Release already exists and will not be replaced: $tag"
-              exit 1
-            fi
           else
             [[ "$SOURCE_REF" == "refs/heads/$DEFAULT_BRANCH" ]] || {
               print -u2 -- "Manual releases must run from $DEFAULT_BRANCH."
@@ -112,12 +108,14 @@ jobs:
             }
             tag="v$version"
             if /usr/bin/git ls-remote --exit-code origin "refs/tags/$tag" >/dev/null 2>&1; then
-              print -u2 -- "Release tag already exists and will not be moved: $tag"
-              exit 1
-            fi
-            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-              print -u2 -- "Release already exists and will not be replaced: $tag"
-              exit 1
+              existing_tag_commit="$(/usr/bin/git ls-remote origin "refs/tags/$tag^{}" | /usr/bin/awk '{print $1}')"
+              if [[ -z "$existing_tag_commit" ]]; then
+                existing_tag_commit="$(/usr/bin/git ls-remote origin "refs/tags/$tag" | /usr/bin/awk '{print $1}')"
+              fi
+              [[ "$existing_tag_commit" == "$SOURCE_SHA" ]] || {
+                print -u2 -- "Release tag already exists at a different commit and will not be moved: $tag"
+                exit 1
+              }
             fi
           fi
 
@@ -197,27 +195,84 @@ jobs:
             print -- "Source commit: [$SOURCE_SHA]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$SOURCE_SHA)"
           } > "$notes_file"
 
-          release_arguments=(
-            "$TAG"
-            "$dmg_path"
-            "$checksum_path"
-            --repo "$GITHUB_REPOSITORY"
-            --title "Onyx $VERSION (development build)"
-            --notes-file "$notes_file"
-            --latest
-            --fail-on-no-commits
-          )
-          if [[ "$EVENT_NAME" == "push" ]]; then
-            release_arguments+=(--verify-tag)
-          else
-            release_arguments+=(--target "$SOURCE_SHA")
-          fi
-          gh release create "${release_arguments[@]}"
+          # Resolve a tag through the authenticated GitHub API instead of the
+          # runner's eventually-consistent remote mirror. The commits endpoint
+          # dereferences both lightweight and annotated tags. A newly-created
+          # ref can take a moment to appear, so retry only this bounded read.
+          resolve_tag_commit() {
+            local tag_name="$1"
+            local resolved=""
+            local attempt
+            for attempt in {1..6}; do
+              resolved="$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag_name" \
+                --jq '.sha' 2>/dev/null || true)"
+              if [[ -n "$resolved" ]]; then
+                print -r -- "$resolved"
+                return 0
+              fi
+              sleep "$attempt"
+            done
+            return 1
+          }
 
-          release_json="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,isPrerelease,assets,url)"
+          # A manual run may spend a long time building. Create its tag only
+          # after the artifact is verified, using the GitHub ref API so a
+          # concurrent tag creator gets an atomic conflict instead of silently
+          # changing the release target. Existing exact tags are reusable for
+          # a retry; tags at another commit fail closed.
+          if [[ "$EVENT_NAME" != "push" ]]; then
+            if ! gh api --method POST \
+                "repos/$GITHUB_REPOSITORY/git/refs" \
+                -f "ref=refs/tags/$TAG" \
+                -f "sha=$SOURCE_SHA" >/dev/null; then
+              # A concurrent run may have won the create race. Continue only
+              # when its immutable tag resolves to this exact source SHA.
+              raced_tag_commit="$(resolve_tag_commit "$TAG" || true)"
+              [[ "$raced_tag_commit" == "$SOURCE_SHA" ]] || {
+                print -u2 -- "Could not create release tag $TAG at $SOURCE_SHA; refusing to accept a different target."
+                exit 1
+              }
+            fi
+          fi
+
+          tag_commit="$(resolve_tag_commit "$TAG" || true)"
+          [[ "$tag_commit" == "$SOURCE_SHA" ]] || {
+            print -u2 -- "Release tag does not point at source commit $SOURCE_SHA."
+            exit 1
+          }
+
+          # Re-read release state after the long build. A prior successful
+          # publication can be safely verified on retry; a different release
+          # is never replaced.
+          release_reused=false
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if ! gh release create \
+                "$TAG" "$dmg_path" "$checksum_path" \
+                --repo "$GITHUB_REPOSITORY" \
+                --title "Onyx $VERSION (development build)" \
+                --notes-file "$notes_file" \
+                --latest \
+                --fail-on-no-commits \
+                --verify-tag; then
+              # Another exact-SHA run may have published while this build was
+              # running. Never replace it; let the postconditions below decide
+              # whether the existing public release is safe to reuse.
+              gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || exit 1
+              release_reused=true
+            fi
+          else
+            release_reused=true
+          fi
+
+          release_json="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,isPrerelease,assets,body,url)"
           [[ "$(print -r -- "$release_json" | /usr/bin/jq -r '.tagName')" == "$TAG" ]] || exit 1
           [[ "$(print -r -- "$release_json" | /usr/bin/jq -r '.isDraft')" == "false" ]] || exit 1
           [[ "$(print -r -- "$release_json" | /usr/bin/jq -r '.isPrerelease')" == "false" ]] || exit 1
+          source_note="Source commit: [$SOURCE_SHA]"
+          [[ "$(print -r -- "$release_json" | /usr/bin/jq -r '.body')" == *"$source_note"* ]] || {
+            print -u2 -- "Release notes do not identify source commit $SOURCE_SHA."
+            exit 1
+          }
           latest_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name')"
           [[ "$latest_tag" == "$TAG" ]] || {
             print -u2 -- "Published release was not selected as latest."
@@ -233,21 +288,52 @@ jobs:
             --arg checksum "$ARTIFACT_NAME.dmg.sha256" \
             '([.assets[].name] | sort) == ([$dmg, $checksum] | sort)' >/dev/null
 
-          for asset_path in "$dmg_path" "$checksum_path"; do
-            asset_name="${asset_path:t}"
-            local_digest="$(/usr/bin/shasum -a 256 "$asset_path" | /usr/bin/awk '{print $1}')"
-            published_digest="$(print -r -- "$release_json" | /usr/bin/jq -r \
-              --arg name "$asset_name" '.assets[] | select(.name == $name) | .digest')"
-            [[ "$published_digest" == "sha256:$local_digest" ]] || {
-              print -u2 -- "Published digest does not match $asset_name."
+          if [[ "$release_reused" == "true" ]]; then
+            # A retry has a different GitHub run number and therefore may have
+            # a different local DMG byte-for-byte. Reuse only the immutable
+            # public pair after downloading it into a fresh directory,
+            # checking its checksum file, and matching GitHub's asset digests.
+            existing_release_dir="$(/usr/bin/mktemp -d "$RUNNER_TEMP/onyx-existing-release.XXXXXX")"
+            gh release download "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern "$ARTIFACT_NAME.dmg" \
+              --pattern "$ARTIFACT_NAME.dmg.sha256" \
+              --dir "$existing_release_dir"
+            existing_dmg="$existing_release_dir/$ARTIFACT_NAME.dmg"
+            existing_checksum="$existing_release_dir/$ARTIFACT_NAME.dmg.sha256"
+            [[ -f "$existing_dmg" && ! -L "$existing_dmg" && \
+               -f "$existing_checksum" && ! -L "$existing_checksum" ]] || {
+              print -u2 -- "Existing release assets could not be downloaded as regular files."
               exit 1
             }
-          done
-
-          tag_commit="$(/usr/bin/git ls-remote origin "refs/tags/$TAG^{}" | /usr/bin/awk '{print $1}')"
-          if [[ -z "$tag_commit" ]]; then
-            tag_commit="$(/usr/bin/git ls-remote origin "refs/tags/$TAG" | /usr/bin/awk '{print $1}')"
+            (
+              cd "$existing_release_dir"
+              /usr/bin/shasum -a 256 -c "$existing_checksum"
+            )
+            for asset_path in "$existing_dmg" "$existing_checksum"; do
+              asset_name="${asset_path:t}"
+              local_digest="$(/usr/bin/shasum -a 256 "$asset_path" | /usr/bin/awk '{print $1}')"
+              published_digest="$(print -r -- "$release_json" | /usr/bin/jq -r \
+                --arg name "$asset_name" '.assets[] | select(.name == $name) | .digest')"
+              [[ "$published_digest" == "sha256:$local_digest" ]] || {
+                print -u2 -- "Existing release digest does not match $asset_name."
+                exit 1
+              }
+            done
+          else
+            for asset_path in "$dmg_path" "$checksum_path"; do
+              asset_name="${asset_path:t}"
+              local_digest="$(/usr/bin/shasum -a 256 "$asset_path" | /usr/bin/awk '{print $1}')"
+              published_digest="$(print -r -- "$release_json" | /usr/bin/jq -r \
+                --arg name "$asset_name" '.assets[] | select(.name == $name) | .digest')"
+              [[ "$published_digest" == "sha256:$local_digest" ]] || {
+                print -u2 -- "Published digest does not match $asset_name."
+                exit 1
+              }
+            done
           fi
+
+          tag_commit="$(resolve_tag_commit "$TAG" || true)"
           [[ "$tag_commit" == "$SOURCE_SHA" ]] || {
             print -u2 -- "Published tag does not point at source commit $SOURCE_SHA."
             exit 1

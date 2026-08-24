@@ -88,16 +88,24 @@ final class SharedRuntimeCoordinatorTests: XCTestCase {
             .runtimeNotice(title: "First", detail: "one"),
             .runtimeNotice(title: "Second", detail: "two"),
             .runtimeNotice(title: "Third", detail: "three"),
+            .runtimeNotice(title: "Fourth", detail: "four"),
         ]
         for (index, event) in events.enumerated() {
             runtime.emit(event)
-            if index < 2 {
+            if index < 3 {
                 try await active.waitForCount(index + 1)
             }
         }
-        await Task.yield()
+        // The stalled subscriber's two-slot queue is full after the first
+        // two events. The third event can still reach the active consumer,
+        // but the shared source pump must remain blocked on the stalled
+        // subscriber before it can process the fourth event. Waiting for the
+        // active third event makes that backpressure boundary deterministic;
+        // a bare Task.yield() was racy because the active consumer could
+        // legitimately receive the third event before the snapshot.
+        try await active.waitForCount(3)
         let activeBeforeDrain = await active.snapshot()
-        XCTAssertEqual(activeBeforeDrain, Array(events.prefix(2)))
+        XCTAssertEqual(activeBeforeDrain, Array(events.prefix(3)))
 
         let stalled = CoordinatorEventRecorder()
         await stalled.start(stream: stalledStream)

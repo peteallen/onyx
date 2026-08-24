@@ -21,10 +21,20 @@ There are two supported ways to cut a release:
    tag such as `v0.1.0`. The tag-triggered path verifies that the tag points at
    the event commit before publishing.
 
-The workflow refuses to move an existing tag or replace an existing release. It
-publishes only after the checksum and mounted DMG checks pass, and verifies the
-public release is non-draft, non-prerelease, marked latest, and contains exactly
-the expected DMG/checksum pair. The notes include the exact source commit.
+The workflow refuses to move an existing tag or replace a mismatched release. A
+retry for an exact same-SHA tag/release is safe: it rechecks the immutable tag,
+reuses the already-published release only when its source-commit note, public
+state, exact DMG/checksum pair, server digests, and downloaded checksum all
+match. The retry verifies the existing published bytes rather than comparing
+them with a newly rebuilt DMG (GitHub's run number and disk-image metadata can
+legitimately differ between runs), and fails closed for a draft, prerelease,
+wrong target, wrong source note, or wrong asset set. Manual tag creation happens
+after the verified build through the GitHub ref API, so a concurrent creator
+cannot silently retarget the release.
+It publishes only after the checksum and mounted DMG checks pass, and verifies
+the public release is non-draft, non-prerelease, marked latest, and contains
+exactly the expected DMG/checksum pair. The notes include the exact source
+commit.
 Public builds are ad-hoc signed and not notarized development distributions, so
 macOS may show an unidentified-developer warning.
 
