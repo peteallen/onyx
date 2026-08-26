@@ -675,8 +675,16 @@ enum BusyComposerPresentation {
         attachmentCount: Int,
         canInterrupt: Bool,
         isComposingNewTask: Bool,
-        userRequestedExpansion: Bool
+        userRequestedExpansion: Bool,
+        automaticCompactionEnabled: Bool = false
     ) -> Bool {
+        // Keep the compact presentation as a reusable visual primitive, but do
+        // not automatically replace the native editor while work is running.
+        // A draft must always have a visible, editable surface; the transcript
+        // owns the waiting/progress indication instead. The explicit opt-in is
+        // reserved for a future surface that can guarantee an alternate editor.
+        guard automaticCompactionEnabled else { return false }
+
         // While review/start is awaiting acceptance, Codex has not exposed a
         // turn ID that interrupt can target. Keep the existing starting UI in
         // that brief phase instead of presenting a Stop action that may fail.
@@ -755,7 +763,8 @@ private struct ComposerView: View {
             attachmentCount: model.composerImages.count,
             canInterrupt: model.supports(.interruption),
             isComposingNewTask: isComposingNewTask,
-            userRequestedExpansion: userExpandedBusyComposer
+            userRequestedExpansion: userExpandedBusyComposer,
+            automaticCompactionEnabled: false
         )
     }
 

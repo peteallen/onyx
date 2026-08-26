@@ -2,17 +2,17 @@ import XCTest
 @testable import Onyx
 
 final class BusyComposerPresentationTests: XCTestCase {
-    func testActiveTaskWithAnEmptyDraftUsesCompactStrip() {
-        XCTAssertTrue(usesCompactStrip(isTurnRunning: true))
-        XCTAssertTrue(usesCompactStrip(isReviewRunning: true))
+    func testActiveTaskAlwaysKeepsTheEditableComposerVisible() {
+        XCTAssertFalse(usesCompactStrip(isTurnRunning: true))
+        XCTAssertFalse(usesCompactStrip(isReviewRunning: true))
     }
 
-    func testReviewStartupWaitsForAnInterruptibleTurn() {
+    func testReviewStartupAlsoKeepsTheEditableComposerVisible() {
         XCTAssertFalse(usesCompactStrip(isTurnRunning: true, isReviewStarting: true))
         XCTAssertFalse(usesCompactStrip(isReviewStarting: true))
     }
 
-    func testContentAndRequiredInteractionKeepFullComposerAvailable() {
+    func testDraftsAndRequiredInteractionsKeepTheFullComposerAvailable() {
         XCTAssertFalse(usesCompactStrip(isTurnRunning: true, draftText: "Follow up"))
         XCTAssertFalse(usesCompactStrip(isTurnRunning: true, draftText: "  \n ", attachmentCount: 1))
         XCTAssertFalse(usesCompactStrip(isTurnRunning: true, hasPendingInteraction: true))
@@ -20,7 +20,7 @@ final class BusyComposerPresentationTests: XCTestCase {
         XCTAssertFalse(usesCompactStrip(isTurnRunning: true, userRequestedExpansion: true))
     }
 
-    func testIdleAndUnsafeNewTaskStartupDoNotCollapseComposer() {
+    func testIdleAndNewTaskStartupDoNotCollapseComposer() {
         XCTAssertFalse(usesCompactStrip())
         XCTAssertFalse(usesCompactStrip(isTurnRunning: true, isComposingNewTask: true))
     }
@@ -56,7 +56,8 @@ final class BusyComposerPresentationTests: XCTestCase {
         attachmentCount: Int = 0,
         canInterrupt: Bool = true,
         isComposingNewTask: Bool = false,
-        userRequestedExpansion: Bool = false
+        userRequestedExpansion: Bool = false,
+        automaticCompactionEnabled: Bool = false
     ) -> Bool {
         BusyComposerPresentation.usesCompactStrip(
             isTurnRunning: isTurnRunning,
@@ -67,7 +68,8 @@ final class BusyComposerPresentationTests: XCTestCase {
             attachmentCount: attachmentCount,
             canInterrupt: canInterrupt,
             isComposingNewTask: isComposingNewTask,
-            userRequestedExpansion: userRequestedExpansion
+            userRequestedExpansion: userRequestedExpansion,
+            automaticCompactionEnabled: automaticCompactionEnabled
         )
     }
 }
