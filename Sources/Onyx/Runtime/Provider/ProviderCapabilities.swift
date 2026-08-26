@@ -194,8 +194,11 @@ struct ProviderCapabilitySet: Codable, Equatable, Hashable, Sendable {
         }
     }
 
-    /// A model's remote tool metadata is useful to explain what the server
-    /// can do, but it is not a claim that Onyx can execute or approve tools.
+    /// A model's remote tool metadata is useful both for explaining what the
+    /// server can do and for starting the adaptive app-server agent attempt.
+    /// It is not, by itself, a claim that the plain chat adapter can execute
+    /// or approve local tools; those controls remain behind the adaptive
+    /// runtime's sandbox and approval boundary.
     var serverAdvertisesToolUse: Bool {
         supportedParameters.contains(.tools)
             || supportedParameters.contains(.toolChoice)
@@ -211,9 +214,10 @@ struct ProviderCapabilitySet: Codable, Equatable, Hashable, Sendable {
             }
     }
 
-    /// Request parameters that the current OpenAI-compatible adapter can
-    /// actually use. Tool parameters remain server metadata until Onyx has a
-    /// decoder, approval surface, and execution lifecycle for tool calls.
+    /// Request parameters that the current OpenAI-compatible chat adapter can
+    /// actually send and handle itself. Tool parameters remain out of this
+    /// set because capable models use the separate adaptive app-server agent
+    /// path, which owns decoding, approvals, and execution.
     var clientUsableParameters: Set<ProviderRequestParameter> {
         var parameters = supportedParameters.subtracting([.tools, .toolChoice])
         // Exact effort values are sufficient client-side evidence for the
@@ -255,9 +259,9 @@ struct ProviderCapabilitySet: Codable, Equatable, Hashable, Sendable {
         }
     }
 
-    /// Whether the model metadata is sufficient for a client feature. This
-    /// deliberately refuses server-only tool metadata until the runtime can
-    /// decode and execute the provider's tool-call protocol.
+    /// Whether the plain chat adapter can use a capability directly. Tool
+    /// metadata is intentionally kept out of this client-level projection;
+    /// the adaptive app-server path handles those calls separately.
     func supportsClient(_ requirement: ProviderCapabilityRequirement) -> Bool {
         switch requirement {
         case .parameter(.tools), .parameter(.toolChoice):

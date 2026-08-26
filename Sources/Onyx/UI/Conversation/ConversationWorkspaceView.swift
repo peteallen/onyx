@@ -130,25 +130,24 @@ struct ConversationWorkspaceView: View {
     }
 }
 
-/// Generic OpenAI-compatible connections are useful chat and reasoning
-/// backends, but the current adapter cannot execute Onyx's local workspace
-/// tools. Keep that boundary beside the composer so a project folder and a
-/// permissive-looking model catalog cannot imply that a request will edit
-/// files behind the scenes.
+/// Models that remain on the plain OpenAI-compatible chat lane are useful
+/// chat/reasoning backends, but that lane cannot execute Onyx's local
+/// workspace tools. Capable models are projected onto the adaptive agent lane
+/// and do not show this strip.
 struct ProviderExecutionScopeStrip: View {
     @ObservedObject var model: OnyxAppModel
 
     var body: some View {
         if !model.supports(.tools) {
             Label(
-                "Chat only — this provider can reply here, but cannot inspect or edit project files or run commands yet.",
+                "Chat only — this model is currently on the reply-only path and cannot inspect or edit project files or run commands.",
                 systemImage: "text.bubble"
             )
             .font(.system(size: OnyxTypography.metadata))
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .accessibilityLabel("Chat-only provider")
-            .accessibilityHint("This provider cannot inspect or edit project files or run Onyx tools")
+            .accessibilityLabel("Chat-only model")
+            .accessibilityHint("This model cannot inspect or edit project files or run Onyx tools")
         }
     }
 }

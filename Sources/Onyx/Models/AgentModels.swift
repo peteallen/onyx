@@ -60,7 +60,8 @@ enum RuntimeModelExecutionMode: String, Sendable, Hashable {
     /// A bounded behavioral check is running in the background. New tasks stay
     /// in chat while this state is unresolved and are never upgraded later.
     case checkingAgent
-    /// The exact connection, scope, and model passed the Responses/tool probe.
+    /// The selected model advertises tool use or passed the behavioral probe,
+    /// so new tasks use the sandboxed app-server agent path.
     case agent
 }
 
@@ -201,8 +202,9 @@ struct RuntimeModel: Identifiable, Sendable, Hashable {
     let supportedRequestParameters: Set<ProviderRequestParameter>
     /// Raw server capability names are retained separately from the
     /// client-usable request parameters. For example, vLLM may advertise
-    /// `tool_use` while this runtime still lacks tool-call decoding and
-    /// execution.
+    /// `tool_use`; the adaptive facade can use that signal to start the
+    /// app-server agent path, while the plain chat adapter still cannot
+    /// execute local tools by itself.
     let serverAdvertisedCapabilities: [String]
     /// Distinguishes provider-advertised metadata from the conservative text
     /// baseline used when a generic `/models` response contains only an ID.
@@ -274,9 +276,10 @@ struct RuntimeModel: Identifiable, Sendable, Hashable {
             && (capabilityEvidence.isUnknown || capabilityEvidence.isPartial)
     }
 
-    /// Compact picker copy distinguishes remote support from client support:
-    /// a provider can advertise tools without implying that Onyx can execute
-    /// or approve them.
+    /// Compact picker copy distinguishes remote support from the adapter's
+    /// plain chat lane. A model that enters the adaptive agent lane is labeled
+    /// as enabled, while the app-server remains responsible for sandboxing,
+    /// approvals, and rejected-call handling.
     var pickerCapabilitySummary: String {
         let providerSummary = capabilityEvidence.pickerSummary(
             inputModalities: inputModalities,
@@ -294,10 +297,10 @@ struct RuntimeModel: Identifiable, Sendable, Hashable {
             if providerSummary.contains(unavailable) {
                 return providerSummary.replacingOccurrences(
                     of: unavailable,
-                    with: "Agent tools verified"
+                    with: "Agent tools enabled"
                 )
             }
-            return providerSummary + " · Agent tools verified"
+            return providerSummary + " · Agent tools enabled"
         }
     }
 }

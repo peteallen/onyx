@@ -32,10 +32,11 @@ tasks, drafts, and model identity provider-scoped.
 The implemented OpenAI-compatible path includes a URL-validated,
 redirect-protected HTTP/SSE transport, Keychain-backed bearer lookup, `/models`
 discovery, capability negotiation, a provider-owned conversation store, and
-production model selection. It is currently the chat fallback and does not
-advertise local tools. The next production path routes endpoints that pass a
-bounded Responses/tool compatibility probe through the pinned app-server as a
-thread-scoped custom model provider. An Onyx-owned loopback proxy injects the
+production model selection. Its plain chat lane does not advertise local
+tools. The adaptive production path routes models that advertise
+tool/function-call support—or sparse models that pass a bounded Responses/tool
+compatibility probe—through the pinned app-server as a thread-scoped custom
+model provider. An Onyx-owned loopback proxy injects the
 Keychain credential upstream so neither app-server configuration nor its
 environment contains the third-party secret. Claude/Anthropic remains
 descriptor-only. See `PROVIDER_EXTENSIBILITY.md` for the exact boundary.

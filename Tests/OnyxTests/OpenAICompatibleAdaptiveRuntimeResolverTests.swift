@@ -3,6 +3,62 @@ import XCTest
 @testable import Onyx
 
 final class OpenAICompatibleAdaptiveRuntimeResolverTests: XCTestCase {
+    func testAdvertisedToolModelStartsAgenticallyDespitePersistedProbeFailure() async throws {
+        let modelID = "acme/agent-17"
+        let descriptor = try ProviderModelDescriptor(
+            id: modelID,
+            wireProtocol: .openAIChatCompletions,
+            capabilities: ProviderCapabilitySet(
+                serverAdvertisedCapabilities: ["tool_use"]
+            )
+        )
+        let connection = try ProviderConnectionRecord(
+            id: ProviderConnectionID("adaptive-provider"),
+            displayName: "Adaptive provider",
+            baseURL: URL(string: "https://provider.example.test/v1")!,
+            selectedModelID: modelID,
+            authMode: .none,
+            transportCapabilities: [.streaming],
+            discovery: ProviderConnectionDiscoveryMetadata(
+                discoveredModels: [descriptor]
+            ),
+            conversationScopeID: "scope-before"
+        )
+        let now = Date(timeIntervalSince1970: 50_000)
+        let stateStore = makeAdaptiveStateStore()
+        let failedRecord = OpenAICompatibleResponsesProbeRecord(
+            fingerprint: OpenAICompatibleResponsesProbeFingerprint(
+                connection: connection,
+                modelID: modelID
+            ),
+            testedAt: now,
+            expiresAt: now.addingTimeInterval(3_600),
+            outcome: .failed(.malformedEventStream)
+        )
+        try await stateStore.storeProbeRecord(failedRecord, at: now)
+        let probe = AdaptiveLaneProbe(
+            outcomes: [modelID: .failed(.malformedEventStream)],
+            testedAt: now
+        )
+        let resolver = OpenAICompatibleAdaptiveRuntimeResolver(
+            probe: probe,
+            stateStore: stateStore,
+            now: { now }
+        )
+
+        let decisions = try await resolver.resolveNewTasks(
+            connection: connection,
+            modelIDs: [modelID],
+            modelIDToProbe: modelID
+        )
+
+        XCTAssertEqual(decisions.first?.lane, .agent)
+        XCTAssertEqual(decisions.first?.basis, .advertisedToolUse)
+        try await Task.sleep(for: .milliseconds(20))
+        let probedModels = await probe.modelsProbed()
+        XCTAssertEqual(probedModels, [])
+    }
+
     func testNewTaskLaneIsResolvedPerModelAndReusableProbeEvidenceIsCached() async throws {
         let connection = try makeAdaptiveConnection()
         let now = Date(timeIntervalSince1970: 100)

@@ -3,6 +3,11 @@ import Foundation
 
 struct OpenAICompatibleRuntimeLaneDecision: Equatable, Sendable {
     enum Basis: Equatable, Sendable {
+        /// The provider's current model catalog explicitly advertises a
+        /// tool/function-call capability. This starts an app-server agent
+        /// attempt immediately; the app-server sandbox, approval, and
+        /// malformed-call handling remain the safety boundary.
+        case advertisedToolUse
         case compatibleProbe
         case failedProbe(OpenAICompatibleResponsesProbeFailure)
         case unavailableProbe
@@ -126,7 +131,11 @@ actor OpenAICompatibleAdaptiveRuntimeResolver {
         }
 
         let decisions = zip(modelIDs, fingerprints).map { modelID, fingerprint in
-            decision(modelID: modelID, record: records[fingerprint])
+            decision(
+                modelID: modelID,
+                connection: connection,
+                record: records[fingerprint]
+            )
         }
         if let modelIDToProbe,
            let selected = decisions.first(where: { $0.modelID == modelIDToProbe }),
@@ -305,8 +314,23 @@ actor OpenAICompatibleAdaptiveRuntimeResolver {
 
     private func decision(
         modelID: String,
+        connection: ProviderConnectionRecord,
         record: OpenAICompatibleResponsesProbeRecord?
     ) -> OpenAICompatibleRuntimeLaneDecision {
+        // A catalog-level tool/function-call declaration is enough to start
+        // the real app-server agent path. It is intentionally model-agnostic:
+        // model IDs are not a capability allow-list, and a stale synthetic
+        // probe failure must not strand a provider that has already told us it
+        // can make tool calls. The app-server sandbox, approval flow, and
+        // malformed/rejected-call handling remain the runtime safety boundary.
+        if connection.discovery.discoveredModels.first(where: { $0.id == modelID })?
+            .capabilities.serverAdvertisesToolUse == true {
+            return decision(
+                modelID: modelID,
+                lane: .agent,
+                basis: .advertisedToolUse
+            )
+        }
         guard let record else {
             return decision(modelID: modelID, lane: .chat, basis: .unavailableProbe)
         }

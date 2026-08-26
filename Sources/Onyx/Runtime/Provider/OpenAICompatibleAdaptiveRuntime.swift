@@ -1914,7 +1914,7 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
             let mode: RuntimeModelExecutionMode
             let capabilities: RuntimeCapabilities
             switch decision.basis {
-            case .compatibleProbe:
+            case .advertisedToolUse, .compatibleProbe:
                 mode = .agent
                 capabilities = Self.capabilities(for: .agent, model: model)
             case .failedProbe:
