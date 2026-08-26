@@ -34,10 +34,11 @@ enum OpenAICompatibleAdaptiveRuntimeResolverError: LocalizedError, Equatable, Se
     }
 }
 
-/// Publishes a cached new-task lane decision and runs bounded behavioral probes
-/// independently. New Task and history loading never await the network: absent
-/// evidence fails closed to chat, while a completed probe affects only tasks
-/// created after its result is published.
+/// Publishes cached lane decisions and runs one bounded behavioral probe per
+/// selected metadata-poor model. Catalog and history loading never await the
+/// network. Actual task creation may join that already-running probe so a
+/// capable first task is not permanently assigned to chat while its capability
+/// result is milliseconds away.
 actor OpenAICompatibleAdaptiveRuntimeResolver {
     struct ProbeUpdateSubscription: Sendable {
         let id: UUID
@@ -82,6 +83,46 @@ actor OpenAICompatibleAdaptiveRuntimeResolver {
             throw OpenAICompatibleAdaptiveRuntimeResolverError.invalidModel
         }
         return result
+    }
+
+    /// Resolves the durable lane at the task-creation boundary. Explicit
+    /// catalog evidence and reusable outcomes return immediately. Only an
+    /// otherwise-unknown selected model joins its single bounded probe; this
+    /// never fans out checks across the provider catalog.
+    func resolveNewTaskAwaitingProbe(
+        connection: ProviderConnectionRecord,
+        modelID rawModelID: String
+    ) async throws -> OpenAICompatibleRuntimeLaneDecision {
+        try Task.checkCancellation()
+        let initial = try await resolveNewTask(
+            connection: connection,
+            modelID: rawModelID
+        )
+        guard initial.basis == .unavailableProbe else { return initial }
+
+        let modelID = try Self.validatedModelID(rawModelID)
+        let fingerprint = OpenAICompatibleResponsesProbeFingerprint(
+            connection: connection,
+            modelID: modelID
+        )
+        try await beginProbe(connection: connection, modelID: modelID)
+        try Task.checkCancellation()
+
+        if let attempt = attempts[fingerprint] {
+            _ = await attempt.task.result
+            try Task.checkCancellation()
+            // The background publisher and this task-creation waiter may both
+            // observe completion. The attempt ID makes publication idempotent;
+            // whichever enters first installs the reusable record.
+            await finishProbe(
+                id: attempt.id,
+                fingerprint: fingerprint,
+                modelID: modelID,
+                task: attempt.task
+            )
+        }
+        try Task.checkCancellation()
+        return try await resolveNewTask(connection: connection, modelID: modelID)
     }
 
     /// Projects a complete provider catalog with at most one durable-state

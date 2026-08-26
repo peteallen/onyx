@@ -57,8 +57,9 @@ enum RuntimeModelExecutionMode: String, Sendable, Hashable {
     case inherited
     /// The app-owned chat adapter remains the durable backend for new tasks.
     case chat
-    /// A bounded behavioral check is running in the background. New tasks stay
-    /// in chat while this state is unresolved and are never upgraded later.
+    /// A bounded behavioral check is running in the background. Creating a
+    /// task with this selected model joins that one check before its durable
+    /// chat/agent owner is chosen.
     case checkingAgent
     /// The selected model advertises tool use or passed the behavioral probe,
     /// so new tasks use the sandboxed app-server agent path.

@@ -15,14 +15,14 @@ Native SwiftUI/AppKit presentation
                 |
         AgentRuntime protocol
           /                 \
- CodexRuntime        OpenAICompatibleRuntime
-      |                       |
-codex app-server       /models + /chat/completions
- (stdio JSONL)              (HTTP/SSE fallback)
-      :
-planned Onyx loopback Responses proxy
-      :
-compatible custom provider
+ CodexRuntime     OpenAICompatibleAdaptiveRuntime
+      |               /                      \
+codex app-server  plain chat fallback     agent lane
+ (stdio JSONL)    /chat/completions       codex app-server
+                                             |
+                                    Onyx loopback proxy
+                                             |
+                               compatible Responses provider
 ```
 
 The registry resolves the default Codex connection. The composition host also
@@ -40,6 +40,15 @@ model provider. An Onyx-owned loopback proxy injects the
 Keychain credential upstream so neither app-server configuration nor its
 environment contains the third-party secret. Claude/Anthropic remains
 descriptor-only. See `PROVIDER_EXTENSIBILITY.md` for the exact boundary.
+
+Catalog and history projection never wait for provider network probing. For a
+metadata-poor selected model, Onyx starts only one bounded check in the
+background; if a new task is created while it is running, creation joins that
+same check before persisting the task's lane. Advertised tool support or a
+compatible probe selects the agent lane, while an incompatible result keeps
+the model usable through chat. Agent capability is never inferred from or
+denied by a model name; probe fallback behavior is driven by the endpoint's
+Responses events.
 
 In the current implementation, the application owns:
 
@@ -74,7 +83,9 @@ draft preferences, local provider conversations, and model usage ranking.
 Existing tasks remain bound to their original provider. Their original model is
 the task default, while the unified picker can select another model from that
 provider for a later turn or reset to the default. New tasks can select any
-configured provider/model pair.
+configured provider/model pair. Each OpenAI-compatible task also keeps its
+persisted agent/chat owner: later catalog or probe evidence affects future task
+creation, not the execution lane of existing history.
 
 A versioned conversation catalog exists as a tested foundation but is not yet
 wired into production task discovery. The shared-runtime coordinator is wired

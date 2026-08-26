@@ -404,6 +404,45 @@ final class TranscriptLayoutPerformanceTests: XCTestCase {
     }
 
     @MainActor
+    func testPendingRemovalKeepsRetiringTailRowRepresentableDuringBatchLayout() throws {
+        let fixture = TranscriptLayoutMutationFixture()
+        fixture.isAwaitingResponse = true
+        let host = TranscriptHostedFixture(fixture: fixture)
+        defer { host.close() }
+        host.layout()
+        let collectionView = try host.collectionView()
+        let controller = try host.controller()
+        let stalePendingPath = IndexPath(
+            item: collectionView.numberOfItems(inSection: 0) - 1,
+            section: 0
+        )
+        XCTAssertEqual(stalePendingPath.item, fixture.snapshot.items.count)
+
+        // Reproduce the production transition directly: the transcript and
+        // revision are unchanged, but its presentation-only waiting row is
+        // removed. AppKit can still ask for that old tail path while laying
+        // out performBatchUpdates, even though the new count is authoritative.
+        controller.update(
+            items: fixture.snapshot.items,
+            isAwaitingResponse: false,
+            revision: fixture.snapshot.revision,
+            changeHint: fixture.snapshot.changeHint
+        )
+        XCTAssertEqual(
+            collectionView.numberOfItems(inSection: 0),
+            fixture.snapshot.items.count
+        )
+
+        let retiringResponse = try XCTUnwrap(
+            controller.pendingResponseForDataSource(at: stalePendingPath.item)
+        )
+        XCTAssertTrue(retiringResponse.isVisible)
+        XCTAssertEqual(retiringResponse.label, "Working")
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
+        XCTAssertNil(controller.pendingResponseForDataSource(at: stalePendingPath.item))
+    }
+
+    @MainActor
     func testPendingRemovalSharesLoneToGroupSuffixBatch() throws {
         let fixture = TranscriptLayoutMutationFixture()
         fixture.isAwaitingResponse = true

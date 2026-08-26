@@ -791,9 +791,10 @@ private struct ComposerView: View {
             NativeComposerTextView(
                 text: $model.composerText,
                 measuredHeight: $textHeight,
-                isEnabled: model.canRunAgent
-                    && !interactionBlocksComposer
-                    && !model.isReviewBlockingComposer,
+                // Keep drafting available across provider reconnects and
+                // authentication gaps. `canSend` still gates submission, so
+                // a draft can never be dispatched until the runtime is ready.
+                isEnabled: model.canEditComposer,
                 canSubmit: { canSend },
                 onSubmit: submitComposer,
                 onPasteImages: { images in

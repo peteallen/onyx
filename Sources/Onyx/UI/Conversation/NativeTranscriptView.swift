@@ -974,6 +974,16 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         }
     }
 
+    /// AppKit can ask for a deleted collection item while laying out the same
+    /// batch that removes it. Keep the old presentation row addressable until
+    /// that transaction and its immediate post-layout pass have retired it;
+    /// it never contributes to the new data-source count.
+    private struct RetiringPendingResponse {
+        let token: UInt64
+        let displayIndex: Int
+        let response: TranscriptPendingResponse
+    }
+
     private struct TailProjectionChange {
         let displayStart: Int
         let oldDisplayCount: Int
@@ -989,6 +999,8 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
     private var itemsRevision: UInt64?
     private var layoutState = TranscriptLayoutState()
     private var pendingResponse = TranscriptPendingResponse(isVisible: false, label: "Working")
+    private var retiringPendingResponses: [RetiringPendingResponse] = []
+    private var nextPendingResponseRetirementToken: UInt64 = 0
     /// Collection rows are presentation-only. A collapsed activity group
     /// replaces its contiguous children with one summary row; expanding it
     /// puts the original children back at their stable positions.
@@ -1348,6 +1360,20 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
             return
         }
 
+        let retirementToken: UInt64?
+        if oldVisible, !newVisible {
+            nextPendingResponseRetirementToken &+= 1
+            let token = nextPendingResponseRetirementToken
+            retiringPendingResponses.append(RetiringPendingResponse(
+                token: token,
+                displayIndex: oldDisplayCount,
+                response: change.old
+            ))
+            retirementToken = token
+        } else {
+            retirementToken = nil
+        }
+
         collectionView.performBatchUpdates({ [weak self] in
             guard let self else { return }
             updates()
@@ -1381,6 +1407,16 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
                     IndexPath(item: self.displayRows.count, section: 0),
                 ])
             }
+            if let retirementToken {
+                // The completion can precede AppKit's final layout request for
+                // the deleted row. Close that window on the next main-loop
+                // turn, once the batch's immediate layout work has drained.
+                DispatchQueue.main.async { [weak self] in
+                    self?.retiringPendingResponses.removeAll {
+                        $0.token == retirementToken
+                    }
+                }
+            }
             completion?()
         })
     }
@@ -1409,13 +1445,12 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         _ collectionView: NSCollectionView,
         itemForRepresentedObjectAt indexPath: IndexPath
     ) -> NSCollectionViewItem {
-        if pendingResponse.isVisible, indexPath.item == displayRows.count {
-            let item = collectionView.makeItem(
-                withIdentifier: Self.pendingItemIdentifier,
-                for: indexPath
+        if let response = pendingResponseForDataSource(at: indexPath.item) {
+            return makePendingResponseItem(
+                in: collectionView,
+                at: indexPath,
+                response: response
             )
-            (item as? TranscriptPendingCollectionItem)?.configure(label: pendingResponse.label)
-            return item
         }
 
         switch displayRows[indexPath.item] {
@@ -1456,13 +1491,39 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
         }
     }
 
+    func pendingResponseForDataSource(at displayIndex: Int) -> TranscriptPendingResponse? {
+        if pendingResponse.isVisible, displayIndex == displayRows.count {
+            return pendingResponse
+        }
+        // A newly inserted transcript row can reuse the old pending row's
+        // index. In that case the real transcript row is authoritative; the
+        // tombstone is only for an index outside the new projection.
+        guard !displayRows.indices.contains(displayIndex) else { return nil }
+        return retiringPendingResponses.last(where: {
+            $0.displayIndex == displayIndex
+        })?.response
+    }
+
+    private func makePendingResponseItem(
+        in collectionView: NSCollectionView,
+        at indexPath: IndexPath,
+        response: TranscriptPendingResponse
+    ) -> NSCollectionViewItem {
+        let item = collectionView.makeItem(
+            withIdentifier: Self.pendingItemIdentifier,
+            for: indexPath
+        )
+        (item as? TranscriptPendingCollectionItem)?.configure(label: response.label)
+        return item
+    }
+
     func collectionView(
         _ collectionView: NSCollectionView,
         layout collectionViewLayout: NSCollectionViewLayout,
         sizeForItemAt indexPath: IndexPath
     ) -> NSSize {
         let width = flowMetrics.itemWidth
-        if pendingResponse.isVisible, indexPath.item == displayRows.count {
+        if pendingResponseForDataSource(at: indexPath.item) != nil {
             return NSSize(width: width, height: TranscriptPendingResponseView.rowHeight)
         }
         switch displayRows[indexPath.item] {

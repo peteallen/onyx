@@ -22,7 +22,7 @@ struct OpenAICompatibleResponsesProbeFingerprint: Codable, Equatable, Hashable, 
             // Bump this whenever the behavioral request contract changes so a
             // cached failure from an older probe cannot keep a repaired model
             // on the chat lane until that failure expires.
-            "onyx-responses-tool-probe-v3",
+            "onyx-responses-tool-probe-v4",
             endpoint,
             modelID.trimmingCharacters(in: .whitespacesAndNewlines),
             connection.conversationScopeID,
@@ -56,6 +56,8 @@ enum OpenAICompatibleResponsesProbeFailure: Codable, Equatable, Hashable, Sendab
     case httpFailure(statusCode: Int)
     case unexpectedContentType
     case responseTooLarge
+    case outputLimitedResponse
+    case incompleteResponse
     case malformedEventStream
     case missingFunctionCall
     case invalidFunctionCall
@@ -73,6 +75,8 @@ enum OpenAICompatibleResponsesProbeFailure: Codable, Equatable, Hashable, Sendab
             statusCode == 401 || statusCode == 403 || statusCode == 408
                 || statusCode == 425 || statusCode == 429 || statusCode >= 500
         case .configuration, .unexpectedContentType, .responseTooLarge,
+             .outputLimitedResponse,
+             .incompleteResponse,
              .malformedEventStream, .missingFunctionCall, .invalidFunctionCall,
              .missingCompletion, .functionOutputRejected:
             false
@@ -133,11 +137,12 @@ protocol OpenAICompatibleResponsesCompatibilityProbing: Sendable {
     ) async throws -> OpenAICompatibleResponsesProbeRecord
 }
 
-/// A bounded two-request behavioral check of the OpenAI Responses function
-/// protocol. The synthetic tool is forced on the first request; its harmless
-/// result is correlated back on the second request and must reach a terminal
-/// streamed response. This proves more than a catalog flag without executing
-/// a command, reading a file, or including user conversation content.
+/// A bounded behavioral check of the OpenAI Responses function protocol. Each
+/// round forces a synthetic tool on the first request, then correlates its
+/// harmless result back on the second request and requires terminal streamed
+/// completion. An explicitly output-limited generic round may be retried once
+/// with a larger bounded allowance. This proves more than a catalog flag without
+/// executing a command, reading a file, or including user conversation content.
 struct OpenAICompatibleResponsesCompatibilityProbe: OpenAICompatibleResponsesCompatibilityProbing, Sendable {
     struct Limits: Sendable, Equatable {
         let timeout: Duration
@@ -228,7 +233,10 @@ struct OpenAICompatibleResponsesCompatibilityProbe: OpenAICompatibleResponsesCom
                 of: OpenAICompatibleResponsesProbeEvidence.self
             ) { group in
                 group.addTask {
-                    try await performProbe(connection: connection, modelID: modelID)
+                    try await performProbeWithOutputBudgetFallback(
+                        connection: connection,
+                        modelID: modelID
+                    )
                 }
                 group.addTask {
                     try await Task.sleep(for: limits.timeout)
@@ -273,7 +281,8 @@ struct OpenAICompatibleResponsesCompatibilityProbe: OpenAICompatibleResponsesCom
 
     private func performProbe(
         connection: ProviderConnectionRecord,
-        modelID rawModelID: String
+        modelID rawModelID: String,
+        maximumOutputTokens: Int
     ) async throws -> OpenAICompatibleResponsesProbeEvidence {
         let modelID = rawModelID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !modelID.isEmpty, modelID.utf8.count <= 512 else {
@@ -327,7 +336,10 @@ struct OpenAICompatibleResponsesCompatibilityProbe: OpenAICompatibleResponsesCom
             transportSecurity: connection.transportSecurity,
             hasBearerCredential: bearerToken != nil
         )
-        let initialPayload = Self.initialPayload(modelID: modelID)
+        let initialPayload = Self.initialPayload(
+            modelID: modelID,
+            maximumOutputTokens: maximumOutputTokens
+        )
         let first = try await performStream(
             endpoint: endpoint,
             payload: initialPayload,
@@ -345,7 +357,8 @@ struct OpenAICompatibleResponsesCompatibilityProbe: OpenAICompatibleResponsesCom
             payload: Self.followupPayload(
                 modelID: modelID,
                 priorOutputItems: first.completedOutputItems,
-                callID: functionCall.callID
+                callID: functionCall.callID,
+                maximumOutputTokens: maximumOutputTokens
             ),
             bearerToken: bearerToken,
             session: protectedSession.session,
@@ -360,6 +373,29 @@ struct OpenAICompatibleResponsesCompatibilityProbe: OpenAICompatibleResponsesCom
             submittedCorrelatedOutput: true,
             completedAfterFunctionOutput: true
         )
+    }
+
+    /// Start with a small generic Responses request. If that harmless bounded
+    /// round explicitly consumes its output allowance, retry the whole round
+    /// once with a larger allowance. The retry introduces no model-family
+    /// fields, so the fallback remains portable across compatible endpoints.
+    private func performProbeWithOutputBudgetFallback(
+        connection: ProviderConnectionRecord,
+        modelID: String
+    ) async throws -> OpenAICompatibleResponsesProbeEvidence {
+        do {
+            return try await performProbe(
+                connection: connection,
+                modelID: modelID,
+                maximumOutputTokens: 64
+            )
+        } catch InternalFailure.failure(.outputLimitedResponse) {
+            return try await performProbe(
+                connection: connection,
+                modelID: modelID,
+                maximumOutputTokens: 1_024
+            )
+        }
     }
 
     private func performStream(
@@ -465,7 +501,14 @@ struct OpenAICompatibleResponsesCompatibilityProbe: OpenAICompatibleResponsesCom
         guard let type = root["type"]?.stringValue else {
             throw InternalFailure.failure(.malformedEventStream)
         }
-        if type == "error" || type == "response.failed" || type == "response.incomplete" {
+        if type == "response.incomplete" {
+            throw InternalFailure.failure(
+                isOutputLimited(response: root["response"])
+                    ? .outputLimitedResponse
+                    : .incompleteResponse
+            )
+        }
+        if type == "error" || type == "response.failed" {
             throw InternalFailure.failure(.functionOutputRejected)
         }
 
@@ -488,8 +531,17 @@ struct OpenAICompatibleResponsesCompatibilityProbe: OpenAICompatibleResponsesCom
         case "response.completed":
             guard let response = root["response"], response.objectValue != nil,
                   let responseID = boundedIdentifier(response["id"]?.stringValue),
-                  response["status"]?.stringValue == "completed",
                   summary.responseID == nil || summary.responseID == responseID else {
+                throw InternalFailure.failure(.malformedEventStream)
+            }
+            if response["status"]?.stringValue == "incomplete" {
+                throw InternalFailure.failure(
+                    isOutputLimited(response: response)
+                        ? .outputLimitedResponse
+                        : .incompleteResponse
+                )
+            }
+            guard response["status"]?.stringValue == "completed" else {
                 throw InternalFailure.failure(.malformedEventStream)
             }
             summary.sawCompleted = true
@@ -547,6 +599,13 @@ struct OpenAICompatibleResponsesCompatibilityProbe: OpenAICompatibleResponsesCom
             throw InternalFailure.failure(.invalidFunctionCall)
         }
         return summary
+    }
+
+    private static func isOutputLimited(response: JSONValue?) -> Bool {
+        guard let reason = response?["incomplete_details"]?["reason"]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() else { return false }
+        return ["length", "max_output_tokens", "max_tokens", "output_limit"].contains(reason)
     }
 
     private static func functionCall(from value: JSONValue?) throws -> FunctionCall? {
@@ -615,8 +674,11 @@ struct OpenAICompatibleResponsesCompatibilityProbe: OpenAICompatibleResponsesCom
         return value
     }
 
-    private static func initialPayload(modelID: String) -> JSONValue {
-        var payload: [String: JSONValue] = [
+    private static func initialPayload(
+        modelID: String,
+        maximumOutputTokens: Int
+    ) -> JSONValue {
+        let payload: [String: JSONValue] = [
             "model": .string(modelID),
             "input": .array(initialInputItems),
             "tools": .array([functionTool]),
@@ -625,16 +687,16 @@ struct OpenAICompatibleResponsesCompatibilityProbe: OpenAICompatibleResponsesCom
                 "name": .string(functionName),
             ]),
             "stream": .bool(true),
-            "max_output_tokens": .integer(64),
+            "max_output_tokens": .integer(maximumOutputTokens),
         ]
-        addProbeReasoningMode(to: &payload, modelID: modelID)
         return .object(payload)
     }
 
     private static func followupPayload(
         modelID: String,
         priorOutputItems: [JSONValue],
-        callID: String
+        callID: String,
+        maximumOutputTokens: Int
     ) -> JSONValue {
         var input = initialInputItems
         input.append(contentsOf: priorOutputItems)
@@ -643,34 +705,15 @@ struct OpenAICompatibleResponsesCompatibilityProbe: OpenAICompatibleResponsesCom
             "call_id": .string(callID),
             "output": .string(#"{"ok":true}"#),
         ]))
-        var payload: [String: JSONValue] = [
+        let payload: [String: JSONValue] = [
             "model": .string(modelID),
             "input": .array(input),
             "tools": .array([functionTool]),
             "tool_choice": .string("none"),
             "stream": .bool(true),
-            "max_output_tokens": .integer(64),
+            "max_output_tokens": .integer(maximumOutputTokens),
         ]
-        addProbeReasoningMode(to: &payload, modelID: modelID)
         return .object(payload)
-    }
-
-    /// The probe intentionally has a very small output allowance. Qwen 3.8's
-    /// vLLM Responses adapter otherwise spends that allowance on hidden
-    /// reasoning and can emit a complete forced function call inside a
-    /// `response.completed` event whose embedded status is still `incomplete`.
-    /// That does not give us the clean two-request completion evidence needed
-    /// to enable local tools. The exact Qwen profile has independently verified
-    /// support for the standard `none` effort, so probe it in direct mode while
-    /// leaving unknown model families on the generic Responses request shape.
-    private static func addProbeReasoningMode(
-        to payload: inout [String: JSONValue],
-        modelID: String
-    ) {
-        guard KnownOpenAICompatibleModelProfile.profile(for: modelID) == .qwen38 else {
-            return
-        }
-        payload["reasoning"] = .object(["effort": .string("none")])
     }
 
     private static var initialInputItems: [JSONValue] {

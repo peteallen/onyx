@@ -34,7 +34,9 @@ original provider and model.
 - Cached catalogs for every configured connection load before provider
   switching, so manually selected or previously discovered vLLM models are
   directly selectable. Capability metadata is persisted without credentials;
-  missing metadata is treated conservatively.
+  missing metadata is treated conservatively. Catalog and history projection
+  never wait on a provider network request; only the selected metadata-poor
+  model starts one bounded compatibility probe in the background.
 
 The catalog projector and request builder remain pure discovery/encoding
 components. The Claude descriptor is configuration metadata only; there is no
@@ -68,6 +70,23 @@ lifecycle. The existing chat runtime remains available for metadata-poor
 models that do not pass the compatibility probe. A stale probe failure cannot
 demote a model whose current catalog explicitly advertises tool use.
 
+Lane selection is capability-based, never a model-name allow-list. Current
+catalog metadata advertising tools or function calling selects the agent lane
+immediately, regardless of model identity. For an otherwise-unknown selected
+model, catalog and history loading continue while its single bounded probe
+runs. If the user creates a task before that result arrives, task creation
+joins the same in-flight probe (or starts it if necessary) before committing
+durable ownership: compatible models start as agent tasks, while models that
+prove incompatible start as useful chat tasks. The probe begins with a small
+ordinary Responses request and retries the whole harmless round once with a
+larger output allowance only after an explicit incomplete/output-limited
+response. It never adds a model-family reasoning field to establish tool use.
+
+Once a task is created, its persisted agent/chat owner remains stable. Later
+catalog refreshes or probe results can affect future tasks, but never migrate
+an existing chat history into the agent runtime or demote an existing agent
+history into chat.
+
 A clean-home probe against bundled app-server 0.149.0 verified custom-provider
 Responses routing, app-server-supplied tool schemas, four request rounds,
 command approval, continuation after a declined call, rejection of a
@@ -94,8 +113,9 @@ Provider request capabilities are deliberately not projected into the plain
 chat adapter. An explicit tool/function-call advertisement selects an
 app-server agent attempt; metadata-poor models use the behavioral probe.
 App-server—not the model catalog—supplies the tool parsing, sandbox, approvals,
-execution, and lifecycle semantics, so incompatible attempts fail inside that
-bounded agent path instead of silently receiving local access.
+execution, and lifecycle semantics. Probe-incompatible models remain on the
+chat fallback, while advertised or probe-compatible models receive local tools
+only through the app-server sandbox and approval boundary.
 
 Local image paths selected in the composer are revalidated, bounded, and
 resolved to image data URLs before crossing the remote endpoint boundary; the

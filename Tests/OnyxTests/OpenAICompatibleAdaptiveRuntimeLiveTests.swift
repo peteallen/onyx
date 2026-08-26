@@ -10,7 +10,8 @@ import XCTest
 final class OpenAICompatibleAdaptiveRuntimeLiveTests: XCTestCase {
     /// A focused wire-level check for the inexpensive capability probe. Unlike
     /// the full test below, this does not start the bundled helper or launch an
-    /// app; it only performs the two side-effect-free Responses requests.
+    /// app; it only performs the bounded, side-effect-free Responses probe
+    /// (one two-request round plus at most one complete fallback round).
     func testConfiguredVLLMResponsesCompatibilityProbe() async throws {
         let environment = ProcessInfo.processInfo.environment
         try XCTSkipUnless(

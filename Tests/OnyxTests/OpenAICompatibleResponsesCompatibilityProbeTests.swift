@@ -89,9 +89,10 @@ final class OpenAICompatibleResponsesCompatibilityProbeTests: XCTestCase {
         XCTAssertEqual(record.fingerprint.value.count, 64)
     }
 
-    func testQwen38UsesDirectReasoningModeForBothBoundedProbeRequests() async throws {
+    func testArbitraryModelRetriesAnIncompleteProbeWithLargerGenericBudget() async throws {
         let requests = ResponsesProbeRequestRecorder()
         let responses = ResponsesProbeResponseQueue([
+            .eventStream(Self.incompleteInitialStream),
             .eventStream(Self.initialToolCallStream),
             .eventStream(Self.followupCompletionStream),
         ])
@@ -103,17 +104,61 @@ final class OpenAICompatibleResponsesCompatibilityProbeTests: XCTestCase {
 
         let record = try await probe.probe(
             connection: makeConnection(),
-            modelID: "Qwen/Qwen3.8-27B-FP8"
+            modelID: "acme/reasoning-tool-model"
         )
 
         guard case .compatible = record.outcome else {
-            return XCTFail("Expected Qwen's direct-mode probe to be compatible")
+            return XCTFail("Expected the larger-budget generic retry to be compatible")
         }
-        XCTAssertEqual(requests.requests.count, 2)
+        XCTAssertEqual(requests.requests.count, 3)
+        XCTAssertEqual(
+            try payload(from: requests.bodies[0])["max_output_tokens"],
+            .integer(64)
+        )
+        XCTAssertNil(try payload(from: requests.bodies[0])["reasoning"])
         for body in requests.bodies {
+            XCTAssertNil(try payload(from: body)["reasoning"])
+        }
+        for body in requests.bodies.dropFirst() {
+            XCTAssertEqual(
+                try payload(from: body)["max_output_tokens"],
+                .integer(1_024)
+            )
+        }
+    }
+
+    func testIncompleteFollowupRestartsTheWholeRoundWithLargerGenericBudget() async throws {
+        let requests = ResponsesProbeRequestRecorder()
+        let responses = ResponsesProbeResponseQueue([
+            .eventStream(Self.initialToolCallStream),
+            .eventStream(Self.incompleteFollowupStream),
+            .eventStream(Self.initialToolCallStream),
+            .eventStream(Self.followupCompletionStream),
+        ])
+        ResponsesProbeURLProtocol.configure { request in
+            requests.record(request)
+            return responses.next()
+        }
+        let probe = makeProbe(credentialStore: InMemoryCredentialStore())
+
+        let record = try await probe.probe(
+            connection: makeConnection(),
+            modelID: "acme/another-reasoning-tool-model"
+        )
+
+        guard case .compatible = record.outcome else {
+            return XCTFail("Expected the restarted larger-budget round to be compatible")
+        }
+        XCTAssertEqual(requests.requests.count, 4)
+        for body in requests.bodies.prefix(2) {
             let payload = try payload(from: body)
-            XCTAssertEqual(payload["reasoning"]?["effort"], .string("none"))
+            XCTAssertNil(payload["reasoning"])
             XCTAssertEqual(payload["max_output_tokens"], .integer(64))
+        }
+        for body in requests.bodies.suffix(2) {
+            let payload = try payload(from: body)
+            XCTAssertNil(payload["reasoning"])
+            XCTAssertEqual(payload["max_output_tokens"], .integer(1_024))
         }
     }
 
@@ -149,7 +194,7 @@ final class OpenAICompatibleResponsesCompatibilityProbeTests: XCTestCase {
         )
     }
 
-    func testCurrentProbeContractDoesNotReuseCachedVersionTwoFailure() throws {
+    func testCurrentProbeContractDoesNotReuseCachedVersionThreeFailure() throws {
         let connection = try makeConnection()
         let modelID = "Qwen/Qwen3.8-27B-FP8"
         let current = OpenAICompatibleResponsesProbeFingerprint(
@@ -157,7 +202,7 @@ final class OpenAICompatibleResponsesCompatibilityProbeTests: XCTestCase {
             modelID: modelID
         )
         let legacyMaterial = [
-            "onyx-responses-tool-probe-v2",
+            "onyx-responses-tool-probe-v3",
             "https://provider.example.test/v1/responses",
             modelID,
             connection.conversationScopeID,
@@ -253,8 +298,40 @@ final class OpenAICompatibleResponsesCompatibilityProbeTests: XCTestCase {
             modelID: "fixture-model"
         )
 
-        XCTAssertEqual(record.outcome, .failed(.malformedEventStream))
+        XCTAssertEqual(record.outcome, .failed(.outputLimitedResponse))
+        XCTAssertEqual(requests.requests.count, 2)
+        let firstPayload = try payload(from: requests.bodies[0])
+        let retryPayload = try payload(from: requests.bodies[1])
+        XCTAssertNil(firstPayload["reasoning"])
+        XCTAssertNil(retryPayload["reasoning"])
+        XCTAssertEqual(firstPayload["max_output_tokens"], .integer(64))
+        XCTAssertEqual(retryPayload["max_output_tokens"], .integer(1_024))
+    }
+
+    func testNonOutputLimitedIncompleteResponseDoesNotRetry() async throws {
+        let requests = ResponsesProbeRequestRecorder()
+        ResponsesProbeURLProtocol.configure { request in
+            requests.record(request)
+            return .eventStream("""
+            data: {"type":"response.created","response":{"id":"resp_initial"}}
+
+            data: {"type":"response.incomplete","response":{"id":"resp_initial","status":"incomplete","incomplete_details":{"reason":"content_filter"}}}
+
+            """)
+        }
+        let probe = makeProbe(credentialStore: InMemoryCredentialStore())
+
+        let record = try await probe.probe(
+            connection: makeConnection(),
+            modelID: "fixture-model"
+        )
+
+        XCTAssertEqual(record.outcome, .failed(.incompleteResponse))
         XCTAssertEqual(requests.requests.count, 1)
+        XCTAssertEqual(
+            try payload(from: requests.bodies[0])["max_output_tokens"],
+            .integer(64)
+        )
     }
 
     func testIncompleteFunctionCallItemInsideCompletedResponseFailsClosed() async throws {
@@ -550,6 +627,22 @@ final class OpenAICompatibleResponsesCompatibilityProbeTests: XCTestCase {
     data: {"type":"response.output_item.done","item":{"type":"function_call","id":"fc_probe","name":"onyx_responses_compatibility_probe","call_id":"call_probe","arguments":"{}"}}
 
     data: {"type":"response.completed","response":{"id":"resp_initial","status":"completed","output":[{"type":"reasoning","id":"rs_probe","summary":[]},{"type":"function_call","id":"fc_probe","name":"onyx_responses_compatibility_probe","call_id":"call_probe","arguments":"{}"}]}}
+
+    """
+
+    private static let incompleteInitialStream = """
+    data: {"type":"response.created","response":{"id":"resp_initial"}}
+
+    data: {"type":"response.output_item.done","item":{"type":"function_call","name":"onyx_responses_compatibility_probe","call_id":"call_probe","arguments":"{}","status":"completed"}}
+
+    data: {"type":"response.completed","response":{"id":"resp_initial","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"function_call","name":"onyx_responses_compatibility_probe","call_id":"call_probe","arguments":"{}","status":"completed"}]}}
+
+    """
+
+    private static let incompleteFollowupStream = """
+    data: {"type":"response.created","response":{"id":"resp_followup"}}
+
+    data: {"type":"response.incomplete","response":{"id":"resp_followup","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}
 
     """
 

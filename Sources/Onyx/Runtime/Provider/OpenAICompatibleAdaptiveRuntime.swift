@@ -1008,7 +1008,7 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
         let connection = try currentConnection()
         let scope = try currentScope()
         let modelID = try selectedModelID(request.model)
-        let decision = try await resolver.resolveNewTask(
+        let decision = try await resolver.resolveNewTaskAwaitingProbe(
             connection: connection,
             modelID: modelID
         )
@@ -1253,7 +1253,7 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
         if let requestedModelID,
            requestedModelID != owner.modelID,
            owner.lane == .agent {
-            let decision = try await resolver.resolveNewTask(
+            let decision = try await resolver.resolveNewTaskAwaitingProbe(
                 connection: connection,
                 modelID: requestedModelID
             )

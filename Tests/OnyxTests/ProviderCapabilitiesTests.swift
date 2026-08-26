@@ -123,6 +123,19 @@ final class ProviderCapabilitiesTests: XCTestCase {
         XCTAssertEqual(catalog, [model])
     }
 
+    func testFunctionCallingAliasesInSupportedParametersAdvertiseAgentTools() throws {
+        for alias in ["function_call", "function_calling"] {
+            let model = try ProviderModelDescriptor.openRouter(from: .object([
+                "id": .string("acme/\(alias)-model"),
+                "supported_parameters": .array([.string(alias)]),
+            ]))
+
+            XCTAssertEqual(model.capabilities.supportedParameters, [.tools])
+            XCTAssertTrue(model.capabilities.serverAdvertisesToolUse)
+            XCTAssertFalse(model.capabilities.supportsClient(.parameter(.tools)))
+        }
+    }
+
     func testGenericVLLMCatalogKeepsTextBaselineButMarksCapabilitiesUnknown() throws {
         let model = try ProviderModelDescriptor.openRouter(from: .object([
             "id": .string("acme/unknown-text-model"),

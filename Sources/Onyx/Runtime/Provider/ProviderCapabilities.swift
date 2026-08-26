@@ -48,7 +48,7 @@ enum ProviderRequestParameter: String, Codable, Hashable, Sendable, CaseIterable
         switch rawValue {
         case "reasoning", "include_reasoning": .reasoning
         case "reasoning_effort": .reasoningEffort
-        case "tools": .tools
+        case "tools", "function_call", "function_calling": .tools
         case "tool_choice": .toolChoice
         case "structured_outputs": .structuredOutputs
         case "response_format": .responseFormat

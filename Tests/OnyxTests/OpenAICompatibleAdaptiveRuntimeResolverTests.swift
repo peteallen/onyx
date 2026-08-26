@@ -107,6 +107,49 @@ final class OpenAICompatibleAdaptiveRuntimeResolverTests: XCTestCase {
         XCTAssertEqual(probedModels, ["agent-model", "chat-model"])
     }
 
+    func testFirstMetadataPoorTaskWaitsForItsProbeAndUsesAgentLaneWhenCompatible() async throws {
+        let connection = try makeAdaptiveConnection()
+        let probe = AdaptiveLaneProbe(
+            outcomes: ["acme/sparse-agent": .compatible(Self.compatibleEvidence)],
+            delay: .milliseconds(20)
+        )
+        let resolver = OpenAICompatibleAdaptiveRuntimeResolver(
+            probe: probe,
+            stateStore: makeAdaptiveStateStore()
+        )
+
+        let decision = try await resolver.resolveNewTaskAwaitingProbe(
+            connection: connection,
+            modelID: "acme/sparse-agent"
+        )
+
+        XCTAssertEqual(decision.lane, .agent)
+        XCTAssertEqual(decision.basis, .compatibleProbe)
+        let probedModels = await probe.modelsProbed()
+        XCTAssertEqual(probedModels, ["acme/sparse-agent"])
+    }
+
+    func testFirstMetadataPoorTaskWaitsForItsProbeAndUsesChatWhenIncompatible() async throws {
+        let connection = try makeAdaptiveConnection()
+        let probe = AdaptiveLaneProbe(
+            outcomes: ["acme/plain-chat": .failed(.missingFunctionCall)]
+        )
+        let resolver = OpenAICompatibleAdaptiveRuntimeResolver(
+            probe: probe,
+            stateStore: makeAdaptiveStateStore()
+        )
+
+        let decision = try await resolver.resolveNewTaskAwaitingProbe(
+            connection: connection,
+            modelID: "acme/plain-chat"
+        )
+
+        XCTAssertEqual(decision.lane, .chat)
+        XCTAssertEqual(decision.basis, .failedProbe(.missingFunctionCall))
+        let probedModels = await probe.modelsProbed()
+        XCTAssertEqual(probedModels, ["acme/plain-chat"])
+    }
+
     func testConcurrentSameModelResolutionSharesOneProbe() async throws {
         let connection = try makeAdaptiveConnection()
         let probe = AdaptiveLaneProbe(
