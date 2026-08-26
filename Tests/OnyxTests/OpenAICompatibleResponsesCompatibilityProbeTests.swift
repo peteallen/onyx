@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import XCTest
 @testable import Onyx
@@ -58,12 +59,14 @@ final class OpenAICompatibleResponsesCompatibilityProbeTests: XCTestCase {
         let first = try payload(from: requests.bodies[0])
         XCTAssertEqual(first["model"], .string("fixture-model"))
         XCTAssertEqual(first["stream"], .bool(true))
+        XCTAssertNil(first["reasoning"])
         XCTAssertEqual(first["tool_choice"]?["name"], .string("onyx_responses_compatibility_probe"))
         XCTAssertEqual(first["tools"]?[0]?["type"], .string("function"))
         XCTAssertEqual(first["tools"]?[0]?["parameters"]?["additionalProperties"], .bool(false))
 
         let second = try payload(from: requests.bodies[1])
         XCTAssertNil(second["previous_response_id"])
+        XCTAssertNil(second["reasoning"])
         XCTAssertEqual(second["tool_choice"], .string("none"))
         XCTAssertEqual(second["input"]?.arrayValue?.count, 4)
         XCTAssertEqual(second["input"]?[0]?["role"], .string("user"))
@@ -84,6 +87,34 @@ final class OpenAICompatibleResponsesCompatibilityProbeTests: XCTestCase {
         XCTAssertFalse(encodedRecord.contains("provider.example.test"))
         XCTAssertFalse(encodedRecord.contains("fixture-model"))
         XCTAssertEqual(record.fingerprint.value.count, 64)
+    }
+
+    func testQwen38UsesDirectReasoningModeForBothBoundedProbeRequests() async throws {
+        let requests = ResponsesProbeRequestRecorder()
+        let responses = ResponsesProbeResponseQueue([
+            .eventStream(Self.initialToolCallStream),
+            .eventStream(Self.followupCompletionStream),
+        ])
+        ResponsesProbeURLProtocol.configure { request in
+            requests.record(request)
+            return responses.next()
+        }
+        let probe = makeProbe(credentialStore: InMemoryCredentialStore())
+
+        let record = try await probe.probe(
+            connection: makeConnection(),
+            modelID: "Qwen/Qwen3.8-27B-FP8"
+        )
+
+        guard case .compatible = record.outcome else {
+            return XCTFail("Expected Qwen's direct-mode probe to be compatible")
+        }
+        XCTAssertEqual(requests.requests.count, 2)
+        for body in requests.bodies {
+            let payload = try payload(from: body)
+            XCTAssertEqual(payload["reasoning"]?["effort"], .string("none"))
+            XCTAssertEqual(payload["max_output_tokens"], .integer(64))
+        }
     }
 
     func testConversationScopeChangeInvalidatesOtherwiseIdenticalEndpointModelCacheEntry() throws {
@@ -116,6 +147,26 @@ final class OpenAICompatibleResponsesCompatibilityProbeTests: XCTestCase {
                 at: Date(timeIntervalSince1970: 20)
             )
         )
+    }
+
+    func testCurrentProbeContractDoesNotReuseCachedVersionTwoFailure() throws {
+        let connection = try makeConnection()
+        let modelID = "Qwen/Qwen3.8-27B-FP8"
+        let current = OpenAICompatibleResponsesProbeFingerprint(
+            connection: connection,
+            modelID: modelID
+        )
+        let legacyMaterial = [
+            "onyx-responses-tool-probe-v2",
+            "https://provider.example.test/v1/responses",
+            modelID,
+            connection.conversationScopeID,
+        ].joined(separator: "\u{0}")
+        let legacy = SHA256.hash(data: Data(legacyMaterial.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+
+        XCTAssertNotEqual(current.value, legacy)
     }
 
     func testHTTPFailureReturnsShortLivedTypedFailureWithoutRetainingCredentialOrBody() async throws {
@@ -179,6 +230,57 @@ final class OpenAICompatibleResponsesCompatibilityProbeTests: XCTestCase {
         XCTAssertEqual(record.outcome, .failed(.missingCompletion))
     }
 
+    func testCompletedEventWithIncompleteResponseStatusFailsClosed() async throws {
+        let requests = ResponsesProbeRequestRecorder()
+        ResponsesProbeURLProtocol.configure { request in
+            requests.record(request)
+            return .eventStream("""
+            event: response.created
+            data: {"type":"response.created","response":{"id":"resp_initial"}}
+
+            event: response.output_item.done
+            data: {"type":"response.output_item.done","item":{"type":"function_call","name":"onyx_responses_compatibility_probe","call_id":"call_probe","arguments":"{}","status":"completed"}}
+
+            event: response.completed
+            data: {"type":"response.completed","response":{"id":"resp_initial","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"function_call","name":"onyx_responses_compatibility_probe","call_id":"call_probe","arguments":"{}","status":"completed"}]}}
+
+            """)
+        }
+        let probe = makeProbe(credentialStore: InMemoryCredentialStore())
+
+        let record = try await probe.probe(
+            connection: makeConnection(),
+            modelID: "fixture-model"
+        )
+
+        XCTAssertEqual(record.outcome, .failed(.malformedEventStream))
+        XCTAssertEqual(requests.requests.count, 1)
+    }
+
+    func testIncompleteFunctionCallItemInsideCompletedResponseFailsClosed() async throws {
+        let requests = ResponsesProbeRequestRecorder()
+        ResponsesProbeURLProtocol.configure { request in
+            requests.record(request)
+            return .eventStream("""
+            event: response.created
+            data: {"type":"response.created","response":{"id":"resp_initial"}}
+
+            event: response.completed
+            data: {"type":"response.completed","response":{"id":"resp_initial","status":"completed","output":[{"type":"function_call","name":"onyx_responses_compatibility_probe","call_id":"call_probe","arguments":"{}","status":"incomplete"}]}}
+
+            """)
+        }
+        let probe = makeProbe(credentialStore: InMemoryCredentialStore())
+
+        let record = try await probe.probe(
+            connection: makeConnection(),
+            modelID: "fixture-model"
+        )
+
+        XCTAssertEqual(record.outcome, .failed(.invalidFunctionCall))
+        XCTAssertEqual(requests.requests.count, 1)
+    }
+
     func testWrongFunctionCallFailsWithoutSendingRoundTripRequest() async throws {
         let requests = ResponsesProbeRequestRecorder()
         ResponsesProbeURLProtocol.configure { request in
@@ -239,6 +341,28 @@ final class OpenAICompatibleResponsesCompatibilityProbeTests: XCTestCase {
             data: {"type":"response.output_item.done","item":{"type":"function_call","name":"onyx_responses_compatibility_probe","call_id":"call_two","arguments":"{}"}}
 
             data: {"type":"response.completed","response":{"id":"resp_initial","status":"completed"}}
+
+            """)
+        }
+        let probe = makeProbe(credentialStore: InMemoryCredentialStore())
+
+        let record = try await probe.probe(
+            connection: makeConnection(),
+            modelID: "fixture-model"
+        )
+
+        XCTAssertEqual(record.outcome, .failed(.invalidFunctionCall))
+        XCTAssertEqual(requests.requests.count, 1)
+    }
+
+    func testMultipleFunctionCallsInsideOneCompletedOutputFailClosed() async throws {
+        let requests = ResponsesProbeRequestRecorder()
+        ResponsesProbeURLProtocol.configure { request in
+            requests.record(request)
+            return .eventStream("""
+            data: {"type":"response.created","response":{"id":"resp_initial"}}
+
+            data: {"type":"response.completed","response":{"id":"resp_initial","status":"completed","output":[{"type":"function_call","name":"onyx_responses_compatibility_probe","call_id":"call_one","arguments":"{}"},{"type":"function_call","name":"onyx_responses_compatibility_probe","call_id":"call_two","arguments":"{}"}]}}
 
             """)
         }

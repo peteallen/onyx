@@ -9,6 +9,7 @@ display_name="${ONYX_APP_DISPLAY_NAME:-}"
 bundle_identifier="${ONYX_BUNDLE_IDENTIFIER:-}"
 short_version="${ONYX_APP_VERSION:-}"
 build_number="${ONYX_BUILD_NUMBER:-}"
+source_revision="${ONYX_SOURCE_REVISION:-}"
 signing_identity="${ONYX_CODESIGN_IDENTITY:-}"
 architectures="${ONYX_ARCHITECTURES:-native}"
 allow_running_overwrite=0
@@ -27,6 +28,7 @@ Options:
   --bundle-id IDENTIFIER         Bundle identifier (for example, dev.example.onyx.preview).
   --version VERSION              CFBundleShortVersionString.
   --build-number NUMBER          CFBundleVersion.
+  --source-revision SHA          Exact 40-character source commit embedded in the bundle.
   --signing-identity IDENTITY    Code-signing identity. Defaults to ad hoc.
   --no-signing-timestamp         Do not request a trusted timestamp (for a local identity).
   --designated-requirement EXPR  Requirement body after `designated =>`.
@@ -36,7 +38,7 @@ Options:
 
 Environment equivalents:
   ONYX_APP_DISPLAY_NAME, ONYX_BUNDLE_IDENTIFIER, ONYX_APP_VERSION,
-  ONYX_BUILD_NUMBER, ONYX_CODESIGN_IDENTITY, ONYX_ARCHITECTURES,
+  ONYX_BUILD_NUMBER, ONYX_SOURCE_REVISION, ONYX_CODESIGN_IDENTITY, ONYX_ARCHITECTURES,
   ONYX_CODESIGN_TIMESTAMP, ONYX_CODESIGN_REQUIREMENT,
   ONYX_CODEX_RUNTIME_CACHE_DIR, ONYX_CODEX_RUNTIME_ARCHIVE_ARM64,
   ONYX_CODEX_RUNTIME_ARCHIVE_X86_64
@@ -78,6 +80,11 @@ while (( $# > 0 )); do
     --build-number)
       require_value "$1" "${2:-}"
       build_number="$2"
+      shift 2
+      ;;
+    --source-revision)
+      require_value "$1" "${2:-}"
+      source_revision="$2"
       shift 2
       ;;
     --signing-identity)
@@ -169,6 +176,8 @@ plist_value() {
   die "version must contain one to three numeric components: $short_version"
 [[ "$build_number" =~ '^[0-9]+([.][0-9]+){0,2}$' ]] || \
   die "build number must contain one to three numeric components: $build_number"
+[[ -z "$source_revision" || "$source_revision" =~ '^[0-9a-f]{40}$' ]] || \
+  die "source revision must be an exact lowercase 40-character Git commit SHA"
 [[ "$architectures" == "native" || "$architectures" == "universal" ]] || \
   die "architectures must be native or universal (got: $architectures)"
 [[ "$signing_timestamp" == "0" || "$signing_timestamp" == "1" ]] || \
@@ -297,6 +306,10 @@ fi
 /usr/bin/plutil -replace CFBundleIdentifier -string "$bundle_identifier" "$contents_dir/Info.plist"
 /usr/bin/plutil -replace CFBundleShortVersionString -string "$short_version" "$contents_dir/Info.plist"
 /usr/bin/plutil -replace CFBundleVersion -string "$build_number" "$contents_dir/Info.plist"
+if [[ -n "$source_revision" ]]; then
+  /usr/bin/plutil -remove OnyxSourceRevision "$contents_dir/Info.plist" 2>/dev/null || true
+  /usr/bin/plutil -insert OnyxSourceRevision -string "$source_revision" "$contents_dir/Info.plist"
+fi
 
 runtime_preparation_root="$staging_root/CodexRuntimePreparation"
 /bin/mkdir -p "$runtime_preparation_root"
@@ -386,6 +399,10 @@ fi
   die "packaged display name did not verify"
 [[ "$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - "$contents_dir/Info.plist")" == "$bundle_identifier" ]] || \
   die "packaged bundle identifier did not verify"
+if [[ -n "$source_revision" ]]; then
+  [[ "$(/usr/bin/plutil -extract OnyxSourceRevision raw -o - "$contents_dir/Info.plist")" == "$source_revision" ]] || \
+    die "packaged source revision did not verify"
+fi
 [[ -x "$contents_dir/MacOS/Onyx" ]] || die "packaged executable is not executable"
 [[ -f "$contents_dir/Resources/Onyx.icns" ]] || die "packaged app icon is missing"
 if [[ "$architectures" == "universal" ]]; then

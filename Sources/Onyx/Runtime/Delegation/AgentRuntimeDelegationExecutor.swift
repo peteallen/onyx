@@ -1,5 +1,94 @@
 import Foundation
 
+/// An arbitrary provider error has to cross an unstructured task boundary in
+/// the setup timeout race.  The provider protocols intentionally expose
+/// `any Error`, so retain it behind an explicitly unchecked Sendable wrapper
+/// and unwrap it before returning to the caller.
+private struct DelegationThrownError: Error, @unchecked Sendable {
+    let underlying: any Error
+}
+
+/// Resolves exactly once without requiring the losing setup operation to
+/// honor cancellation.  A structured task group is unsuitable here because
+/// Swift waits for every child before leaving the group; a provider that is
+/// stuck in a non-cooperative await would therefore defeat the timeout.
+private final class DelegationFirstResult<Value: Sendable>: @unchecked Sendable {
+    typealias Outcome = Result<Value, DelegationThrownError>
+
+    private let lock = NSLock()
+    private var outcome: Outcome?
+    private var waiter: CheckedContinuation<Outcome, Never>?
+
+    func wait() async -> Outcome {
+        await withCheckedContinuation { continuation in
+            let immediate = lock.withLock { () -> Outcome? in
+                if let outcome {
+                    return outcome
+                }
+                waiter = continuation
+                return nil
+            }
+            immediate.map { continuation.resume(returning: $0) }
+        }
+    }
+
+    /// Returns `true` when this call won the race.  A late success is still
+    /// useful to the caller for cleanup (notably a child thread created after
+    /// the setup deadline), so callers must not simply discard a `false`.
+    @discardableResult
+    func resolve(_ outcome: Outcome) -> Bool {
+        let resolution = lock.withLock {
+            () -> (won: Bool, waiter: CheckedContinuation<Outcome, Never>?) in
+            guard self.outcome == nil else { return (false, nil) }
+            self.outcome = outcome
+            let waiter = self.waiter
+            self.waiter = nil
+            return (true, waiter)
+        }
+        resolution.waiter?.resume(returning: outcome)
+        return resolution.won
+    }
+}
+
+/// Serializes every cleanup request for one delegated child. A setup timeout
+/// can return before the provider call does, so the ordinary failure path and
+/// a late-success reconciliation may both ask to remove the same child. Keep
+/// those requests ordered and stop after the first confirmed deletion instead
+/// of assuming repeated provider delete/interrupt calls are harmless.
+private final class DelegationChildCleanup: @unchecked Sendable {
+    private let lock = NSLock()
+    private var deletionSucceeded = false
+    private var tail: Task<Void, Never>?
+
+    func run(
+        interruptFirst: Bool,
+        interrupt: @escaping @Sendable () async -> Void,
+        delete: @escaping @Sendable () async -> Bool
+    ) async {
+        let task = lock.withLock { () -> Task<Void, Never>? in
+            guard !deletionSucceeded else { return nil }
+            let previous = tail
+            let task = Task.detached(priority: .utility) { [self] in
+                await previous?.value
+                guard !hasDeletedChild else { return }
+                if interruptFirst { await interrupt() }
+                if await delete() { markChildDeleted() }
+            }
+            tail = task
+            return task
+        }
+        await task?.value
+    }
+
+    private var hasDeletedChild: Bool {
+        lock.withLock { deletionSucceeded }
+    }
+
+    private func markChildDeleted() {
+        lock.withLock { deletionSucceeded = true }
+    }
+}
+
 /// Bridges an existing provider runtime into the provider-neutral delegation
 /// scheduler.
 ///
@@ -19,6 +108,7 @@ struct AgentRuntimeDelegationExecutor: DelegationExecutor {
     private let deletesThreadAfterExecution: Bool
     private let sandboxMode: RuntimeSandboxMode
     private let approvalPolicy: RuntimeApprovalPolicy
+    private let setupTimeout: Duration
     private let terminalTimeout: Duration
 
     /// - Parameters:
@@ -30,6 +120,9 @@ struct AgentRuntimeDelegationExecutor: DelegationExecutor {
     ///   - deletesThreadAfterExecution: Remove the child after the response.
     ///     This is useful for private/background delegations and should be
     ///     paired with ephemeral starts where the provider supports them.
+    ///   - setupTimeout: Bound provider connect, child creation, and turn-start
+    ///     handshakes. Once a child identity is known, a timed-out setup is
+    ///     interrupted and removed by the same cleanup path as a failed turn.
     init(
         connectionID: ProviderConnectionID,
         runtime: any AgentRuntime,
@@ -39,6 +132,10 @@ struct AgentRuntimeDelegationExecutor: DelegationExecutor {
         deletesThreadAfterExecution: Bool = false,
         sandboxMode: RuntimeSandboxMode = .readOnly,
         approvalPolicy: RuntimeApprovalPolicy = .never,
+        // Allow provider discovery plus one transport request on a cold
+        // connection. Callers and tests may choose a shorter value for a
+        // deliberately local runtime.
+        setupTimeout: Duration = .seconds(180),
         terminalTimeout: Duration = .seconds(600)
     ) {
         self.connectionID = connectionID
@@ -49,6 +146,9 @@ struct AgentRuntimeDelegationExecutor: DelegationExecutor {
         self.deletesThreadAfterExecution = deletesThreadAfterExecution
         self.sandboxMode = sandboxMode
         self.approvalPolicy = approvalPolicy
+        self.setupTimeout = setupTimeout > .zero
+            ? setupTimeout
+            : .seconds(180)
         self.terminalTimeout = terminalTimeout > .zero
             ? terminalTimeout
             : .seconds(600)
@@ -74,37 +174,64 @@ struct AgentRuntimeDelegationExecutor: DelegationExecutor {
         }
         try Task.checkCancellation()
 
-        let session = try await runtime.connect()
-        guard session.auth.canRun else {
-            throw DelegationExecutorError.unavailable
-        }
-        if supportedModelIDs == nil,
-           !session.availableModels.isEmpty,
-           !session.availableModels.contains(where: { $0.id == request.targetModel.modelID })
-        {
-            throw DelegationExecutorError.unsupportedModel(request.targetModel.modelID)
-        }
-        try Task.checkCancellation()
-
-        let workingDirectory = resolvedWorkingDirectory(for: request)
-        let child = try await runtime.startThread(
-            StartThreadRequest(
-                cwd: workingDirectory,
-                model: request.targetModel.modelID,
-                ephemeral: startsEphemeralThreads,
-                sandboxMode: sandboxMode,
-                approvalPolicy: approvalPolicy
-            )
-        )
-        guard DelegationSafeText.boundedIdentifier(child.id) != nil else {
-            _ = try? await runtime.deleteThread(id: child.id)
-            throw DelegationExecutorError.execution(
-                "The provider returned an invalid child conversation identity."
-            )
-        }
+        let childCleanup = DelegationChildCleanup()
+        var childID: String?
         var turnMayHaveBeenAccepted = false
         var collector: Task<DelegationOutput, any Error>?
         do {
+            // Setup is part of the delegated operation, not an unbounded
+            // prelude. A provider can hang during connect or child creation
+            // before the terminal collector ever gets a chance to enforce its
+            // response timeout.
+            let session = try await boundedSetup("connection") {
+                try await runtime.connect()
+            }
+            try Task.checkCancellation()
+            guard session.auth.canRun else {
+                throw DelegationExecutorError.unavailable
+            }
+            if supportedModelIDs == nil,
+               !session.availableModels.isEmpty,
+               !session.availableModels.contains(where: { $0.id == request.targetModel.modelID })
+            {
+                throw DelegationExecutorError.unsupportedModel(request.targetModel.modelID)
+            }
+            try Task.checkCancellation()
+
+            let workingDirectory = resolvedWorkingDirectory(for: request)
+            let child = try await boundedSetup(
+                "child creation",
+                lateSuccess: { [self] child in
+                    // The child can be created after the timeout if the
+                    // provider ignores cancellation.  Delete it from the
+                    // detached, independently bounded cleanup task so it
+                    // cannot become an orphan. Keep the provider's exact ID
+                    // here; the normal invalid-identity path also attempts a
+                    // best-effort delete before surfacing the error.
+                    await deleteAbandonedThreadBestEffort(
+                        child.id,
+                        cleanup: childCleanup
+                    )
+                }
+            ) {
+                try await runtime.startThread(
+                    StartThreadRequest(
+                        cwd: workingDirectory,
+                        model: request.targetModel.modelID,
+                        ephemeral: startsEphemeralThreads,
+                        sandboxMode: sandboxMode,
+                        approvalPolicy: approvalPolicy,
+                        allowsDynamicTools: false
+                    )
+                )
+            }
+            childID = child.id
+            guard DelegationSafeText.boundedIdentifier(child.id) != nil else {
+                throw DelegationExecutorError.execution(
+                    "The provider returned an invalid child conversation identity."
+                )
+            }
+
             try Task.checkCancellation()
             await reportProgress(
                 DelegationProgressUpdate(
@@ -112,6 +239,7 @@ struct AgentRuntimeDelegationExecutor: DelegationExecutor {
                     message: Self.nonBlank(child.title)
                 )
             )
+            try Task.checkCancellation()
 
             // Obtain the stream before starting the turn. Shared coordinators
             // buffer events, but this ordering also protects runtimes whose
@@ -131,21 +259,50 @@ struct AgentRuntimeDelegationExecutor: DelegationExecutor {
             // returning from `startTurn`; an interrupt is harmless if the
             // request ultimately failed, but missing it can strand work.
             turnMayHaveBeenAccepted = true
-            try await runtime.startTurn(
-                StartTurnRequest(
-                    threadID: child.id,
-                    inputs: [.text(request.prompt)],
-                    model: request.targetModel.modelID,
-                    cwd: workingDirectory,
-                    reasoningEffort: request.reasoningEffort,
-                    sandboxMode: sandboxMode,
-                    approvalPolicy: approvalPolicy
+            try await boundedSetup(
+                "turn start",
+                lateSuccess: { [self] _ in
+                    // If startTurn ignores cancellation and returns after the
+                    // timeout, reconcile it through the same serialized
+                    // cleanup owner. A prior successful deletion suppresses
+                    // duplicate provider mutations; a failed attempt may be
+                    // retried now that the provider call has settled.
+                    await deleteAbandonedThreadBestEffort(
+                        child.id,
+                        cleanup: childCleanup,
+                        interruptFirst: true
+                    )
+                }
+            ) {
+                try await runtime.startTurn(
+                    StartTurnRequest(
+                        threadID: child.id,
+                        inputs: [.text(request.prompt)],
+                        model: request.targetModel.modelID,
+                        cwd: workingDirectory,
+                        reasoningEffort: request.reasoningEffort,
+                        sandboxMode: sandboxMode,
+                        approvalPolicy: approvalPolicy
+                    )
                 )
-            )
+            }
+            // A turn can complete at the same instant that its parent is
+            // cancelled.  Do not publish a successful delegation after that
+            // cancellation has become authoritative.
+            try Task.checkCancellation()
             let output = try await collector!.value
             collector = nil
+            try Task.checkCancellation()
             await reportProgress(.init(phase: "completed", fraction: 1))
-            await cleanupThreadIfNeeded(child.id, interruptFirst: false)
+            await cleanupThreadIfNeeded(
+                child.id,
+                cleanup: childCleanup,
+                interruptFirst: false
+            )
+            // Cancellation can arrive while the progress sink or private
+            // cleanup is awaiting. Re-check immediately before exposing a
+            // successful result so the coordinator's cancellation wins.
+            try Task.checkCancellation()
             guard startsEphemeralThreads || deletesThreadAfterExecution else {
                 return output
             }
@@ -160,21 +317,116 @@ struct AgentRuntimeDelegationExecutor: DelegationExecutor {
             )
         } catch is CancellationError {
             collector?.cancel()
-            if turnMayHaveBeenAccepted { await interruptBestEffort(threadID: child.id) }
-            _ = try? await collector?.value
-            await deleteAbandonedThreadBestEffort(child.id)
+            collector = nil
+            if let childID {
+                await deleteAbandonedThreadBestEffort(
+                    childID,
+                    cleanup: childCleanup,
+                    interruptFirst: turnMayHaveBeenAccepted
+                )
+            }
             throw CancellationError()
         } catch {
+            let cancellationRequested = Task.isCancelled
             collector?.cancel()
-            if turnMayHaveBeenAccepted { await interruptBestEffort(threadID: child.id) }
-            _ = try? await collector?.value
-            await deleteAbandonedThreadBestEffort(child.id)
+            collector = nil
+            if let childID {
+                await deleteAbandonedThreadBestEffort(
+                    childID,
+                    cleanup: childCleanup,
+                    interruptFirst: turnMayHaveBeenAccepted
+                )
+            }
+            if cancellationRequested { throw CancellationError() }
             throw error
         }
     }
 
+    /// Race one provider setup operation against a timer without waiting for a
+    /// cancellation-uncooperative provider task. A structured task group is
+    /// unsuitable here because Swift waits for every child before leaving the
+    /// group; a hung app-server call would otherwise defeat the timeout.
+    private func boundedSetup<T: Sendable>(
+        _ phase: String,
+        lateSuccess: (@Sendable (T) async -> Void)? = nil,
+        shieldCancellation: Bool = false,
+        timeout: Duration? = nil,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        if !shieldCancellation {
+            try Task.checkCancellation()
+        }
+        let race = DelegationFirstResult<T>()
+        let operationTask = Task.detached(priority: .utility) {
+            do {
+                let value = try await operation()
+                let won = race.resolve(.success(value))
+                if !won, let lateSuccess {
+                    // The operation task inherits cancellation from the
+                    // timeout defer. Launch cleanup independently so a late
+                    // provider success cannot skip its orphan removal.
+                    Task.detached(priority: .utility) {
+                        await lateSuccess(value)
+                    }
+                }
+            } catch {
+                _ = race.resolve(.failure(DelegationThrownError(underlying: error)))
+            }
+        }
+        let timerTask = Task.detached(priority: .utility) {
+            do {
+                try await Task.sleep(for: timeout ?? self.setupTimeout)
+            } catch {
+                return
+            }
+            _ = race.resolve(.failure(DelegationThrownError(
+                underlying: DelegationExecutorError.provider(
+                    "The provider \(phase) did not complete before the setup timeout."
+                )
+            )))
+        }
+        defer {
+            operationTask.cancel()
+            timerTask.cancel()
+        }
+
+        let outcome: DelegationFirstResult<T>.Outcome
+        if shieldCancellation {
+            // Cleanup must still be attempted when the parent task is already
+            // canceled. The detached operation and independent timer provide
+            // their own bounded lifetime in this branch.
+            outcome = await race.wait()
+        } else {
+            if Task.isCancelled {
+                _ = race.resolve(.failure(DelegationThrownError(
+                    underlying: CancellationError()
+                )))
+            }
+            outcome = await withTaskCancellationHandler {
+                await race.wait()
+            } onCancel: {
+                _ = race.resolve(.failure(DelegationThrownError(
+                    underlying: CancellationError()
+                )))
+            }
+        }
+
+        switch outcome {
+        case let .success(value):
+            return value
+        case let .failure(failure):
+            throw failure.underlying
+        }
+    }
+
     private func interruptBestEffort(threadID: String) async {
-        _ = try? await runtime.interrupt(threadID: threadID)
+        _ = try? await boundedSetup(
+            "child interruption",
+            shieldCancellation: true,
+            timeout: .seconds(10)
+        ) {
+            try await runtime.interrupt(threadID: threadID)
+        }
     }
 
     private func resolvedWorkingDirectory(for request: DelegationRequest) -> String {
@@ -184,17 +436,47 @@ struct AgentRuntimeDelegationExecutor: DelegationExecutor {
         return requested
     }
 
-    private func cleanupThreadIfNeeded(_ threadID: String, interruptFirst: Bool) async {
+    private func cleanupThreadIfNeeded(
+        _ threadID: String,
+        cleanup: DelegationChildCleanup,
+        interruptFirst: Bool
+    ) async {
         guard deletesThreadAfterExecution else { return }
-        if interruptFirst { await interruptBestEffort(threadID: threadID) }
-        _ = try? await runtime.deleteThread(id: threadID)
+        await cleanup.run(
+            interruptFirst: interruptFirst,
+            interrupt: { await interruptBestEffort(threadID: threadID) },
+            delete: { await deleteThreadBestEffort(threadID, phase: "child cleanup") }
+        )
     }
 
     /// A child that never produced a successful delegation result has no UI
     /// join key. Remove that app-created orphan even when successful children
     /// are configured to remain durable and clickable.
-    private func deleteAbandonedThreadBestEffort(_ threadID: String) async {
-        _ = try? await runtime.deleteThread(id: threadID)
+    private func deleteAbandonedThreadBestEffort(
+        _ threadID: String,
+        cleanup: DelegationChildCleanup,
+        interruptFirst: Bool = false
+    ) async {
+        await cleanup.run(
+            interruptFirst: interruptFirst,
+            interrupt: { await interruptBestEffort(threadID: threadID) },
+            delete: { await deleteThreadBestEffort(threadID, phase: "orphan cleanup") }
+        )
+    }
+
+    private func deleteThreadBestEffort(_ threadID: String, phase: String) async -> Bool {
+        do {
+            try await boundedSetup(
+                phase,
+                shieldCancellation: true,
+                timeout: .seconds(10)
+            ) {
+                try await runtime.deleteThread(id: threadID)
+            }
+            return true
+        } catch {
+            return false
+        }
     }
 
     private static func collectOutput(
@@ -203,28 +485,53 @@ struct AgentRuntimeDelegationExecutor: DelegationExecutor {
         timeout: Duration,
         reportProgress: @escaping DelegationProgressReporter
     ) async throws -> DelegationOutput {
-        try await withThrowingTaskGroup(of: DelegationOutput.self) { group in
-            group.addTask {
-                try await collectOutputUntilTerminal(
+        let race = DelegationFirstResult<DelegationOutput>()
+        let collectorTask = Task.detached(priority: .utility) {
+            do {
+                let output = try await collectOutputUntilTerminal(
                     from: stream,
                     threadID: threadID,
                     reportProgress: reportProgress
                 )
+                _ = race.resolve(.success(output))
+            } catch {
+                _ = race.resolve(.failure(DelegationThrownError(underlying: error)))
             }
-            group.addTask {
+        }
+        let timeoutTask = Task.detached(priority: .utility) {
+            do {
                 try await Task.sleep(for: timeout)
-                throw DelegationExecutorError.provider(
+            } catch {
+                return
+            }
+            _ = race.resolve(.failure(DelegationThrownError(
+                underlying: DelegationExecutorError.provider(
                     "The delegated turn did not reach a terminal state before the timeout."
                 )
-            }
+            )))
+        }
+        defer {
+            collectorTask.cancel()
+            timeoutTask.cancel()
+        }
 
-            guard let output = try await group.next() else {
-                throw DelegationExecutorError.provider(
-                    "The delegated turn ended without a terminal result."
-                )
-            }
-            group.cancelAll()
+        if Task.isCancelled {
+            _ = race.resolve(.failure(DelegationThrownError(
+                underlying: CancellationError()
+            )))
+        }
+        let outcome = await withTaskCancellationHandler {
+            await race.wait()
+        } onCancel: {
+            _ = race.resolve(.failure(DelegationThrownError(
+                underlying: CancellationError()
+            )))
+        }
+        switch outcome {
+        case let .success(output):
             return output
+        case let .failure(failure):
+            throw failure.underlying
         }
     }
 

@@ -2,11 +2,45 @@ import Foundation
 import XCTest
 @testable import Onyx
 
-/// Opt-in, destructive-to-the-temporary-workspace integration coverage for the
-/// adaptive OpenAI-compatible lane.  It is intentionally separate from the
-/// deterministic adaptive tests: this test starts the real bundled app-server
-/// and asks the configured endpoint to use a local tool.
+/// Opt-in integration coverage for the adaptive OpenAI-compatible lane. It is
+/// intentionally separate from the deterministic adaptive tests. The focused
+/// probe check only uses the network; the full project-agent test starts the
+/// real bundled app-server and asks the configured endpoint to use a local tool
+/// inside a temporary workspace.
 final class OpenAICompatibleAdaptiveRuntimeLiveTests: XCTestCase {
+    /// A focused wire-level check for the inexpensive capability probe. Unlike
+    /// the full test below, this does not start the bundled helper or launch an
+    /// app; it only performs the two side-effect-free Responses requests.
+    func testConfiguredVLLMResponsesCompatibilityProbe() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        try XCTSkipUnless(
+            environment["ONYX_LIVE_QWEN_COMPATIBILITY_PROBE_TEST"] == "1",
+            "Set ONYX_LIVE_QWEN_COMPATIBILITY_PROBE_TEST=1 to run the live vLLM Responses compatibility check."
+        )
+
+        let connection = try await configuredConnection(environment: environment)
+        try XCTSkipUnless(
+            connection.authMode == .none,
+            "The focused live probe only accepts a credential-free local endpoint."
+        )
+        let record = try await OpenAICompatibleResponsesCompatibilityProbe(
+            credentialStore: InMemoryCredentialStore()
+        ).probe(
+            connection: connection,
+            modelID: try modelID(connection)
+        )
+
+        XCTAssertEqual(
+            record.outcome,
+            .compatible(.init(
+                usedServerSentEvents: true,
+                receivedFunctionCall: true,
+                submittedCorrelatedOutput: true,
+                completedAfterFunctionOutput: true
+            ))
+        )
+    }
+
     func testConfiguredVLLMProjectAgentCanCreateAndVerifyMarkerFile() async throws {
         let environment = ProcessInfo.processInfo.environment
         try XCTSkipUnless(
@@ -62,14 +96,17 @@ final class OpenAICompatibleAdaptiveRuntimeLiveTests: XCTestCase {
         ]
         let agentFactory = OpenAICompatibleAgentRuntimeFactory(
             credentialStore: credentialStore,
-            runtimeFactory: { [appURL, applicationSupportURL, runtimeEnvironment] binding in
+            runtimeFactory: { [appURL, applicationSupportURL, runtimeEnvironment] binding, handler in
                 let launchConfiguration = try CodexRuntimeLaunchConfiguration.production(
                     bundleURL: appURL,
                     userApplicationSupportURL: applicationSupportURL,
                     inheritedEnvironment: runtimeEnvironment,
                     modelProvider: binding
                 )
-                return CodexRuntime(launchConfiguration: launchConfiguration)
+                return CodexRuntime(
+                    launchConfiguration: launchConfiguration,
+                    dynamicToolHandler: handler
+                )
             }
         )
         let runtime = OpenAICompatibleAdaptiveRuntime(

@@ -68,13 +68,11 @@ enum KnownOpenAICompatibleModelProfile: Equatable, Sendable {
         let normalized = modelID
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
-        let name = normalized.split(separator: "/").last.map(String.init) ?? normalized
-        let qwen38Prefixes = ["qwen3.8", "qwen3-8", "qwen3_8"]
-        if qwen38Prefixes.contains(where: { prefix in
-            name == prefix
-                || name.hasPrefix("\(prefix)-")
-                || name.hasPrefix("\(prefix)_")
-        }) {
+        // This fallback intentionally names only the deployed model whose
+        // request contract Onyx has exercised end to end. Similar-looking
+        // Qwen variants (for example VL models) must provide their own
+        // capability metadata until separately verified.
+        if normalized == "qwen/qwen3.8-27b-fp8" {
             return .qwen38
         }
         return nil

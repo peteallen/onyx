@@ -1504,7 +1504,8 @@ enum CodexProjection {
                 updatedAt: timestamp,
                 destination: RuntimeCollaborationAgentDestination(
                     connectionID: .codexDefault,
-                    threadID: agentID
+                    threadID: agentID,
+                    inheritsParentConnection: true
                 )
             )
         }
@@ -1569,7 +1570,8 @@ enum CodexProjection {
             updatedAt: timestamp,
             destination: RuntimeCollaborationAgentDestination(
                 connectionID: .codexDefault,
-                threadID: agentID
+                threadID: agentID,
+                inheritsParentConnection: true
             )
         )
         let title: String = switch action {

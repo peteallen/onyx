@@ -1,5 +1,15 @@
 import Foundation
 
+/// App-server call IDs are only unique within one provider/thread stream.
+/// Onyx can host several provider runtimes behind one broker, so every
+/// internal cancellation, capacity, and coordinator identity must retain the
+/// parent scope instead of trusting a model-authored call ID globally.
+private struct OnyxDelegationCallKey: Hashable, Sendable {
+    let parentConnectionID: ProviderConnectionID
+    let parentThreadID: String
+    let callID: String
+}
+
 /// Credential-free provider and model snapshot consumed by the delegation
 /// broker. Production composition should build this from the current saved
 /// connections and cached/live model catalogs. Endpoints, headers, and
@@ -25,6 +35,7 @@ enum OnyxDelegationBrokerErrorCode: String, Codable, Equatable, Sendable {
     case duplicateCall = "duplicate_call"
     case providerNotConfigured = "provider_not_configured"
     case codexTargetNotAllowed = "codex_target_not_allowed"
+    case sameProviderTargetNotAllowed = "same_provider_target_not_allowed"
     case modelNotAvailable = "model_not_available"
     case textInputNotSupported = "text_input_not_supported"
     case reasoningEffortNotSupported = "reasoning_effort_not_supported"
@@ -119,9 +130,19 @@ actor OnyxDelegationBroker: CodexDynamicToolHandler {
 
     private var coordinator: DelegationCoordinator?
     private var coordinatorConfiguration: [DelegationProviderConfiguration] = []
-    private var activeJobs: [String: ActiveJob] = [:]
-    private var acceptedCallIDs: Set<String> = []
-    private var acceptedCallIDOrder: [String] = []
+    private var activeJobs: [OnyxDelegationCallKey: ActiveJob] = [:]
+    /// A call can wait for the app-wide capacity gate before a coordinator
+    /// handle exists. Retain its opaque scheduler token for that interval so
+    /// cancellation can address exactly one scoped invocation.
+    private var jobIDsByCallKey: [OnyxDelegationCallKey: DelegationJobID] = [:]
+    /// Duplicate-call history is deliberately bounded, but an invocation that
+    /// is still resolving its catalog or waiting for capacity must remain
+    /// reserved for its exact parent scope. Without this separate reservation,
+    /// evicting an old key could admit a second call and overwrite the first
+    /// call's cancellation mapping while its provider work was still running.
+    private var inFlightCallKeys: Set<OnyxDelegationCallKey> = []
+    private var acceptedCallIDs: Set<OnyxDelegationCallKey> = []
+    private var acceptedCallIDOrder: [OnyxDelegationCallKey] = []
 
     init(
         maxConcurrentJobs: Int = 2,
@@ -137,10 +158,40 @@ actor OnyxDelegationBroker: CodexDynamicToolHandler {
         capacity = DelegationCapacityLimiter(limit: boundedConcurrency)
     }
 
+    /// Returns a lightweight provider-scoped facade suitable for runtime
+    /// construction from a synchronous composition root. Creating the facade
+    /// does not read broker state; its async calls hop to this actor later.
+    nonisolated func scopedHandler(
+        parentConnectionID: ProviderConnectionID
+    ) -> any CodexDynamicToolHandler {
+        OnyxScopedDelegationHandler(
+            broker: self,
+            parentConnectionID: parentConnectionID
+        )
+    }
+
     func handleDynamicToolCall(
         _ call: CodexDynamicToolCall
     ) async throws -> CodexDynamicToolResult {
-        let payload = await handle(call)
+        try await handleDynamicToolCall(
+            call,
+            parentConnectionID: .codexDefault
+        )
+    }
+
+    /// Executes a dynamic-tool call on behalf of a provider-scoped parent.
+    /// The app-server wire call intentionally remains provider-neutral; the
+    /// composition root supplies this identity when it installs the handler
+    /// into a non-Codex runtime. Keeping the parent outside model-authored
+    /// arguments prevents a child from impersonating another provider.
+    func handleDynamicToolCall(
+        _ call: CodexDynamicToolCall,
+        parentConnectionID: ProviderConnectionID
+    ) async throws -> CodexDynamicToolResult {
+        let payload = await handle(
+            call,
+            parentConnectionID: parentConnectionID
+        )
         return CodexDynamicToolResult(
             text: payload.compactJSONString,
             success: payload.success
@@ -148,6 +199,18 @@ actor OnyxDelegationBroker: CodexDynamicToolHandler {
     }
 
     func dynamicToolDefinition() async -> CodexDynamicToolDefinition {
+        // The unscoped handler is the native Codex parent. Never advertise a
+        // Codex target to Codex itself; generic parents use the scoped facade
+        // below to expose Codex as a valid cross-provider destination.
+        await dynamicToolDefinition(excluding: .codexDefault)
+    }
+
+    /// Builds a definition for one provider-scoped parent. A parent must not
+    /// be offered itself as a target: recursive self-delegation would consume
+    /// the same runtime's capacity without crossing a provider boundary.
+    func dynamicToolDefinition(
+        excluding parentConnectionID: ProviderConnectionID?
+    ) async -> CodexDynamicToolDefinition {
         let configurations: [DelegationProviderConfiguration]
         do {
             configurations = try normalizedConfigurations(
@@ -158,7 +221,9 @@ actor OnyxDelegationBroker: CodexDynamicToolHandler {
         }
 
         let advertisedProviders = Array(
-            configurations.prefix(Self.maximumAdvertisedProviders)
+            configurations
+                .filter { $0.connectionID != parentConnectionID }
+                .prefix(Self.maximumAdvertisedProviders)
         )
         let providerIDs = advertisedProviders.map(\.connectionID.rawValue)
         var seenModels: Set<String> = []
@@ -252,20 +317,56 @@ actor OnyxDelegationBroker: CodexDynamicToolHandler {
         callID: String,
         reason: DelegationCancellationReason = .parent
     ) async -> Bool {
-        let cancelledQueued = await capacity.cancel(callID: callID)
-        guard let active = activeJobs[callID] else { return cancelledQueued }
+        // Compatibility convenience for callers that only have the legacy
+        // Codex call ID. If multiple provider scopes share that ID, fail
+        // closed rather than cancelling an arbitrary parent's work.
+        let candidates = jobIDsByCallKey.compactMap { key, jobID in
+            key.callID == callID ? (key, jobID) : nil
+        }
+        guard candidates.count == 1 else { return false }
+        let (key, jobID) = candidates[0]
+        return await cancel(callKey: key, jobID: jobID, reason: reason)
+    }
+
+    @discardableResult
+    func cancel(
+        call: CodexDynamicToolCall,
+        parentConnectionID: ProviderConnectionID,
+        reason: DelegationCancellationReason = .parent
+    ) async -> Bool {
+        let key = OnyxDelegationCallKey(
+            parentConnectionID: parentConnectionID,
+            parentThreadID: call.threadID,
+            callID: call.callID
+        )
+        guard let jobID = jobIDsByCallKey[key] else { return false }
+        return await cancel(callKey: key, jobID: jobID, reason: reason)
+    }
+
+    private func cancel(
+        callKey: OnyxDelegationCallKey,
+        jobID: DelegationJobID,
+        reason: DelegationCancellationReason
+    ) async -> Bool {
+        let cancelledFromCapacity = await capacity.cancel(jobID: jobID)
+        guard let active = activeJobs[callKey], active.jobID == jobID else {
+            return cancelledFromCapacity
+        }
         do {
             let disposition = try await active.coordinator.cancel(
-                active.jobID,
+                jobID,
                 reason: reason
             )
-            return disposition != .alreadyTerminal || cancelledQueued
+            return disposition != .alreadyTerminal || cancelledFromCapacity
         } catch {
-            return cancelledQueued
+            return cancelledFromCapacity
         }
     }
 
-    private func handle(_ call: CodexDynamicToolCall) async -> OnyxDelegationToolPayload {
+    private func handle(
+        _ call: CodexDynamicToolCall,
+        parentConnectionID: ProviderConnectionID
+    ) async -> OnyxDelegationToolPayload {
         let jobID = boundedIdentifier(call.callID) ?? "invalid"
         guard let arguments = parseArguments(call.arguments) else {
             return failure(
@@ -282,7 +383,14 @@ actor OnyxDelegationBroker: CodexDynamicToolHandler {
                 message: "The delegation call identity is invalid."
             )
         }
-        guard acceptedCallIDs.insert(call.callID).inserted else {
+        let callKey = OnyxDelegationCallKey(
+            parentConnectionID: parentConnectionID,
+            parentThreadID: call.threadID,
+            callID: call.callID
+        )
+        guard !inFlightCallKeys.contains(callKey),
+              acceptedCallIDs.insert(callKey).inserted
+        else {
             return failure(
                 jobID: jobID,
                 arguments: arguments,
@@ -290,7 +398,12 @@ actor OnyxDelegationBroker: CodexDynamicToolHandler {
                 message: "This delegation call was already submitted."
             )
         }
-        acceptedCallIDOrder.append(call.callID)
+        // Reserve the exact scoped invocation before the first await. The
+        // bounded historical ledger may evict this key while it is queued or
+        // running, but the reservation remains until this handle returns.
+        inFlightCallKeys.insert(callKey)
+        defer { inFlightCallKeys.remove(callKey) }
+        acceptedCallIDOrder.append(callKey)
         if acceptedCallIDOrder.count > Self.maximumRememberedCallIDs {
             let evicted = acceptedCallIDOrder.removeFirst()
             acceptedCallIDs.remove(evicted)
@@ -311,12 +424,20 @@ actor OnyxDelegationBroker: CodexDynamicToolHandler {
         }
 
         let connectionID = ProviderConnectionID(arguments.provider)
-        guard connectionID != .codexDefault else {
+        guard connectionID != .codexDefault || parentConnectionID != .codexDefault else {
             return failure(
                 jobID: jobID,
                 arguments: arguments,
                 code: .codexTargetNotAllowed,
                 message: "Select a configured non-Codex provider for this delegation."
+            )
+        }
+        guard connectionID != parentConnectionID else {
+            return failure(
+                jobID: jobID,
+                arguments: arguments,
+                code: .sameProviderTargetNotAllowed,
+                message: "Choose a different provider for this delegation."
             )
         }
         guard let provider = configurations.first(where: {
@@ -360,9 +481,12 @@ actor OnyxDelegationBroker: CodexDynamicToolHandler {
             )
         }
 
+        let internalJobID = DelegationJobID()
+        jobIDsByCallKey[callKey] = internalJobID
         do {
-            try await capacity.acquire(callID: call.callID)
+            try await capacity.acquire(jobID: internalJobID)
         } catch {
+            jobIDsByCallKey.removeValue(forKey: callKey)
             return failure(
                 jobID: jobID,
                 arguments: arguments,
@@ -375,12 +499,21 @@ actor OnyxDelegationBroker: CodexDynamicToolHandler {
         let payload = await withTaskCancellationHandler {
             await execute(
                 call: call,
+                parentConnectionID: parentConnectionID,
+                callKey: callKey,
+                internalJobID: internalJobID,
                 arguments: arguments,
                 reasoningEffort: reasoningEffort,
                 configurations: configurations
             )
         } onCancel: {
-            Task { await self.cancel(callID: call.callID, reason: .parent) }
+            Task {
+                await self.cancel(
+                    callKey: callKey,
+                    jobID: internalJobID,
+                    reason: .parent
+                )
+            }
         }
         await capacity.release()
         return payload
@@ -388,10 +521,14 @@ actor OnyxDelegationBroker: CodexDynamicToolHandler {
 
     private func execute(
         call: CodexDynamicToolCall,
+        parentConnectionID: ProviderConnectionID,
+        callKey: OnyxDelegationCallKey,
+        internalJobID: DelegationJobID,
         arguments: Arguments,
         reasoningEffort: String?,
         configurations: [DelegationProviderConfiguration]
     ) async -> OnyxDelegationToolPayload {
+        defer { jobIDsByCallKey.removeValue(forKey: callKey) }
         if Task.isCancelled {
             return failure(
                 jobID: call.callID,
@@ -419,9 +556,12 @@ actor OnyxDelegationBroker: CodexDynamicToolHandler {
 
         let parentModelID = boundedIdentifier(call.parentModelID) ?? "codex"
         let request = DelegationRequest(
-            id: DelegationJobID(call.callID),
+            // Provider call IDs are not globally unique. Keep an opaque
+            // Onyx-owned job ID for coordinator lineage/cancellation and use
+            // the original call ID only in the sanitized tool payload.
+            id: internalJobID,
             parentAgent: DelegationAgentIdentity(
-                connectionID: .codexDefault,
+                connectionID: parentConnectionID,
                 modelID: parentModelID,
                 agentID: "parent"
             ),
@@ -437,17 +577,20 @@ actor OnyxDelegationBroker: CodexDynamicToolHandler {
 
         do {
             let handle = try await selectedCoordinator.submit(request)
-            activeJobs[call.callID] = ActiveJob(
+            activeJobs[callKey] = ActiveJob(
                 coordinator: selectedCoordinator,
                 jobID: handle.jobID
             )
             if Task.isCancelled {
                 _ = try? await selectedCoordinator.cancel(handle.jobID, reason: .parent)
             }
-            defer { activeJobs.removeValue(forKey: call.callID) }
+            defer {
+                activeJobs.removeValue(forKey: callKey)
+            }
             let result = try await selectedCoordinator.result(for: handle.jobID)
             return success(
                 result,
+                externalJobID: call.callID,
                 arguments: arguments,
                 reasoningEffort: reasoningEffort
             )
@@ -554,7 +697,7 @@ actor OnyxDelegationBroker: CodexDynamicToolHandler {
     ) throws -> [DelegationProviderConfiguration] {
         var seenConnections: Set<ProviderConnectionID> = []
         var normalized: [DelegationProviderConfiguration] = []
-        for provider in values where provider.connectionID != .codexDefault {
+        for provider in values {
             guard boundedIdentifier(provider.connectionID.rawValue) != nil,
                   seenConnections.insert(provider.connectionID).inserted
             else { throw BrokerCatalogError.invalid }
@@ -577,6 +720,7 @@ actor OnyxDelegationBroker: CodexDynamicToolHandler {
 
     private func success(
         _ result: DelegationResult,
+        externalJobID: String,
         arguments: Arguments,
         reasoningEffort: String?
     ) -> OnyxDelegationToolPayload {
@@ -591,7 +735,7 @@ actor OnyxDelegationBroker: CodexDynamicToolHandler {
         }
         return OnyxDelegationToolPayload(
             success: true,
-            jobID: result.jobID.rawValue,
+            jobID: externalJobID,
             providerConnectionID: arguments.provider,
             model: arguments.model,
             reasoningEffort: reasoningEffort,
@@ -647,6 +791,36 @@ actor OnyxDelegationBroker: CodexDynamicToolHandler {
     private enum BrokerCatalogError: Error { case invalid }
 }
 
+/// Provider-scoped view of the app-owned delegation broker. The generic
+/// OpenAI-compatible agent lane uses this wrapper when it constructs its
+/// pinned app-server runtime; no provider identity is inferred from a model's
+/// tool arguments or from the custom model-provider ID.
+struct OnyxScopedDelegationHandler: CodexDynamicToolHandler {
+    private let broker: OnyxDelegationBroker
+    private let parentConnectionID: ProviderConnectionID
+
+    init(
+        broker: OnyxDelegationBroker,
+        parentConnectionID: ProviderConnectionID
+    ) {
+        self.broker = broker
+        self.parentConnectionID = parentConnectionID
+    }
+
+    func dynamicToolDefinition() async -> CodexDynamicToolDefinition {
+        await broker.dynamicToolDefinition(excluding: parentConnectionID)
+    }
+
+    func handleDynamicToolCall(
+        _ call: CodexDynamicToolCall
+    ) async throws -> CodexDynamicToolResult {
+        try await broker.handleDynamicToolCall(
+            call,
+            parentConnectionID: parentConnectionID
+        )
+    }
+}
+
 /// Resolves the current app-shared runtime at execution time, after the broker
 /// has validated the request against a credential-free catalog snapshot.
 private struct ResolvingAgentRuntimeDelegationExecutor: DelegationExecutor {
@@ -690,7 +864,7 @@ private struct ResolvingAgentRuntimeDelegationExecutor: DelegationExecutor {
 /// generations from exceeding the configured global concurrency limit.
 private actor DelegationCapacityLimiter {
     private struct Waiter {
-        let callID: String
+        let jobID: DelegationJobID
         let continuation: CheckedContinuation<Void, any Error>
     }
 
@@ -703,7 +877,7 @@ private actor DelegationCapacityLimiter {
         self.limit = max(1, limit)
     }
 
-    func acquire(callID: String) async throws {
+    func acquire(jobID: DelegationJobID) async throws {
         if Task.isCancelled { throw CancellationError() }
         if active < limit {
             active += 1
@@ -716,7 +890,10 @@ private actor DelegationCapacityLimiter {
                 if Task.isCancelled {
                     continuation.resume(throwing: CancellationError())
                 } else {
-                    waiters[id] = Waiter(callID: callID, continuation: continuation)
+                    waiters[id] = Waiter(
+                        jobID: jobID,
+                        continuation: continuation
+                    )
                     order.append(id)
                 }
             }
@@ -736,8 +913,8 @@ private actor DelegationCapacityLimiter {
     }
 
     @discardableResult
-    func cancel(callID: String) -> Bool {
-        guard let id = order.first(where: { waiters[$0]?.callID == callID }) else {
+    func cancel(jobID: DelegationJobID) -> Bool {
+        guard let id = order.first(where: { waiters[$0]?.jobID == jobID }) else {
             return false
         }
         cancel(id: id)

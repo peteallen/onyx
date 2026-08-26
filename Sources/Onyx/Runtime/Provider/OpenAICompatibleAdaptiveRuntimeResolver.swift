@@ -447,23 +447,50 @@ struct OpenAICompatibleAgentRuntimeFactory: Sendable {
         ProviderBearerCredential?
     ) async throws -> OpenAICompatibleAgentProxyLease
     typealias RuntimeFactory = @Sendable (
+        CodexRuntimeModelProviderBinding,
+        (any CodexDynamicToolHandler)?
+    ) throws -> any AgentRuntime
+    typealias LegacyRuntimeFactory = @Sendable (
         CodexRuntimeModelProviderBinding
     ) throws -> any AgentRuntime
 
     private let credentialStore: any CredentialStore
+    private let dynamicToolHandler: (any CodexDynamicToolHandler)?
     private let proxyFactory: ProxyFactory
     private let runtimeFactory: RuntimeFactory
 
     init(
         credentialStore: any CredentialStore = KeychainCredentialStore(),
+        dynamicToolHandler: (any CodexDynamicToolHandler)? = nil,
         proxyFactory: @escaping ProxyFactory = OpenAICompatibleAgentRuntimeFactory.productionProxy,
-        runtimeFactory: @escaping RuntimeFactory = { binding in
-            try CodexRuntime.makeDefault(modelProvider: binding)
+        runtimeFactory: @escaping RuntimeFactory = { binding, handler in
+            try CodexRuntime.makeDefault(
+                modelProvider: binding,
+                dynamicToolHandler: handler
+            )
         }
     ) {
         self.credentialStore = credentialStore
+        self.dynamicToolHandler = dynamicToolHandler
         self.proxyFactory = proxyFactory
         self.runtimeFactory = runtimeFactory
+    }
+
+    /// Source-compatible seam for focused integrations that only need to
+    /// capture the proxy binding. Such factories intentionally opt out of
+    /// dynamic delegation; production uses the two-argument initializer
+    /// above so the scoped broker reaches app-server.
+    init(
+        credentialStore: any CredentialStore = KeychainCredentialStore(),
+        proxyFactory: @escaping ProxyFactory = OpenAICompatibleAgentRuntimeFactory.productionProxy,
+        runtimeFactory: @escaping LegacyRuntimeFactory
+    ) {
+        self.init(
+            credentialStore: credentialStore,
+            dynamicToolHandler: nil,
+            proxyFactory: proxyFactory,
+            runtimeFactory: { binding, _ in try runtimeFactory(binding) }
+        )
     }
 
     func prepare(
@@ -491,7 +518,7 @@ struct OpenAICompatibleAgentRuntimeFactory: Sendable {
                 apiKey: proxy.disposableAPIKey,
                 stateIdentifier: identity.stateIdentifier
             )
-            let runtime = try runtimeFactory(binding)
+            let runtime = try runtimeFactory(binding, dynamicToolHandler)
             return OpenAICompatiblePreparedAgentRuntime(
                 runtime: runtime,
                 identity: identity,

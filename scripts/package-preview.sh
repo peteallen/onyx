@@ -8,6 +8,41 @@ prepared_app="$repo_root/dist-preview/.Onyx Preview.prepared.$$.app"
 preview_bundle_identifier="app.onyx.preview"
 preview_display_name="Onyx Preview"
 preview_build_number="$(/bin/date -u +%Y%m%d%H%M%S)"
+preview_source_revision="$(/usr/bin/git -C "$repo_root" rev-parse HEAD 2>/dev/null)" || {
+  print -u2 -- "package-preview: could not resolve the repository HEAD for provenance"
+  exit 1
+}
+[[ "$preview_source_revision" =~ '^[0-9a-f]{40}$' ]] || {
+  print -u2 -- "package-preview: repository HEAD is not a full commit SHA: $preview_source_revision"
+  exit 1
+}
+
+# The bundle records a commit SHA as an exact source-provenance claim. A dirty
+# checkout would compile files that are not represented by that SHA, and the
+# resulting preview would look trustworthy while actually being unreproducible.
+# Pete's unrelated document/artifact files may remain untracked in this
+# checkout, so only build-input paths are considered here. Check both ends of
+# packaging to catch edits made while Swift is compiling.
+assert_source_clean() {
+  local current_revision tracked_changes untracked_inputs
+  current_revision="$(/usr/bin/git -C "$repo_root" rev-parse HEAD 2>/dev/null)" || \
+    die "could not re-read repository HEAD while checking preview provenance"
+  [[ "$current_revision" == "$preview_source_revision" ]] || \
+    die "repository HEAD changed while packaging; refusing to stamp stale provenance"
+  if /usr/bin/git -C "$repo_root" diff-index --quiet HEAD -- \
+      Package.swift Package.resolved Sources support scripts >/dev/null 2>&1; then
+    tracked_changes=0
+  else
+    tracked_changes=$?
+  fi
+  if (( tracked_changes != 0 )); then
+    die "tracked build inputs changed; commit or stash them before packaging a revisioned preview"
+  fi
+  untracked_inputs="$(/usr/bin/git -C "$repo_root" ls-files --others --exclude-standard -- \
+    Package.swift Package.resolved Sources support scripts 2>/dev/null)"
+  [[ -z "$untracked_inputs" ]] ||
+    die "untracked build inputs would make the embedded revision inaccurate: ${(j:, :)${(f)untracked_inputs}}"
+}
 # Keep the local preview tied to the certificate that already owns its macOS
 # privacy grants. An explicit environment override remains available for a
 # different machine or a rotated development certificate; silently choosing
@@ -112,6 +147,8 @@ fi
 [[ ! -L "$preview_app" && ! -L "$preview_executable" ]] || \
   die "refusing to operate through a symbolic link: $preview_app"
 
+assert_source_clean
+
 pid_owns_preview_executable() {
   local preview_pid="$1"
   [[ "$(lsof_pids_or_die -a -p "$preview_pid" -d txt -t -- \
@@ -124,6 +161,7 @@ package_arguments=(
   --display-name "$preview_display_name"
   --bundle-id "$preview_bundle_identifier"
   --build-number "$preview_build_number"
+  --source-revision "$preview_source_revision"
 )
 if [[ -n "$signing_identity" ]]; then
   package_arguments+=(--signing-identity "$signing_identity" --no-signing-timestamp)
@@ -142,6 +180,12 @@ fi
 [[ "$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - \
   "$prepared_app/Contents/Info.plist")" == "$preview_bundle_identifier" ]] || \
   die "packaged preview bundle identifier changed"
+bundle_source_revision="$(/usr/bin/plutil -extract OnyxSourceRevision raw -o - \
+  "$prepared_app/Contents/Info.plist" 2>/dev/null)" || \
+  die "packaged preview source revision is missing"
+[[ "$bundle_source_revision" == "$preview_source_revision" ]] || \
+  die "packaged preview source revision changed"
+assert_source_clean
 
 if [[ -n "$signing_identity" && "$signing_identity" != "-" ]]; then
   code_signature_details="$(/usr/bin/codesign -dvv "$prepared_app" 2>&1)"

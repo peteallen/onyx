@@ -83,6 +83,48 @@ final class OpenAICompatibleChatTransportTests: XCTestCase {
         XCTAssertNil(payload["chat_template_kwargs"])
     }
 
+    func testNonStreamingResponseIsBoundedBeforeJSONDecoding() async throws {
+        MockChatURLProtocol.configure { _ in
+            .json(
+                statusCode: 200,
+                body: String(repeating: "x", count: 4_096)
+            )
+        }
+        let transport = try OpenAICompatibleChatTransport(
+            endpoint: URL(string: "https://provider.example/v1")!,
+            session: makeMockSession(),
+            maximumResponseBytes: 256
+        )
+
+        do {
+            _ = try await transport.complete(makeRequest(stream: false))
+            XCTFail("An oversized non-streaming response must be rejected")
+        } catch let error as OpenAICompatibleChatTransportError {
+            XCTAssertEqual(error, .responseTooLarge)
+        }
+    }
+
+    func testStreamingHTTPErrorBodyUsesConfiguredResponseLimit() async throws {
+        MockChatURLProtocol.configure { _ in
+            .json(
+                statusCode: 502,
+                body: String(repeating: "x", count: 4_096)
+            )
+        }
+        let transport = try OpenAICompatibleChatTransport(
+            endpoint: URL(string: "https://provider.example/v1")!,
+            session: makeMockSession(),
+            maximumResponseBytes: 256
+        )
+
+        do {
+            for try await _ in transport.stream(makeRequest(stream: true)) {}
+            XCTFail("An oversized streamed HTTP error must be rejected")
+        } catch let error as OpenAICompatibleChatTransportError {
+            XCTAssertEqual(error, .responseTooLarge)
+        }
+    }
+
     func testNonStreamingDecodesNullContentAndMultipleToolCalls() async throws {
         MockChatURLProtocol.configure { _ in
             .json(
@@ -267,6 +309,27 @@ final class OpenAICompatibleChatTransportTests: XCTestCase {
         XCTAssertEqual(chunks[3].choices[0].delta.content, "Final answer")
         XCTAssertFalse(chunks[3].choices[0].delta.hasReasoning)
         XCTAssertEqual(chunks[3].choices[0].finishReason, "stop")
+    }
+
+    func testStreamingResponseHasAnAggregateByteLimitAcrossEvents() async throws {
+        let event = Data(
+            "data: {\"choices\":[]}\n\n".utf8
+        )
+        MockChatURLProtocol.configure { _ in
+            .eventStream(chunks: [event, event, event])
+        }
+        let transport = try OpenAICompatibleChatTransport(
+            endpoint: URL(string: "https://provider.example/v1")!,
+            session: makeMockSession(),
+            maximumResponseBytes: event.count * 2
+        )
+
+        do {
+            for try await _ in transport.stream(makeRequest(stream: true)) {}
+            XCTFail("An unbounded SSE response must be rejected")
+        } catch let error as OpenAICompatibleChatTransportError {
+            XCTAssertEqual(error, .responseTooLarge)
+        }
     }
 
     func testStreamingAccumulatesFragmentedInterleavedToolCallsByIndex() async throws {

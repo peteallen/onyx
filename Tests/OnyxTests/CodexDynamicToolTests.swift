@@ -59,6 +59,30 @@ final class CodexDynamicToolTests: XCTestCase {
         XCTAssertNil(request.params["dynamicTools"])
     }
 
+    func testDelegatedChildThreadExplicitlyDisablesDynamicTools() async throws {
+        let handler = RecordingDynamicToolHandler(
+            behavior: .result(.succeeded("unused"))
+        )
+        let transport = DynamicToolCodexTransport()
+        let runtime = CodexRuntime(client: transport, dynamicToolHandler: handler)
+
+        _ = try await runtime.startThread(
+            StartThreadRequest(
+                cwd: "/tmp/onyx",
+                model: "gpt-child",
+                allowsDynamicTools: false
+            )
+        )
+
+        let recordedRequests = await transport.recordedRequests()
+        let request = try XCTUnwrap(
+            recordedRequests.first(where: { $0.method == "thread/start" })
+        )
+        XCTAssertNil(request.params["dynamicTools"])
+        let definitionRequestCount = await handler.definitionRequestCount()
+        XCTAssertEqual(definitionRequestCount, 0)
+    }
+
     func testRecognizedToolCallForwardsSanitizedEnvelopeAndReturnsSuccessWithoutNotice() async throws {
         let handler = RecordingDynamicToolHandler(
             behavior: .result(.succeeded("{\"type\":\"onyx_delegation_result\",\"success\":true}"))

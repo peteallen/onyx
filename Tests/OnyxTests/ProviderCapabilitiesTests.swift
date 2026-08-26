@@ -142,6 +142,21 @@ final class ProviderCapabilitiesTests: XCTestCase {
         ]))
         XCTAssertTrue(nearMatch.capabilities.reasoningEfforts.isEmpty)
         XCTAssertTrue(nearMatch.capabilityEvidence.isUnknown)
+
+        for unverifiedVariant in [
+            "acme/Qwen3.8-27B-FP8",
+            "Qwen/Qwen3.8-VL",
+            "Qwen/Qwen3-8-27B-FP8",
+        ] {
+            let model = try ProviderModelDescriptor.openRouter(from: .object([
+                "id": .string(unverifiedVariant),
+                "owned_by": .string("vllm"),
+            ]))
+            XCTAssertTrue(
+                model.capabilities.reasoningEfforts.isEmpty,
+                "Unverified lookalike unexpectedly inherited Qwen request controls: \(unverifiedVariant)"
+            )
+        }
     }
 
     func testSparseQwen38CatalogUsesVerifiedFamilyReasoningProfile() throws {

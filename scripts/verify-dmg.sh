@@ -9,6 +9,7 @@ expected_app_name=""
 expected_bundle_identifier=""
 expected_version=""
 expected_build_number=""
+expected_source_revision=""
 require_notarized=0
 require_universal=0
 probe_runtime=0
@@ -25,6 +26,7 @@ Options:
   --bundle-id IDENTIFIER      Expected CFBundleIdentifier.
   --version VERSION           Expected CFBundleShortVersionString.
   --build-number NUMBER       Expected CFBundleVersion.
+  --source-revision SHA       Expected embedded 40-character source commit.
   --require-universal         Require arm64 and x86_64 executable slices.
   --require-notarized         Require a stapled ticket and Gatekeeper acceptance.
   --probe-runtime             Start the verified bundled helper from the mounted image.
@@ -63,6 +65,11 @@ while (( $# > 0 )); do
     --build-number)
       require_value "$1" "${2:-}"
       expected_build_number="$2"
+      shift 2
+      ;;
+    --source-revision)
+      require_value "$1" "${2:-}"
+      expected_source_revision="$2"
       shift 2
       ;;
     --require-notarized)
@@ -186,6 +193,7 @@ verify_plist_value() {
 verify_plist_value CFBundleIdentifier "$expected_bundle_identifier" "bundle identifier"
 verify_plist_value CFBundleShortVersionString "$expected_version" "version"
 verify_plist_value CFBundleVersion "$expected_build_number" "build number"
+verify_plist_value OnyxSourceRevision "$expected_source_revision" "source revision"
 
 executable_architectures="$(/usr/bin/lipo -archs "$executable_path")"
 if (( require_universal == 1 )); then

@@ -102,6 +102,75 @@ final class OnyxApplicationHostDelegationCompositionTests: XCTestCase {
         )
     }
 
+    func testHostInstallsScopedBrokerIntoGenericProviderRuntime() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanUp() }
+
+        _ = fixture.host.makeWindowModel(
+            for: WorkspaceWindowID(providerConnectionID: fixture.providerID)
+        )
+
+        XCTAssertEqual(fixture.probe.providerConnectionIDs, [fixture.providerID])
+        XCTAssertTrue(
+            fixture.probe.providerHandlerWasPassed,
+            "A generic provider agent runtime must receive the scoped Onyx delegation handler"
+        )
+        let handler = try XCTUnwrap(fixture.probe.providerHandler)
+        let definition = await handler.dynamicToolDefinition()
+        XCTAssertEqual(
+            definition.inputSchema["properties"]?["provider"]?["enum"]?
+                .arrayValue?.compactMap(\.stringValue),
+            [ProviderConnectionID.codexDefault.rawValue]
+        )
+        XCTAssertEqual(
+            definition.inputSchema["properties"]?["model"]?["enum"]?
+                .arrayValue?.compactMap(\.stringValue),
+            [HostDelegationCodexRuntime.modelID]
+        )
+    }
+
+    func testGenericDefinitionResolvesCodexOnDemandOnceWithoutConnectingGenericRuntime() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanUp() }
+
+        _ = fixture.host.makeWindowModel(
+            for: WorkspaceWindowID(providerConnectionID: fixture.providerID)
+        )
+        let handler = try XCTUnwrap(fixture.probe.providerHandler)
+
+        let initialProviderConnectCount = await fixture.providerRuntime.connectCount()
+        XCTAssertEqual(initialProviderConnectCount, 0)
+        XCTAssertEqual(fixture.probe.codexConnectCount, 0)
+
+        _ = await handler.dynamicToolDefinition()
+
+        let firstProviderConnectCount = await fixture.providerRuntime.connectCount()
+        XCTAssertEqual(
+            firstProviderConnectCount,
+            0,
+            "Building a delegation definition must use the saved generic catalog, not connect its runtime"
+        )
+        XCTAssertEqual(
+            fixture.probe.codexConnectCount,
+            1,
+            "Codex discovery is an explicit, demand-scoped connection for the cross-provider target"
+        )
+
+        _ = await handler.dynamicToolDefinition()
+
+        let secondProviderConnectCount = await fixture.providerRuntime.connectCount()
+        XCTAssertEqual(
+            secondProviderConnectCount,
+            0,
+            "Repeated definition reads must not connect the generic provider"
+        )
+        XCTAssertEqual(
+            fixture.probe.codexConnectCount,
+            1,
+            "The shared Codex coordinator must reuse its cached catalog"
+        )
+    }
+
     private func makeFixture() async throws -> CompositionFixture {
         let providerID = ProviderConnectionID("local.vllm.qwen")
         let providerDisplayName = "Local Qwen"
@@ -150,14 +219,16 @@ final class OnyxApplicationHostDelegationCompositionTests: XCTestCase {
                     displayName: "Scripted Codex",
                     dynamicToolFactory: { connectionID, handler in
                         probe.recordCodex(connectionID: connectionID, handler: handler)
-                        return HostDelegationCodexRuntime()
+                        return HostDelegationCodexRuntime {
+                            probe.recordCodexConnect()
+                        }
                     }
                 ),
                 RuntimeProviderDescriptor(
                     id: providerAdapterID,
                     displayName: providerDisplayName,
-                    factory: { connectionID in
-                        probe.recordProvider(connectionID: connectionID)
+                    dynamicToolFactory: { connectionID, handler in
+                        probe.recordProvider(connectionID: connectionID, handler: handler)
                         return providerRuntime
                     }
                 ),
@@ -237,6 +308,7 @@ private final class HostDelegationCompositionProbe: @unchecked Sendable {
     private var recordedCodexConnectionIDs: [ProviderConnectionID] = []
     private var recordedProviderConnectionIDs: [ProviderConnectionID] = []
     private var recordedCodexHandler: (any CodexDynamicToolHandler)?
+    private var recordedProviderHandler: (any CodexDynamicToolHandler)?
 
     var codexConnectionIDs: [ProviderConnectionID] {
         lock.withLock { recordedCodexConnectionIDs }
@@ -246,9 +318,23 @@ private final class HostDelegationCompositionProbe: @unchecked Sendable {
         lock.withLock { recordedProviderConnectionIDs }
     }
 
+    var providerHandlerWasPassed: Bool {
+        lock.withLock { recordedProviderHandler != nil }
+    }
+
+    var providerHandler: (any CodexDynamicToolHandler)? {
+        lock.withLock { recordedProviderHandler }
+    }
+
     var codexHandler: (any CodexDynamicToolHandler)? {
         lock.withLock { recordedCodexHandler }
     }
+
+    var codexConnectCount: Int {
+        lock.withLock { recordedCodexConnectCount }
+    }
+
+    private var recordedCodexConnectCount = 0
 
     func recordCodex(
         connectionID: ProviderConnectionID,
@@ -260,19 +346,36 @@ private final class HostDelegationCompositionProbe: @unchecked Sendable {
         }
     }
 
-    func recordProvider(connectionID: ProviderConnectionID) {
-        lock.withLock { recordedProviderConnectionIDs.append(connectionID) }
+    func recordProvider(
+        connectionID: ProviderConnectionID,
+        handler: (any CodexDynamicToolHandler)?
+    ) {
+        lock.withLock {
+            recordedProviderConnectionIDs.append(connectionID)
+            recordedProviderHandler = handler
+        }
+    }
+
+    func recordCodexConnect() {
+        lock.withLock { recordedCodexConnectCount += 1 }
     }
 }
 
 private struct HostDelegationCodexRuntime: AgentRuntime {
+    static let modelID = "gpt-5.6-codex"
+    private let onConnect: @Sendable () -> Void
     let kind = AgentRuntimeKind.codex
     let events = AsyncStream<AgentRuntimeEvent> { continuation in
         continuation.finish()
     }
 
+    init(onConnect: @escaping @Sendable () -> Void = {}) {
+        self.onConnect = onConnect
+    }
+
     func connect() async throws -> RuntimeSession {
-        RuntimeSession(
+        onConnect()
+        return RuntimeSession(
             runtime: .codex,
             displayName: "Scripted Codex",
             accountLabel: nil,
@@ -284,7 +387,17 @@ private struct HostDelegationCodexRuntime: AgentRuntime {
                 requiresAuthentication: false
             ),
             availableLoginMethods: [],
-            availableModels: [],
+            availableModels: [
+                RuntimeModel(
+                    id: Self.modelID,
+                    displayName: "GPT-5.6 Codex",
+                    description: nil,
+                    isDefault: true,
+                    defaultReasoningEffort: "high",
+                    reasoningEfforts: ["low", "medium", "high"],
+                    inputModalities: [.text]
+                ),
+            ],
             capabilities: []
         )
     }

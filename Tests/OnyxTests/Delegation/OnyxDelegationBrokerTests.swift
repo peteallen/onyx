@@ -39,6 +39,147 @@ final class OnyxDelegationBrokerTests: XCTestCase {
         )
     }
 
+    func testScopedHandlerHidesItsParentAndAdvertisesOtherConfiguredProviders() async throws {
+        let otherConnectionID = ProviderConnectionID("remote.child")
+        let otherModelID = "remote-child-model"
+        let runtime = BrokerScriptedRuntime()
+        let state = BrokerTestState(
+            configurations: [
+                configuration(),
+                DelegationProviderConfiguration(
+                    connectionID: otherConnectionID,
+                    displayName: "Remote child",
+                    models: [runtimeModel(id: otherModelID, efforts: ["low"])]
+                ),
+            ],
+            runtime: runtime
+        )
+        let broker = makeBroker(state: state)
+        let handler = broker.scopedHandler(parentConnectionID: connectionID)
+
+        let definition = await handler.dynamicToolDefinition()
+        let properties = try XCTUnwrap(
+            definition.inputSchema["properties"]?.objectValue
+        )
+
+        XCTAssertEqual(
+            properties["provider"]?["enum"]?.arrayValue?.compactMap(\.stringValue),
+            [otherConnectionID.rawValue]
+        )
+        XCTAssertEqual(
+            properties["model"]?["enum"]?.arrayValue?.compactMap(\.stringValue),
+            [otherModelID]
+        )
+        XCTAssertFalse(definition.description.contains("Home Qwen"))
+        XCTAssertTrue(definition.description.contains("Remote child"))
+    }
+
+    func testScopedHandlerRejectsSameProviderBeforeRuntimeResolution() async throws {
+        let runtime = BrokerScriptedRuntime()
+        let state = BrokerTestState(
+            configurations: [configuration()],
+            runtime: runtime
+        )
+        let broker = makeBroker(state: state)
+        let handler = broker.scopedHandler(parentConnectionID: connectionID)
+
+        let result = try await handler.handleDynamicToolCall(
+            call(id: "same-provider")
+        )
+        let payload = try decodePayload(result)
+
+        XCTAssertFalse(result.success)
+        XCTAssertEqual(
+            payload["error_code"]?.stringValue,
+            OnyxDelegationBrokerErrorCode.sameProviderTargetNotAllowed.rawValue
+        )
+        XCTAssertEqual(
+            payload["error_message"]?.stringValue,
+            "Choose a different provider for this delegation."
+        )
+        let resolutionCount = await state.runtimeResolutionCount()
+        let startedRequests = await runtime.startedRequests()
+        XCTAssertEqual(resolutionCount, 0)
+        XCTAssertTrue(startedRequests.isEmpty)
+    }
+
+    func testScopedProviderParentCanDelegateToConfiguredCodexTarget() async throws {
+        let codexModelID = "gpt-child"
+        let runtime = BrokerScriptedRuntime(response: "Codex child result")
+        let state = BrokerTestState(
+            configurations: [
+                configuration(),
+                DelegationProviderConfiguration(
+                    connectionID: .codexDefault,
+                    displayName: "Codex",
+                    models: [runtimeModel(id: codexModelID, efforts: ["medium"])]
+                ),
+            ],
+            runtime: runtime
+        )
+        let broker = makeBroker(state: state)
+        let handler = broker.scopedHandler(parentConnectionID: connectionID)
+
+        let definition = await handler.dynamicToolDefinition()
+        XCTAssertEqual(
+            definition.inputSchema["properties"]?["provider"]?["enum"]?
+                .arrayValue?.compactMap(\.stringValue),
+            [ProviderConnectionID.codexDefault.rawValue]
+        )
+        let result = try await handler.handleDynamicToolCall(
+            call(
+                id: "qwen-to-codex",
+                provider: .codexDefault,
+                model: codexModelID,
+                reasoningEffort: "medium"
+            )
+        )
+        let payload = try decodePayload(result)
+
+        XCTAssertTrue(result.success)
+        XCTAssertEqual(
+            payload["provider_connection_id"]?.stringValue,
+            ProviderConnectionID.codexDefault.rawValue
+        )
+        XCTAssertEqual(payload["model"]?.stringValue, codexModelID)
+        XCTAssertEqual(payload["text"]?.stringValue, "Codex child result")
+        let startedRequests = await runtime.startedRequests()
+        XCTAssertEqual(startedRequests.first?.model, codexModelID)
+    }
+
+    func testCodexParentStillRejectsCodexTargetBeforeRuntimeResolution() async throws {
+        let codexModelID = "gpt-child"
+        let runtime = BrokerScriptedRuntime()
+        let state = BrokerTestState(
+            configurations: [
+                DelegationProviderConfiguration(
+                    connectionID: .codexDefault,
+                    displayName: "Codex",
+                    models: [runtimeModel(id: codexModelID, efforts: [])]
+                ),
+            ],
+            runtime: runtime
+        )
+        let broker = makeBroker(state: state)
+
+        let result = try await broker.handleDynamicToolCall(
+            call(
+                id: "codex-to-codex",
+                provider: .codexDefault,
+                model: codexModelID
+            )
+        )
+        let payload = try decodePayload(result)
+
+        XCTAssertFalse(result.success)
+        XCTAssertEqual(
+            payload["error_code"]?.stringValue,
+            OnyxDelegationBrokerErrorCode.codexTargetNotAllowed.rawValue
+        )
+        let resolutionCount = await state.runtimeResolutionCount()
+        XCTAssertEqual(resolutionCount, 0)
+    }
+
     func testSuccessfulCallRunsReadOnlyWithoutApprovalsAndReturnsClickableMetadata() async throws {
         let runtime = BrokerScriptedRuntime(response: "A concise delegated answer.")
         let state = BrokerTestState(
@@ -241,6 +382,374 @@ final class OnyxDelegationBrokerTests: XCTestCase {
         XCTAssertEqual(maximumConcurrentTurns, 1)
     }
 
+    func testSameExternalCallIDAcrossProviderAndThreadScopesExecutesIndependently() async throws {
+        let firstConnection = ProviderConnectionID("local.first")
+        let secondConnection = ProviderConnectionID("local.second")
+        let firstModel = "first-model"
+        let secondModel = "second-model"
+        let firstRuntime = BrokerScriptedRuntime(response: "first response")
+        let secondRuntime = BrokerScriptedRuntime(response: "second response")
+        let state = BrokerMultiRuntimeState(
+            configurations: [
+                DelegationProviderConfiguration(
+                    connectionID: firstConnection,
+                    displayName: "First",
+                    models: [runtimeModel(id: firstModel, efforts: ["low"])]
+                ),
+                DelegationProviderConfiguration(
+                    connectionID: secondConnection,
+                    displayName: "Second",
+                    models: [runtimeModel(id: secondModel, efforts: ["low"])]
+                ),
+            ],
+            runtimes: [firstConnection: firstRuntime, secondConnection: secondRuntime]
+        )
+        let broker = OnyxDelegationBroker(
+            providerCatalogResolver: { try await state.catalog() },
+            runtimeResolver: { try await state.resolve($0) }
+        )
+        let firstCall = call(
+            id: "reused-call-id",
+            provider: firstConnection,
+            model: firstModel,
+            threadID: "first-parent"
+        )
+        let secondCall = call(
+            id: "reused-call-id",
+            provider: secondConnection,
+            model: secondModel,
+            threadID: "second-parent"
+        )
+
+        async let firstResult = broker.handleDynamicToolCall(
+            firstCall,
+            parentConnectionID: .codexDefault
+        )
+        async let secondResult = broker.handleDynamicToolCall(
+            secondCall,
+            parentConnectionID: ProviderConnectionID("generic.parent")
+        )
+        let results = try await [firstResult, secondResult]
+        let payloads = try results.map(decodePayload)
+
+        XCTAssertTrue(results.allSatisfy(\.success))
+        XCTAssertEqual(payloads.map { $0["job_id"]?.stringValue }, [
+            "reused-call-id",
+            "reused-call-id",
+        ])
+        XCTAssertEqual(payloads.map { $0["text"]?.stringValue }, [
+            "first response",
+            "second response",
+        ])
+        let firstStarts = await firstRuntime.startedRequests()
+        let secondStarts = await secondRuntime.startedRequests()
+        XCTAssertEqual(firstStarts.map(\.model), [firstModel])
+        XCTAssertEqual(secondStarts.map(\.model), [secondModel])
+    }
+
+    func testScopedCancellationDoesNotCancelAnotherSameIDCall() async throws {
+        let firstConnection = ProviderConnectionID("local.first")
+        let secondConnection = ProviderConnectionID("local.second")
+        let firstRuntime = BrokerScriptedRuntime(behavior: .blockUntilCancelled)
+        let secondRuntime = BrokerScriptedRuntime(behavior: .blockUntilCancelled)
+        let state = BrokerMultiRuntimeState(
+            configurations: [
+                DelegationProviderConfiguration(
+                    connectionID: firstConnection,
+                    displayName: "First",
+                    models: [runtimeModel(id: "first-model", efforts: ["low"])]
+                ),
+                DelegationProviderConfiguration(
+                    connectionID: secondConnection,
+                    displayName: "Second",
+                    models: [runtimeModel(id: "second-model", efforts: ["low"])]
+                ),
+            ],
+            runtimes: [firstConnection: firstRuntime, secondConnection: secondRuntime]
+        )
+        let broker = OnyxDelegationBroker(
+            maxConcurrentJobs: 2,
+            providerCatalogResolver: { try await state.catalog() },
+            runtimeResolver: { try await state.resolve($0) }
+        )
+        let firstCall = call(
+            id: "cancel-reused-id",
+            provider: firstConnection,
+            model: "first-model",
+            threadID: "first-parent"
+        )
+        let secondCall = call(
+            id: "cancel-reused-id",
+            provider: secondConnection,
+            model: "second-model",
+            threadID: "second-parent"
+        )
+        let first = Task {
+            try await broker.handleDynamicToolCall(
+                firstCall,
+                parentConnectionID: .codexDefault
+            )
+        }
+        let second = Task {
+            try await broker.handleDynamicToolCall(
+                secondCall,
+                parentConnectionID: ProviderConnectionID("generic.parent")
+            )
+        }
+        try await waitForStartedRequestCount(1, runtime: firstRuntime)
+        try await waitForStartedRequestCount(1, runtime: secondRuntime)
+
+        let cancelledFirst = await broker.cancel(
+            call: firstCall,
+            parentConnectionID: .codexDefault
+        )
+        XCTAssertTrue(cancelledFirst)
+        let firstResult = try await first.value
+        XCTAssertFalse(firstResult.success)
+        try await Task.sleep(for: .milliseconds(30))
+        let secondStarts = await secondRuntime.startedRequests()
+        XCTAssertEqual(secondStarts.count, 1)
+        let cancelledSecond = await broker.cancel(
+            call: secondCall,
+            parentConnectionID: ProviderConnectionID("generic.parent")
+        )
+        XCTAssertTrue(cancelledSecond)
+        let secondResult = try await second.value
+        XCTAssertFalse(secondResult.success)
+    }
+
+    func testLegacyCancellationFailsClosedForTwoQueuedSameIDCalls() async throws {
+        let runtime = BrokerScriptedRuntime(behavior: .blockUntilCancelled)
+        let state = BrokerTestState(
+            configurations: [configuration()],
+            runtime: runtime
+        )
+        let broker = makeBroker(state: state, maxConcurrentJobs: 1)
+
+        let blockerCall = call(id: "ambiguous-capacity-blocker")
+        let blocker = Task {
+            try await broker.handleDynamicToolCall(blockerCall)
+        }
+        try await waitForStartedRequestCount(1, runtime: runtime)
+
+        let firstQueuedCall = call(
+            id: "ambiguous-queued-call",
+            threadID: "queued-parent-one"
+        )
+        let secondQueuedCall = call(
+            id: "ambiguous-queued-call",
+            threadID: "queued-parent-two"
+        )
+        let firstQueued = Task {
+            try await broker.handleDynamicToolCall(
+                firstQueuedCall,
+                parentConnectionID: .codexDefault
+            )
+        }
+        let secondQueued = Task {
+            try await broker.handleDynamicToolCall(
+                secondQueuedCall,
+                parentConnectionID: ProviderConnectionID("generic.parent")
+            )
+        }
+
+        // Let both calls reach the capacity queue while the blocker owns the
+        // only slot. Repeat each exact call to prove admission without
+        // advancing the capacity gate; the duplicate is rejected before it
+        // can mutate the queued work.
+        try await Task.sleep(for: .milliseconds(40))
+        let firstDuplicate = try await broker.handleDynamicToolCall(
+            firstQueuedCall,
+            parentConnectionID: .codexDefault
+        )
+        let secondDuplicate = try await broker.handleDynamicToolCall(
+            secondQueuedCall,
+            parentConnectionID: ProviderConnectionID("generic.parent")
+        )
+        XCTAssertFalse(firstDuplicate.success)
+        XCTAssertFalse(secondDuplicate.success)
+        XCTAssertEqual(
+            try decodePayload(firstDuplicate)["error_code"]?.stringValue,
+            OnyxDelegationBrokerErrorCode.duplicateCall.rawValue
+        )
+        XCTAssertEqual(
+            try decodePayload(secondDuplicate)["error_code"]?.stringValue,
+            OnyxDelegationBrokerErrorCode.duplicateCall.rawValue
+        )
+        let startsBeforeLegacyCancellation = await runtime.startedRequests().count
+        XCTAssertEqual(startsBeforeLegacyCancellation, 1)
+        let legacyCancelled = await broker.cancel(callID: "ambiguous-queued-call")
+        XCTAssertFalse(legacyCancelled)
+        let startsAfterLegacyCancellation = await runtime.startedRequests().count
+        XCTAssertEqual(startsAfterLegacyCancellation, 1)
+
+        // Each scoped token must still be present after the ambiguous legacy
+        // cancellation. Cancel both while they are queued, then release the
+        // blocker so no second provider turn needs to start.
+        let firstQueuedCancelled = await broker.cancel(
+            call: firstQueuedCall,
+            parentConnectionID: .codexDefault
+        )
+        XCTAssertTrue(firstQueuedCancelled)
+        let firstResult = try await firstQueued.value
+        XCTAssertFalse(firstResult.success)
+
+        let secondQueuedCancelled = await broker.cancel(
+            call: secondQueuedCall,
+            parentConnectionID: ProviderConnectionID("generic.parent")
+        )
+        XCTAssertTrue(secondQueuedCancelled)
+        let secondResult = try await secondQueued.value
+        XCTAssertFalse(secondResult.success)
+
+        let blockerCancelled = await broker.cancel(
+            call: blockerCall,
+            parentConnectionID: .codexDefault
+        )
+        XCTAssertTrue(blockerCancelled)
+        let blockerResult = try await blocker.value
+        XCTAssertFalse(blockerResult.success)
+    }
+
+    func testLongRunningCallRemainsCancellableAfterCallHistoryEviction() async throws {
+        let runtime = BrokerScriptedRuntime(behavior: .blockUntilCancelled)
+        let state = BrokerTestState(
+            configurations: [configuration()],
+            runtime: runtime
+        )
+        let broker = makeBroker(state: state, maxConcurrentJobs: 1)
+
+        let longRunningCall = call(id: "history-eviction-live-call")
+        let running = Task {
+            try await broker.handleDynamicToolCall(longRunningCall)
+        }
+        try await waitForStartedRequestCount(1, runtime: runtime)
+
+        // These calls fail validation before acquiring capacity, but they are
+        // still admitted into the bounded duplicate-history ledger. Once the
+        // ledger rolls over, the live job's opaque cancellation token must
+        // remain addressable.
+        for index in 0 ..< OnyxDelegationBroker.maximumRememberedCallIDs {
+            let result = try await broker.handleDynamicToolCall(
+                call(
+                    id: "history-eviction-\(index)",
+                    model: "not-configured-model"
+                )
+            )
+            XCTAssertFalse(result.success)
+        }
+
+        // The bounded duplicate ledger has now evicted the original external
+        // call ID. It is nevertheless still running, so a retry must remain a
+        // duplicate and must not replace the opaque cancellation token used by
+        // the first invocation.
+        let duplicate = try await broker.handleDynamicToolCall(longRunningCall)
+        let duplicatePayload = try decodePayload(duplicate)
+        XCTAssertFalse(duplicate.success)
+        XCTAssertEqual(
+            duplicatePayload["error_code"]?.stringValue,
+            OnyxDelegationBrokerErrorCode.duplicateCall.rawValue
+        )
+
+        let longRunningCancelled = await broker.cancel(
+            call: longRunningCall,
+            parentConnectionID: .codexDefault
+        )
+        XCTAssertTrue(longRunningCancelled)
+        let result = try await running.value
+        XCTAssertFalse(result.success)
+    }
+
+    func testQueuedCallRemainsDuplicateAfterCallHistoryEviction() async throws {
+        let runtime = BrokerScriptedRuntime(behavior: .blockUntilCancelled)
+        let state = BrokerTestState(
+            configurations: [configuration()],
+            runtime: runtime
+        )
+        let broker = makeBroker(state: state, maxConcurrentJobs: 1)
+
+        let blockerCall = call(id: "queued-history-blocker")
+        let blocker = Task {
+            try await broker.handleDynamicToolCall(blockerCall)
+        }
+        try await waitForStartedRequestCount(1, runtime: runtime)
+
+        let queuedCall = call(
+            id: "queued-history-call",
+            threadID: "queued-parent"
+        )
+        let queued = Task {
+            try await broker.handleDynamicToolCall(queuedCall)
+        }
+        // The catalog await precedes the capacity wait. Once both calls have
+        // resolved their catalog, the queued call has its in-flight
+        // reservation and opaque cancellation ID even though no turn started.
+        try await waitForCatalogCallCount(2, state: state)
+
+        for index in 0 ..< OnyxDelegationBroker.maximumRememberedCallIDs {
+            let result = try await broker.handleDynamicToolCall(
+                call(
+                    id: "queued-history-eviction-\(index)",
+                    model: "not-configured-model"
+                )
+            )
+            XCTAssertFalse(result.success)
+        }
+
+        let duplicate = try await broker.handleDynamicToolCall(queuedCall)
+        let duplicatePayload = try decodePayload(duplicate)
+        XCTAssertFalse(duplicate.success)
+        XCTAssertEqual(
+            duplicatePayload["error_code"]?.stringValue,
+            OnyxDelegationBrokerErrorCode.duplicateCall.rawValue
+        )
+
+        let blockerCancelled = await broker.cancel(
+            call: blockerCall,
+            parentConnectionID: .codexDefault
+        )
+        XCTAssertTrue(blockerCancelled)
+        let blockerResult = try await blocker.value
+        XCTAssertFalse(blockerResult.success)
+        try await waitForStartedRequestCount(2, runtime: runtime)
+
+        // The queued invocation's scoped cancellation mapping must still
+        // address the original job after its history entry was evicted.
+        let queuedCancelled = await broker.cancel(
+            call: queuedCall,
+            parentConnectionID: .codexDefault
+        )
+        XCTAssertTrue(queuedCancelled)
+        let queuedResult = try await queued.value
+        XCTAssertFalse(queuedResult.success)
+    }
+
+    func testDuplicateCallIDRemainsRejectedWithinOneExactProviderThreadScope() async throws {
+        let runtime = BrokerScriptedRuntime(behavior: .blockUntilCancelled)
+        let state = BrokerTestState(
+            configurations: [configuration()],
+            runtime: runtime
+        )
+        let broker = makeBroker(state: state)
+        let original = call(id: "duplicate-in-scope")
+        let first = Task { try await broker.handleDynamicToolCall(original) }
+        try await waitForStartedRequestCount(1, runtime: runtime)
+
+        let duplicate = try await broker.handleDynamicToolCall(original)
+        let payload = try decodePayload(duplicate)
+        XCTAssertFalse(duplicate.success)
+        XCTAssertEqual(
+            payload["error_code"]?.stringValue,
+            OnyxDelegationBrokerErrorCode.duplicateCall.rawValue
+        )
+        let cancelled = await broker.cancel(
+            call: original,
+            parentConnectionID: .codexDefault
+        )
+        XCTAssertTrue(cancelled)
+        _ = try await first.value
+    }
+
     func testLiveQwenDelegationThroughProductionBrokerIsOptIn() async throws {
         let environment = ProcessInfo.processInfo.environment
         try XCTSkipUnless(
@@ -387,13 +896,15 @@ final class OnyxDelegationBrokerTests: XCTestCase {
 
     private func call(
         id: String,
+        provider: ProviderConnectionID? = nil,
         model: String? = nil,
         reasoningEffort: String? = nil,
         workingDirectory: String? = nil,
-        prompt: String = "Check the proposed approach."
+        prompt: String = "Check the proposed approach.",
+        threadID: String = "parent-thread"
     ) -> CodexDynamicToolCall {
         var arguments: [String: JSONValue] = [
-            "provider": .string(connectionID.rawValue),
+            "provider": .string((provider ?? connectionID).rawValue),
             "model": .string(model ?? modelID),
             "prompt": .string(prompt),
         ]
@@ -401,7 +912,7 @@ final class OnyxDelegationBrokerTests: XCTestCase {
             arguments["reasoningEffort"] = .string(reasoningEffort)
         }
         return CodexDynamicToolCall(
-            threadID: "parent-thread",
+            threadID: threadID,
             callID: id,
             arguments: .object(arguments),
             parentModelID: "gpt-5.6-codex",
@@ -425,6 +936,17 @@ final class OnyxDelegationBrokerTests: XCTestCase {
         }
         XCTFail("Timed out waiting for \(expected) delegated turns")
     }
+
+    private func waitForCatalogCallCount(
+        _ expected: Int,
+        state: BrokerTestState
+    ) async throws {
+        for _ in 0 ..< 200 {
+            if await state.catalogCallCount() >= expected { return }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTFail("Timed out waiting for \(expected) provider catalog reads")
+    }
 }
 
 private actor BrokerTestState {
@@ -432,6 +954,7 @@ private actor BrokerTestState {
     private let runtime: any AgentRuntime
     private var runtimeFailure: String?
     private var resolutions = 0
+    private var catalogReads = 0
 
     init(
         configurations: [DelegationProviderConfiguration],
@@ -442,7 +965,8 @@ private actor BrokerTestState {
     }
 
     func catalog() throws -> [DelegationProviderConfiguration] {
-        configurations
+        catalogReads += 1
+        return configurations
     }
 
     func resolve(_ connectionID: ProviderConnectionID) throws -> any AgentRuntime {
@@ -464,9 +988,39 @@ private actor BrokerTestState {
 
     func runtimeResolutionCount() -> Int { resolutions }
 
+    func catalogCallCount() -> Int { catalogReads }
+
     private struct TestFailure: Error {
         let message: String
         init(_ message: String) { self.message = message }
+    }
+}
+
+private actor BrokerMultiRuntimeState {
+    private let configurations: [DelegationProviderConfiguration]
+    private let runtimes: [ProviderConnectionID: any AgentRuntime]
+
+    init(
+        configurations: [DelegationProviderConfiguration],
+        runtimes: [ProviderConnectionID: any AgentRuntime]
+    ) {
+        self.configurations = configurations
+        self.runtimes = runtimes
+    }
+
+    func catalog() -> [DelegationProviderConfiguration] {
+        configurations
+    }
+
+    func resolve(_ connectionID: ProviderConnectionID) throws -> any AgentRuntime {
+        guard let runtime = runtimes[connectionID] else {
+            throw BrokerMultiRuntimeError.missingConnection
+        }
+        return runtime
+    }
+
+    private enum BrokerMultiRuntimeError: Error {
+        case missingConnection
     }
 }
 

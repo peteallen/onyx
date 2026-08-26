@@ -549,15 +549,23 @@ struct RuntimeCollaborationAgentDestination: Sendable, Hashable {
     /// visible connection. A destination retains its lane so equal provider
     /// thread strings can never navigate to the wrong backend.
     let lane: OpenAICompatibleTaskLane?
+    /// Native app-server subagents use `.codexDefault` as a provider-relative
+    /// placeholder. When app-server is hosting an adaptive provider, those
+    /// children inherit that visible provider connection. Onyx-owned
+    /// cross-provider delegation destinations are absolute and leave this
+    /// false, including when their real target is Codex.
+    let inheritsParentConnection: Bool
 
     init(
         connectionID: ProviderConnectionID,
         threadID: String,
-        lane: OpenAICompatibleTaskLane? = nil
+        lane: OpenAICompatibleTaskLane? = nil,
+        inheritsParentConnection: Bool = false
     ) {
         self.connectionID = connectionID
         self.threadID = threadID
         self.lane = lane
+        self.inheritsParentConnection = inheritsParentConnection
     }
 
     var navigableThreadID: String? {
@@ -1025,6 +1033,10 @@ struct StartThreadRequest: Sendable {
     var ephemeral = false
     var sandboxMode = RuntimeSandboxMode.workspaceWrite
     var approvalPolicy = RuntimeApprovalPolicy.onRequest
+    /// Whether a runtime may attach app-owned dynamic tools to this child.
+    /// Delegated children disable this so a delegated model cannot recursively
+    /// delegate and consume the same bounded broker capacity.
+    var allowsDynamicTools = true
 }
 
 /// Provider-neutral, ordered content supplied by the user for a turn. Runtime

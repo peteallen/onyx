@@ -187,6 +187,7 @@ enum OpenAICompatibleChatTransportError: LocalizedError, Sendable, Equatable {
     case malformedResponse
     case malformedStreamEvent
     case streamEndedBeforeDone
+    case responseTooLarge
     case networkFailure(String)
 
     var errorDescription: String? {
@@ -223,6 +224,8 @@ enum OpenAICompatibleChatTransportError: LocalizedError, Sendable, Equatable {
             "The provider returned a malformed server-sent event."
         case .streamEndedBeforeDone:
             "The provider stream ended before its completion sentinel."
+        case .responseTooLarge:
+            "The provider response exceeded Onyx's safety limit."
         case let .networkFailure(message):
             "The provider request failed: \(message)"
         }
@@ -233,9 +236,11 @@ enum OpenAICompatibleChatTransportError: LocalizedError, Sendable, Equatable {
 /// protocol. It has no conversation persistence or runtime semantics; those
 /// remain app-owned integration concerns.
 struct OpenAICompatibleChatTransport: Sendable {
+    private static let defaultMaximumResponseBytes = 64 * 1_024 * 1_024
     private let chatCompletionsURL: URL
     private let bearerToken: String?
     private let protectedSession: ProviderRedirectProtectedSession
+    private let maximumResponseBytes: Int
 
     /// - Parameters:
     ///   - endpoint: Provider base URL (for example `https://host/v1`) or the
@@ -250,7 +255,8 @@ struct OpenAICompatibleChatTransport: Sendable {
         endpoint: URL,
         bearerToken: String? = nil,
         allowsInsecureHTTP: Bool = false,
-        session: URLSession? = nil
+        session: URLSession? = nil,
+        maximumResponseBytes: Int = Self.defaultMaximumResponseBytes
     ) throws {
         guard let scheme = endpoint.scheme?.lowercased(),
               scheme == "http" || scheme == "https",
@@ -277,6 +283,7 @@ struct OpenAICompatibleChatTransport: Sendable {
 
         self.chatCompletionsURL = Self.resolveChatCompletionsURL(from: endpoint)
         self.bearerToken = token
+        self.maximumResponseBytes = max(1, maximumResponseBytes)
         self.protectedSession = ProviderRedirectProtectedSession(
             wrapping: session ?? Self.makeDefaultSession(),
             transportSecurity: allowsInsecureHTTP ? .allowInsecureHTTP : .requireTLS,
@@ -295,9 +302,16 @@ struct OpenAICompatibleChatTransport: Sendable {
 
         let request = try makeURLRequest(for: chatRequest)
         do {
-            let (data, response) = try await protectedSession.session.data(for: request)
+            let (bytes, response) = try await protectedSession.session.bytes(for: request)
             try Task.checkCancellation()
             let http = try validatedHTTPResponse(response)
+            if response.expectedContentLength > Int64(maximumResponseBytes) {
+                throw OpenAICompatibleChatTransportError.responseTooLarge
+            }
+            let data = try await Self.collect(
+                bytes: bytes,
+                maximumBytes: maximumResponseBytes
+            )
             guard (200 ..< 300).contains(http.statusCode) else {
                 throw httpError(statusCode: http.statusCode, data: data)
             }
@@ -334,6 +348,7 @@ struct OpenAICompatibleChatTransport: Sendable {
 
         let session = protectedSession.session
         let secret = bearerToken
+        let maximumResponseBytes = maximumResponseBytes
         let pair = AsyncThrowingStream.makeStream(
             of: OpenAICompatibleChatStreamEvent.self,
             throwing: (any Error).self
@@ -342,8 +357,14 @@ struct OpenAICompatibleChatTransport: Sendable {
             do {
                 let (bytes, response) = try await session.bytes(for: urlRequest)
                 let http = try Self.validatedHTTPResponse(response)
+                if response.expectedContentLength > Int64(maximumResponseBytes) {
+                    throw OpenAICompatibleChatTransportError.responseTooLarge
+                }
                 guard (200 ..< 300).contains(http.statusCode) else {
-                    let data = try await Self.collect(bytes: bytes)
+                    let data = try await Self.collect(
+                        bytes: bytes,
+                        maximumBytes: maximumResponseBytes
+                    )
                     throw Self.httpError(
                         statusCode: http.statusCode,
                         data: data,
@@ -354,8 +375,13 @@ struct OpenAICompatibleChatTransport: Sendable {
                 var parser = OpenAICompatibleSSEParser()
                 var toolCallAccumulator = OpenAICompatibleChatToolCallAccumulator()
                 var sawDone = false
+                var responseBytes = 0
                 streamLoop: for try await byte in bytes {
                     try Task.checkCancellation()
+                    guard responseBytes < maximumResponseBytes else {
+                        throw OpenAICompatibleChatTransportError.responseTooLarge
+                    }
+                    responseBytes += 1
                     for payload in try parser.append(byte) {
                         switch try Self.decodeStreamPayload(payload, redacting: secret) {
                         case let .chunk(chunk):
@@ -700,7 +726,9 @@ struct OpenAICompatibleChatTransport: Sendable {
         var data = Data()
         for try await byte in bytes {
             try Task.checkCancellation()
-            guard data.count < maximumBytes else { break }
+            guard data.count < maximumBytes else {
+                throw OpenAICompatibleChatTransportError.responseTooLarge
+            }
             data.append(byte)
         }
         return data

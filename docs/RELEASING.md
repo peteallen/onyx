@@ -11,30 +11,49 @@ The normal download is always the public
 contains the universal DMG and its matching `.dmg.sha256` checksum as direct,
 non-expiring release assets.
 
+### Install the downloaded build
+
+Quit any running Onyx before installing. Open the DMG and drag `Onyx.app` to
+`Applications`; choose **Replace** when Finder asks whether to replace an older
+copy. Merely downloading or opening the DMG does not update
+`/Applications/Onyx.app`, so launching from the old Applications copy can show
+an older interface. If Gatekeeper displays “Onyx Not Opened”, open **System
+Settings → Privacy & Security** and choose **Open Anyway** for this download, or
+Control-click the copied `/Applications/Onyx.app` and choose **Open** once. The
+public build is ad-hoc signed and intentionally not notarized, so this first-run
+warning is expected; it is separate from the future Developer ID/notarization
+gate.
+
 There are two supported ways to cut a release:
 
 1. **Actions → Release → Run workflow:** choose the `main` branch and enter the
-   three-part version from `support/Info.plist` (for example, `0.1.1`). The
-   workflow verifies that the selected commit is still the current `main` head,
-   runs the complete test/package path, and creates `v0.1.1` at that exact SHA.
+   three-part version from `support/Info.plist` (for example, `0.1.2`). For a
+   new tag, the workflow verifies that the selected commit is still the current
+   `main` head, runs the complete test/package path, and creates `v0.1.2` at
+   that exact SHA. Re-running an exact existing tag is safe while it still
+   targets that same current head; a tag from an older head is rejected rather
+   than rebuilt or moved.
 2. **Push a semver tag:** after the same checks have passed locally, push a new
-   tag such as `v0.1.1`. The tag-triggered path verifies that the tag points at
-   the event commit before publishing.
+   tag such as `v0.1.2`. The tag-triggered path verifies that the tag points at
+   both the event commit and the current `main` head before publishing.
 
 The workflow refuses to move an existing tag or replace a mismatched release. A
-retry for an exact same-SHA tag/release is safe: it rechecks the immutable tag,
-reuses the already-published release only when its source-commit note, public
-state, exact DMG/checksum pair, server digests, and downloaded checksum all
-match. The retry verifies the existing published bytes rather than comparing
-them with a newly rebuilt DMG (GitHub's run number and disk-image metadata can
-legitimately differ between runs), and fails closed for a draft, prerelease,
-wrong target, wrong source note, or wrong asset set. Manual tag creation happens
-after the verified build through the GitHub ref API, so a concurrent creator
-cannot silently retarget the release.
+retry for an exact same-SHA tag is safe while `main` remains at that SHA: it may
+create a missing release or reuse an already-published release only when its
+source-commit note, public state, exact DMG/checksum pair, server digests, and
+downloaded checksum all match. A reused release verifies the existing published
+bytes rather than comparing them with a newly rebuilt DMG
+(GitHub's run number and disk-image metadata can legitimately differ between
+runs), and fails closed for a draft, prerelease, wrong target, wrong source
+note, wrong embedded source revision, or wrong asset set. Manual tag creation
+happens after the verified build through the GitHub ref API, so a concurrent
+creator cannot silently retarget the release.
 It publishes only after the checksum and mounted DMG checks pass, and verifies
 the public release is non-draft, non-prerelease, marked latest, and contains
 exactly the expected DMG/checksum pair. The notes include the exact source
-commit.
+commit. The same commit is embedded in the app bundle and checked again when an
+existing release is reused, so a self-consistent but stale DMG cannot satisfy a
+retry.
 Public builds are ad-hoc signed and not notarized development distributions, so
 macOS may show an unidentified-developer warning.
 
@@ -50,14 +69,14 @@ scripts/fetch-codex-runtime.sh --architectures universal
 ```
 
 ```bash
-scripts/release.sh 0.1.1
+scripts/release.sh 0.1.2
 ```
 
 This builds a universal Apple Silicon + Intel release in an isolated staging
 directory, embeds the pinned Codex app-server helper, and creates:
 
-- `dist-release/Onyx-0.1.1-macOS.dmg`
-- `dist-release/Onyx-0.1.1-macOS.dmg.sha256`
+- `dist-release/Onyx-0.1.2-macOS.dmg`
+- `dist-release/Onyx-0.1.2-macOS.dmg.sha256`
 
 The app is ad-hoc signed and the DMG is unsigned when no Developer ID identity
 is configured. That is useful for local testing, but users will see the normal
@@ -91,11 +110,11 @@ universal build.
 To verify a downloaded artifact independently:
 
 ```bash
-(cd dist-release && /usr/bin/shasum -a 256 -c Onyx-0.1.1-macOS.dmg.sha256)
-scripts/verify-dmg.sh dist-release/Onyx-0.1.1-macOS.dmg \
+(cd dist-release && /usr/bin/shasum -a 256 -c Onyx-0.1.2-macOS.dmg.sha256)
+scripts/verify-dmg.sh dist-release/Onyx-0.1.2-macOS.dmg \
   --app-name Onyx.app \
   --bundle-id app.onyx.agent \
-  --version 0.1.1 \
+  --version 0.1.2 \
   --require-universal
 ```
 
@@ -111,7 +130,7 @@ then use its exact Keychain identity when building:
 
 ```bash
 ONYX_CODESIGN_IDENTITY='Developer ID Application: Example (TEAMID)' \
-scripts/release.sh 0.1.1
+scripts/release.sh 0.1.2
 ```
 
 That enables the hardened runtime and timestamps both the app and the disk
@@ -127,7 +146,7 @@ xcrun notarytool store-credentials onyx-notary \
 ONYX_CODESIGN_IDENTITY='Developer ID Application: Example (TEAMID)' \
 ONYX_NOTARIZE=1 \
 ONYX_NOTARY_PROFILE=onyx-notary \
-scripts/release.sh 0.1.1
+scripts/release.sh 0.1.2
 ```
 
 `create-dmg.sh` also supports App Store Connect API-key credentials and direct
@@ -147,11 +166,17 @@ The `CI` workflow runs on pushes to `main`, pull requests, and manual requests.
 It runs the unit suite, exercises app-packaging failure safeguards, then builds
 and mounts an unsigned release DMG as an end-to-end packaging check.
 
-The `Release` workflow accepts a semver tag push or a manual dispatch from the
-current `main` head. It builds the same verified universal DMG as the local
-script, then publishes the DMG and checksum directly as a public GitHub Release.
+The `Release` workflow accepts a semver tag push, or a manual dispatch for a
+new tag, only when the source is the current `main` head. An exact existing tag
+may be re-run while `main` remains at that same source; an older tag is not
+rebuilt or moved.
+It builds the same verified universal DMG as the local script, then publishes
+the DMG and checksum directly as a public GitHub Release.
 It has no Apple secrets and pins the Onyx display name, bundle ID, universal
 architecture, ad-hoc identity, and no-notarize mode on the command line.
+It embeds the exact source commit in `OnyxSourceRevision` and verifies that
+revision before publication and when safely reusing an existing immutable
+release.
 
 Release versions must use three numeric components because macOS stores them in
 `CFBundleShortVersionString`. GitHub's run number becomes `CFBundleVersion`.
@@ -161,8 +186,9 @@ ID/notarized workflow remains a separate hardening project.
 `scripts/check-release-automation.sh` enforces the public-release contract in
 both CI and the Release workflow. It checks immutable action pins, exact source
 and tag targeting, universal pinned-runtime packaging, direct DMG/checksum
-assets, non-draft postconditions, and the no-launch contract. Changing the
-publication policy therefore requires changing a visible, executable gate
+assets, embedded source revision, version-matched README download links,
+non-draft postconditions, and the no-launch contract. Changing the publication
+policy therefore requires changing a visible, executable gate
 together with the workflow and this document.
 
 ### Automated Developer ID release gate

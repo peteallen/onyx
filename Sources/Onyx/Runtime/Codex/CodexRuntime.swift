@@ -582,7 +582,7 @@ actor CodexRuntime: AgentRuntime {
         ]
         if let model = request.model { params["model"] = .string(model) }
         if let modelProviderID { params["modelProvider"] = .string(modelProviderID) }
-        if let dynamicToolHandler {
+        if request.allowsDynamicTools, let dynamicToolHandler {
             let definition = await dynamicToolHandler.dynamicToolDefinition()
             params["dynamicTools"] = .array([Self.dynamicToolSpecification(definition)])
         }
@@ -591,7 +591,7 @@ actor CodexRuntime: AgentRuntime {
         guard let thread = CodexProjection.thread(from: result["thread"] ?? result) else {
             throw AgentRuntimeError.missingField("thread.id")
         }
-        if dynamicToolHandler != nil {
+        if request.allowsDynamicTools, dynamicToolHandler != nil {
             dynamicToolParentContexts[thread.id] = DynamicToolParentContext(
                 modelID: request.model ?? thread.model,
                 workingDirectory: request.cwd

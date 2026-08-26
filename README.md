@@ -12,7 +12,7 @@ path and a distinct polished-stone visual language.
 Onyx is an independent, unofficial project. It is not affiliated with,
 endorsed by, or sponsored by OpenAI.
 
-> **Download the current Onyx build:** [latest macOS release](https://github.com/peteallen/onyx/releases/latest) · [universal DMG](https://github.com/peteallen/onyx/releases/download/v0.1.1/Onyx-0.1.1-macOS.dmg) · [SHA-256 checksum](https://github.com/peteallen/onyx/releases/download/v0.1.1/Onyx-0.1.1-macOS.dmg.sha256)
+> **Download the current Onyx build:** [latest macOS release](https://github.com/peteallen/onyx/releases/latest) · [universal DMG](https://github.com/peteallen/onyx/releases/download/v0.1.2/Onyx-0.1.2-macOS.dmg) · [SHA-256 checksum](https://github.com/peteallen/onyx/releases/download/v0.1.2/Onyx-0.1.2-macOS.dmg.sha256)
 
 OpenAI Codex through the bundled `codex app-server` remains the default runtime. Saved
 OpenAI-compatible connections are also available in the production workspace:
@@ -142,10 +142,19 @@ These public builds are ad-hoc signed development distributions, so macOS may
 show an unidentified-developer warning until Developer ID signing and
 notarization are added.
 
+To install the build you just downloaded, quit any running Onyx first, open the
+DMG, and drag `Onyx.app` onto `Applications`. Choose **Replace** if macOS asks;
+opening the DMG alone does not update an older `/Applications/Onyx.app`. If
+Gatekeeper says “Onyx Not Opened”, open **System Settings → Privacy & Security**
+and choose **Open Anyway** for this exact download, or Control-click the copied
+`/Applications/Onyx.app` and choose **Open** once. This release is intentionally
+ad-hoc signed and not notarized; those warnings are expected until the future
+Developer ID distribution gate is complete.
+
 Create a fully verified local DMG with one command:
 
 ```bash
-scripts/release.sh 0.1.1
+scripts/release.sh 0.1.2
 ```
 
 This produces a universal Apple Silicon + Intel disk image and SHA-256 checksum

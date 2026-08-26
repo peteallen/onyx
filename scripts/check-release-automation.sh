@@ -8,6 +8,7 @@ verify_dmg_script="$repo_root/scripts/verify-dmg.sh"
 create_dmg_script="$repo_root/scripts/create-dmg.sh"
 release_script="$repo_root/scripts/release.sh"
 readme="$repo_root/README.md"
+info_plist="$repo_root/support/Info.plist"
 
 die() {
   print -u2 -- "check-release-automation: $*"
@@ -35,6 +36,7 @@ forbid_text() {
 require_regular_file "$release_workflow"
 require_regular_file "$ci_workflow"
 require_regular_file "$readme"
+require_regular_file "$info_plist"
 for script in release.sh create-dmg.sh verify-dmg.sh; do
   script_path="$repo_root/scripts/$script"
   require_regular_file "$script_path"
@@ -48,6 +50,7 @@ verify_dmg_text="$(<"$verify_dmg_script")"
 create_dmg_text="$(<"$create_dmg_script")"
 release_script_text="$(<"$release_script")"
 readme_text="$(<"$readme")"
+declared_version="$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - "$info_plist")"
 
 # A public release may be cut either by pushing an immutable semver tag or by
 # dispatching from the current default branch. Keep the set of triggers small
@@ -92,19 +95,21 @@ done
 require_text "$release_text" "ad-hoc signed" "ad-hoc distribution disclosure"
 require_text "$release_text" "not notarized" "notarization disclosure"
 
-# Source and version gates: checkout is pinned to the event SHA, manual runs
-# are main-only, tags cannot be moved, and manual tags are created atomically
-# only after the verified artifact is ready. Exact existing tags/releases may be
-# rechecked on retry but are never replaced.
+# Source and version gates: checkout is pinned to the event SHA, every new tag
+# created from an untagged source requires the current main head at both
+# mutation boundaries, and manual tags are created atomically only after the
+# verified artifact is ready. Exact existing tags are reusable only at that
+# same current source; existing releases are rechecked, never replaced.
 for marker in \
   'ref: ${{ github.sha }}' \
   'EVENT_NAME: ${{ github.event_name }}' \
   'SOURCE_SHA: ${{ github.sha }}' \
   'refs/heads/$DEFAULT_BRANCH' \
   '[[ "$tag" =~ '\''^v[0-9]+[.][0-9]+[.][0-9]+$'\'' ]]' \
-  'git ls-remote origin "refs/heads/$DEFAULT_BRANCH"' \
+  'repos/$GITHUB_REPOSITORY/branches/$DEFAULT_BRANCH' \
   'git ls-remote --exit-code origin "refs/tags/$tag"' \
   'git rev-parse "$tag^{commit}"' \
+  '[[ "$main_sha" == "$SOURCE_SHA" ]]' \
   'support/Info.plist' \
   'checked_out_sha="$(/usr/bin/git rev-parse HEAD)"'; do
   require_text "$release_text" "$marker" "immutable source/version gate '$marker'"
@@ -147,12 +152,31 @@ require_text "$release_text" 'gh release download "$TAG"' \
   "exact-release retry asset verification"
 require_text "$release_text" 'release_reused=false' \
   "explicit exact-release retry state"
+require_text "$release_text" 'tag_created_this_run=false' \
+  "explicit preexisting-tag retry state"
+require_text "$release_text" 'tag_created_this_run=true' \
+  "new manual-tag mutation state"
+require_text "$release_text" 'if [[ "$tag_created_this_run" == "true" ]]; then' \
+  "conditional current-main release mutation gate"
 require_text "$release_text" 'if [[ "$release_reused" == "true" ]]; then' \
   "separate retry asset verification"
 require_text "$release_text" 'Existing release digest does not match' \
   "reused asset digest verification"
 require_text "$release_text" 'shasum -a 256 -c "$existing_checksum"' \
   "reused checksum pair verification"
+require_text "$release_text" 'scripts/verify-dmg.sh "$existing_dmg"' \
+  "reused DMG product verification"
+require_text "$release_text" '--source-revision "$GITHUB_SHA"' \
+  "release source revision embedding and verification"
+for marker in \
+  'assert_clean_source()' \
+  'assert_current_main()' \
+  '/usr/bin/git diff-index --quiet HEAD --' \
+  '/usr/bin/git status --porcelain --untracked-files=all' \
+  'repos/$GITHUB_REPOSITORY/branches/$DEFAULT_BRANCH' \
+  '[[ "$current_main_sha" == "$SOURCE_SHA" ]]'; do
+  require_text "$release_text" "$marker" "late release source gate '$marker'"
+done
 require_text "$release_text" 'ARTIFACT_NAME.dmg.sha256' \
   "checksum asset name"
 require_text "$release_text" 'releases/download/' "direct public DMG URL"
@@ -163,10 +187,31 @@ for forbidden in '--draft' '--target' 'gh release edit' 'gh release upload' '--c
 done
 
 artifact_gate_line="$(/usr/bin/awk '/Release DMG\/checksum pair is incomplete/ { print NR; exit }' "$release_workflow")"
+clean_assertion_line="$(/usr/bin/awk '/^[[:space:]]+assert_clean_source$/ { print NR; exit }' "$release_workflow")"
+main_assertion_lines=("${(@f)$(/usr/bin/awk '/^[[:space:]]+assert_current_main$/ { print NR }' "$release_workflow")}")
 tag_create_line="$(/usr/bin/awk '/gh api --method POST/ { print NR; exit }' "$release_workflow")"
+tag_created_line="$(/usr/bin/awk '/^[[:space:]]+tag_created_this_run=true$/ { print NR; exit }' "$release_workflow")"
+release_main_condition_line="$(/usr/bin/awk '/^[[:space:]]+if \[\[ "\$tag_created_this_run" == "true" \]\]; then$/ { print NR; exit }' "$release_workflow")"
+release_create_line="$(/usr/bin/awk '/if ! gh release create/ { print NR; exit }' "$release_workflow")"
 [[ "$artifact_gate_line" == <1-> && "$tag_create_line" == <1-> && \
+   "$tag_created_line" == <1-> && "$release_main_condition_line" == <1-> && \
+   "$release_create_line" == <1-> && \
    "$tag_create_line" -gt "$artifact_gate_line" ]] || \
   die "manual tag creation must follow the verified artifact gate"
+[[ "$clean_assertion_line" == <1-> && "$clean_assertion_line" -gt "$artifact_gate_line" ]] || \
+  die "release publication must verify the immutable checkout after the artifact gate"
+(( ${#main_assertion_lines[@]} == 2 )) || \
+  die "release publication must perform exactly two current-main mutation assertions"
+[[ "${main_assertion_lines[1]}" -lt "$tag_create_line" && \
+   "$tag_create_line" -lt "$tag_created_line" && \
+   "$tag_created_line" -lt "$release_main_condition_line" && \
+   "$release_main_condition_line" -lt "${main_assertion_lines[2]}" && \
+   "${main_assertion_lines[2]}" -lt "$release_create_line" ]] || \
+  die "current-main assertions must guard only this run's new tag/release mutation boundaries"
+(( tag_create_line - main_assertion_lines[1] <= 2 )) || \
+  die "manual tag creation must immediately follow a current-main assertion"
+(( release_create_line - main_assertion_lines[2] <= 2 )) || \
+  die "public release creation must immediately follow a current-main assertion"
 require_text "$release_text" \
   'if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then' \
   "fresh existing-release check"
@@ -195,11 +240,23 @@ for workflow_text in "$release_text" "$ci_text"; do
   require_text "$workflow_text" "--signing-identity -" "explicit ad-hoc signing"
   require_text "$workflow_text" "--no-notarize" "explicitly disabled notarization"
 done
+require_text "$ci_text" '--source-revision "$GITHUB_SHA"' \
+  "CI source revision embedding and verification"
+for script_text in "$release_script_text" "$verify_dmg_text"; do
+  require_text "$script_text" "--source-revision" \
+    "source revision packaging/verifier option"
+done
 require_text "$release_text" ".dmg" "DMG release asset"
 require_text "$release_text" ".dmg.sha256" "DMG checksum release asset"
 require_text "$readme_text" \
   "https://github.com/peteallen/onyx/releases/latest" \
   "obvious latest public download link"
+require_text "$readme_text" \
+  "https://github.com/peteallen/onyx/releases/download/v$declared_version/Onyx-$declared_version-macOS.dmg" \
+  "direct DMG link matching support/Info.plist"
+require_text "$readme_text" \
+  "https://github.com/peteallen/onyx/releases/download/v$declared_version/Onyx-$declared_version-macOS.dmg.sha256" \
+  "direct checksum link matching support/Info.plist"
 
 # Third-party actions execute in the release trust boundary. Require immutable
 # commit pins while retaining the human-readable major-version comment.

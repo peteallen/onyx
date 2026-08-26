@@ -254,9 +254,9 @@ final class OnyxApplicationHost: ObservableObject {
             coordinator = SharedRuntimeCoordinator(
                 runtime: try registry.resolve(
                     connectionID,
-                    dynamicToolHandler: connectionID == .codexDefault
-                        ? delegationBroker
-                        : nil
+                    dynamicToolHandler: delegationBroker.scopedHandler(
+                        parentConnectionID: connectionID
+                    )
                 )
             )
             resolutionError = nil
@@ -461,21 +461,39 @@ final class OnyxApplicationHost: ObservableObject {
     fileprivate func delegationProviderConfigurations() async throws
         -> [DelegationProviderConfiguration]
     {
-        try await providerConnectionStore.connections().map { record in
-            DelegationProviderConfiguration(
-                connectionID: record.id,
-                displayName: record.displayName,
-                models: Self.cachedRuntimeModels(for: record)
+        var configurations = try await providerConnectionStore.connections()
+            .filter { $0.id != .codexDefault }
+            .map { record in
+                DelegationProviderConfiguration(
+                    connectionID: record.id,
+                    displayName: record.displayName,
+                    models: Self.cachedRuntimeModels(for: record)
+                )
+            }
+        // Keep the Codex target in the same credential-free catalog as saved
+        // OpenAI-compatible providers.  A generic agent can therefore hand a
+        // bounded subtask back to the native Codex runtime without receiving
+        // its auth state or endpoint.  `connect()` is a cached read when the
+        // Codex runtime is already active (which it is for a Codex task),
+        // and is intentionally best-effort so a signed-out/failed Codex lane
+        // does not prevent other providers from delegating.
+        if let codexCoordinator = runtimeCoordinator(for: .codexDefault).coordinator,
+           let codexSession = try? await codexCoordinator.connect() {
+            configurations.insert(
+                DelegationProviderConfiguration(
+                    connectionID: .codexDefault,
+                    displayName: "Codex",
+                    models: codexSession.availableModels
+                ),
+                at: 0
             )
         }
+        return configurations
     }
 
     fileprivate func delegationRuntime(
         for connectionID: ProviderConnectionID
     ) throws -> any AgentRuntime {
-        guard connectionID != defaultConnectionID else {
-            throw AgentRuntimeError.unsupported("delegating back to the parent Codex provider")
-        }
         let resolved = runtimeCoordinator(for: connectionID)
         if let error = resolved.error { throw error }
         guard let coordinator = resolved.coordinator else {
@@ -936,14 +954,22 @@ final class OnyxApplicationHost: ObservableObject {
         do {
             let runtime: any AgentRuntime
             if registry.connections.contains(where: { $0.id == connectionID }) {
-                runtime = try registry.resolve(connectionID)
+                runtime = try registry.resolve(
+                    connectionID,
+                    dynamicToolHandler: delegationBroker.scopedHandler(
+                        parentConnectionID: connectionID
+                    )
+                )
             } else {
                 runtime = OpenAICompatibleAdaptiveRuntime(
                     connectionID: connectionID,
                     connectionStore: providerConnectionStore,
                     credentialStore: providerCredentialStore,
                     conversationStore: providerConversationStore,
-                    stateStore: providerAdaptiveStateStore
+                    stateStore: providerAdaptiveStateStore,
+                    dynamicToolHandler: delegationBroker.scopedHandler(
+                        parentConnectionID: connectionID
+                    )
                 )
             }
             let coordinator = SharedRuntimeCoordinator(runtime: runtime)

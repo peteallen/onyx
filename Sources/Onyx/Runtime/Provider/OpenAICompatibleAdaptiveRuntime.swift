@@ -195,6 +195,7 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
         conversationStore: OpenAICompatibleConversationStore = OpenAICompatibleConversationStore(),
         stateStore: OpenAICompatibleAdaptiveStateStore = OpenAICompatibleAdaptiveStateStore(),
         resolver: OpenAICompatibleAdaptiveRuntimeResolver? = nil,
+        dynamicToolHandler: (any CodexDynamicToolHandler)? = nil,
         agentFactory: OpenAICompatibleAgentRuntimeFactory? = nil,
         chatRuntime: (any AgentRuntime)? = nil
     ) {
@@ -214,7 +215,8 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
             stateStore: stateStore
         )
         self.agentFactory = agentFactory ?? OpenAICompatibleAgentRuntimeFactory(
-            credentialStore: credentialStore
+            credentialStore: credentialStore,
+            dynamicToolHandler: dynamicToolHandler
         )
         let stream = AsyncStream.makeStream(of: AgentRuntimeEvent.self)
         events = stream.stream
@@ -860,7 +862,11 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
         let lease = try await taskLease(for: id, scope: scope)
         let conversation = try await lease.runtime.readThread(id: lease.runtimeThreadID)
         try validate(scope)
-        let projected = try await publicConversation(conversation, lane: lease.owner.lane)
+        let projected = try await publicConversation(
+            conversation,
+            lane: lease.owner.lane,
+            modelID: lease.owner.modelID
+        )
         try validate(scope)
         return projected
     }
@@ -874,7 +880,11 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
         guard lease.owner.lane == .agent else {
             let conversation = try await lease.runtime.readThread(id: lease.runtimeThreadID)
             try validate(scope)
-            let projected = try await publicConversation(conversation, lane: .chat)
+            let projected = try await publicConversation(
+                conversation,
+                lane: .chat,
+                modelID: lease.owner.modelID
+            )
             try validate(scope)
             return RuntimeThreadResumeResult(
                 conversation: projected,
@@ -888,7 +898,11 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
             initialHistoryPage: initialHistoryPage
         )
         try validate(scope)
-        result.conversation = try await publicConversation(result.conversation, lane: lease.owner.lane)
+        result.conversation = try await publicConversation(
+            result.conversation,
+            lane: lease.owner.lane,
+            modelID: lease.owner.modelID
+        )
         if var page = result.initialHistoryPage {
             page.turns = try await publicTurns(page.turns, lane: lease.owner.lane)
             result.initialHistoryPage = page
@@ -902,7 +916,11 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
         let lease = try await taskLease(for: id, scope: scope)
         let conversation = try await lease.runtime.resumeThread(id: lease.runtimeThreadID)
         try validate(scope)
-        let projected = try await publicConversation(conversation, lane: lease.owner.lane)
+        let projected = try await publicConversation(
+            conversation,
+            lane: lease.owner.lane,
+            modelID: lease.owner.modelID
+        )
         try validate(scope)
         return projected
     }
@@ -916,7 +934,11 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
         guard lease.owner.lane == .agent else {
             let conversation = try await lease.runtime.resumeThread(id: lease.runtimeThreadID)
             try validate(scope)
-            let projected = try await publicConversation(conversation, lane: .chat)
+            let projected = try await publicConversation(
+                conversation,
+                lane: .chat,
+                modelID: lease.owner.modelID
+            )
             try validate(scope)
             return RuntimeThreadResumeResult(
                 conversation: projected,
@@ -930,7 +952,11 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
             initialHistoryPage: initialHistoryPage
         )
         try validate(scope)
-        result.conversation = try await publicConversation(result.conversation, lane: lease.owner.lane)
+        result.conversation = try await publicConversation(
+            result.conversation,
+            lane: lease.owner.lane,
+            modelID: lease.owner.modelID
+        )
         if var page = result.initialHistoryPage {
             page.turns = try await publicTurns(page.turns, lane: lease.owner.lane)
             result.initialHistoryPage = page
@@ -966,7 +992,15 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
             beforeTurnID: beforeTurnID
         )
         try validate(scope)
-        result.thread = Self.publicThread(result.thread, lane: lease.owner.lane)
+        result.thread = publicThread(
+            result.thread,
+            lane: lease.owner.lane,
+            modelID: result.thread.model ?? lease.owner.modelID
+        )
+        result.thread.taskCapabilities = taskCapabilities(
+            for: lease.owner.lane,
+            modelID: result.thread.model ?? lease.owner.modelID
+        )
         return result
     }
 
@@ -993,7 +1027,11 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
         do {
             let runtimeThread = try await laneRuntime.startThread(routedRequest)
             createdThread = runtimeThread
-            var thread = Self.publicThread(runtimeThread, lane: decision.lane)
+            var thread = publicThread(
+                runtimeThread,
+                lane: decision.lane,
+                modelID: modelID
+            )
             let publicThreadID = thread.id
             associatePendingCreation(creationToken, with: publicThreadID)
             try validate(scope)
@@ -1017,14 +1055,21 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
             )
             try validate(scope)
             finishPendingCreation(creationToken, discardAssociatedEvents: false)
-            thread.taskCapabilities = Self.capabilities(for: decision.lane)
+            // A lane proves the execution semantics (chat vs. Responses
+            // agent), but the selected model still owns input/reasoning
+            // capability projection.  Do not let an agent-capable text-only
+            // model inherit image or reasoning controls from the lane.
+            thread.taskCapabilities = taskCapabilities(
+                for: decision.lane,
+                modelID: modelID
+            )
             return thread
         } catch {
             if persistedOwnership, let createdThread {
                 _ = try? await stateStore.removeTaskOwnership(
                     connectionID: scope.connectionID,
                     conversationScopeID: scope.conversationScopeID,
-                    threadID: Self.publicThread(createdThread, lane: decision.lane).id
+                    threadID: publicThread(createdThread, lane: decision.lane).id
                 )
             }
             if let createdThread, isCurrent(scope) {
@@ -1053,7 +1098,11 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
                 id: try Self.runtimeThreadID(id, for: owner.lane)
             )
             createdThread = runtimeThread
-            var thread = Self.publicThread(runtimeThread, lane: owner.lane)
+            var thread = publicThread(
+                runtimeThread,
+                lane: owner.lane,
+                modelID: owner.modelID
+            )
             let publicThreadID = thread.id
             associatePendingCreation(creationToken, with: publicThreadID)
             try validate(scope)
@@ -1077,14 +1126,17 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
             )
             try validate(scope)
             finishPendingCreation(creationToken, discardAssociatedEvents: false)
-            thread.taskCapabilities = Self.capabilities(for: owner.lane)
+            thread.taskCapabilities = taskCapabilities(
+                for: owner.lane,
+                modelID: thread.model ?? owner.modelID
+            )
             return thread
         } catch {
             if persistedOwnership, let createdThread {
                 _ = try? await stateStore.removeTaskOwnership(
                     connectionID: scope.connectionID,
                     conversationScopeID: scope.conversationScopeID,
-                    threadID: Self.publicThread(createdThread, lane: owner.lane).id
+                    threadID: publicThread(createdThread, lane: owner.lane).id
                 )
             }
             if let createdThread, isCurrent(scope) {
@@ -1121,7 +1173,11 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
             ephemeralAgentThreadIDs.insert(publicThreadID)
             await flushPendingTaskEvents(for: publicThreadID, lane: .agent, scope: scope)
             try validate(scope)
-            conversation = try await publicConversation(conversation, lane: .agent)
+            conversation = try await publicConversation(
+                conversation,
+                lane: .agent,
+                modelID: conversation.thread.model ?? selectedModelID(nil)
+            )
             try validate(scope)
             finishPendingCreation(creationToken, discardAssociatedEvents: false)
             return conversation
@@ -1208,6 +1264,11 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
                 )
             }
         }
+        try validateModelInputs(
+            request.inputs,
+            reasoningEffort: request.reasoningEffort,
+            modelID: requestedModelID ?? owner.modelID
+        )
         var routedRequest = request
         routedRequest.model = requestedModelID
         routedRequest.threadID = try Self.runtimeThreadID(request.threadID, for: owner.lane)
@@ -1258,6 +1319,11 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
     func steer(threadID: String, inputs: [RuntimeTurnInput]) async throws {
         let scope = try currentScope()
         let lease = try await taskLease(for: threadID, scope: scope)
+        try validateModelInputs(
+            inputs,
+            reasoningEffort: nil,
+            modelID: lease.owner.modelID
+        )
         try await lease.runtime.steer(
             threadID: lease.runtimeThreadID,
             inputs: inputs
@@ -1386,16 +1452,16 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
         var byID: [String: RuntimeThread] = [:]
         for thread in try await chat {
             try validate(scope)
-            let publicThread = Self.publicThread(thread, lane: .chat)
+            let projectedThread = publicThread(thread, lane: .chat)
             // Listing a legacy chat task is sufficient process-local evidence
             // that this exact raw ID belongs to the chat lane. Keep its live
             // events flowing even before the first explicit read persists the
             // ownership migration.
-            rememberOwnedThread(publicThread.id, lane: .chat)
-            byID[publicThread.id] = publicThread
+            rememberOwnedThread(projectedThread.id, lane: .chat)
+            byID[projectedThread.id] = projectedThread
         }
         for var thread in agentThreads {
-            thread = Self.publicThread(thread, lane: .agent)
+            thread = publicThread(thread, lane: .agent)
             guard ownersByThread[thread.id] != nil else { continue }
             byID[thread.id] = thread
         }
@@ -1850,17 +1916,17 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
             switch decision.basis {
             case .compatibleProbe:
                 mode = .agent
-                capabilities = Self.agentTaskCapabilities
+                capabilities = Self.capabilities(for: .agent, model: model)
             case .failedProbe:
                 mode = .chat
-                capabilities = Self.chatTaskCapabilities
+                capabilities = Self.capabilities(for: .chat, model: model)
             case .unavailableProbe:
                 let shouldStartProbe = model.id == selectedProbeModelID
                 mode = shouldStartProbe ? .checkingAgent : .chat
-                capabilities = Self.chatTaskCapabilities
+                capabilities = Self.capabilities(for: .chat, model: model)
             case .existingTask:
                 mode = decision.lane == .agent ? .agent : .chat
-                capabilities = Self.capabilities(for: decision.lane)
+                capabilities = Self.capabilities(for: decision.lane, model: model)
             }
             values.append(model.withExecutionMode(mode, taskCapabilities: capabilities))
         }
@@ -2167,7 +2233,7 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
         let publicID: (String) -> String = Self.publicAgentThreadID
         return switch event {
         case let .threadUpdated(thread):
-            .threadUpdated(Self.publicThread(thread, lane: .agent))
+            .threadUpdated(publicThread(thread, lane: .agent))
         case let .threadNameChanged(threadID, name):
             .threadNameChanged(threadID: publicID(threadID), name: name)
         case let .threadStatusChanged(threadID, status):
@@ -2214,7 +2280,7 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
         let publicID: (String) -> String = Self.publicChatThreadID
         return switch event {
         case let .threadUpdated(thread):
-            .threadUpdated(Self.publicThread(thread, lane: .chat))
+            .threadUpdated(publicThread(thread, lane: .chat))
         case let .threadNameChanged(threadID, name):
             .threadNameChanged(threadID: publicID(threadID), name: name)
         case let .threadStatusChanged(threadID, status):
@@ -2255,7 +2321,10 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
               let session else { return }
         let updateRevision = sessionRevision
         let baseModels = session.availableModels.map { model in
-            model.withExecutionMode(.chat, taskCapabilities: Self.chatTaskCapabilities)
+            model.withExecutionMode(
+                .chat,
+                taskCapabilities: Self.capabilities(for: .chat, model: model)
+            )
         }
         guard let projected = try? await models(
             baseModels,
@@ -2272,10 +2341,14 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
 
     private func publicConversation(
         _ conversation: RuntimeConversation,
-        lane: OpenAICompatibleTaskLane
+        lane: OpenAICompatibleTaskLane,
+        modelID: String? = nil
     ) async throws -> RuntimeConversation {
-        var value = conversation.withTaskCapabilities(Self.capabilities(for: lane))
-        value.thread = Self.publicThread(value.thread, lane: lane)
+        let effectiveModelID = modelID ?? conversation.thread.model
+        var value = conversation.withTaskCapabilities(
+            taskCapabilities(for: lane, modelID: effectiveModelID)
+        )
+        value.thread = publicThread(value.thread, lane: lane, modelID: effectiveModelID)
         value.items = await publicItems(value.items, lane: lane)
         value.turns = try await publicTurns(value.turns, lane: lane)
         return value
@@ -2322,7 +2395,8 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
                 continue
             }
             var projectedAgent = agent
-            if destination.connectionID == .codexDefault {
+            if destination.inheritsParentConnection,
+               destination.connectionID == .codexDefault {
                 // Native app-server subagents inherit the adaptive provider.
                 // Record them before exposing a clickable destination so a
                 // subsequent read or restart always reaches the same lane.
@@ -2347,7 +2421,8 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
                         projectedAgent.destination = RuntimeCollaborationAgentDestination(
                             connectionID: connectionID,
                             threadID: publicThreadID,
-                            lane: .agent
+                            lane: .agent,
+                            inheritsParentConnection: false
                         )
                     } else {
                         projectedAgent.destination = nil
@@ -2358,9 +2433,9 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
                     projectedAgent.destination = nil
                 }
             }
-            // Every Onyx-owned delegation destination already carries its
-            // complete public identity. Preserve it verbatim, including when
-            // the target happens to be this same configured provider.
+            // Every absolute Onyx-owned delegation destination already carries
+            // its complete public identity. Preserve it verbatim, including a
+            // generic-provider delegation whose actual target is Codex.
             agents.append(projectedAgent)
         }
         value.collaboration = RuntimeCollaborationActivity(
@@ -2370,13 +2445,15 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
         return value
     }
 
-    private static func publicThread(
+    private func publicThread(
         _ thread: RuntimeThread,
-        lane: OpenAICompatibleTaskLane
+        lane: OpenAICompatibleTaskLane,
+        modelID: String? = nil
     ) -> RuntimeThread {
+        let effectiveModelID = modelID ?? thread.model
         var value = thread
         if lane == .agent { value = RuntimeThread(
-            id: publicAgentThreadID(thread.id),
+            id: Self.publicAgentThreadID(thread.id),
             title: thread.title,
             preview: thread.preview,
             cwd: thread.cwd,
@@ -2386,10 +2463,10 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
             runtime: thread.runtime,
             model: thread.model,
             branch: thread.branch,
-            taskCapabilities: agentTaskCapabilities
+            taskCapabilities: taskCapabilities(for: lane, modelID: effectiveModelID)
         ) } else {
             value = RuntimeThread(
-                id: publicChatThreadID(thread.id),
+                id: Self.publicChatThreadID(thread.id),
                 title: thread.title,
                 preview: thread.preview,
                 cwd: thread.cwd,
@@ -2399,7 +2476,7 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
                 runtime: thread.runtime,
                 model: thread.model,
                 branch: thread.branch,
-                taskCapabilities: chatTaskCapabilities
+            taskCapabilities: taskCapabilities(for: lane, modelID: effectiveModelID)
             )
         }
         return value
@@ -2568,8 +2645,101 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
         lane == .agent ? try rawAgentThreadID(publicID) : try rawChatThreadID(publicID)
     }
 
-    private static func capabilities(for lane: OpenAICompatibleTaskLane) -> RuntimeCapabilities {
-        lane == .agent ? agentTaskCapabilities : chatTaskCapabilities
+    /// Projects the lane's execution semantics onto the selected model's
+    /// actual input/reasoning metadata.  Agent probing proves that the
+    /// Responses lane can run; it does not make every model in that lane
+    /// multimodal or reasoning-capable.
+    private static func capabilities(
+        for lane: OpenAICompatibleTaskLane,
+        model: RuntimeModel?
+    ) -> RuntimeCapabilities {
+        var projected = lane == .agent ? agentTaskCapabilities : chatTaskCapabilities
+        guard let model else {
+            // This facade serves a generic provider, so a missing catalog row
+            // is not permission to inherit native Codex's richer controls.
+            // Text remains usable; image/reasoning requests must be rejected
+            // until the provider supplies model evidence.
+            projected.remove(.images)
+            projected.remove(.reasoning)
+            return projected
+        }
+
+        // Unknown model metadata is intentionally conservative.  A generic
+        // provider row with no modality evidence must not grow an image
+        // control merely because the lane supports images for another model.
+        let supportsImages = !model.capabilityMetadataIsUnknown
+            && model.inputModalities.contains(.image)
+        if !supportsImages { projected.remove(.images) }
+        if model.reasoningEfforts.isEmpty { projected.remove(.reasoning) }
+        return projected
+    }
+
+    private func taskCapabilities(
+        for lane: OpenAICompatibleTaskLane,
+        modelID: String?
+    ) -> RuntimeCapabilities {
+        let normalizedID = modelID?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        let model = normalizedID.flatMap { id in
+            session?.availableModels.first { $0.id == id }
+        }
+        return Self.capabilities(for: lane, model: model)
+    }
+
+    private func modelMetadata(for modelID: String?) -> RuntimeModel? {
+        let normalizedID = modelID?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard let normalizedID, !normalizedID.isEmpty else { return nil }
+        return session?.availableModels.first { $0.id == normalizedID }
+    }
+
+    private func validateModelInputs(
+        _ inputs: [RuntimeTurnInput],
+        reasoningEffort: String?,
+        modelID: String?
+    ) throws {
+        let hasText = inputs.contains { input in
+            if case .text = input { return true }
+            return false
+        }
+        let hasImage = inputs.contains { input in
+            switch input {
+            case .localImagePath, .imageURL: true
+            case .text: false
+            }
+        }
+        let model = modelMetadata(for: modelID)
+        if hasText {
+            // Text is the conservative baseline for an OpenAI-compatible
+            // model.  A missing/unknown catalog row must remain usable for
+            // ordinary chat; only explicit, trusted modality metadata that
+            // omits text can reject the request.
+            if let model,
+               !model.capabilityMetadataIsUnknown,
+               !model.inputModalities.contains(.text) {
+                throw AgentRuntimeError.unsupported(
+                    "text input for model \(modelID ?? "the selected model")"
+                )
+            }
+        }
+        if hasImage {
+            guard let model,
+                  !model.capabilityMetadataIsUnknown,
+                  model.inputModalities.contains(.image) else {
+                throw AgentRuntimeError.unsupported(
+                    "image input for model \(modelID ?? "the selected model")"
+                )
+            }
+        }
+        guard let reasoningEffort else { return }
+        guard let model,
+              model.reasoningEfforts.contains(reasoningEffort) else {
+            throw AgentRuntimeError.unsupported(
+                "reasoning effort \(reasoningEffort) for model \(modelID ?? "the selected model")"
+            )
+        }
     }
 }
 

@@ -43,6 +43,9 @@ final class AgentRuntimeDelegationExecutorTests: XCTestCase {
         XCTAssertEqual(starts[0].inputs, [.text(request.prompt)])
         XCTAssertEqual(starts[0].sandboxMode, .readOnly)
         XCTAssertEqual(starts[0].approvalPolicy, .never)
+        let childStarts = await runtime.startedThreadRequests()
+        XCTAssertEqual(childStarts.count, 1)
+        XCTAssertFalse(childStarts[0].allowsDynamicTools)
         let connectCalls = await runtime.connectCallCount()
         XCTAssertEqual(connectCalls, 1)
     }
@@ -223,6 +226,229 @@ final class AgentRuntimeDelegationExecutorTests: XCTestCase {
         XCTAssertEqual(deleted, ["child-thread"])
     }
 
+    func testRuntimeBridgeBoundsConnectSetup() async throws {
+        let runtime = ScriptedDelegationRuntime(
+            connectionName: connection.rawValue,
+            behavior: .blockConnect
+        )
+        let executor = AgentRuntimeDelegationExecutor(
+            connectionID: connection,
+            runtime: runtime,
+            supportedModelIDs: [modelID],
+            setupTimeout: .milliseconds(30)
+        )
+
+        do {
+            _ = try await executor.execute(makeRequest(id: "connect-timeout"), reportProgress: { _ in })
+            XCTFail("A hanging provider connection must be bounded")
+        } catch let error as DelegationExecutorError {
+            XCTAssertEqual(
+                error,
+                .provider("The provider connection did not complete before the setup timeout.")
+            )
+        }
+        let started = await runtime.startedRequests()
+        let deleted = await runtime.deletedThreadIDs()
+        XCTAssertEqual(started.count, 0)
+        XCTAssertEqual(deleted, [])
+    }
+
+    func testRuntimeBridgeBoundsChildCreationSetup() async throws {
+        let runtime = ScriptedDelegationRuntime(
+            connectionName: connection.rawValue,
+            behavior: .blockStartThread
+        )
+        let executor = AgentRuntimeDelegationExecutor(
+            connectionID: connection,
+            runtime: runtime,
+            supportedModelIDs: [modelID],
+            setupTimeout: .milliseconds(30)
+        )
+
+        do {
+            _ = try await executor.execute(makeRequest(id: "child-timeout"), reportProgress: { _ in })
+            XCTFail("A hanging child creation must be bounded")
+        } catch let error as DelegationExecutorError {
+            XCTAssertEqual(
+                error,
+                .provider("The provider child creation did not complete before the setup timeout.")
+            )
+        }
+        let started = await runtime.startedRequests()
+        let deleted = await runtime.deletedThreadIDs()
+        XCTAssertEqual(started.count, 0)
+        XCTAssertEqual(deleted, [])
+    }
+
+    func testRuntimeBridgeBoundsTurnStartAndCleansKnownChild() async throws {
+        let runtime = ScriptedDelegationRuntime(
+            connectionName: connection.rawValue,
+            behavior: .blockStartTurn
+        )
+        let executor = AgentRuntimeDelegationExecutor(
+            connectionID: connection,
+            runtime: runtime,
+            supportedModelIDs: [modelID],
+            setupTimeout: .milliseconds(30)
+        )
+
+        do {
+            _ = try await executor.execute(makeRequest(id: "turn-timeout"), reportProgress: { _ in })
+            XCTFail("A hanging turn start must be bounded")
+        } catch let error as DelegationExecutorError {
+            XCTAssertEqual(
+                error,
+                .provider("The provider turn start did not complete before the setup timeout.")
+            )
+        }
+        let interrupted = await runtime.interruptedThreadIDs()
+        let deleted = await runtime.deletedThreadIDs()
+        XCTAssertEqual(interrupted, ["child-thread"])
+        XCTAssertEqual(deleted, ["child-thread"])
+    }
+
+    func testRuntimeBridgeHardBoundsCancellationUncooperativeConnect() async throws {
+        let gate = NonCooperativeDelegationGate()
+        let runtime = ScriptedDelegationRuntime(
+            connectionName: connection.rawValue,
+            behavior: .ignoreConnectCancellation(gate)
+        )
+        let executor = AgentRuntimeDelegationExecutor(
+            connectionID: connection,
+            runtime: runtime,
+            supportedModelIDs: [modelID],
+            setupTimeout: .milliseconds(30)
+        )
+
+        let clock = ContinuousClock()
+        let startedAt = clock.now
+        do {
+            _ = try await executor.execute(
+                makeRequest(id: "noncooperative-connect-timeout"),
+                reportProgress: { _ in }
+            )
+            XCTFail("A cancellation-uncooperative connection must still time out")
+        } catch let error as DelegationExecutorError {
+            XCTAssertEqual(
+                error,
+                .provider("The provider connection did not complete before the setup timeout.")
+            )
+        }
+        XCTAssertLessThan(startedAt.duration(to: clock.now), .seconds(1))
+        gate.release()
+    }
+
+    func testRuntimeBridgeCancellationDuringCompletedProgressCannotReturnSuccess() async throws {
+        let runtime = ScriptedDelegationRuntime(connectionName: connection.rawValue)
+        let executor = AgentRuntimeDelegationExecutor(
+            connectionID: connection,
+            runtime: runtime,
+            supportedModelIDs: [modelID]
+        )
+        let completedProgress = NonCooperativeDelegationGate()
+        let request = makeRequest(id: "cancel-during-completed-progress")
+        let execution = Task {
+            try await executor.execute(
+                request,
+                reportProgress: { update in
+                    if update.phase == "completed" {
+                        await completedProgress.wait()
+                    }
+                }
+            )
+        }
+        for _ in 0 ..< 200 {
+            if await runtime.startedRequests().isEmpty == false { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        // Give the synchronous fixture time to reach its suspended completed
+        // progress sink, then make cancellation authoritative.
+        try await Task.sleep(for: .milliseconds(10))
+        execution.cancel()
+        completedProgress.release()
+
+        do {
+            _ = try await execution.value
+            XCTFail("Cancellation during completed progress must not publish success")
+        } catch is CancellationError {
+            // Expected.
+        }
+        let deleted = await runtime.deletedThreadIDs()
+        XCTAssertEqual(deleted, ["child-thread"])
+    }
+
+    func testRuntimeBridgeRemovesChildCreatedAfterSetupTimeout() async throws {
+        let gate = NonCooperativeDelegationGate()
+        let runtime = ScriptedDelegationRuntime(
+            connectionName: connection.rawValue,
+            behavior: .ignoreStartThreadCancellation(gate)
+        )
+        let executor = AgentRuntimeDelegationExecutor(
+            connectionID: connection,
+            runtime: runtime,
+            supportedModelIDs: [modelID],
+            setupTimeout: .milliseconds(30)
+        )
+
+        do {
+            _ = try await executor.execute(
+                makeRequest(id: "late-child-timeout"),
+                reportProgress: { _ in }
+            )
+            XCTFail("A cancellation-uncooperative child creation must time out")
+        } catch let error as DelegationExecutorError {
+            XCTAssertEqual(
+                error,
+                .provider("The provider child creation did not complete before the setup timeout.")
+            )
+        }
+        gate.release()
+        for _ in 0 ..< 200 {
+            if await runtime.deletedThreadIDs() == ["child-thread"] { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let deleted = await runtime.deletedThreadIDs()
+        XCTAssertEqual(deleted, ["child-thread"])
+    }
+
+    func testRuntimeBridgeStopsTurnThatReturnsAfterSetupTimeout() async throws {
+        let gate = NonCooperativeDelegationGate()
+        let runtime = ScriptedDelegationRuntime(
+            connectionName: connection.rawValue,
+            behavior: .ignoreStartTurnCancellation(gate)
+        )
+        let executor = AgentRuntimeDelegationExecutor(
+            connectionID: connection,
+            runtime: runtime,
+            supportedModelIDs: [modelID],
+            setupTimeout: .milliseconds(30)
+        )
+
+        do {
+            _ = try await executor.execute(
+                makeRequest(id: "late-turn-timeout"),
+                reportProgress: { _ in }
+            )
+            XCTFail("A cancellation-uncooperative turn start must time out")
+        } catch let error as DelegationExecutorError {
+            XCTAssertEqual(
+                error,
+                .provider("The provider turn start did not complete before the setup timeout.")
+            )
+        }
+        gate.release()
+        for _ in 0 ..< 200 {
+            let interrupted = await runtime.interruptedThreadIDs()
+            let deleted = await runtime.deletedThreadIDs()
+            if interrupted == ["child-thread"], deleted == ["child-thread"] { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let interrupted = await runtime.interruptedThreadIDs()
+        let deleted = await runtime.deletedThreadIDs()
+        XCTAssertEqual(interrupted, ["child-thread"])
+        XCTAssertEqual(deleted, ["child-thread"])
+    }
+
     func testRuntimeBridgeFailsWhenChildIsDeletedBeforeCompletion() async throws {
         let runtime = ScriptedDelegationRuntime(
             connectionName: connection.rawValue,
@@ -293,6 +519,12 @@ final class AgentRuntimeDelegationExecutorTests: XCTestCase {
 
 private enum ScriptedDelegationBehavior: Sendable {
     case respond(String)
+    case blockConnect
+    case blockStartThread
+    case blockStartTurn
+    case ignoreConnectCancellation(NonCooperativeDelegationGate)
+    case ignoreStartThreadCancellation(NonCooperativeDelegationGate)
+    case ignoreStartTurnCancellation(NonCooperativeDelegationGate)
     case blockUntilCancellation
     case connectionFailure(String)
     case noTerminal(String)
@@ -308,6 +540,7 @@ private actor ScriptedDelegationRuntime: AgentRuntime {
     private let thread: RuntimeThread
     private let behavior: ScriptedDelegationBehavior
     private var starts: [StartTurnRequest] = []
+    private var threadStarts: [StartThreadRequest] = []
     private var deleted: [String] = []
     private var interrupted: [String] = []
     private var connects = 0
@@ -339,6 +572,12 @@ private actor ScriptedDelegationRuntime: AgentRuntime {
 
     func connect() async throws -> RuntimeSession {
         connects += 1
+        if case .blockConnect = behavior {
+            try await Task.sleep(for: .seconds(60))
+        }
+        if case let .ignoreConnectCancellation(gate) = behavior {
+            await gate.wait()
+        }
         return RuntimeSession(
             runtime: .local,
             displayName: "Scripted",
@@ -374,10 +613,31 @@ private actor ScriptedDelegationRuntime: AgentRuntime {
     func listAllThreads(archived _: Bool) async throws -> [RuntimeThread] { [] }
     func readThread(id _: String) async throws -> RuntimeConversation { RuntimeConversation(thread: thread, items: []) }
     func resumeThread(id: String) async throws -> RuntimeConversation { try await readThread(id: id) }
-    func startThread(_: StartThreadRequest) async throws -> RuntimeThread { thread }
+    func startThread(_ request: StartThreadRequest) async throws -> RuntimeThread {
+        threadStarts.append(request)
+        if case .blockStartThread = behavior {
+            try await Task.sleep(for: .seconds(60))
+        }
+        if case let .ignoreStartThreadCancellation(gate) = behavior {
+            await gate.wait()
+        }
+        return thread
+    }
     func startTurn(_ request: StartTurnRequest) async throws {
         starts.append(request)
         switch behavior {
+        case .blockConnect, .blockStartThread, .ignoreConnectCancellation,
+             .ignoreStartThreadCancellation:
+            return
+
+        case .blockStartTurn:
+            try await Task.sleep(for: .seconds(60))
+            return
+
+        case let .ignoreStartTurnCancellation(gate):
+            await gate.wait()
+            return
+
         case .blockUntilCancellation:
             try await Task.sleep(for: .seconds(60))
             return
@@ -464,7 +724,35 @@ private actor ScriptedDelegationRuntime: AgentRuntime {
     func deleteThread(id: String) async throws { deleted.append(id) }
 
     func startedRequests() -> [StartTurnRequest] { starts }
+    func startedThreadRequests() -> [StartThreadRequest] { threadStarts }
     func deletedThreadIDs() -> [String] { deleted }
     func interruptedThreadIDs() -> [String] { interrupted }
     func connectCallCount() -> Int { connects }
+}
+
+private final class NonCooperativeDelegationGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isReleased = false
+    private var waiter: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            let shouldResume = lock.withLock { () -> Bool in
+                if isReleased { return true }
+                waiter = continuation
+                return false
+            }
+            if shouldResume { continuation.resume() }
+        }
+    }
+
+    func release() {
+        let waiter = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            isReleased = true
+            let waiter = self.waiter
+            self.waiter = nil
+            return waiter
+        }
+        waiter?.resume()
+    }
 }

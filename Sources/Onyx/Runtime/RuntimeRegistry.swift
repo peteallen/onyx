@@ -73,8 +73,8 @@ struct RuntimeProviderDescriptor: Identifiable, Sendable {
     }
 
     /// Construction seam used by adapters whose protocol surface is extended
-    /// by app-owned tools. Generic providers continue using the simpler
-    /// one-argument factory above and never learn about Codex app-server.
+    /// by app-owned tools. The handler stays provider-neutral: an adapter can
+    /// opt in without receiving broker state, credentials, or provider URLs.
     init(
         id: RuntimeAdapterID,
         displayName: String,

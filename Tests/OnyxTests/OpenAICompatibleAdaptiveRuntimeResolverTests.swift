@@ -384,8 +384,10 @@ final class OpenAICompatibleAdaptiveRuntimeResolverTests: XCTestCase {
             recorder: recorder,
             blocksDisconnect: true
         )
+        let delegationHandler = AdaptiveFactoryDynamicToolHandler()
         let factory = OpenAICompatibleAgentRuntimeFactory(
             credentialStore: credentialStore,
+            dynamicToolHandler: delegationHandler,
             proxyFactory: { _, credential in
                 let upstream = try credential?.withValue { $0 }
                 recorder.recordUpstreamCredential(upstream)
@@ -395,8 +397,9 @@ final class OpenAICompatibleAdaptiveRuntimeResolverTests: XCTestCase {
                     stop: { recorder.recordProxyStop() }
                 )
             },
-            runtimeFactory: { binding in
+            runtimeFactory: { binding, handler in
                 recorder.recordBinding(binding)
+                recorder.recordDynamicToolHandler(handler)
                 return runtime
             }
         )
@@ -410,6 +413,10 @@ final class OpenAICompatibleAdaptiveRuntimeResolverTests: XCTestCase {
         XCTAssertEqual(binding.baseURL.absoluteString, "http://127.0.0.1:54321/v1")
         XCTAssertEqual(binding.id, prepared.identity.modelProviderID)
         XCTAssertEqual(binding.stateIdentifier, prepared.identity.stateIdentifier)
+        XCTAssertTrue(
+            recorder.dynamicToolHandlerWasPassed,
+            "The generic agent factory must install Onyx's provider-neutral delegation handler"
+        )
 
         let shutdownTask = Task { await prepared.shutdown() }
         for _ in 0..<100 where recorder.events != ["proxy.stop"] {
@@ -446,7 +453,7 @@ final class OpenAICompatibleAdaptiveRuntimeResolverTests: XCTestCase {
                     stop: { recorder.recordProxyStop() }
                 )
             },
-            runtimeFactory: { binding in
+            runtimeFactory: { binding, _ in
                 recorder.recordBinding(binding)
                 return AdaptiveFactoryRuntime()
             }
@@ -481,7 +488,7 @@ final class OpenAICompatibleAdaptiveRuntimeResolverTests: XCTestCase {
                     stop: { recorder.recordProxyStop() }
                 )
             },
-            runtimeFactory: { _ in runtime }
+            runtimeFactory: { _, _ in runtime }
         )
 
         let prepared = try await factory.prepare(connection: connection)
@@ -613,6 +620,7 @@ private final class AdaptiveFactoryRecorder: @unchecked Sendable {
     private var storedUpstreamCredential: String?
     private var storedProxyStopCount = 0
     private var storedEvents: [String] = []
+    private var storedDynamicToolHandlerWasPassed = false
 
     var binding: CodexRuntimeModelProviderBinding? {
         lock.withLock { storedBinding }
@@ -628,6 +636,10 @@ private final class AdaptiveFactoryRecorder: @unchecked Sendable {
 
     var events: [String] {
         lock.withLock { storedEvents }
+    }
+
+    var dynamicToolHandlerWasPassed: Bool {
+        lock.withLock { storedDynamicToolHandlerWasPassed }
     }
 
     func recordBinding(_ binding: CodexRuntimeModelProviderBinding) {
@@ -647,6 +659,18 @@ private final class AdaptiveFactoryRecorder: @unchecked Sendable {
 
     func recordRuntimeDisconnect() {
         lock.withLock { storedEvents.append("runtime.disconnect") }
+    }
+
+    func recordDynamicToolHandler(_ handler: (any CodexDynamicToolHandler)?) {
+        lock.withLock { storedDynamicToolHandlerWasPassed = handler != nil }
+    }
+}
+
+private struct AdaptiveFactoryDynamicToolHandler: CodexDynamicToolHandler {
+    func handleDynamicToolCall(
+        _: CodexDynamicToolCall
+    ) async throws -> CodexDynamicToolResult {
+        .failed("fixture")
     }
 }
 

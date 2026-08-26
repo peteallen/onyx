@@ -145,6 +145,7 @@ display_name="$(plist_value CFBundleDisplayName)"
 bundle_identifier="$(plist_value CFBundleIdentifier)"
 short_version="$(plist_value CFBundleShortVersionString)"
 build_number="$(plist_value CFBundleVersion)"
+source_revision="$(/usr/bin/plutil -extract OnyxSourceRevision raw -o - "$info_plist" 2>/dev/null || true)"
 [[ -n "$volume_name" ]] || volume_name="$display_name"
 [[ -n "$volume_name" ]] || die "volume name cannot be empty"
 [[ "$volume_name" != */* && "$volume_name" != *:* ]] || \
@@ -233,6 +234,9 @@ verification_arguments=(
   --build-number "$build_number"
   --probe-runtime
 )
+if [[ -n "$source_revision" ]]; then
+  verification_arguments+=(--source-revision "$source_revision")
+fi
 app_architectures="$(/usr/bin/lipo -archs \
   "$app_path/Contents/MacOS/$(/usr/bin/plutil -extract CFBundleExecutable raw -o - "$info_plist")")"
 if [[ " $app_architectures " == *" arm64 "* && \

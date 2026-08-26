@@ -276,6 +276,116 @@ final class OpenAICompatibleAdaptiveRuntimeTests: XCTestCase {
         await harness.runtime.disconnect()
     }
 
+    func testAgentLaneProjectsSelectedModelCapabilitiesAndRejectsUnsupportedInputs() async throws {
+        let rawID = "text-only-agent"
+        let publicID = publicAgentThreadID(rawID)
+        let now = Date(timeIntervalSince1970: 55_000)
+        let probe = AdaptiveRuntimeProbe(
+            outcomes: ["agent-model": .compatible(adaptiveCompatibleEvidence)],
+            testedAt: now
+        )
+        let textOnlyModel = makeAdaptiveModel(
+            id: "agent-model",
+            isDefault: true,
+            inputModalities: [.text],
+            reasoningEfforts: [],
+            capabilityEvidence: .advertised
+        )
+        let agent = AdaptiveRuntimeFake(
+            kind: .codex,
+            models: [textOnlyModel],
+            threads: [makeAdaptiveThread(id: rawID, model: "agent-model")]
+        )
+        let harness = try await makeAdaptiveHarness(
+            chat: AdaptiveRuntimeFake(kind: .local, models: [textOnlyModel]),
+            agents: [agent],
+            ownerships: [(publicID, .agent, "agent-model")],
+            probe: probe,
+            now: now
+        )
+        defer { harness.removeTemporaryState() }
+
+        let session = try await harness.runtime.connect()
+        let model = try XCTUnwrap(session.availableModels.first)
+        XCTAssertFalse(model.taskCapabilities?.contains(.images) == true)
+        XCTAssertFalse(model.taskCapabilities?.contains(.reasoning) == true)
+
+        let conversation = try await harness.runtime.readThread(id: publicID)
+        XCTAssertFalse(conversation.thread.taskCapabilities?.contains(.images) == true)
+        XCTAssertFalse(conversation.thread.taskCapabilities?.contains(.reasoning) == true)
+
+        do {
+            try await harness.runtime.startTurn(.init(
+                threadID: publicID,
+                inputs: [.localImagePath("/tmp/unsupported.png")],
+                model: "agent-model"
+            ))
+            XCTFail("A text-only model must reject image input before dispatch")
+        } catch let error as AgentRuntimeError {
+            XCTAssertTrue(error.localizedDescription.contains("image input"))
+        }
+        do {
+            try await harness.runtime.startTurn(.init(
+                threadID: publicID,
+                inputs: [.text("reasoning should fail")],
+                model: "agent-model",
+                reasoningEffort: "medium"
+            ))
+            XCTFail("A model without reasoning metadata must reject an effort")
+        } catch let error as AgentRuntimeError {
+            XCTAssertTrue(error.localizedDescription.contains("reasoning effort"))
+        }
+        let dispatchedTurnIDs = await agent.threadIDs(for: .startTurn)
+        XCTAssertEqual(dispatchedTurnIDs, [])
+
+        await harness.runtime.disconnect()
+    }
+
+    func testAgentLaneRejectsTextForModelWithoutTextModality() async throws {
+        let rawID = "image-only-agent"
+        let publicID = publicAgentThreadID(rawID)
+        let now = Date(timeIntervalSince1970: 56_000)
+        let probe = AdaptiveRuntimeProbe(
+            outcomes: ["image-model": .compatible(adaptiveCompatibleEvidence)],
+            testedAt: now
+        )
+        let imageOnlyModel = makeAdaptiveModel(
+            id: "image-model",
+            isDefault: true,
+            inputModalities: [.image],
+            capabilityEvidence: .advertised
+        )
+        let agent = AdaptiveRuntimeFake(
+            kind: .codex,
+            models: [imageOnlyModel],
+            threads: [makeAdaptiveThread(id: rawID, model: "image-model")]
+        )
+        let harness = try await makeAdaptiveHarness(
+            chat: AdaptiveRuntimeFake(kind: .local, models: [imageOnlyModel]),
+            agents: [agent],
+            ownerships: [(publicID, .agent, "image-model")],
+            probe: probe,
+            now: now
+        )
+        defer { harness.removeTemporaryState() }
+
+        _ = try await harness.runtime.connect()
+        do {
+            try await harness.runtime.startTurn(.init(
+                threadID: publicID,
+                inputs: [.text("unsupported text")],
+                model: "image-model"
+            ))
+            XCTFail("A model without text input must reject text before dispatch")
+        } catch let error as AgentRuntimeError {
+            XCTAssertTrue(error.localizedDescription.contains("text input"))
+        }
+        let dispatchedTurnIDs = await agent.threadIDs(for: .startTurn)
+        XCTAssertEqual(dispatchedTurnIDs, [])
+
+        await harness.runtime.disconnect()
+    }
+
     func testConnectProbesOnlySelectedModelAndPublishesUpdatedCatalog() async throws {
         let now = Date(timeIntervalSince1970: 60_000)
         let probeGate = AdaptiveAsyncGate()
@@ -391,6 +501,48 @@ final class OpenAICompatibleAdaptiveRuntimeTests: XCTestCase {
         )
         XCTAssertEqual(createdOwner?.lane, .agent)
 
+        await harness.runtime.disconnect()
+    }
+
+    func testAgentLanePreservesDynamicToolSuppressionWhenRoutingThreadStart() async throws {
+        let now = Date(timeIntervalSince1970: 72_000)
+        let probe = AdaptiveRuntimeProbe(
+            outcomes: ["agent-model": .compatible(adaptiveCompatibleEvidence)],
+            testedAt: now
+        )
+        let agent = AdaptiveRuntimeFake(
+            kind: .codex,
+            startThreadResult: makeAdaptiveThread(id: "suppressed-agent", model: "agent-model")
+        )
+        let harness = try await makeAdaptiveHarness(
+            chat: AdaptiveRuntimeFake(kind: .local),
+            agents: [agent],
+            probe: probe,
+            now: now
+        )
+        defer { harness.removeTemporaryState() }
+        try await harness.resolver.beginProbe(
+            connection: harness.connection,
+            modelID: "agent-model"
+        )
+        try await eventually("agent model is verified") {
+            (try? await harness.resolver.resolveNewTask(
+                connection: harness.connection,
+                modelID: "agent-model"
+            ).lane) == .agent
+        }
+        _ = try await harness.runtime.connect()
+
+        _ = try await harness.runtime.startThread(StartThreadRequest(
+            cwd: "/tmp/project",
+            model: "agent-model",
+            allowsDynamicTools: false
+        ))
+        let invocations = await agent.invocations()
+        let start = try XCTUnwrap(
+            invocations.first(where: { $0.name == .startThread })
+        )
+        XCTAssertEqual(start.allowsDynamicTools, false)
         await harness.runtime.disconnect()
     }
 
@@ -543,7 +695,7 @@ final class OpenAICompatibleAdaptiveRuntimeTests: XCTestCase {
         await harness.runtime.disconnect()
     }
 
-    func testCollaborationDestinationsNamespaceNativeChildrenWithoutOverwritingCrossProviderTargets() async throws {
+    func testCollaborationDestinationsDistinguishNativeChildrenFromAbsoluteCrossProviderTargets() async throws {
         let parentRawID = "collaboration-parent"
         let parentID = publicAgentThreadID(parentRawID)
         let remoteConnectionID = ProviderConnectionID("another-provider")
@@ -558,7 +710,19 @@ final class OpenAICompatibleAdaptiveRuntimeTests: XCTestCase {
                     updatedAt: .now,
                     destination: RuntimeCollaborationAgentDestination(
                         connectionID: .codexDefault,
-                        threadID: "native-child"
+                        threadID: "native-child",
+                        inheritsParentConnection: true
+                    )
+                ),
+                RuntimeCollaborationAgent(
+                    id: "codex-delegated-child",
+                    path: "codex-delegated",
+                    status: .completed,
+                    message: nil,
+                    updatedAt: .now,
+                    destination: RuntimeCollaborationAgentDestination(
+                        connectionID: .codexDefault,
+                        threadID: "codex-child"
                     )
                 ),
                 RuntimeCollaborationAgent(
@@ -620,6 +784,15 @@ final class OpenAICompatibleAdaptiveRuntimeTests: XCTestCase {
         XCTAssertEqual(local.connectionID, harness.connection.id)
         XCTAssertEqual(local.threadID, publicAgentThreadID("native-child"))
         XCTAssertEqual(local.lane, .agent)
+        XCTAssertFalse(local.inheritsParentConnection)
+
+        let delegatedCodex = try XCTUnwrap(
+            projectedAgents.first { $0.id == "codex-delegated-child" }?.destination
+        )
+        XCTAssertEqual(delegatedCodex.connectionID, .codexDefault)
+        XCTAssertEqual(delegatedCodex.threadID, "codex-child")
+        XCTAssertNil(delegatedCodex.lane)
+        XCTAssertFalse(delegatedCodex.inheritsParentConnection)
 
         let sameProvider = try XCTUnwrap(
             projectedAgents.first { $0.id == "same-provider-child" }?.destination
@@ -640,6 +813,12 @@ final class OpenAICompatibleAdaptiveRuntimeTests: XCTestCase {
             threadID: nativeChildID
         )
         XCTAssertEqual(nativeOwner?.lane, .agent)
+        let wronglyAdoptedCodexChild = try await harness.stateStore.taskOwnership(
+            connectionID: harness.connection.id,
+            conversationScopeID: harness.connection.conversationScopeID,
+            threadID: publicAgentThreadID("codex-child")
+        )
+        XCTAssertNil(wronglyAdoptedCodexChild)
 
         await harness.runtime.disconnect()
         _ = try await harness.runtime.connect()
@@ -1259,17 +1438,20 @@ private struct AdaptiveRuntimeInvocation: Equatable, Sendable {
     let threadID: String?
     let modelID: String?
     let requestID: RuntimeRequestID?
+    let allowsDynamicTools: Bool?
 
     init(
         _ name: Name,
         threadID: String? = nil,
         modelID: String? = nil,
-        requestID: RuntimeRequestID? = nil
+        requestID: RuntimeRequestID? = nil,
+        allowsDynamicTools: Bool? = nil
     ) {
         self.name = name
         self.threadID = threadID
         self.modelID = modelID
         self.requestID = requestID
+        self.allowsDynamicTools = allowsDynamicTools
     }
 }
 
@@ -1444,7 +1626,11 @@ private actor AdaptiveRuntimeFake: AgentRuntime {
     }
 
     func startThread(_ request: StartThreadRequest) async throws -> RuntimeThread {
-        recordedInvocations.append(.init(.startThread, modelID: request.model))
+        recordedInvocations.append(.init(
+            .startThread,
+            modelID: request.model,
+            allowsDynamicTools: request.allowsDynamicTools
+        ))
         for event in startThreadEvents { eventContinuation.yield(event) }
         if let startThreadGate { try await startThreadGate.wait() }
         return startThreadResult
@@ -1572,7 +1758,7 @@ private final class AdaptiveAgentFactoryQueue: @unchecked Sendable {
                     }
                 )
             },
-            runtimeFactory: { [self] _ in
+            runtimeFactory: { [self] _, _ in
                 try lock.withLock {
                     guard !runtimes.isEmpty else { throw AdaptiveRuntimeTestError.noAgentRuntime }
                     return runtimes.removeFirst()
@@ -1713,14 +1899,22 @@ private let adaptiveCompatibleEvidence = OpenAICompatibleResponsesProbeEvidence(
     completedAfterFunctionOutput: true
 )
 
-private func makeAdaptiveModel(id: String, isDefault: Bool = false) -> RuntimeModel {
+private func makeAdaptiveModel(
+    id: String,
+    isDefault: Bool = false,
+    inputModalities: Set<ProviderInputModality> = [.text, .image],
+    reasoningEfforts: [String] = [],
+    capabilityEvidence: ProviderCapabilityEvidence = .advertised
+) -> RuntimeModel {
     RuntimeModel(
         id: id,
         displayName: id,
         description: nil,
         isDefault: isDefault,
         defaultReasoningEffort: nil,
-        reasoningEfforts: []
+        reasoningEfforts: reasoningEfforts,
+        inputModalities: inputModalities,
+        capabilityEvidence: capabilityEvidence
     )
 }
 

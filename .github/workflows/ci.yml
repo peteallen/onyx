@@ -85,6 +85,7 @@ jobs:
           release_dir="$RUNNER_TEMP/onyx-ci-release"
           scripts/release.sh "$version" "$release_dir" \
             --build-number "$GITHUB_RUN_NUMBER" \
+            --source-revision "$GITHUB_SHA" \
             --display-name Onyx \
             --bundle-id app.onyx.agent \
             --architectures universal \

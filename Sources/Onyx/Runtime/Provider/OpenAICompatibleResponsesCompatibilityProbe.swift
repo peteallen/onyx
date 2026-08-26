@@ -19,7 +19,10 @@ struct OpenAICompatibleResponsesProbeFingerprint: Codable, Equatable, Hashable, 
             from: connection.baseURL
         )?.absoluteString ?? connection.baseURL.absoluteString
         let material = [
-            "onyx-responses-tool-probe-v2",
+            // Bump this whenever the behavioral request contract changes so a
+            // cached failure from an older probe cannot keep a repaired model
+            // on the chat lane until that failure expires.
+            "onyx-responses-tool-probe-v3",
             endpoint,
             modelID.trimmingCharacters(in: .whitespacesAndNewlines),
             connection.conversationScopeID,
@@ -495,9 +498,23 @@ struct OpenAICompatibleResponsesCompatibilityProbe: OpenAICompatibleResponsesCom
                 guard let output = outputValue.arrayValue else {
                     throw InternalFailure.failure(.malformedEventStream)
                 }
+                // A provider may repeat the one function-call item from an
+                // earlier `response.output_item.done` event here, sometimes
+                // with a generated call ID. That is the only terminal
+                // snapshot for which a call-ID change is tolerated. Two
+                // function-call items in the same terminal output represent
+                // two calls, even when name and arguments happen to match;
+                // do not collapse them into one probe call.
+                var terminalFunctionCallCount = 0
                 for item in output {
                     guard item.objectValue != nil else {
                         throw InternalFailure.failure(.malformedEventStream)
+                    }
+                    if item["type"]?.stringValue == "function_call" {
+                        terminalFunctionCallCount += 1
+                        guard terminalFunctionCallCount == 1 else {
+                            throw InternalFailure.failure(.invalidFunctionCall)
+                        }
                     }
                     try recordCompletedOutputItem(
                         item,
@@ -534,7 +551,8 @@ struct OpenAICompatibleResponsesCompatibilityProbe: OpenAICompatibleResponsesCom
 
     private static func functionCall(from value: JSONValue?) throws -> FunctionCall? {
         guard let value, value["type"]?.stringValue == "function_call" else { return nil }
-        guard value["name"]?.stringValue == functionName,
+        guard value["status"] == nil || value["status"]?.stringValue == "completed",
+              value["name"]?.stringValue == functionName,
               let callID = boundedIdentifier(value["call_id"]?.stringValue),
               let arguments = value["arguments"]?.stringValue,
               arguments.utf8.count <= 1_024,
@@ -598,7 +616,7 @@ struct OpenAICompatibleResponsesCompatibilityProbe: OpenAICompatibleResponsesCom
     }
 
     private static func initialPayload(modelID: String) -> JSONValue {
-        .object([
+        var payload: [String: JSONValue] = [
             "model": .string(modelID),
             "input": .array(initialInputItems),
             "tools": .array([functionTool]),
@@ -608,7 +626,9 @@ struct OpenAICompatibleResponsesCompatibilityProbe: OpenAICompatibleResponsesCom
             ]),
             "stream": .bool(true),
             "max_output_tokens": .integer(64),
-        ])
+        ]
+        addProbeReasoningMode(to: &payload, modelID: modelID)
+        return .object(payload)
     }
 
     private static func followupPayload(
@@ -623,14 +643,34 @@ struct OpenAICompatibleResponsesCompatibilityProbe: OpenAICompatibleResponsesCom
             "call_id": .string(callID),
             "output": .string(#"{"ok":true}"#),
         ]))
-        return .object([
+        var payload: [String: JSONValue] = [
             "model": .string(modelID),
             "input": .array(input),
             "tools": .array([functionTool]),
             "tool_choice": .string("none"),
             "stream": .bool(true),
             "max_output_tokens": .integer(64),
-        ])
+        ]
+        addProbeReasoningMode(to: &payload, modelID: modelID)
+        return .object(payload)
+    }
+
+    /// The probe intentionally has a very small output allowance. Qwen 3.8's
+    /// vLLM Responses adapter otherwise spends that allowance on hidden
+    /// reasoning and can emit a complete forced function call inside a
+    /// `response.completed` event whose embedded status is still `incomplete`.
+    /// That does not give us the clean two-request completion evidence needed
+    /// to enable local tools. The exact Qwen profile has independently verified
+    /// support for the standard `none` effort, so probe it in direct mode while
+    /// leaving unknown model families on the generic Responses request shape.
+    private static func addProbeReasoningMode(
+        to payload: inout [String: JSONValue],
+        modelID: String
+    ) {
+        guard KnownOpenAICompatibleModelProfile.profile(for: modelID) == .qwen38 else {
+            return
+        }
+        payload["reasoning"] = .object(["effort": .string("none")])
     }
 
     private static var initialInputItems: [JSONValue] {

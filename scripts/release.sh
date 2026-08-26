@@ -5,6 +5,7 @@ repo_root="${0:A:h:h}"
 version=""
 output_dir="$repo_root/dist-release"
 build_number="${ONYX_BUILD_NUMBER:-}"
+source_revision="${ONYX_SOURCE_REVISION:-}"
 display_name="${ONYX_APP_DISPLAY_NAME:-Onyx}"
 bundle_identifier="${ONYX_BUNDLE_IDENTIFIER:-app.onyx.agent}"
 volume_name=""
@@ -22,6 +23,7 @@ Usage:
 
 Options:
   --build-number NUMBER          CFBundleVersion. Defaults to a UTC timestamp.
+  --source-revision SHA          Exact 40-character source commit embedded in the app.
   --display-name NAME            Application display name. Defaults to Onyx.
   --bundle-id IDENTIFIER         Application bundle identifier.
   --volume-name NAME             Mounted DMG volume name. Defaults to "Onyx VERSION".
@@ -33,12 +35,12 @@ Options:
   -h, --help                     Show this help.
 
 Unsigned local release:
-  scripts/release.sh 0.1.1
+  scripts/release.sh 0.1.2
 
 Developer ID signed and notarized release:
   ONYX_CODESIGN_IDENTITY='Developer ID Application: Example (TEAMID)' \
   ONYX_NOTARIZE=1 ONYX_NOTARY_PROFILE=onyx-notary \
-  scripts/release.sh 0.1.1
+  scripts/release.sh 0.1.2
 
 See scripts/create-dmg.sh --help for supported notarization credentials.
 EOF
@@ -60,6 +62,11 @@ while (( $# > 0 )); do
     --build-number)
       require_value "$1" "${2:-}"
       build_number="$2"
+      shift 2
+      ;;
+    --source-revision)
+      require_value "$1" "${2:-}"
+      source_revision="$2"
       shift 2
       ;;
     --display-name)
@@ -126,10 +133,12 @@ if (( ${#positional[@]} == 2 )); then
 fi
 
 [[ "$version" =~ '^[0-9]+[.][0-9]+[.][0-9]+$' ]] || \
-  die "VERSION must contain exactly three numeric components (for example, 0.1.1)"
+  die "VERSION must contain exactly three numeric components (for example, 0.1.2)"
 [[ -n "$build_number" ]] || build_number="$(/bin/date -u +%Y%m%d%H%M)"
 [[ "$build_number" =~ '^[0-9]+([.][0-9]+){0,2}$' ]] || \
   die "build number must contain one to three numeric components"
+[[ -z "$source_revision" || "$source_revision" =~ '^[0-9a-f]{40}$' ]] || \
+  die "source revision must be an exact lowercase 40-character Git commit SHA"
 [[ "$architectures" == "native" || "$architectures" == "universal" ]] || \
   die "architectures must be native or universal"
 case "$notarize_mode" in
@@ -209,6 +218,9 @@ package_arguments=(
   --build-number "$build_number"
   --architectures "$architectures"
 )
+if [[ -n "$source_revision" ]]; then
+  package_arguments+=(--source-revision "$source_revision")
+fi
 if [[ -n "$signing_identity" ]]; then
   package_arguments+=(--signing-identity "$signing_identity")
 fi
@@ -238,6 +250,9 @@ verification_arguments=(
   --version "$version"
   --build-number "$build_number"
 )
+if [[ -n "$source_revision" ]]; then
+  verification_arguments+=(--source-revision "$source_revision")
+fi
 if (( notarize_mode == 1 )); then
   verification_arguments+=(--require-notarized)
 fi
