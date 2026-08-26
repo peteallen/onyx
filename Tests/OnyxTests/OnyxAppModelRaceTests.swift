@@ -865,6 +865,10 @@ final class OnyxAppModelRaceTests: XCTestCase {
         )
         XCTAssertEqual(model.selectedTaskAttention, .needsApproval)
         XCTAssertTrue(model.pendingUserInteractions.contains(Fixture.nonblockingQuestionForA))
+        XCTAssertTrue(
+            model.canEditComposer,
+            "A blocking approval must gate Send without disabling local follow-up drafting"
+        )
     }
 
     func testGlobalBlockingInteractionDisablesTaskActionsAndIsHiddenInArchivedScope() async throws {

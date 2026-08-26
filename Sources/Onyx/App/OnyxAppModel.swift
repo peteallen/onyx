@@ -680,14 +680,12 @@ final class OnyxAppModel: ObservableObject {
         return false
     }
 
-    /// Drafting is a local window action and must not depend on the provider
-    /// handshake. Keep the native editor available while a provider is
-    /// connecting, disconnected, signed out, or otherwise unavailable; only
-    /// the Send action is gated by `canRunAgent`.
+    /// Drafting is a local window action and must not depend on provider or
+    /// task writer availability. Keep the native editor available while a
+    /// provider reconnects, an approval is pending, or a review owns the task;
+    /// the Send action remains separately gated until writing is safe.
     var canEditComposer: Bool {
         !isShowingArchivedThreads
-            && activeUserInteraction?.isBlocking != true
-            && !isReviewBlockingComposer
     }
 
     var canReconnect: Bool {

@@ -268,7 +268,6 @@ jobs:
           # changing the release target. Existing exact tags are reusable for
           # a retry while this source remains the current branch head; tags at
           # another commit fail closed.
-          tag_created_this_run=false
           if [[ "$EVENT_NAME" != "push" ]]; then
             existing_tag_commit="$(resolve_tag_commit "$TAG" || true)"
             if [[ -n "$existing_tag_commit" ]]; then
@@ -290,7 +289,6 @@ jobs:
                   exit 1
                 }
               fi
-              tag_created_this_run=true
             fi
           fi
 
@@ -302,12 +300,11 @@ jobs:
 
           # Re-read release state after the long build. A prior successful
           # publication can be safely verified on retry, while a different
-          # release is never replaced.
+          # release is never replaced. Apply the current-main gate to every
+          # create or reuse path, including tag-triggered and existing-tag runs.
           release_reused=false
+          assert_current_main
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            if [[ "$tag_created_this_run" == "true" ]]; then
-              assert_current_main
-            fi
             if ! gh release create \
                 "$TAG" "$dmg_path" "$checksum_path" \
                 --repo "$GITHUB_REPOSITORY" \

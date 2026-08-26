@@ -211,7 +211,7 @@ final class OpenAICompatibleAdaptiveRuntimeTests: XCTestCase {
         }
     }
 
-    func testSwitchingAgentTaskModelWaitsForCurrentProcessCompatibleProbe() async throws {
+    func testSwitchingAgentTaskModelDoesNotWaitForOrStartProbe() async throws {
         let rawID = "agent-model-switch"
         let agentID = publicAgentThreadID(rawID)
         let now = Date(timeIntervalSince1970: 50_000)
@@ -236,12 +236,12 @@ final class OpenAICompatibleAdaptiveRuntimeTests: XCTestCase {
 
         try await harness.runtime.startTurn(.init(
             threadID: agentID,
-            inputs: [.text("probe and continue")],
+            inputs: [.text("continue with the selected model")],
             model: "verified-model"
         ))
         let probedModelIDs = await probe.modelIDs()
         let acceptedTurnIDs = await agent.threadIDs(for: .startTurn)
-        XCTAssertTrue(probedModelIDs.contains("verified-model"))
+        XCTAssertEqual(probedModelIDs, [])
         XCTAssertEqual(acceptedTurnIDs, [rawID])
         let owner = try await harness.stateStore.taskOwnership(
             connectionID: harness.connection.id,
@@ -254,7 +254,7 @@ final class OpenAICompatibleAdaptiveRuntimeTests: XCTestCase {
         await harness.runtime.disconnect()
     }
 
-    func testSwitchingAgentTaskModelStillRejectsAnIncompatibleProbe() async throws {
+    func testFailedDiagnosticProbeCannotBlockAgentTaskModelSwitch() async throws {
         let rawID = "agent-incompatible-model-switch"
         let agentID = publicAgentThreadID(rawID)
         let now = Date(timeIntervalSince1970: 50_500)
@@ -274,27 +274,33 @@ final class OpenAICompatibleAdaptiveRuntimeTests: XCTestCase {
             now: now
         )
         defer { harness.removeTemporaryState() }
+        try await harness.resolver.beginProbe(
+            connection: harness.connection,
+            modelID: "chat-model"
+        )
+        try await eventually("failed diagnostic probe is recorded") {
+            guard let decision = try? await harness.resolver.resolveNewTask(
+                connection: harness.connection,
+                modelID: "chat-model"
+            ) else { return false }
+            return decision.basis == .failedProbe(.missingFunctionCall)
+        }
         _ = try await harness.runtime.connect()
 
-        do {
-            try await harness.runtime.startTurn(.init(
-                threadID: agentID,
-                inputs: [.text("must stay on the existing agent model")],
-                model: "chat-model"
-            ))
-            XCTFail("An incompatible model switch should fail closed")
-        } catch let error as AgentRuntimeError {
-            XCTAssertTrue(error.localizedDescription.contains("verified agent tools"))
-        }
+        try await harness.runtime.startTurn(.init(
+            threadID: agentID,
+            inputs: [.text("continue despite the diagnostic result")],
+            model: "chat-model"
+        ))
 
         let dispatchedTurnIDs = await agent.threadIDs(for: .startTurn)
-        XCTAssertEqual(dispatchedTurnIDs, [])
+        XCTAssertEqual(dispatchedTurnIDs, [rawID])
         let owner = try await harness.stateStore.taskOwnership(
             connectionID: harness.connection.id,
             conversationScopeID: harness.connection.conversationScopeID,
             threadID: agentID
         )
-        XCTAssertEqual(owner?.modelID, "original-model")
+        XCTAssertEqual(owner?.modelID, "chat-model")
 
         await harness.runtime.disconnect()
     }
@@ -409,12 +415,10 @@ final class OpenAICompatibleAdaptiveRuntimeTests: XCTestCase {
         await harness.runtime.disconnect()
     }
 
-    func testConnectProbesOnlySelectedModelAndPublishesUpdatedCatalog() async throws {
+    func testConnectProjectsEveryGenericModelAsAgentWithoutStartingProbe() async throws {
         let now = Date(timeIntervalSince1970: 60_000)
-        let probeGate = AdaptiveAsyncGate()
         let probe = AdaptiveRuntimeProbe(
             outcomes: ["agent-model": .compatible(adaptiveCompatibleEvidence)],
-            gate: probeGate,
             testedAt: now
         )
         let chat = AdaptiveRuntimeFake(
@@ -431,35 +435,19 @@ final class OpenAICompatibleAdaptiveRuntimeTests: XCTestCase {
             now: now
         )
         defer { harness.removeTemporaryState() }
-        let eventLog = AdaptiveEventLog()
-        let collector = collectEvents(from: harness.runtime.events, into: eventLog)
-        defer { collector.cancel() }
-
         let session = try await harness.runtime.connect()
-        XCTAssertEqual(session.availableModels.map(\.executionMode), [.checkingAgent, .chat])
-        try await eventually("selected model probe starts") { await probe.modelIDs() == ["agent-model"] }
-        let initialProbeIDs = await probe.modelIDs()
-        XCTAssertEqual(initialProbeIDs, ["agent-model"])
-
-        await probeGate.open()
-        try await eventually("updated model catalog") {
-            await eventLog.events().contains { event in
-                guard case let .runtimeModelsUpdated(models) = event else { return false }
-                return models.map(\.executionMode) == [.agent, .chat]
-            }
-        }
-        let finalProbeIDs = await probe.modelIDs()
-        XCTAssertEqual(finalProbeIDs, ["agent-model"])
+        XCTAssertEqual(session.availableModels.map(\.executionMode), [.agent, .agent])
+        try await Task.sleep(for: .milliseconds(20))
+        let probedModelIDs = await probe.modelIDs()
+        XCTAssertEqual(probedModelIDs, [])
 
         await harness.runtime.disconnect()
     }
 
-    func testFirstMetadataPoorTaskJoinsProbeBeforeChoosingDurableLane() async throws {
+    func testFirstMetadataPoorTaskStartsAgentImmediatelyWithoutProbe() async throws {
         let now = Date(timeIntervalSince1970: 65_000)
-        let probeGate = AdaptiveAsyncGate()
         let probe = AdaptiveRuntimeProbe(
             outcomes: ["agent-model": .compatible(adaptiveCompatibleEvidence)],
-            gate: probeGate,
             testedAt: now
         )
         let chat = AdaptiveRuntimeFake(
@@ -482,24 +470,11 @@ final class OpenAICompatibleAdaptiveRuntimeTests: XCTestCase {
         defer { harness.removeTemporaryState() }
 
         let session = try await harness.runtime.connect()
-        XCTAssertEqual(session.availableModels.first?.executionMode, .checkingAgent)
-        let task = Task {
-            try await harness.runtime.startThread(.init(
-                cwd: "/tmp/project",
-                model: "agent-model"
-            ))
-        }
-        try await eventually("task creation joined selected-model probe") {
-            await probe.modelIDs() == ["agent-model"]
-        }
-        try await Task.sleep(for: .milliseconds(20))
-        let chatInvocationsBeforeProbe = await chat.invocations()
-        let agentInvocationsBeforeProbe = await agent.invocations()
-        XCTAssertFalse(chatInvocationsBeforeProbe.contains { $0.name == .startThread })
-        XCTAssertFalse(agentInvocationsBeforeProbe.contains { $0.name == .startThread })
-
-        await probeGate.open()
-        let thread = try await task.value
+        XCTAssertEqual(session.availableModels.first?.executionMode, .agent)
+        let thread = try await harness.runtime.startThread(.init(
+            cwd: "/tmp/project",
+            model: "agent-model"
+        ))
         XCTAssertEqual(thread.id, publicAgentThreadID("first-capable-task"))
         let chatInvocations = await chat.invocations()
         let agentInvocations = await agent.invocations()
@@ -508,6 +483,8 @@ final class OpenAICompatibleAdaptiveRuntimeTests: XCTestCase {
             agentInvocations.filter { $0.name == .startThread }.count,
             1
         )
+        let probedModelIDs = await probe.modelIDs()
+        XCTAssertEqual(probedModelIDs, [])
 
         await harness.runtime.disconnect()
     }
@@ -538,16 +515,6 @@ final class OpenAICompatibleAdaptiveRuntimeTests: XCTestCase {
             now: now
         )
         defer { harness.removeTemporaryState() }
-        try await harness.resolver.beginProbe(
-            connection: harness.connection,
-            modelID: "agent-model"
-        )
-        try await eventually("agent model is verified") {
-            (try? await harness.resolver.resolveNewTask(
-                connection: harness.connection,
-                modelID: "agent-model"
-            ).lane) == .agent
-        }
         _ = try await harness.runtime.connect()
         let eventLog = AdaptiveEventLog()
         let collector = collectEvents(from: harness.runtime.events, into: eventLog)
@@ -602,16 +569,6 @@ final class OpenAICompatibleAdaptiveRuntimeTests: XCTestCase {
             now: now
         )
         defer { harness.removeTemporaryState() }
-        try await harness.resolver.beginProbe(
-            connection: harness.connection,
-            modelID: "agent-model"
-        )
-        try await eventually("agent model is verified") {
-            (try? await harness.resolver.resolveNewTask(
-                connection: harness.connection,
-                modelID: "agent-model"
-            ).lane) == .agent
-        }
         _ = try await harness.runtime.connect()
 
         _ = try await harness.runtime.startThread(StartThreadRequest(

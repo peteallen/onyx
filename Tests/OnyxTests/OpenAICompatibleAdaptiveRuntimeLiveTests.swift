@@ -49,12 +49,17 @@ final class OpenAICompatibleAdaptiveRuntimeLiveTests: XCTestCase {
             "Set ONYX_LIVE_QWEN_ADAPTIVE_AGENT_TEST=1 to run the real vLLM project-agent proof."
         )
 
-        let connection = try await configuredConnection(environment: environment)
+        var connection = try await configuredConnection(environment: environment)
         guard connection.authMode == .none else {
             throw XCTSkip(
                 "The configured vLLM connection uses bearer authentication; this live proof only accepts the credential-free local setup."
             )
         }
+        // Deliberately discard catalog capability metadata. This proof must
+        // exercise optimistic generic-provider admission, not an advertised
+        // tool bit or a synthetic compatibility-probe result.
+        connection.discovery = .init()
+        XCTAssertTrue(connection.discovery.discoveredModels.isEmpty)
 
         let fileManager = FileManager.default
         let fixtureRoot = fileManager.temporaryDirectory.appendingPathComponent(
@@ -149,21 +154,6 @@ final class OpenAICompatibleAdaptiveRuntimeLiveTests: XCTestCase {
 
         do {
             _ = try await runtime.connect()
-            let directProbe = OpenAICompatibleResponsesCompatibilityProbe(
-                credentialStore: credentialStore
-            )
-            let directRecord = try await directProbe.probe(
-                connection: connection,
-                modelID: try modelID(connection)
-            )
-            print("Onyx live vLLM compatibility probe outcome: \(directRecord.outcome)")
-            try await resolver.beginProbe(connection: connection, modelID: try modelID(connection))
-            try await waitForCompatibleProbe(
-                resolver: resolver,
-                connection: connection,
-                modelID: try modelID(connection)
-            )
-
             let thread = try await runtime.startThread(
                 StartThreadRequest(
                     cwd: workspaceURL.path,
@@ -279,25 +269,6 @@ final class OpenAICompatibleAdaptiveRuntimeLiveTests: XCTestCase {
             throw XCTSkip("The configured vLLM connection has no selected model.")
         }
         return modelID
-    }
-
-    private func waitForCompatibleProbe(
-        resolver: OpenAICompatibleAdaptiveRuntimeResolver,
-        connection: ProviderConnectionRecord,
-        modelID: String
-    ) async throws {
-        for _ in 0..<240 {
-            if let decision = try? await resolver.resolveNewTask(
-                connection: connection,
-                modelID: modelID
-            ), decision.lane == .agent {
-                return
-            }
-            try await Task.sleep(for: .milliseconds(250))
-        }
-        throw AgentRuntimeError.protocolFailure(
-            "The configured vLLM model did not pass the Responses/tool compatibility probe within 60 seconds."
-        )
     }
 
     private func bundledPreviewURL(

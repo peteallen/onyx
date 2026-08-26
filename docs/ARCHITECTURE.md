@@ -17,7 +17,7 @@ Native SwiftUI/AppKit presentation
           /                 \
  CodexRuntime     OpenAICompatibleAdaptiveRuntime
       |               /                      \
-codex app-server  plain chat fallback     agent lane
+codex app-server  existing chat lane      new generic task agent lane
  (stdio JSONL)    /chat/completions       codex app-server
                                              |
                                     Onyx loopback proxy
@@ -32,23 +32,24 @@ tasks, drafts, and model identity provider-scoped.
 The implemented OpenAI-compatible path includes a URL-validated,
 redirect-protected HTTP/SSE transport, Keychain-backed bearer lookup, `/models`
 discovery, capability negotiation, a provider-owned conversation store, and
-production model selection. Its plain chat lane does not advertise local
-tools. The adaptive production path routes models that advertise
-tool/function-call support—or sparse models that pass a bounded Responses/tool
-compatibility probe—through the pinned app-server as a thread-scoped custom
-model provider. An Onyx-owned loopback proxy injects the
-Keychain credential upstream so neither app-server configuration nor its
-environment contains the third-party secret. Claude/Anthropic remains
-descriptor-only. See `PROVIDER_EXTENSIBILITY.md` for the exact boundary.
+production model selection. Its app-owned chat lane remains available for
+existing chat-owned tasks and does not advertise local tools. Every newly
+created OpenAI-compatible task attempts the pinned app-server as a
+thread-scoped custom model provider, regardless of model name or sparse
+catalog metadata. An Onyx-owned loopback proxy injects the Keychain credential
+upstream so neither app-server configuration nor its environment contains the
+third-party secret. Claude/Anthropic remains descriptor-only. See
+`PROVIDER_EXTENSIBILITY.md` for the exact boundary.
 
-Catalog and history projection never wait for provider network probing. For a
-metadata-poor selected model, Onyx starts only one bounded check in the
-background; if a new task is created while it is running, creation joins that
-same check before persisting the task's lane. Advertised tool support or a
-compatible probe selects the agent lane, while an incompatible result keeps
-the model usable through chat. Agent capability is never inferred from or
-denied by a model name; probe fallback behavior is driven by the endpoint's
-Responses events.
+Catalog and history projection never wait for provider network probing, and
+normal connection, task-creation, and agent-task model-switch paths do not
+start one. Resolver results may include advertised, compatible, failed, or
+unavailable probe evidence for diagnostics, but every new generic task is
+assigned the agent lane immediately and keeps that durable owner. An explicit
+diagnostic can run one bounded probe in the background; its result never
+demotes a model or migrates an existing task. If the endpoint cannot complete
+the real Responses/tool attempt, that failure is reported by the agent path
+instead of being silently converted to a new chat task.
 
 In the current implementation, the application owns:
 
@@ -83,9 +84,10 @@ draft preferences, local provider conversations, and model usage ranking.
 Existing tasks remain bound to their original provider. Their original model is
 the task default, while the unified picker can select another model from that
 provider for a later turn or reset to the default. New tasks can select any
-configured provider/model pair. Each OpenAI-compatible task also keeps its
-persisted agent/chat owner: later catalog or probe evidence affects future task
-creation, not the execution lane of existing history.
+configured provider/model pair. Newly created OpenAI-compatible tasks start
+with the agent owner; legacy or explicitly chat-owned tasks retain their
+persisted chat owner. Later catalog or probe evidence never migrates an
+existing history or changes the new-task agent default.
 
 A versioned conversation catalog exists as a tested foundation but is not yet
 wired into production task discovery. The shared-runtime coordinator is wired

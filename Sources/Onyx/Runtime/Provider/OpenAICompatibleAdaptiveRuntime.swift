@@ -403,8 +403,7 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
             probeUpdateSubscriptionID = probeUpdates.id
             var projected = try await models(
                 chatSession.availableModels,
-                for: connection,
-                startMissingProbes: true
+                for: connection
             )
             if projected.isEmpty { projected = chatSession.availableModels }
             guard currentGeneration == generation,
@@ -675,8 +674,7 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
                 )
                 var projected = try await models(
                     refreshed.availableModels,
-                    for: nextConnection,
-                    startMissingProbes: true
+                    for: nextConnection
                 )
                 if projected.isEmpty { projected = refreshed.availableModels }
                 guard connected, generation == refreshGeneration,
@@ -778,8 +776,7 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
                 replacementSubscription = subscription
                 var projected = try await models(
                     replacementChatSession.availableModels,
-                    for: nextConnection,
-                    startMissingProbes: true
+                    for: nextConnection
                 )
                 if projected.isEmpty { projected = replacementChatSession.availableModels }
                 guard generation == replacementGeneration, !Task.isCancelled,
@@ -1008,7 +1005,7 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
         let connection = try currentConnection()
         let scope = try currentScope()
         let modelID = try selectedModelID(request.model)
-        let decision = try await resolver.resolveNewTaskAwaitingProbe(
+        let decision = try await resolver.resolveNewTask(
             connection: connection,
             modelID: modelID
         )
@@ -1253,7 +1250,7 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
         if let requestedModelID,
            requestedModelID != owner.modelID,
            owner.lane == .agent {
-            let decision = try await resolver.resolveNewTaskAwaitingProbe(
+            let decision = try await resolver.resolveNewTask(
                 connection: connection,
                 modelID: requestedModelID
             )
@@ -1896,34 +1893,20 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
 
     private func models(
         _ baseModels: [RuntimeModel],
-        for connection: ProviderConnectionRecord,
-        startMissingProbes: Bool
+        for connection: ProviderConnectionRecord
     ) async throws -> [RuntimeModel] {
         var values: [RuntimeModel] = []
-        let selectedProbeModelID = startMissingProbes
-            ? (connection.selectedModelID
-                ?? baseModels.first(where: \.isDefault)?.id
-                ?? baseModels.first?.id)
-            : nil
         let decisions = try await resolver.resolveNewTasks(
             connection: connection,
-            modelIDs: baseModels.map(\.id),
-            modelIDToProbe: selectedProbeModelID
+            modelIDs: baseModels.map(\.id)
         )
         for (model, decision) in zip(baseModels, decisions) {
             let mode: RuntimeModelExecutionMode
             let capabilities: RuntimeCapabilities
             switch decision.basis {
-            case .advertisedToolUse, .compatibleProbe:
+            case .advertisedToolUse, .compatibleProbe, .failedProbe, .unavailableProbe:
                 mode = .agent
                 capabilities = Self.capabilities(for: .agent, model: model)
-            case .failedProbe:
-                mode = .chat
-                capabilities = Self.capabilities(for: .chat, model: model)
-            case .unavailableProbe:
-                let shouldStartProbe = model.id == selectedProbeModelID
-                mode = shouldStartProbe ? .checkingAgent : .chat
-                capabilities = Self.capabilities(for: .chat, model: model)
             case .existingTask:
                 mode = decision.lane == .agent ? .agent : .chat
                 capabilities = Self.capabilities(for: decision.lane, model: model)
@@ -2328,8 +2311,7 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
         }
         guard let projected = try? await models(
             baseModels,
-            for: connection,
-            startMissingProbes: false
+            for: connection
         ), generation == updateGeneration,
               sessionRevision == updateRevision,
               self.connection?.id == connection.id,

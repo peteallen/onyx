@@ -22,6 +22,10 @@ final class OnyxAppModelReviewTests: XCTestCase {
         }
         XCTAssertTrue(model.isSelectedReviewStarting)
         XCTAssertTrue(model.isReviewBlockingComposer)
+        XCTAssertTrue(
+            model.canEditComposer,
+            "An active review must gate Send without disabling local follow-up drafting"
+        )
 
         model.composerText = "Keep this draft while review runs"
         model.sendComposer()

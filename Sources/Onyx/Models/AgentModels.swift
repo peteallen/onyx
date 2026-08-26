@@ -49,20 +49,21 @@ struct RuntimeCapabilities: OptionSet, Sendable, Hashable {
     static let threadHistoryRevert = Self(rawValue: 1 << 17)
 }
 
-/// How Onyx will execute a newly created task for one model. This is deliberately
-/// model-specific: a provider-wide tools bit would make chat-owned tasks appear
-/// able to edit files merely because a different model passed the agent probe.
+/// How Onyx will execute a newly created task for one model. Durable existing
+/// tasks retain the lane they were created on even when the new-task default
+/// changes.
 enum RuntimeModelExecutionMode: String, Sendable, Hashable {
     /// Native runtimes such as Codex inherit the session's capability set.
     case inherited
     /// The app-owned chat adapter remains the durable backend for new tasks.
     case chat
-    /// A bounded behavioral check is running in the background. Creating a
-    /// task with this selected model joins that one check before its durable
-    /// chat/agent owner is chosen.
+    /// Legacy/transitional presentation state for runtimes that explicitly
+    /// perform a diagnostic agent check. Generic-provider admission no longer
+    /// waits on this state.
     case checkingAgent
-    /// The selected model advertises tool use or passed the behavioral probe,
-    /// so new tasks use the sandboxed app-server agent path.
+    /// New tasks use the sandboxed app-server agent path. For generic
+    /// OpenAI-compatible providers this is the default real attempt, not a
+    /// conclusion inferred from model names or a synthetic probe.
     case agent
 }
 

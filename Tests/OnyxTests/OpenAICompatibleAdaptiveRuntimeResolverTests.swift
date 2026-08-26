@@ -59,7 +59,7 @@ final class OpenAICompatibleAdaptiveRuntimeResolverTests: XCTestCase {
         XCTAssertEqual(probedModels, [])
     }
 
-    func testNewTaskLaneIsResolvedPerModelAndReusableProbeEvidenceIsCached() async throws {
+    func testNewTaskAgentAdmissionIsIndependentOfReusableProbeEvidence() async throws {
         let connection = try makeAdaptiveConnection()
         let now = Date(timeIntervalSince1970: 100)
         let probe = AdaptiveLaneProbe(outcomes: [
@@ -76,7 +76,7 @@ final class OpenAICompatibleAdaptiveRuntimeResolverTests: XCTestCase {
             connection: connection,
             modelID: "agent-model"
         )
-        XCTAssertEqual(beforeProbe.lane, .chat)
+        XCTAssertEqual(beforeProbe.lane, .agent)
         XCTAssertEqual(beforeProbe.basis, .unavailableProbe)
         let callsBeforeProbe = await probe.modelsProbed()
         XCTAssertEqual(callsBeforeProbe.count, 0)
@@ -99,7 +99,7 @@ final class OpenAICompatibleAdaptiveRuntimeResolverTests: XCTestCase {
         XCTAssertEqual(agent.lane, .agent)
         XCTAssertEqual(agent.basis, .compatibleProbe)
         XCTAssertEqual(cachedAgent, agent)
-        XCTAssertEqual(chat.lane, .chat)
+        XCTAssertEqual(chat.lane, .agent)
         XCTAssertEqual(chat.basis, .failedProbe(.missingFunctionCall))
         XCTAssertEqual(agent.modelID, "agent-model")
         XCTAssertEqual(chat.modelID, "chat-model")
@@ -107,7 +107,7 @@ final class OpenAICompatibleAdaptiveRuntimeResolverTests: XCTestCase {
         XCTAssertEqual(probedModels, ["agent-model", "chat-model"])
     }
 
-    func testFirstMetadataPoorTaskWaitsForItsProbeAndUsesAgentLaneWhenCompatible() async throws {
+    func testMetadataPoorNewTaskAttemptsAgentWithoutStartingProbe() async throws {
         let connection = try makeAdaptiveConnection()
         let probe = AdaptiveLaneProbe(
             outcomes: ["acme/sparse-agent": .compatible(Self.compatibleEvidence)],
@@ -118,36 +118,49 @@ final class OpenAICompatibleAdaptiveRuntimeResolverTests: XCTestCase {
             stateStore: makeAdaptiveStateStore()
         )
 
-        let decision = try await resolver.resolveNewTaskAwaitingProbe(
+        let decision = try await resolver.resolveNewTask(
             connection: connection,
             modelID: "acme/sparse-agent"
         )
 
         XCTAssertEqual(decision.lane, .agent)
-        XCTAssertEqual(decision.basis, .compatibleProbe)
+        XCTAssertEqual(decision.basis, .unavailableProbe)
         let probedModels = await probe.modelsProbed()
-        XCTAssertEqual(probedModels, ["acme/sparse-agent"])
+        XCTAssertEqual(probedModels, [])
     }
 
-    func testFirstMetadataPoorTaskWaitsForItsProbeAndUsesChatWhenIncompatible() async throws {
+    func testPersistedFailedProbeCannotDemoteMetadataPoorNewTask() async throws {
         let connection = try makeAdaptiveConnection()
+        let now = Date(timeIntervalSince1970: 50_100)
+        let stateStore = makeAdaptiveStateStore()
+        try await stateStore.storeProbeRecord(
+            OpenAICompatibleResponsesProbeRecord(
+                fingerprint: .init(connection: connection, modelID: "acme/plain-chat"),
+                testedAt: now,
+                expiresAt: now.addingTimeInterval(3_600),
+                outcome: .failed(.missingFunctionCall)
+            ),
+            at: now
+        )
         let probe = AdaptiveLaneProbe(
-            outcomes: ["acme/plain-chat": .failed(.missingFunctionCall)]
+            outcomes: ["acme/plain-chat": .failed(.missingFunctionCall)],
+            testedAt: now
         )
         let resolver = OpenAICompatibleAdaptiveRuntimeResolver(
             probe: probe,
-            stateStore: makeAdaptiveStateStore()
+            stateStore: stateStore,
+            now: { now }
         )
 
-        let decision = try await resolver.resolveNewTaskAwaitingProbe(
+        let decision = try await resolver.resolveNewTask(
             connection: connection,
             modelID: "acme/plain-chat"
         )
 
-        XCTAssertEqual(decision.lane, .chat)
+        XCTAssertEqual(decision.lane, .agent)
         XCTAssertEqual(decision.basis, .failedProbe(.missingFunctionCall))
         let probedModels = await probe.modelsProbed()
-        XCTAssertEqual(probedModels, ["acme/plain-chat"])
+        XCTAssertEqual(probedModels, [])
     }
 
     func testConcurrentSameModelResolutionSharesOneProbe() async throws {
@@ -200,7 +213,7 @@ final class OpenAICompatibleAdaptiveRuntimeResolverTests: XCTestCase {
             modelIDToProbe: "agent-model"
         )
 
-        XCTAssertEqual(initial.map(\.lane), [.chat, .chat, .chat])
+        XCTAssertEqual(initial.map(\.lane), [.agent, .agent, .agent])
         XCTAssertEqual(initial.map(\.basis), [
             .unavailableProbe, .unavailableProbe, .unavailableProbe,
         ])
@@ -252,7 +265,7 @@ final class OpenAICompatibleAdaptiveRuntimeResolverTests: XCTestCase {
         XCTAssertEqual(update?.1.outcome, .compatible(Self.compatibleEvidence))
     }
 
-    func testProbeFailureFailsClosedToChatWithoutCachingAnException() async throws {
+    func testProbeExceptionDoesNotDemoteDefaultAgentAdmission() async throws {
         let connection = try makeAdaptiveConnection()
         let probe = AdaptiveLaneProbe(
             outcomes: [:],
@@ -284,9 +297,9 @@ final class OpenAICompatibleAdaptiveRuntimeResolverTests: XCTestCase {
             modelID: "unavailable"
         )
 
-        XCTAssertEqual(first.lane, .chat)
+        XCTAssertEqual(first.lane, .agent)
         XCTAssertEqual(first.basis, .unavailableProbe)
-        XCTAssertEqual(second.lane, .chat)
+        XCTAssertEqual(second.lane, .agent)
         let probedModels = await probe.modelsProbed()
         XCTAssertEqual(probedModels, ["unavailable", "unavailable"])
     }
@@ -359,7 +372,7 @@ final class OpenAICompatibleAdaptiveRuntimeResolverTests: XCTestCase {
             connection: connection,
             modelID: "agent-model"
         )
-        XCTAssertEqual(beforeFreshProbe.lane, .chat)
+        XCTAssertEqual(beforeFreshProbe.lane, .agent)
         XCTAssertEqual(beforeFreshProbe.basis, .unavailableProbe)
         let callsBeforeFreshProbe = await freshProbe.modelsProbed()
         XCTAssertEqual(callsBeforeFreshProbe, [])
@@ -378,7 +391,7 @@ final class OpenAICompatibleAdaptiveRuntimeResolverTests: XCTestCase {
         await freshResolver.invalidateProbeCache()
     }
 
-    func testExistingTasksKeepDurableLanesWithoutUnlockingNewTasks() async throws {
+    func testExistingTasksKeepDurableLanesWhileNewTasksDefaultToAgent() async throws {
         let connection = try makeAdaptiveConnection()
         let probe = AdaptiveLaneProbe(
             outcomes: ["later-compatible": .compatible(Self.compatibleEvidence)]
@@ -421,7 +434,7 @@ final class OpenAICompatibleAdaptiveRuntimeResolverTests: XCTestCase {
         XCTAssertEqual(existingChat.basis, .existingTask)
         XCTAssertEqual(existingAgent.lane, .agent)
         XCTAssertEqual(existingAgent.basis, .existingTask)
-        XCTAssertEqual(freshTaskWithOwnedAgentModel.lane, .chat)
+        XCTAssertEqual(freshTaskWithOwnedAgentModel.lane, .agent)
         XCTAssertEqual(freshTaskWithOwnedAgentModel.basis, .unavailableProbe)
         let probedModels = await probe.modelsProbed()
         XCTAssertEqual(probedModels, [])

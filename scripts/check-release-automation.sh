@@ -152,12 +152,6 @@ require_text "$release_text" 'gh release download "$TAG"' \
   "exact-release retry asset verification"
 require_text "$release_text" 'release_reused=false' \
   "explicit exact-release retry state"
-require_text "$release_text" 'tag_created_this_run=false' \
-  "explicit preexisting-tag retry state"
-require_text "$release_text" 'tag_created_this_run=true' \
-  "new manual-tag mutation state"
-require_text "$release_text" 'if [[ "$tag_created_this_run" == "true" ]]; then' \
-  "conditional current-main release mutation gate"
 require_text "$release_text" 'if [[ "$release_reused" == "true" ]]; then' \
   "separate retry asset verification"
 require_text "$release_text" 'Existing release digest does not match' \
@@ -190,11 +184,10 @@ artifact_gate_line="$(/usr/bin/awk '/Release DMG\/checksum pair is incomplete/ {
 clean_assertion_line="$(/usr/bin/awk '/^[[:space:]]+assert_clean_source$/ { print NR; exit }' "$release_workflow")"
 main_assertion_lines=("${(@f)$(/usr/bin/awk '/^[[:space:]]+assert_current_main$/ { print NR }' "$release_workflow")}")
 tag_create_line="$(/usr/bin/awk '/gh api --method POST/ { print NR; exit }' "$release_workflow")"
-tag_created_line="$(/usr/bin/awk '/^[[:space:]]+tag_created_this_run=true$/ { print NR; exit }' "$release_workflow")"
-release_main_condition_line="$(/usr/bin/awk '/^[[:space:]]+if \[\[ "\$tag_created_this_run" == "true" \]\]; then$/ { print NR; exit }' "$release_workflow")"
+release_check_line="$(/usr/bin/awk '/^[[:space:]]+if ! gh release view "\$TAG" --repo "\$GITHUB_REPOSITORY" >\/dev\/null 2>&1; then$/ { print NR; exit }' "$release_workflow")"
 release_create_line="$(/usr/bin/awk '/if ! gh release create/ { print NR; exit }' "$release_workflow")"
 [[ "$artifact_gate_line" == <1-> && "$tag_create_line" == <1-> && \
-   "$tag_created_line" == <1-> && "$release_main_condition_line" == <1-> && \
+   "$release_check_line" == <1-> && \
    "$release_create_line" == <1-> && \
    "$tag_create_line" -gt "$artifact_gate_line" ]] || \
   die "manual tag creation must follow the verified artifact gate"
@@ -203,15 +196,16 @@ release_create_line="$(/usr/bin/awk '/if ! gh release create/ { print NR; exit }
 (( ${#main_assertion_lines[@]} == 2 )) || \
   die "release publication must perform exactly two current-main mutation assertions"
 [[ "${main_assertion_lines[1]}" -lt "$tag_create_line" && \
-   "$tag_create_line" -lt "$tag_created_line" && \
-   "$tag_created_line" -lt "$release_main_condition_line" && \
-   "$release_main_condition_line" -lt "${main_assertion_lines[2]}" && \
-   "${main_assertion_lines[2]}" -lt "$release_create_line" ]] || \
-  die "current-main assertions must guard only this run's new tag/release mutation boundaries"
+   "$tag_create_line" -lt "${main_assertion_lines[2]}" && \
+   "${main_assertion_lines[2]}" -lt "$release_check_line" && \
+   "$release_check_line" -lt "$release_create_line" ]] || \
+  die "current-main assertions must guard manual tag creation and every release/reuse path"
 (( tag_create_line - main_assertion_lines[1] <= 2 )) || \
   die "manual tag creation must immediately follow a current-main assertion"
-(( release_create_line - main_assertion_lines[2] <= 2 )) || \
-  die "public release creation must immediately follow a current-main assertion"
+(( release_check_line - main_assertion_lines[2] <= 2 )) || \
+  die "the current-main gate must immediately precede the release create/reuse decision"
+forbid_text "$release_text" 'if [[ "$tag_created_this_run" == "true" ]]; then' \
+  "conditional current-main release gate"
 require_text "$release_text" \
   'if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then' \
   "fresh existing-release check"

@@ -8,8 +8,14 @@ struct OpenAICompatibleRuntimeLaneDecision: Equatable, Sendable {
         /// attempt immediately; the app-server sandbox, approval, and
         /// malformed-call handling remain the safety boundary.
         case advertisedToolUse
+        /// Diagnostic evidence from the optional synthetic probe. New generic
+        /// tasks attempt the real app-server lane regardless of this result.
         case compatibleProbe
+        /// Diagnostic evidence from the optional synthetic probe. A failure
+        /// never demotes a new generic task to the reply-only lane.
         case failedProbe(OpenAICompatibleResponsesProbeFailure)
+        /// No reusable diagnostic probe result is available. This is not a
+        /// routing gate: new generic tasks still attempt the agent lane.
         case unavailableProbe
         case existingTask
     }
@@ -34,11 +40,10 @@ enum OpenAICompatibleAdaptiveRuntimeResolverError: LocalizedError, Equatable, Se
     }
 }
 
-/// Publishes cached lane decisions and runs one bounded behavioral probe per
-/// selected metadata-poor model. Catalog and history loading never await the
-/// network. Actual task creation may join that already-running probe so a
-/// capable first task is not permanently assigned to chat while its capability
-/// result is milliseconds away.
+/// Resolves every new generic-provider task to the real app-server agent lane.
+/// Synthetic probe results remain available to explicit diagnostics, but they
+/// never gate task creation, demote a model, or migrate an existing task's
+/// durable lane ownership.
 actor OpenAICompatibleAdaptiveRuntimeResolver {
     struct ProbeUpdateSubscription: Sendable {
         let id: UUID
@@ -83,46 +88,6 @@ actor OpenAICompatibleAdaptiveRuntimeResolver {
             throw OpenAICompatibleAdaptiveRuntimeResolverError.invalidModel
         }
         return result
-    }
-
-    /// Resolves the durable lane at the task-creation boundary. Explicit
-    /// catalog evidence and reusable outcomes return immediately. Only an
-    /// otherwise-unknown selected model joins its single bounded probe; this
-    /// never fans out checks across the provider catalog.
-    func resolveNewTaskAwaitingProbe(
-        connection: ProviderConnectionRecord,
-        modelID rawModelID: String
-    ) async throws -> OpenAICompatibleRuntimeLaneDecision {
-        try Task.checkCancellation()
-        let initial = try await resolveNewTask(
-            connection: connection,
-            modelID: rawModelID
-        )
-        guard initial.basis == .unavailableProbe else { return initial }
-
-        let modelID = try Self.validatedModelID(rawModelID)
-        let fingerprint = OpenAICompatibleResponsesProbeFingerprint(
-            connection: connection,
-            modelID: modelID
-        )
-        try await beginProbe(connection: connection, modelID: modelID)
-        try Task.checkCancellation()
-
-        if let attempt = attempts[fingerprint] {
-            _ = await attempt.task.result
-            try Task.checkCancellation()
-            // The background publisher and this task-creation waiter may both
-            // observe completion. The attempt ID makes publication idempotent;
-            // whichever enters first installs the reusable record.
-            await finishProbe(
-                id: attempt.id,
-                fingerprint: fingerprint,
-                modelID: modelID,
-                task: attempt.task
-            )
-        }
-        try Task.checkCancellation()
-        return try await resolveNewTask(connection: connection, modelID: modelID)
     }
 
     /// Projects a complete provider catalog with at most one durable-state
@@ -322,8 +287,8 @@ actor OpenAICompatibleAdaptiveRuntimeResolver {
         guard record.isReusable(for: fingerprint, at: completionDate) else { return }
 
         if case .failed = record.outcome {
-            // Failed evidence is safe to retain in memory even if persistence
-            // fails because it can only keep the model on the chat lane.
+            // Failed evidence is safe to retain for diagnostics even if
+            // persistence fails because it cannot change lane admission.
             try? await stateStore.storeProbeRecord(record, at: completionDate)
         }
         guard attempts[fingerprint]?.id == id, !Task.isCancelled else { return }
@@ -358,12 +323,11 @@ actor OpenAICompatibleAdaptiveRuntimeResolver {
         connection: ProviderConnectionRecord,
         record: OpenAICompatibleResponsesProbeRecord?
     ) -> OpenAICompatibleRuntimeLaneDecision {
-        // A catalog-level tool/function-call declaration is enough to start
-        // the real app-server agent path. It is intentionally model-agnostic:
-        // model IDs are not a capability allow-list, and a stale synthetic
-        // probe failure must not strand a provider that has already told us it
-        // can make tool calls. The app-server sandbox, approval flow, and
-        // malformed/rejected-call handling remain the runtime safety boundary.
+        // Every new OpenAI-compatible task gets a real app-server agent
+        // attempt. Catalog evidence and probe outcomes remain useful
+        // diagnostics, but model names and synthetic checks are not admission
+        // gates. App-server's parser, sandbox, approvals, and provider errors
+        // are the execution boundary.
         if connection.discovery.discoveredModels.first(where: { $0.id == modelID })?
             .capabilities.serverAdvertisesToolUse == true {
             return decision(
@@ -373,13 +337,13 @@ actor OpenAICompatibleAdaptiveRuntimeResolver {
             )
         }
         guard let record else {
-            return decision(modelID: modelID, lane: .chat, basis: .unavailableProbe)
+            return decision(modelID: modelID, lane: .agent, basis: .unavailableProbe)
         }
         switch record.outcome {
         case .compatible:
             return decision(modelID: modelID, lane: .agent, basis: .compatibleProbe)
         case let .failed(failure):
-            return decision(modelID: modelID, lane: .chat, basis: .failedProbe(failure))
+            return decision(modelID: modelID, lane: .agent, basis: .failedProbe(failure))
         }
     }
 
