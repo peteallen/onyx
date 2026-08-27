@@ -158,6 +158,27 @@ struct TranscriptPresentationSnapshot: Equatable, Sendable {
     }
 }
 
+/// One follow-up submitted into an active turn. This is deliberately
+/// presentation state rather than a `TimelineItem`: the provider remains the
+/// authority for durable user-message history, while Onyx owns the short gap
+/// between clearing the composer and receiving that authoritative item.
+struct PendingSteeringMessage: Identifiable, Equatable, Sendable {
+    enum State: Equatable, Sendable {
+        /// The local request has been captured but `turn/steer` has not yet
+        /// acknowledged it.
+        case submitting
+        /// The runtime accepted the request and it is waiting to be reflected
+        /// by the live turn.
+        case queued
+    }
+
+    let id: UUID
+    let threadID: String
+    let text: String
+    let attachmentCount: Int
+    var state: State
+}
+
 @MainActor
 final class OnyxAppModel: ObservableObject {
     @Published var connectionState: RuntimeConnectionState = .disconnected
@@ -251,6 +272,12 @@ final class OnyxAppModel: ObservableObject {
     @Published private(set) var isPreparingLatestMessageEdit = false
     @Published private(set) var isPreparingFailedResponseRetry = false
     @Published var isTurnRunning = false
+    /// Follow-ups submitted while the selected turn is already active are
+    /// steering messages, not new turns. Keep a small app-owned projection of
+    /// those requests until app-server publishes the matching user item (or
+    /// the active turn ends) so clearing the composer never makes an accepted
+    /// instruction look lost.
+    @Published private(set) var pendingSteeringMessagesByThreadID: [String: [PendingSteeringMessage]] = [:]
     @Published private(set) var reviewingThreadID: String?
     @Published private(set) var startingReviewThreadID: String?
     @Published private(set) var pendingUserInteractions: [RuntimeUserInteraction] = []
@@ -449,6 +476,9 @@ final class OnyxAppModel: ObservableObject {
         let optimisticUserItem: TimelineItem?
         let cwd: String?
         let wasTurnRunning: Bool
+        /// Stable UI identity for a follow-up submitted into an already-live
+        /// turn. It is absent for fresh turns and new-task creation.
+        let pendingSteeringMessageID: UUID?
         let modelID: String?
         let reasoningEffort: String?
         let sandboxMode: RuntimeSandboxMode
@@ -707,6 +737,23 @@ final class OnyxAppModel: ObservableObject {
         guard authState.canRun, !isSigningOut else { return false }
         if case .connected = connectionState { return true }
         return false
+    }
+
+    /// A follow-up submitted while a response is active is a provider
+    /// `steer` operation, not a second independent turn. Keep the composer
+    /// editable for every runtime, but expose/accept its Send action only
+    /// when the selected task can actually steer the active turn.
+    var canQueueFollowUp: Bool {
+        !isTurnRunning || supports(.steering)
+    }
+
+    /// Steering feedback follows the selected task, but requests for other
+    /// tasks remain retained until their provider event or turn completion
+    /// arrives. This makes a quick navigation away and back lossless without
+    /// publishing an app-owned message into durable history.
+    var pendingSteeringMessagesForSelectedThread: [PendingSteeringMessage] {
+        guard let selectedThreadID else { return [] }
+        return pendingSteeringMessagesByThreadID[selectedThreadID] ?? []
     }
 
     /// Drafting is a local window action and must not depend on provider or
@@ -2375,13 +2422,22 @@ final class OnyxAppModel: ObservableObject {
         let originThread = selectedThread
         let originThreadID = selectedThreadID
         let isNewThread = originThreadID == nil || originThreadID == Self.welcomeThread.id
+        let wasTurnRunning = originThread.map(\.status.isBusy) ?? isTurnRunning
+        guard !wasTurnRunning || supports(.steering) else {
+            notice = (
+                "Follow-ups are unavailable",
+                "This provider is still finishing the current response and does not support queued follow-ups. Your draft is still here."
+            )
+            return false
+        }
+        let pendingSteeringMessageID = !isNewThread && wasTurnRunning ? UUID() : nil
         let sourceDraftKey = composerDraftKey
         let provisionalDraftKey = isNewThread ? "onyx:pending:\(UUID().uuidString)" : nil
         let inputs: [RuntimeTurnInput] = (text.isEmpty ? [] : [.text(text)]) + images.map(\.input)
         let optimisticUserItem = contextOptimisticUserItem(
             text: text,
             images: images,
-            wasTurnRunning: originThread.map(\.status.isBusy) ?? isTurnRunning
+            wasTurnRunning: wasTurnRunning
         )
         let context = SendContext(
             draftText: draftText,
@@ -2394,7 +2450,8 @@ final class OnyxAppModel: ObservableObject {
             isNewThread: isNewThread,
             optimisticUserItem: optimisticUserItem,
             cwd: isNewThread ? draftWorkspacePath : originThread?.cwd,
-            wasTurnRunning: originThread.map(\.status.isBusy) ?? isTurnRunning,
+            wasTurnRunning: wasTurnRunning,
+            pendingSteeringMessageID: pendingSteeringMessageID,
             // Capture the resolved default as well as an explicit picker
             // choice. This keeps the request and its usage attribution
             // aligned even when the user never opens the picker.
@@ -2408,6 +2465,18 @@ final class OnyxAppModel: ObservableObject {
             navigationRevision: navigationRevision,
             accountEpoch: accountEpoch
         )
+
+        if let pendingSteeringMessageID, let originThreadID {
+            enqueuePendingSteeringMessage(
+                PendingSteeringMessage(
+                    id: pendingSteeringMessageID,
+                    threadID: originThreadID,
+                    text: text,
+                    attachmentCount: images.count,
+                    state: .submitting
+                )
+            )
+        }
 
         composerText = ""
         saveCurrentDraftNow()
@@ -2478,25 +2547,15 @@ final class OnyxAppModel: ObservableObject {
                     // Steering has no model field, so an override selected
                     // while a turn is active applies to the next fresh turn.
                     modelUsed = originThread?.model ?? context.modelID
-                    if !context.images.isEmpty,
-                       selectedThreadID == threadID,
-                       navigationRevision == context.navigationRevision {
-                        appendTimeline(
-                            TimelineItem(
-                                id: "optimistic:\(UUID().uuidString)",
-                                kind: .userMessage,
-                                title: nil,
-                                body: context.text,
-                                status: .completed,
-                                timestamp: .now,
-                                detail: nil,
-                                attachments: context.images.map(\.timelineAttachment)
-                            )
-                        )
-                    }
                     try await runtime.steer(threadID: threadID, inputs: context.inputs)
                     recordModelUsageIfAvailable(modelUsed)
                     guard accountEpoch == context.accountEpoch, !Task.isCancelled else { return }
+                    if let pendingSteeringMessageID = context.pendingSteeringMessageID {
+                        markPendingSteeringMessageQueued(
+                            id: pendingSteeringMessageID,
+                            for: threadID
+                        )
+                    }
                 } else {
                     if !createdThread, resumedThreadID != threadID {
                         let loaded = try await loadInitialHistory(
@@ -2562,19 +2621,32 @@ final class OnyxAppModel: ObservableObject {
                         for: targetThreadID ?? context.originThreadID
                     )
                 }
+                if let pendingSteeringMessageID = context.pendingSteeringMessageID,
+                   let steeringThreadID = targetThreadID ?? context.originThreadID {
+                    removePendingSteeringMessage(
+                        id: pendingSteeringMessageID,
+                        for: steeringThreadID
+                    )
+                }
                 if context.isNewThread, !createdThread {
                     restoreFailedNewTaskSend(context)
                 } else {
                     restoreFailedSend(context.draftText, for: failureDraftKey)
                     restoreFailedImages(context.images, for: failureDraftKey)
                 }
-                let failure = sendFailureMessage(for: error)
+                let failure = context.wasTurnRunning
+                    ? (
+                        title: "Could not queue steering message",
+                        detail: "The active task is still running. \(error.localizedDescription)"
+                    )
+                    : sendFailureMessage(for: error)
                 notice = failure
-                if let targetThreadID {
+                if !context.wasTurnRunning, let targetThreadID {
                     mutateThread(id: targetThreadID) { $0.status = .idle }
                 }
-                if selectedThreadID == targetThreadID
-                    || (targetThreadID == nil && navigationRevision == context.navigationRevision) {
+                if !context.wasTurnRunning,
+                   (selectedThreadID == targetThreadID
+                    || (targetThreadID == nil && navigationRevision == context.navigationRevision)) {
                     isTurnRunning = false
                     appendTimeline(
                         TimelineItem(
@@ -2649,6 +2721,54 @@ final class OnyxAppModel: ObservableObject {
         for index in loadedConversationTurns.indices {
             loadedConversationTurns[index].items.removeAll { $0.id == item.id }
         }
+    }
+
+    private func enqueuePendingSteeringMessage(_ message: PendingSteeringMessage) {
+        pendingSteeringMessagesByThreadID[message.threadID, default: []].append(message)
+    }
+
+    private func markPendingSteeringMessageQueued(id: UUID, for threadID: String) {
+        guard var messages = pendingSteeringMessagesByThreadID[threadID],
+              let index = messages.firstIndex(where: { $0.id == id }) else { return }
+        messages[index].state = .queued
+        pendingSteeringMessagesByThreadID[threadID] = messages
+    }
+
+    private func removePendingSteeringMessage(id: UUID, for threadID: String) {
+        guard var messages = pendingSteeringMessagesByThreadID[threadID] else { return }
+        messages.removeAll { $0.id == id }
+        if messages.isEmpty {
+            pendingSteeringMessagesByThreadID.removeValue(forKey: threadID)
+        } else {
+            pendingSteeringMessagesByThreadID[threadID] = messages
+        }
+    }
+
+    /// Reconciles one app-owned queue row with the provider's durable user
+    /// item. FIFO matching matters when the same short correction is sent
+    /// twice; attachment count disambiguates image-only follow-ups without
+    /// retaining image bytes in the presentation queue.
+    @discardableResult
+    private func consumePendingSteeringMessage(
+        matching item: TimelineItem,
+        for threadID: String
+    ) -> Bool {
+        guard item.kind == .userMessage,
+              var messages = pendingSteeringMessagesByThreadID[threadID],
+              let index = messages.firstIndex(where: {
+                  $0.text == item.body && $0.attachmentCount == item.attachments.count
+              }) else { return false }
+        messages.remove(at: index)
+        if messages.isEmpty {
+            pendingSteeringMessagesByThreadID.removeValue(forKey: threadID)
+        } else {
+            pendingSteeringMessagesByThreadID[threadID] = messages
+        }
+        return true
+    }
+
+    private func settlePendingSteeringMessages(for threadID: String) {
+        pendingSteeringMessagesByThreadID.removeValue(forKey: threadID)
     }
 
     func interrupt() {
@@ -3444,6 +3564,7 @@ final class OnyxAppModel: ObservableObject {
                 startingReviewThreadID = nil
                 isTurnRunning = false
                 activeTurnIDsByThreadID.removeAll()
+                pendingSteeringMessagesByThreadID.removeAll()
                 downgradeLiveCollaborationAgents()
             } else if case .disconnected = state {
                 pendingUserInteractions.removeAll()
@@ -3453,6 +3574,7 @@ final class OnyxAppModel: ObservableObject {
                 startingReviewThreadID = nil
                 isTurnRunning = false
                 activeTurnIDsByThreadID.removeAll()
+                pendingSteeringMessagesByThreadID.removeAll()
                 downgradeLiveCollaborationAgents()
             }
         case let .runtimeCapabilitiesDowngraded(capabilities):
@@ -3526,6 +3648,9 @@ final class OnyxAppModel: ObservableObject {
         case let .threadStatusChanged(threadID, status):
             guard authState.canRun, !isSigningOut else { return }
             updateThreadLifecycle(id: threadID, status: status)
+            if !status.isBusy {
+                settlePendingSteeringMessages(for: threadID)
+            }
             if selectedThreadID == threadID {
                 isTurnRunning = status.isBusy || isReviewActive(for: threadID)
             }
@@ -3536,6 +3661,7 @@ final class OnyxAppModel: ObservableObject {
             }
             clearReviewState(for: threadID)
             activeTurnIDsByThreadID.removeValue(forKey: threadID)
+            settlePendingSteeringMessages(for: threadID)
             removeUserInteractions(for: threadID)
             if threadListScope == .active {
                 removeThreadFromCurrentList(threadID)
@@ -3556,6 +3682,7 @@ final class OnyxAppModel: ObservableObject {
             }
             clearReviewState(for: threadID)
             activeTurnIDsByThreadID.removeValue(forKey: threadID)
+            settlePendingSteeringMessages(for: threadID)
             removeUserInteractions(for: threadID)
             removeThreadFromCurrentList(threadID)
             pinnedThreadStore.remove(threadID)
@@ -3570,7 +3697,9 @@ final class OnyxAppModel: ObservableObject {
             guard authState.canRun, !isSigningOut else { return }
             refreshThreadIfSelected(threadID)
         case let .itemStarted(threadID, item):
-            guard authState.canRun, !isSigningOut, selectedThreadID == threadID else { return }
+            guard authState.canRun, !isSigningOut else { return }
+            consumePendingSteeringMessage(matching: item, for: threadID)
+            guard selectedThreadID == threadID else { return }
             recordLiveItem(item.id, for: threadID)
             if item.kind == .userMessage,
                let optimisticIndex = timeline.lastIndex(where: { $0.id.hasPrefix("optimistic:") && $0.body == item.body }) {
@@ -3587,7 +3716,9 @@ final class OnyxAppModel: ObservableObject {
             pendingDeltas[DeltaKey(threadID: threadID, itemID: itemID), default: ""] += delta
             scheduleDeltaFlush()
         case let .itemCompleted(threadID, item):
-            guard authState.canRun, !isSigningOut, selectedThreadID == threadID else { return }
+            guard authState.canRun, !isSigningOut else { return }
+            consumePendingSteeringMessage(matching: item, for: threadID)
+            guard selectedThreadID == threadID else { return }
             recordLiveItem(item.id, for: threadID)
             flushDeltas()
             if let index = timeline.firstIndex(where: { $0.id == item.id }) {
@@ -3633,6 +3764,9 @@ final class OnyxAppModel: ObservableObject {
             }
             activeTurnIDsByThreadID.removeValue(forKey: threadID)
             pendingUserItemByThreadID.removeValue(forKey: threadID)
+            if status != .running {
+                settlePendingSteeringMessages(for: threadID)
+            }
             if selectedThreadID == threadID {
                 flushDeltas()
                 isTurnRunning = status == .running
@@ -5091,6 +5225,7 @@ final class OnyxAppModel: ObservableObject {
         pendingDeltas.removeAll()
         discardedSideChatThreadIDs.removeAll()
         activeTurnIDsByThreadID.removeAll()
+        pendingSteeringMessagesByThreadID.removeAll()
         liveTimelineRevisionByThreadID.removeAll()
         liveItemRevisionByThreadID.removeAll()
         livePlanRevisionByThreadID.removeAll()

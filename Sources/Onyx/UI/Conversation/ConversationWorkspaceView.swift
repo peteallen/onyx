@@ -95,6 +95,7 @@ struct ConversationWorkspaceView: View {
                             AccountAccessStrip(model: model)
                         }
 
+                        PendingSteeringStrip(model: model)
                         RuntimeStatusStrip(model: model)
                         ProviderExecutionScopeStrip(model: model)
                         if model.isShowingArchivedThreads {
@@ -128,6 +129,104 @@ struct ConversationWorkspaceView: View {
         }
         .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: model.isSideChatPresented)
         .background(OnyxTheme.canvas)
+    }
+}
+
+/// Presentation for follow-ups submitted while a task is already running.
+/// Steering is intentionally separate from the transcript: the provider owns
+/// the durable user item, while this row makes the short acknowledgement gap
+/// visible instead of making the cleared composer feel like it swallowed the
+/// message.
+enum PendingSteeringPresentation {
+    static let rowHeight: CGFloat = 40
+
+    static func title(for count: Int) -> String {
+        count == 1 ? "Follow-up queued" : "\(count) follow-ups queued"
+    }
+
+    static func stateLabel(for state: PendingSteeringMessage.State) -> String {
+        switch state {
+        case .submitting: "Sending…"
+        case .queued: "Queued for this response"
+        }
+    }
+
+    static func messagePreview(for message: PendingSteeringMessage) -> String {
+        let trimmed = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return message.attachmentCount == 1
+                ? "Image follow-up"
+                : "\(message.attachmentCount) image follow-ups"
+        }
+        return trimmed
+    }
+}
+
+private struct PendingSteeringStrip: View {
+    @ObservedObject var model: OnyxAppModel
+
+    private var messages: [PendingSteeringMessage] {
+        model.pendingSteeringMessagesForSelectedThread
+    }
+
+    private var latestMessage: PendingSteeringMessage? { messages.last }
+
+    var body: some View {
+        if !messages.isEmpty {
+            HStack(spacing: 10) {
+                ZStack {
+                    Circle()
+                        .fill(OnyxTheme.iris.opacity(0.16))
+                    Image(systemName: "arrow.turn.down.right")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(OnyxTheme.electric)
+                }
+                .frame(width: 28, height: 28)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(PendingSteeringPresentation.title(for: messages.count))
+                        .font(.system(size: OnyxTypography.navigation, weight: .semibold))
+                        .foregroundStyle(.primary)
+                    if let latestMessage {
+                        Text("\(PendingSteeringPresentation.stateLabel(for: latestMessage.state)) · \(PendingSteeringPresentation.messagePreview(for: latestMessage))")
+                            .font(.system(size: OnyxTypography.secondary))
+                            .foregroundStyle(OnyxTheme.quietText)
+                            .lineLimit(1)
+                    }
+                }
+
+                Spacer(minLength: 8)
+
+                if messages.count > 1 {
+                    Text("\(messages.count)")
+                        .font(.system(size: OnyxTypography.metadata, weight: .bold, design: .rounded))
+                        .foregroundStyle(OnyxTheme.electric)
+                        .frame(minWidth: 22, minHeight: 22)
+                        .background(OnyxTheme.iris.opacity(0.12))
+                        .clipShape(Capsule())
+                }
+            }
+            .padding(.horizontal, 12)
+            .frame(maxWidth: .infinity, minHeight: PendingSteeringPresentation.rowHeight, alignment: .leading)
+            .background(OnyxTheme.iris.opacity(0.065))
+            .overlay {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(OnyxTheme.iris.opacity(0.24), lineWidth: OnyxTheme.hairline)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(accessibilityLabel)
+            .accessibilityValue(accessibilityValue)
+        }
+    }
+
+    private var accessibilityLabel: String {
+        PendingSteeringPresentation.title(for: messages.count)
+    }
+
+    private var accessibilityValue: String {
+        guard let latestMessage else { return "" }
+        return "\(PendingSteeringPresentation.stateLabel(for: latestMessage.state)): \(PendingSteeringPresentation.messagePreview(for: latestMessage))"
     }
 }
 
@@ -744,6 +843,7 @@ private struct ComposerView: View {
 
     private var canSend: Bool {
         model.canRunAgent
+            && model.canQueueFollowUp
             && !model.isPreparingLatestMessageEditForSelectedThread
             && !interactionBlocksComposer
             && !model.isReviewBlockingComposer
@@ -1255,22 +1355,43 @@ private struct ComposerView: View {
                 .onyxHelp("Starting task")
                 .accessibilityLabel("Starting task")
         } else if model.isTurnRunning {
-            Button(action: model.interrupt) {
-                ZStack {
-                    Circle()
-                        .fill(Color.primary)
-                        .frame(width: 28, height: 28)
-
-                    Image(systemName: "stop.fill")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(OnyxTheme.canvas)
+            HStack(spacing: 1) {
+                if canSend {
+                    Button(action: model.sendComposer) {
+                        ZStack {
+                            Circle()
+                                .fill(OnyxTheme.accentGradient)
+                                .frame(width: 29, height: 29)
+                            Image(systemName: "arrow.up")
+                                .font(.system(size: 12, weight: .bold))
+                                .foregroundStyle(Color.white)
+                        }
+                        .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .onyxHelp("Queue follow-up")
+                    .accessibilityLabel("Queue follow-up")
+                    .accessibilityHint("Sends this message into the active task without stopping it")
                 }
-                .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
-                .contentShape(Rectangle())
+
+                Button(action: model.interrupt) {
+                    ZStack {
+                        Circle()
+                            .fill(Color.primary)
+                            .frame(width: 28, height: 28)
+
+                        Image(systemName: "stop.fill")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(OnyxTheme.canvas)
+                    }
+                    .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .onyxHelp("Stop")
+                .accessibilityLabel("Stop task")
             }
-            .buttonStyle(.plain)
-            .onyxHelp("Stop")
-            .accessibilityLabel("Stop task")
         } else {
             Button(action: model.sendComposer) {
                 ZStack {

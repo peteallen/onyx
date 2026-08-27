@@ -2329,7 +2329,23 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
     }
 }
 
-private final class TranscriptPendingResponseView: NSView {
+/// Colors and geometry for the presentation-only response-status row. Keeping
+/// the palette in one small value type makes the contrast contract explicit
+/// and lets hosted tests verify both appearances without relying on whatever
+/// appearance happens to be active for the test process.
+enum TranscriptPendingResponsePresentation {
+    static let darkTint = NSColor(srgbRed: 0.43, green: 0.72, blue: 1.0, alpha: 1)
+    static let lightTint = NSColor(srgbRed: 0.08, green: 0.31, blue: 0.68, alpha: 1)
+    static let darkText = NSColor(srgbRed: 0.93, green: 0.95, blue: 1.0, alpha: 1)
+    static let lightText = NSColor(srgbRed: 0.12, green: 0.14, blue: 0.18, alpha: 1)
+
+    static func colors(for appearance: NSAppearance?) -> (tint: NSColor, text: NSColor) {
+        let isDark = appearance?.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        return isDark ? (darkTint, darkText) : (lightTint, lightText)
+    }
+}
+
+final class TranscriptPendingResponseView: NSView {
     static let rowHeight: CGFloat = 34
 
     private let spinner = NSProgressIndicator()
@@ -2338,10 +2354,13 @@ private final class TranscriptPendingResponseView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
 
+        wantsLayer = true
+        layer?.cornerRadius = 8
+        layer?.masksToBounds = true
+
         spinner.style = .spinning
         spinner.controlSize = .small
-        label.font = .systemFont(ofSize: OnyxTypography.reading, weight: .regular)
-        label.textColor = .secondaryLabelColor
+        label.font = .systemFont(ofSize: OnyxTypography.reading, weight: .medium)
         label.lineBreakMode = .byTruncatingTail
         label.maximumNumberOfLines = 1
         label.usesSingleLineMode = true
@@ -2351,6 +2370,7 @@ private final class TranscriptPendingResponseView: NSView {
         setAccessibilityRole(.group)
         setAccessibilityLabel("Assistant response status")
         setAccessibilityValue("Working")
+        applyThinkingAppearance()
     }
 
     @available(*, unavailable)
@@ -2383,10 +2403,38 @@ private final class TranscriptPendingResponseView: NSView {
         )
     }
 
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyThinkingAppearance()
+    }
+
     func configure(label value: String) {
         label.stringValue = value
         setAccessibilityValue(value)
+        applyThinkingAppearance()
         spinner.startAnimation(nil)
+    }
+
+    private func applyThinkingAppearance() {
+        // The pending row is the only feedback available while a provider is
+        // spending time thinking before it has emitted a visible assistant
+        // item. Do not rely on AppKit's secondary-label color here: a native
+        // view can be created while its hosting window is still in the default
+        // appearance, which briefly resolves that dynamic color to near-black
+        // on Onyx's near-black canvas. Resolve an explicit, high-contrast
+        // treatment every time the view's effective appearance changes.
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let colors = TranscriptPendingResponsePresentation.colors(for: effectiveAppearance)
+        let tint = colors.tint
+        let text = colors.text
+        self.label.textColor = text
+        // A restrained tinted wash gives the row a visible boundary without
+        // turning routine progress into a bright card. The text itself remains
+        // fully opaque so it is readable even if the wash is imperceptible on
+        // a particular display or accessibility contrast setting.
+        layer?.backgroundColor = tint.withAlphaComponent(isDark ? 0.14 : 0.09).cgColor
+        layer?.borderWidth = 1
+        layer?.borderColor = tint.withAlphaComponent(isDark ? 0.34 : 0.25).cgColor
     }
 }
 

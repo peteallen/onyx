@@ -7,6 +7,16 @@ import Network
 /// `POST /v1/responses`, and injects the configured provider credential on the
 /// outbound request.
 actor OpenAICompatibleResponsesProxy {
+    /// App-server currently omits a Responses output allowance for custom
+    /// providers. Some compatible servers interpret that omission as a very
+    /// small provider default, which can terminate otherwise-valid agent work
+    /// before it reaches a tool call or final answer.
+    /// Keep the fallback below the context limits of common 8k/16k models,
+    /// while still leaving enough room for reasoning-heavy agent turns. A
+    /// discovered per-model limit is applied below when the catalog provides
+    /// one.
+    static let defaultMaximumOutputTokens = 16_384
+
     struct Limits: Sendable, Equatable {
         let maximumHeaderBytes: Int
         let maximumRequestBodyBytes: Int
@@ -79,6 +89,9 @@ actor OpenAICompatibleResponsesProxy {
     private let upstreamURL: URL
     private let upstreamCredential: String?
     private let disposableToken: String
+    private let modelCompletionLimits: [String: Int]
+    private let modelContextLimits: [String: Int]
+    private let selectedModelID: String?
     private let limits: Limits
     private let session: URLSession
     private var listener: NWListener?
@@ -120,6 +133,23 @@ actor OpenAICompatibleResponsesProxy {
         upstreamURL = responsesURL
         self.upstreamCredential = credential
         self.disposableToken = disposableToken
+        // Discovery metadata is provider-controlled and may have come from a
+        // hand-edited/legacy cache. Reduce defensively instead of using
+        // `Dictionary(uniqueKeysWithValues:)`, which would trap if duplicate
+        // model IDs ever crossed that boundary.
+        modelCompletionLimits = connection.discovery.discoveredModels.reduce(
+            into: [String: Int]()
+        ) { limits, model in
+            guard let limit = model.maxCompletionTokens, limit > 0 else { return }
+            limits[model.id] = limit
+        }
+        modelContextLimits = connection.discovery.discoveredModels.reduce(
+            into: [String: Int]()
+        ) { limits, model in
+            guard let limit = model.contextLength, limit > 0 else { return }
+            limits[model.id] = limit
+        }
+        selectedModelID = connection.selectedModelID
         self.limits = limits
 
         let baseSession = session ?? Self.makeDefaultSession(limits: limits)
@@ -219,7 +249,8 @@ actor OpenAICompatibleResponsesProxy {
         do {
             try await Self.start(connection)
             let body = try await readValidatedRequestBody(from: connection)
-            try await forwardWhileMonitoringClient(body: body, to: connection)
+            let upstreamBody = try requestBodyWithDefaultOutputBudget(body)
+            try await forwardWhileMonitoringClient(body: upstreamBody, to: connection)
         } catch is CancellationError {
             connection.cancel()
         } catch let error as ProxyError {
@@ -358,6 +389,60 @@ actor OpenAICompatibleResponsesProxy {
             body.append(chunk)
         }
         return body
+    }
+
+    /// Adds the generic-provider allowance only when app-server omitted it.
+    /// An explicit caller value is returned byte-for-byte so Onyx never
+    /// second-guesses a future app-server that owns this parameter itself.
+    /// Malformed JSON and non-object request bodies fail before any upstream
+    /// request (and therefore before the provider credential is attached).
+    private func requestBodyWithDefaultOutputBudget(_ body: Data) throws -> Data {
+        let value: Any
+        do {
+            value = try JSONSerialization.jsonObject(with: body)
+        } catch {
+            throw ProxyError.invalidRequest
+        }
+        guard var object = value as? [String: Any] else {
+            throw ProxyError.invalidRequest
+        }
+        if object.keys.contains("max_output_tokens") {
+            return body
+        }
+
+        let requestedModelID = (object["model"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let modelID = requestedModelID?.isEmpty == false ? requestedModelID : selectedModelID
+        let advertisedLimit = modelID.flatMap { modelCompletionLimits[$0] }
+        let contextLimit = modelID.flatMap { modelContextLimits[$0] }
+        // A context window includes the prompt and tool history. Reserve at
+        // least half of it for that input so a long-running agent still has
+        // room for subsequent tool rounds. Never let metadata force a
+        // zero/negative allowance; malformed limits are ignored at discovery.
+        let contextDerivedLimit = contextLimit.map {
+            max(1, min(Self.defaultMaximumOutputTokens, $0 / 2))
+        }
+        let metadataLimit = [advertisedLimit, contextDerivedLimit]
+            .compactMap { $0 }
+            .min()
+        object["max_output_tokens"] = min(
+            Self.defaultMaximumOutputTokens,
+            metadataLimit ?? Self.defaultMaximumOutputTokens
+        )
+        do {
+            let rewritten = try JSONSerialization.data(
+                withJSONObject: object,
+                options: [.sortedKeys, .withoutEscapingSlashes]
+            )
+            guard rewritten.count <= limits.maximumRequestBodyBytes else {
+                throw ProxyError.requestTooLarge
+            }
+            return rewritten
+        } catch let error as ProxyError {
+            throw error
+        } catch {
+            throw ProxyError.invalidRequest
+        }
     }
 
     private func forward(body: Data, to connection: NWConnection) async throws {

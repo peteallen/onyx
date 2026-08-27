@@ -85,6 +85,53 @@ final class OnyxAppModelRaceTests: XCTestCase {
         XCTAssertEqual(model.threads.map(\.id), [Fixture.threadBID, Fixture.threadAID])
     }
 
+    func testSteeringFollowUpStaysVisibleUntilProviderEchoesUserItem() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        model.start()
+        await waitUntil("The runtime did not finish its initial load") {
+            model.selectedThreadID == Fixture.threadAID && !model.isLoadingThread
+        }
+
+        await fixture.runtime.emit(
+            .threadStatusChanged(threadID: Fixture.threadAID, status: .running)
+        )
+        await waitUntil("The task did not enter its running state") {
+            model.isTurnRunning
+        }
+
+        model.composerText = "Keep going with the same approach"
+        model.sendComposer()
+        await waitUntil("The steering request was not acknowledged") {
+            model.pendingSteeringMessagesForSelectedThread.count == 1
+                && model.pendingSteeringMessagesForSelectedThread[0].state == .queued
+        }
+        XCTAssertEqual(
+            model.pendingSteeringMessagesForSelectedThread[0].text,
+            "Keep going with the same approach"
+        )
+
+        await fixture.runtime.emit(
+            .itemStarted(
+                threadID: Fixture.threadAID,
+                item: TimelineItem(
+                    id: "steered-user-item",
+                    kind: .userMessage,
+                    title: nil,
+                    body: "Keep going with the same approach",
+                    status: .completed,
+                    timestamp: .now,
+                    detail: nil
+                )
+            )
+        )
+        await waitUntil("The queued steering row did not reconcile") {
+            model.pendingSteeringMessagesForSelectedThread.isEmpty
+        }
+    }
+
     func testLateInitialReadPreservesNewerLiveItemsCollaborationAndPlan() async {
         let fixture = makeFixture()
         defer { fixture.cleanUp() }
@@ -1913,7 +1960,7 @@ private actor RaceTestRuntime: AgentRuntime {
             ),
             availableLoginMethods: [],
             availableModels: [],
-            capabilities: [.streaming, .approvals, .threadForking]
+            capabilities: [.streaming, .steering, .approvals, .threadForking]
         )
     }
 

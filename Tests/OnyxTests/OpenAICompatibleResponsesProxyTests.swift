@@ -122,6 +122,169 @@ final class OpenAICompatibleResponsesProxyTests: XCTestCase {
         XCTAssertFalse(body.contains(binding.bearerToken))
     }
 
+    func testInjectsDefaultOutputBudgetWhenAppServerOmitsIt() async throws {
+        let requests = ProxyRequestRecorder()
+        ProxyUpstreamURLProtocol.configure { request in
+            requests.record(request)
+            return .sse(Self.completedEvent)
+        }
+        let proxy = try makeProxy(disposableToken: "local-token")
+        let binding = try await proxy.start()
+        addTeardownBlock { await proxy.stop() }
+
+        let result = try await sendClientRequest(
+            binding: binding,
+            target: "/v1/responses",
+            token: binding.bearerToken,
+            body: Data(#"{"model":"fixture-model","stream":true}"#.utf8)
+        )
+        let upstreamBody = try XCTUnwrap(requests.bodies.first ?? nil)
+        let payload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: upstreamBody) as? [String: Any]
+        )
+
+        XCTAssertEqual(result.response.statusCode, 200)
+        XCTAssertEqual(
+            payload["max_output_tokens"] as? Int,
+            OpenAICompatibleResponsesProxy.defaultMaximumOutputTokens
+        )
+    }
+
+    func testPreservesCallerSpecifiedOutputBudgetByteForByte() async throws {
+        let requests = ProxyRequestRecorder()
+        ProxyUpstreamURLProtocol.configure { request in
+            requests.record(request)
+            return .sse(Self.completedEvent)
+        }
+        let proxy = try makeProxy(disposableToken: "local-token")
+        let binding = try await proxy.start()
+        addTeardownBlock { await proxy.stop() }
+        let original = Data(
+            #"{ "stream" : true, "max_output_tokens" : 777, "model" : "fixture-model" }"#.utf8
+        )
+
+        let result = try await sendClientRequest(
+            binding: binding,
+            target: "/v1/responses",
+            token: binding.bearerToken,
+            body: original
+        )
+
+        XCTAssertEqual(result.response.statusCode, 200)
+        XCTAssertEqual(requests.bodies.first ?? nil, original)
+    }
+
+    func testClampsInjectedOutputBudgetToRequestedModelsAdvertisedLimit() async throws {
+        let requests = ProxyRequestRecorder()
+        ProxyUpstreamURLProtocol.configure { request in
+            requests.record(request)
+            return .sse(Self.completedEvent)
+        }
+        let proxy = try makeProxy(
+            disposableToken: "local-token",
+            completionLimits: ["small-model": 8_192, "fixture-model": 12_000]
+        )
+        let binding = try await proxy.start()
+        addTeardownBlock { await proxy.stop() }
+
+        let result = try await sendClientRequest(
+            binding: binding,
+            target: "/v1/responses",
+            token: binding.bearerToken,
+            body: Data(#"{"model":"small-model","stream":true}"#.utf8)
+        )
+        let upstreamBody = try XCTUnwrap(requests.bodies.first ?? nil)
+        let payload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: upstreamBody) as? [String: Any]
+        )
+
+        XCTAssertEqual(result.response.statusCode, 200)
+        XCTAssertEqual(payload["max_output_tokens"] as? Int, 8_192)
+    }
+
+    func testDerivesInjectedOutputBudgetFromModelContextWhenCompletionLimitIsAbsent() async throws {
+        let requests = ProxyRequestRecorder()
+        ProxyUpstreamURLProtocol.configure { request in
+            requests.record(request)
+            return .sse(Self.completedEvent)
+        }
+        let proxy = try makeProxy(
+            disposableToken: "local-token",
+            contextLimits: ["context-model": 8_192]
+        )
+        let binding = try await proxy.start()
+        addTeardownBlock { await proxy.stop() }
+
+        let result = try await sendClientRequest(
+            binding: binding,
+            target: "/v1/responses",
+            token: binding.bearerToken,
+            body: Data(#"{"model":"context-model","stream":true}"#.utf8)
+        )
+        let upstreamBody = try XCTUnwrap(requests.bodies.first ?? nil)
+        let payload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: upstreamBody) as? [String: Any]
+        )
+
+        XCTAssertEqual(result.response.statusCode, 200)
+        XCTAssertEqual(payload["max_output_tokens"] as? Int, 4_096)
+    }
+
+    func testRejectsMalformedAndNonObjectJSONBeforeCredentialedForwarding() async throws {
+        let requests = ProxyRequestRecorder()
+        ProxyUpstreamURLProtocol.configure { request in
+            requests.record(request)
+            return .sse(Self.completedEvent)
+        }
+        let proxy = try makeProxy(
+            credential: "fixture-provider-secret",
+            authMode: .bearer,
+            disposableToken: "local-token"
+        )
+        let binding = try await proxy.start()
+        addTeardownBlock { await proxy.stop() }
+
+        for body in [Data(#"{"model":"unterminated""#.utf8), Data(#"["not","an","object"]"#.utf8)] {
+            let result = try await sendClientRequest(
+                binding: binding,
+                target: "/v1/responses",
+                token: binding.bearerToken,
+                body: body
+            )
+            XCTAssertEqual(result.response.statusCode, 400)
+        }
+        XCTAssertTrue(requests.requests.isEmpty)
+    }
+
+    func testOversizedRequestStillFailsBeforeJSONRewriteOrForwarding() async throws {
+        let requests = ProxyRequestRecorder()
+        ProxyUpstreamURLProtocol.configure { request in
+            requests.record(request)
+            return .sse(Self.completedEvent)
+        }
+        let proxy = try makeProxy(
+            disposableToken: "local-token",
+            limits: .init(maximumRequestBodyBytes: 1_024)
+        )
+        let binding = try await proxy.start()
+        addTeardownBlock { await proxy.stop() }
+        let oversized = Data(
+            (#"{"model":"fixture-model","input":""#
+                + String(repeating: "x", count: 1_024)
+                + #""}"#).utf8
+        )
+
+        let result = try await sendClientRequest(
+            binding: binding,
+            target: "/v1/responses",
+            token: binding.bearerToken,
+            body: oversized
+        )
+
+        XCTAssertEqual(result.response.statusCode, 413)
+        XCTAssertTrue(requests.requests.isEmpty)
+    }
+
     func testRedirectIsNotFollowedToAnotherProviderURL() async throws {
         let requests = ProxyRequestRecorder()
         ProxyUpstreamURLProtocol.configure { request in
@@ -666,14 +829,29 @@ final class OpenAICompatibleResponsesProxyTests: XCTestCase {
         credential: String? = nil,
         authMode: ProviderConnectionAuthMode = .none,
         disposableToken: String = "fixture-local-token",
-        limits: OpenAICompatibleResponsesProxy.Limits = .init()
+        limits: OpenAICompatibleResponsesProxy.Limits = .init(),
+        completionLimits: [String: Int] = [:],
+        contextLimits: [String: Int] = [:]
     ) throws -> OpenAICompatibleResponsesProxy {
+        let modelIDs = Set(completionLimits.keys).union(contextLimits.keys).sorted()
+        let discoveredModels = try modelIDs.map { modelID in
+            try ProviderModelDescriptor(
+                id: modelID,
+                wireProtocol: .openAIChatCompletions,
+                capabilities: ProviderCapabilitySet(),
+                contextLength: contextLimits[modelID],
+                maxCompletionTokens: completionLimits[modelID]
+            )
+        }
         let connection = try ProviderConnectionRecord(
             id: ProviderConnectionID("responses.proxy.fixture"),
             displayName: "Responses proxy fixture",
             baseURL: URL(string: "https://provider.example.test/v1")!,
             selectedModelID: "fixture-model",
-            authMode: authMode
+            authMode: authMode,
+            discovery: ProviderConnectionDiscoveryMetadata(
+                discoveredModels: discoveredModels
+            )
         )
         let providerCredential = try credential.map(ProviderBearerCredential.init)
         let configuration = URLSessionConfiguration.ephemeral
@@ -818,11 +996,31 @@ enum ProxyTestError: Error {
 private final class ProxyRequestRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var values: [URLRequest] = []
+    private var bodyValues: [Data?] = []
 
     var requests: [URLRequest] { lock.withLock { values } }
+    var bodies: [Data?] { lock.withLock { bodyValues } }
 
     func record(_ request: URLRequest) {
-        lock.withLock { values.append(request) }
+        let body = request.httpBody ?? Self.readBodyStream(request.httpBodyStream)
+        lock.withLock {
+            values.append(request)
+            bodyValues.append(body)
+        }
+    }
+
+    private static func readBodyStream(_ stream: InputStream?) -> Data? {
+        guard let stream else { return nil }
+        stream.open()
+        defer { stream.close() }
+        var result = Data()
+        var buffer = [UInt8](repeating: 0, count: 4_096)
+        while stream.hasBytesAvailable {
+            let count = stream.read(&buffer, maxLength: buffer.count)
+            guard count > 0 else { break }
+            result.append(buffer, count: count)
+        }
+        return result
     }
 }
 
