@@ -128,6 +128,13 @@ require_text "$release_text" 'resolve_tag_commit()' \
   "authenticated exact tag resolution"
 require_text "$release_text" 'commits/$tag_name' \
   "tag-to-commit dereference"
+require_text "$release_text" "/usr/bin/jq -er '.sha // empty'" \
+  "strict tag response parsing"
+require_text "$release_text" "'^[0-9a-f]{40}$'" \
+  "strict tag SHA validation"
+forbid_text "$release_text" \
+  "--jq '.sha' 2>/dev/null || true" \
+  "non-2xx tag response accepted as a commit"
 require_text "$release_text" 'if ! gh api --method POST' \
   "atomic tag-create race handling"
 require_text "$release_text" 'for attempt in {1..6}' \

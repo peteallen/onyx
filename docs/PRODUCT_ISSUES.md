@@ -11,7 +11,7 @@ Status values: **Open**, **In progress**, **Blocked**, **Done**, **Deferred**.
 3. ✅ Commit the verified source so preview and release bundles can embed that exact revision.
 4. ✅ Repackage and relaunch only the canonical `Onyx Preview` build, then verify one stable app process and its expected bundled app-server child.
 5. ✅ Verify local typing plus a real metadata-poor vLLM file/tool task through the rebuilt UI.
-6. Publish `v0.1.3` from the verified composer/agent build, then verify its checksum, embedded revision, dark baseline, and public download links. `v0.1.2` is intentionally skipped after a late immutable-tag collision repeatedly blocked publication.
+6. Publish `v0.1.3` from the verified composer/agent build, then verify its checksum, embedded revision, dark baseline, and public download links. `v0.1.2` is intentionally skipped after the release workflow repeatedly misclassified GitHub's tag-not-found response as an immutable-tag collision.
 
 New hands-on feedback is added to this ledger as it arrives. It changes this sequence only when it exposes data loss, a security boundary failure, a crash, or another blocker to the work already in progress.
 
@@ -27,7 +27,7 @@ New hands-on feedback is added to this ledger as it arrives. It changes this seq
 
 - **Discoverability follow-up:** Complete. The README presents the latest-release page, direct DMG, and checksum as a top-level download callout; the public `v0.1.1` release now satisfies the download and provenance acceptance criteria.
 
-- **Current release refresh:** In progress. CI run `32946321394` attempt 2 passed all 865 tests plus the universal DMG gates on commit `6899fda0e9d0154befa4575a608b1ed7b2fa253a`. Two `v0.1.2` publication attempts built valid artifacts but encountered a late tag at a different source commit; the workflow correctly refused to move it. The fixed build is advancing to `v0.1.3` with new immutable provenance.
+- **Current release refresh:** In progress. CI run `32946321394` attempt 2 passed all 865 tests plus the universal DMG gates on commit `6899fda0e9d0154befa4575a608b1ed7b2fa253a`, and release run `33037834905` built and verified the `0.1.3` universal DMG. Publication then failed because `gh api` wrote its HTTP 422 tag-not-found JSON to stdout and the workflow accepted any nonempty response as a tag commit. Public tag, release, and remote-ref checks confirm that `v0.1.3` did not exist. The resolver now requires a successful response containing an exact 40-character commit SHA, while immutable-tag conflicts still fail closed; CI and public release verification remain pending.
 
 ### RELEASE-002 — Installing a release must replace stale local Onyx copies
 
@@ -143,11 +143,11 @@ New hands-on feedback is added to this ledger as it arrives. It changes this seq
 
 ### UI-012 — Waiting feedback belongs inside the conversation
 
-- **Status:** In progress
+- **Status:** Done
 - **Problem:** A detached `Working` label above the chat does not clearly communicate that the assistant owes the user a response.
 - **Decision:** Keep a calm pending-response row at the end of the transcript from send acceptance until assistant text begins streaming. The main composer remains visible and editable during active work so users can draft a follow-up without waiting for the current turn; Send and writer operations remain separately gated. Do not automatically replace the composer with a compact busy strip.
 - **Acceptance:** The pending state appears immediately beside the conversation, uses review-specific wording when relevant, disappears only when response content arrives or work ends, and never duplicates an assistant response. An existing active task still exposes a visible native composer that accepts drafting while the turn runs.
-- **Verification:** Transcript-state coverage and opt-in visual fixtures exercise the inline pending row and its handoff to streaming text. Busy-composer regression coverage now proves active turns do not select the compact replacement path. Running-preview typing verification after this change is pending.
+- **Verification:** Transcript-state coverage and opt-in visual fixtures exercise the inline pending row and its handoff to streaming text. Busy-composer regression coverage proves active turns do not select the compact replacement path. On 2026-08-26, the canonical preview kept the native composer visible and editable during real generic vLLM agent work; a typed draft remained editable and survived the transition from waiting back to idle, and no `Write a follow-up` replacement strip appeared. This satisfies the acceptance criteria.
 
 ### UI-013 — Composer image paste is missing
 
@@ -366,7 +366,7 @@ New hands-on feedback is added to this ledger as it arrives. It changes this seq
 - **Status:** Active
 - **Decision:** `OnyxSourceRevision` is an exact commit claim, not a label for an arbitrary dirty build. The canonical preview refuses tracked or untracked build-input changes before packaging, verifies that `HEAD` is unchanged, and checks again after the bundle is built; unrelated user documents and artifacts outside the build-input paths remain untouched.
 - **Consequence:** Preview rebuilds happen after the source is committed or otherwise made clean. A failed provenance check leaves the currently running preview in place rather than replacing it with an ambiguous bundle.
-- **Verification:** The stable-preview contract checks the fail-closed source gate and the canonical rebuild must report the committed revision in its bundle before handoff.
+- **Verification:** The stable-preview contract checks the fail-closed source gate. The canonical preview used for the 2026-08-26 composer and vLLM agent verification reports committed revision `6899fda0e9d0154befa4575a608b1ed7b2fa253a` in its bundle.
 
 ### D-010 — Model switching preserves task ownership
 
@@ -429,7 +429,7 @@ New hands-on feedback is added to this ledger as it arrives. It changes this seq
 - **Status:** Active
 - **Decision:** Every provider task operation captures the connection scope and the concrete lane runtime before an await, then validates that lease before dispatch and before publishing results. A provider operation that has already been accepted is not reported as failed solely because best-effort Onyx routing metadata cleanup is delayed.
 - **Consequence:** Endpoint changes, reconnects, and provider replacement cannot route an old task request into a new history or make a successfully sent/deleted task appear retryable. Ephemeral side chats remain process-local, and browsing a transcript does not refresh child-task recency.
-- **Verification:** Adaptive facade coverage remains green after lifecycle fencing, accepted-send cleanup handling, idempotent native-child adoption, scope-guarded deletion changes, identity-fenced teardown ownership, and duplicate-disconnect pump cleanup. Store and host coverage also prove that unscoped legacy chat history cannot be adopted after an endpoint or credential has already rotated to a replacement scope. Running-preview and live vLLM checks remain the final product gate.
+- **Verification:** Adaptive facade coverage remains green after lifecycle fencing, accepted-send cleanup handling, idempotent native-child adoption, scope-guarded deletion changes, identity-fenced teardown ownership, and duplicate-disconnect pump cleanup. Store and host coverage also prove that unscoped legacy chat history cannot be adopted after an endpoint or credential has already rotated to a replacement scope. On 2026-08-26, the canonical preview completed the final live vLLM file/tool flow while preserving an editable draft through active work, so the running-product gate is verified for revision `6899fda0e9d0154befa4575a608b1ed7b2fa253a`.
 
 ### D-019 — Escape dismisses Side Chat without destabilizing the editor
 
