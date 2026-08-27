@@ -198,15 +198,34 @@ final class OnyxAppModel: ObservableObject {
     private var threadIndexCacheRevision: UInt64?
     @Published private(set) var transcriptSnapshot: TranscriptPresentationSnapshot
     var timeline: [TimelineItem] { transcriptSnapshot.items }
-    @Published var composerText: String {
-        didSet { scheduleComposerDraftSave() }
+    /// Primary composer editing state is observed by the composer subtree only.
+    /// Keeping it out of this model's `objectWillChange` stream prevents a
+    /// publication for every keystroke from invalidating the sidebar and
+    /// transcript.
+    let composerDraftModel: OnyxComposerDraftModel
+
+    /// Compatibility accessors keep the app model's navigation/send API
+    /// stable while routing reads and writes to the isolated composer child.
+    var composerText: String {
+        get { composerDraftModel.text }
+        set { composerDraftModel.text = newValue }
     }
-    @Published private(set) var composerImages: [ComposerImageDraft]
-    /// A monotonic request consumed by the native composer. New Task can be an
-    /// idempotent model operation while still being a meaningful keyboard
-    /// command: the button that invoked it must yield focus to the blank input
-    /// instead of leaving subsequent typing attached to the sidebar.
-    @Published private(set) var composerFocusRequest: UInt64 = 0
+
+    private(set) var composerImages: [ComposerImageDraft] {
+        get { composerDraftModel.images }
+        set { composerDraftModel.images = newValue }
+    }
+
+    /// Explicit focus requests use an identity token so a newly replaced
+    /// provider model cannot accidentally reuse a value already consumed by a
+    /// surviving native editor coordinator.
+    var composerFocusRequest: UUID? {
+        composerDraftModel.focusRequest
+    }
+
+    func requestComposerFocus() {
+        composerDraftModel.requestFocus()
+    }
     @Published var searchText = ""
     @Published var isSidebarVisible: Bool {
         didSet { preferences.set(isSidebarVisible, forKey: preferenceKey(PreferenceKey.sidebarVisible)) }
@@ -532,9 +551,10 @@ final class OnyxAppModel: ObservableObject {
         draftWorkspacePath = defaults.string(forKey: preferenceNamespace.key("Onyx.lastWorkspacePath"))
         composerDrafts = restoredDrafts
         composerDraftKey = Self.welcomeThread.id
-        composerText = restoredDrafts[Self.welcomeThread.id] ?? ""
-        composerImages = []
-        composerFocusRequest = startsWithNewTask ? 1 : 0
+        composerDraftModel = OnyxComposerDraftModel(
+            text: restoredDrafts[Self.welcomeThread.id] ?? "",
+            focusRequest: startsWithNewTask ? UUID() : nil
+        )
         taskModelOverrides = restoredTaskModelOverrides
         taskModelDefaults = restoredTaskModelDefaults
         isSidebarVisible = Self.boolPreference(
@@ -572,6 +592,9 @@ final class OnyxAppModel: ObservableObject {
             .sink { [weak self] ids in
                 self?.applyPinnedThreadIDs(ids)
             }
+        composerDraftModel.onTextChanged = { [weak self] _ in
+            self?.scheduleComposerDraftSave()
+        }
         refreshSelectedThreadCache()
 
     }
@@ -1991,7 +2014,7 @@ final class OnyxAppModel: ObservableObject {
     }
 
     func newTask() {
-        composerFocusRequest &+= 1
+        requestComposerFocus()
 
         // Treat a blank welcome surface as an idempotent click before
         // cancelling any in-flight list refresh. This matters while the first
@@ -2216,14 +2239,29 @@ final class OnyxAppModel: ObservableObject {
             panel.directoryURL = URL(fileURLWithPath: draftWorkspacePath)
         }
         let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
-            guard response == .OK, let path = panel.url?.path else { return }
             Task { @MainActor [weak self] in
                 guard let self, accountEpoch == epoch else { return }
-                selectWorkspace(path)
+                resolveWorkspaceChoice(response: response, path: panel.url?.path)
             }
         }
         guard let window else { return }
         panel.beginSheetModal(for: window, completionHandler: completion)
+    }
+
+    /// Restores the normal typing destination after the transient folder sheet
+    /// closes. Cancellation must be just as lossless as choosing a folder: the
+    /// still-visible composer should accept the next keystroke without another
+    /// click. Archived history has no composer, so do not leave a latent focus
+    /// token that could fire after navigating back to active tasks.
+    func resolveWorkspaceChoice(
+        response: NSApplication.ModalResponse,
+        path: String?
+    ) {
+        guard response == .OK, let path else {
+            if canEditComposer { requestComposerFocus() }
+            return
+        }
+        selectWorkspace(path)
     }
 
     /// Applies a folder chosen by the user. If they are already composing a
@@ -2243,7 +2281,7 @@ final class OnyxAppModel: ObservableObject {
             // Closing the project picker returns focus to the control that
             // opened it. Put the caret back in the still-visible draft so the
             // user can continue without a second click.
-            composerFocusRequest &+= 1
+            requestComposerFocus()
         }
     }
 

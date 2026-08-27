@@ -5,10 +5,10 @@ struct NativeComposerTextView: NSViewRepresentable {
     @Binding var text: String
     @Binding var measuredHeight: CGFloat
     let isEnabled: Bool
-    /// A changed nonzero value explicitly moves keyboard focus into this
+    /// A changed non-nil identity explicitly moves keyboard focus into this
     /// editor. The request is separate from `isEnabled`: local drafting can be
     /// available without every ordinary view update stealing focus.
-    var focusRequest: UInt64 = 0
+    var focusRequest: UUID? = nil
     /// Separating eligibility from the submit callback keeps an invalid Return
     /// key from stealing focus. This matters while a task is locked, while a
     /// side-chat fork is still being created, or when the composer is empty.
@@ -36,8 +36,8 @@ struct NativeComposerTextView: NSViewRepresentable {
 
         let textView = ComposerTextView(frame: .zero)
         context.coordinator.textView = textView
-        textView.onExplicitFocusSatisfied = { [weak coordinator = context.coordinator] in
-            coordinator?.focusRequestDidSucceed()
+        textView.onExplicitFocusBecameAvailable = { [weak coordinator = context.coordinator] in
+            coordinator?.attemptPendingFocusRequest()
         }
         textView.onTextContainerWidthChange = { [weak coordinator = context.coordinator] in
             coordinator?.updateHeight()
@@ -103,7 +103,7 @@ struct NativeComposerTextView: NSViewRepresentable {
         textView.onSubmit = nil
         textView.onPasteImages = nil
         textView.onCancel = nil
-        textView.onExplicitFocusSatisfied = nil
+        textView.onExplicitFocusBecameAvailable = nil
         textView.onTextContainerWidthChange = nil
         coordinator.cancelPendingFocusRequest()
         textView.cancelFocusRestorationAfterSubmit()
@@ -143,10 +143,12 @@ struct NativeComposerTextView: NSViewRepresentable {
         /// request until the editor attaches and reports a successful focus.
         /// Existing composers can accept focus synchronously during the New
         /// Task state update.
-        func consumeFocusRequest(_ request: UInt64) {
-            guard request != 0, request != lastConsumedFocusRequest else { return }
+        func consumeFocusRequest(_ request: UUID?) {
+            guard let request, request != lastConsumedFocusRequest else { return }
             if pendingFocusRequest != request {
                 pendingFocusRequest = request
+                scheduledFocusRetryRequest = nil
+                retriedFocusRequest = nil
             }
             attemptPendingFocusRequest()
         }
@@ -155,6 +157,8 @@ struct NativeComposerTextView: NSViewRepresentable {
             guard let request = pendingFocusRequest else { return }
             lastConsumedFocusRequest = request
             pendingFocusRequest = nil
+            scheduledFocusRetryRequest = nil
+            retriedFocusRequest = nil
         }
 
         /// Drops a focus request when SwiftUI is dismantling this representable.
@@ -162,24 +166,64 @@ struct NativeComposerTextView: NSViewRepresentable {
         /// coordinator and attempt to focus a view that is no longer mounted.
         fileprivate func cancelPendingFocusRequest() {
             pendingFocusRequest = nil
+            scheduledFocusRetryRequest = nil
+            retriedFocusRequest = nil
+            textView?.cancelExplicitFocusRequest()
         }
 
-        private func attemptPendingFocusRequest() {
-            guard let pendingFocusRequest,
-                  pendingFocusRequest != lastConsumedFocusRequest else { return }
+        /// AppKit can temporarily reject `makeFirstResponder` while SwiftUI is
+        /// mounting or replacing the surrounding hierarchy. Retry that exact
+        /// request once on the next main-queue turn, then consume it so an old
+        /// navigation event cannot steal focus later.
+        fileprivate func attemptPendingFocusRequest() {
+            guard let request = pendingFocusRequest,
+                  request != lastConsumedFocusRequest,
+                  scheduledFocusRetryRequest != request else { return }
             guard let textView else { return }
             if textView.focusForExplicitRequest() {
-                // `focusForExplicitRequest` normally calls the satisfaction
-                // callback synchronously. Keep this fallback for test doubles
-                // or future native implementations that only return Bool.
-                if self.pendingFocusRequest == pendingFocusRequest {
+                // `focusForExplicitRequest` returns only after confirming the
+                // window's actual first responder, so consume this exact
+                // request without a callback that could race a newer token.
+                if pendingFocusRequest == request {
                     focusRequestDidSucceed()
+                }
+            } else if textView.window != nil, textView.isEditable {
+                if retriedFocusRequest == request {
+                    finishUnsuccessfulFocusRequest(request)
+                } else {
+                    scheduleFocusRetry(request)
                 }
             }
         }
 
-        private var lastConsumedFocusRequest: UInt64 = 0
-        private var pendingFocusRequest: UInt64?
+        private func scheduleFocusRetry(_ request: UUID) {
+            guard pendingFocusRequest == request,
+                  scheduledFocusRetryRequest != request,
+                  retriedFocusRequest != request else { return }
+            scheduledFocusRetryRequest = request
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      pendingFocusRequest == request,
+                      scheduledFocusRetryRequest == request else { return }
+                scheduledFocusRetryRequest = nil
+                retriedFocusRequest = request
+                attemptPendingFocusRequest()
+            }
+        }
+
+        private func finishUnsuccessfulFocusRequest(_ request: UUID) {
+            guard pendingFocusRequest == request else { return }
+            lastConsumedFocusRequest = request
+            pendingFocusRequest = nil
+            scheduledFocusRetryRequest = nil
+            retriedFocusRequest = nil
+            textView?.cancelExplicitFocusRequest()
+        }
+
+        private var lastConsumedFocusRequest: UUID?
+        private var pendingFocusRequest: UUID?
+        private var scheduledFocusRetryRequest: UUID?
+        private var retriedFocusRequest: UUID?
     }
 }
 
@@ -190,7 +234,7 @@ final class ComposerTextView: NSTextView {
     var onSubmit: (() -> Void)?
     var onPasteImages: (([NSImage]) -> Void)?
     var onCancel: (() -> Void)?
-    var onExplicitFocusSatisfied: (() -> Void)?
+    var onExplicitFocusBecameAvailable: (() -> Void)?
     var pastedImagesProvider: () -> [NSImage]? = {
         ComposerPasteboardImages.images(from: .general)
     }
@@ -227,17 +271,18 @@ final class ComposerTextView: NSTextView {
         let accepted = window.makeFirstResponder(self)
         let focused = accepted && window.firstResponder === self
         hasPendingExplicitFocusRequest = !focused
-        if focused {
-            onExplicitFocusSatisfied?()
-        }
         return focused
+    }
+
+    func cancelExplicitFocusRequest() {
+        hasPendingExplicitFocusRequest = false
     }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         guard window != nil, hasPendingExplicitFocusRequest else { return }
         DispatchQueue.main.async { [weak self] in
-            _ = self?.focusForExplicitRequest()
+            self?.onExplicitFocusBecameAvailable?()
         }
     }
 

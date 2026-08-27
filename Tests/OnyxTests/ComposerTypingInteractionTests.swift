@@ -22,8 +22,35 @@ final class ComposerTypingInteractionTests: XCTestCase {
         let firstRequest = model.composerFocusRequest
         model.newTask()
 
-        XCTAssertEqual(firstRequest, initialRequest &+ 1)
-        XCTAssertEqual(model.composerFocusRequest, firstRequest &+ 1)
+        XCTAssertNotEqual(firstRequest, initialRequest)
+        XCTAssertNotEqual(model.composerFocusRequest, firstRequest)
+    }
+
+    func testCancellingProjectPickerReturnsFocusToActiveComposer() {
+        let suiteName = "ComposerTypingInteractionTests.picker-cancel.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let model = OnyxAppModel(runtime: nil, defaults: defaults)
+        let initialRequest = model.composerFocusRequest
+
+        model.resolveWorkspaceChoice(response: .cancel, path: nil)
+
+        XCTAssertNotEqual(model.composerFocusRequest, initialRequest)
+    }
+
+    func testCancellingProjectPickerDoesNotLeaveLatentFocusInArchivedHistory() {
+        let suiteName = "ComposerTypingInteractionTests.picker-cancel-archive.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let model = OnyxAppModel(runtime: nil, defaults: defaults)
+        model.threadListScope = .archived
+        let initialRequest = model.composerFocusRequest
+
+        model.resolveWorkspaceChoice(response: .cancel, path: nil)
+
+        XCTAssertEqual(model.composerFocusRequest, initialRequest)
     }
 
     func testFocusedComposerAcceptsTypedTextAndUpdatesTheBoundDraft() async throws {
@@ -78,7 +105,7 @@ final class ComposerTypingInteractionTests: XCTestCase {
         XCTAssertTrue(window.makeFirstResponder(otherEditor))
         XCTAssertTrue(window.firstResponder === otherEditor)
 
-        fixture.focusRequest = 1
+        fixture.focusRequest = UUID()
         await waitUntil("The explicit focus request did not move focus to the composer") {
             hostingView.layoutSubtreeIfNeeded()
             return window.firstResponder === textView
@@ -160,7 +187,7 @@ final class ComposerTypingInteractionTests: XCTestCase {
 private final class ComposerTypingFixture: ObservableObject {
     @Published var text = ""
     @Published var measuredHeight: CGFloat = 46
-    @Published var focusRequest: UInt64 = 0
+    @Published var focusRequest: UUID?
 }
 
 private struct ComposerTypingHarness: View {

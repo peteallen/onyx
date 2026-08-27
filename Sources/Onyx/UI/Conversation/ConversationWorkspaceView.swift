@@ -102,6 +102,7 @@ struct ConversationWorkspaceView: View {
                         } else {
                             ComposerView(
                                 model: model,
+                                composer: model.composerDraftModel,
                                 providerConnections: providerConnections,
                                 selectedProviderConnectionID: selectedProviderConnectionID,
                                 onSelectProviderConnection: onSelectProviderConnection,
@@ -706,6 +707,7 @@ enum BusyComposerPresentation {
 
 private struct ComposerView: View {
     @ObservedObject var model: OnyxAppModel
+    @ObservedObject var composer: OnyxComposerDraftModel
     let providerConnections: [OnyxApplicationHost.WorkspaceConnection]
     let selectedProviderConnectionID: ProviderConnectionID
     let onSelectProviderConnection: @MainActor (ProviderConnectionID) -> Void
@@ -745,8 +747,8 @@ private struct ComposerView: View {
             && !model.isPreparingLatestMessageEditForSelectedThread
             && !interactionBlocksComposer
             && !model.isReviewBlockingComposer
-            && (!model.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                || !model.composerImages.isEmpty)
+            && (!composer.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || !composer.images.isEmpty)
     }
 
     private var hasActiveWork: Bool {
@@ -759,8 +761,8 @@ private struct ComposerView: View {
             isReviewRunning: model.isReviewRunning,
             isReviewStarting: model.isSelectedReviewStarting,
             hasPendingInteraction: model.activeUserInteraction != nil,
-            draftText: model.composerText,
-            attachmentCount: model.composerImages.count,
+            draftText: composer.text,
+            attachmentCount: composer.images.count,
             canInterrupt: model.supports(.interruption),
             isComposingNewTask: isComposingNewTask,
             userRequestedExpansion: userExpandedBusyComposer,
@@ -788,9 +790,9 @@ private struct ComposerView: View {
 
     private var expandedComposer: some View {
         VStack(spacing: 0) {
-            if !model.composerImages.isEmpty {
+            if !composer.images.isEmpty {
                 ComposerImagePreviewRow(
-                    images: model.composerImages,
+                    images: composer.images,
                     onRemove: model.removeComposerImage
                 )
                 .padding(.horizontal, OnyxWorkspaceMetrics.composerInnerInset)
@@ -798,13 +800,13 @@ private struct ComposerView: View {
             }
 
             NativeComposerTextView(
-                text: $model.composerText,
+                text: $composer.text,
                 measuredHeight: $textHeight,
                 // Keep drafting available across provider reconnects and
                 // authentication gaps. `canSend` still gates submission, so
                 // a draft can never be dispatched until the runtime is ready.
                 isEnabled: model.canEditComposer,
-                focusRequest: model.composerFocusRequest,
+                focusRequest: composer.focusRequest,
                 canSubmit: { canSend },
                 onSubmit: submitComposer,
                 onPasteImages: { images in
