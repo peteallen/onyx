@@ -95,7 +95,14 @@ struct ConversationWorkspaceView: View {
                             AccountAccessStrip(model: model)
                         }
 
-                        PendingSteeringStrip(model: model)
+                        // Keep the queue projection out of the cold welcome
+                        // path. A fresh task has no steering state, and
+                        // avoiding an extra ObservableObject subscription here
+                        // keeps New Task's first paint on the same fast path as
+                        // the pre-active-turn workspace.
+                        if model.isTurnRunning {
+                            PendingSteeringStrip(model: model)
+                        }
                         RuntimeStatusStrip(model: model)
                         ProviderExecutionScopeStrip(model: model)
                         if model.isShowingArchivedThreads {
