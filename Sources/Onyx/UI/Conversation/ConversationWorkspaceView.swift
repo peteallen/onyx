@@ -804,6 +804,7 @@ private struct ComposerView: View {
                 // authentication gaps. `canSend` still gates submission, so
                 // a draft can never be dispatched until the runtime is ready.
                 isEnabled: model.canEditComposer,
+                focusRequest: model.composerFocusRequest,
                 canSubmit: { canSend },
                 onSubmit: submitComposer,
                 onPasteImages: { images in

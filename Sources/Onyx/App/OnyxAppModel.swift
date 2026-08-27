@@ -202,6 +202,11 @@ final class OnyxAppModel: ObservableObject {
         didSet { scheduleComposerDraftSave() }
     }
     @Published private(set) var composerImages: [ComposerImageDraft]
+    /// A monotonic request consumed by the native composer. New Task can be an
+    /// idempotent model operation while still being a meaningful keyboard
+    /// command: the button that invoked it must yield focus to the blank input
+    /// instead of leaving subsequent typing attached to the sidebar.
+    @Published private(set) var composerFocusRequest: UInt64 = 0
     @Published var searchText = ""
     @Published var isSidebarVisible: Bool {
         didSet { preferences.set(isSidebarVisible, forKey: preferenceKey(PreferenceKey.sidebarVisible)) }
@@ -529,6 +534,7 @@ final class OnyxAppModel: ObservableObject {
         composerDraftKey = Self.welcomeThread.id
         composerText = restoredDrafts[Self.welcomeThread.id] ?? ""
         composerImages = []
+        composerFocusRequest = startsWithNewTask ? 1 : 0
         taskModelOverrides = restoredTaskModelOverrides
         taskModelDefaults = restoredTaskModelDefaults
         isSidebarVisible = Self.boolPreference(
@@ -1985,6 +1991,8 @@ final class OnyxAppModel: ObservableObject {
     }
 
     func newTask() {
+        composerFocusRequest &+= 1
+
         // Treat a blank welcome surface as an idempotent click before
         // cancelling any in-flight list refresh. This matters while the first
         // active catalog is still loading: repeated clicks should not restart
@@ -2231,6 +2239,11 @@ final class OnyxAppModel: ObservableObject {
         rememberWorkspace(path)
         if !isComposingNewTask {
             newTask()
+        } else {
+            // Closing the project picker returns focus to the control that
+            // opened it. Put the caret back in the still-visible draft so the
+            // user can continue without a second click.
+            composerFocusRequest &+= 1
         }
     }
 

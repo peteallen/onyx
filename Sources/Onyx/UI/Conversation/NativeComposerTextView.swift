@@ -5,6 +5,10 @@ struct NativeComposerTextView: NSViewRepresentable {
     @Binding var text: String
     @Binding var measuredHeight: CGFloat
     let isEnabled: Bool
+    /// A changed nonzero value explicitly moves keyboard focus into this
+    /// editor. The request is separate from `isEnabled`: local drafting can be
+    /// available without every ordinary view update stealing focus.
+    var focusRequest: UInt64 = 0
     /// Separating eligibility from the submit callback keeps an invalid Return
     /// key from stealing focus. This matters while a task is locked, while a
     /// side-chat fork is still being created, or when the composer is empty.
@@ -32,6 +36,9 @@ struct NativeComposerTextView: NSViewRepresentable {
 
         let textView = ComposerTextView(frame: .zero)
         context.coordinator.textView = textView
+        textView.onExplicitFocusSatisfied = { [weak coordinator = context.coordinator] in
+            coordinator?.focusRequestDidSucceed()
+        }
         textView.onTextContainerWidthChange = { [weak coordinator = context.coordinator] in
             coordinator?.updateHeight()
         }
@@ -59,6 +66,7 @@ struct NativeComposerTextView: NSViewRepresentable {
         textView.maximumTextContainerWidth = OnyxWorkspaceMetrics.maximumConversationTextWidth
         textView.isEditable = isEnabled
         scrollView.documentView = textView
+        context.coordinator.consumeFocusRequest(focusRequest)
         return scrollView
     }
 
@@ -72,6 +80,7 @@ struct NativeComposerTextView: NSViewRepresentable {
         textView.placeholder = Self.placeholder
         textView.maximumTextContainerWidth = OnyxWorkspaceMetrics.maximumConversationTextWidth
         textView.isEditable = isEnabled
+        context.coordinator.consumeFocusRequest(focusRequest)
         if textView.string != text {
             textView.string = text
             textView.needsDisplay = true
@@ -94,7 +103,9 @@ struct NativeComposerTextView: NSViewRepresentable {
         textView.onSubmit = nil
         textView.onPasteImages = nil
         textView.onCancel = nil
+        textView.onExplicitFocusSatisfied = nil
         textView.onTextContainerWidthChange = nil
+        coordinator.cancelPendingFocusRequest()
         textView.cancelFocusRestorationAfterSubmit()
         coordinator.textView = nil
         scrollView.documentView = nil
@@ -126,6 +137,49 @@ struct NativeComposerTextView: NSViewRepresentable {
                 self?.parent.measuredHeight = newHeight
             }
         }
+
+        /// Focus only for an explicit model request. A freshly mounted native
+        /// view may not have its window during `makeNSView`, so retain the
+        /// request until the editor attaches and reports a successful focus.
+        /// Existing composers can accept focus synchronously during the New
+        /// Task state update.
+        func consumeFocusRequest(_ request: UInt64) {
+            guard request != 0, request != lastConsumedFocusRequest else { return }
+            if pendingFocusRequest != request {
+                pendingFocusRequest = request
+            }
+            attemptPendingFocusRequest()
+        }
+
+        fileprivate func focusRequestDidSucceed() {
+            guard let request = pendingFocusRequest else { return }
+            lastConsumedFocusRequest = request
+            pendingFocusRequest = nil
+        }
+
+        /// Drops a focus request when SwiftUI is dismantling this representable.
+        /// Without this boundary a deferred callback could keep retaining the
+        /// coordinator and attempt to focus a view that is no longer mounted.
+        fileprivate func cancelPendingFocusRequest() {
+            pendingFocusRequest = nil
+        }
+
+        private func attemptPendingFocusRequest() {
+            guard let pendingFocusRequest,
+                  pendingFocusRequest != lastConsumedFocusRequest else { return }
+            guard let textView else { return }
+            if textView.focusForExplicitRequest() {
+                // `focusForExplicitRequest` normally calls the satisfaction
+                // callback synchronously. Keep this fallback for test doubles
+                // or future native implementations that only return Bool.
+                if self.pendingFocusRequest == pendingFocusRequest {
+                    focusRequestDidSucceed()
+                }
+            }
+        }
+
+        private var lastConsumedFocusRequest: UInt64 = 0
+        private var pendingFocusRequest: UInt64?
     }
 }
 
@@ -136,6 +190,7 @@ final class ComposerTextView: NSTextView {
     var onSubmit: (() -> Void)?
     var onPasteImages: (([NSImage]) -> Void)?
     var onCancel: (() -> Void)?
+    var onExplicitFocusSatisfied: (() -> Void)?
     var pastedImagesProvider: () -> [NSImage]? = {
         ComposerPasteboardImages.images(from: .general)
     }
@@ -157,6 +212,34 @@ final class ComposerTextView: NSTextView {
     private var submitKeyWasReleased = false
     private var focusRestorationScheduled = false
     private var submitKeyUpMonitor: Any?
+    private var hasPendingExplicitFocusRequest = false
+
+    @discardableResult
+    func focusForExplicitRequest() -> Bool {
+        guard isEditable else {
+            hasPendingExplicitFocusRequest = false
+            return false
+        }
+        guard let window else {
+            hasPendingExplicitFocusRequest = true
+            return false
+        }
+        let accepted = window.makeFirstResponder(self)
+        let focused = accepted && window.firstResponder === self
+        hasPendingExplicitFocusRequest = !focused
+        if focused {
+            onExplicitFocusSatisfied?()
+        }
+        return focused
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard window != nil, hasPendingExplicitFocusRequest else { return }
+        DispatchQueue.main.async { [weak self] in
+            _ = self?.focusForExplicitRequest()
+        }
+    }
 
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
