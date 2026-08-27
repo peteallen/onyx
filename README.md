@@ -12,7 +12,7 @@ path and a distinct polished-stone visual language.
 Onyx is an independent, unofficial project. It is not affiliated with,
 endorsed by, or sponsored by OpenAI.
 
-> **Download the current Onyx build:** [latest macOS release](https://github.com/peteallen/onyx/releases/latest) · [universal DMG](https://github.com/peteallen/onyx/releases/download/v0.1.2/Onyx-0.1.2-macOS.dmg) · [SHA-256 checksum](https://github.com/peteallen/onyx/releases/download/v0.1.2/Onyx-0.1.2-macOS.dmg.sha256)
+> **Download the current Onyx build:** [latest macOS release](https://github.com/peteallen/onyx/releases/latest) · [universal DMG](https://github.com/peteallen/onyx/releases/download/v0.1.3/Onyx-0.1.3-macOS.dmg) · [SHA-256 checksum](https://github.com/peteallen/onyx/releases/download/v0.1.3/Onyx-0.1.3-macOS.dmg.sha256)
 
 OpenAI Codex through the bundled `codex app-server` remains the default runtime. Saved
 OpenAI-compatible connections are also available in the production workspace:
@@ -154,7 +154,7 @@ Developer ID distribution gate is complete.
 Create a fully verified local DMG with one command:
 
 ```bash
-scripts/release.sh 0.1.2
+scripts/release.sh 0.1.3
 ```
 
 This produces a universal Apple Silicon + Intel disk image and SHA-256 checksum

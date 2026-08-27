@@ -11,7 +11,7 @@ Status values: **Open**, **In progress**, **Blocked**, **Done**, **Deferred**.
 3. ✅ Commit the verified source so preview and release bundles can embed that exact revision.
 4. ✅ Repackage and relaunch only the canonical `Onyx Preview` build, then verify one stable app process and its expected bundled app-server child.
 5. ✅ Verify local typing plus a real metadata-poor vLLM file/tool task through the rebuilt UI.
-6. Push, wait for CI, publish the immutable DMG, and verify its checksum, embedded revision, dark baseline, and public download links.
+6. Publish `v0.1.3` from the verified composer/agent build, then verify its checksum, embedded revision, dark baseline, and public download links. `v0.1.2` is intentionally skipped after a late immutable-tag collision repeatedly blocked publication.
 
 New hands-on feedback is added to this ledger as it arrives. It changes this sequence only when it exposes data loss, a security boundary failure, a crash, or another blocker to the work already in progress.
 
@@ -26,6 +26,8 @@ New hands-on feedback is added to this ledger as it arrives. It changes this seq
 - **Verification:** The workflow and executable contract enforce exact source targeting, full test/package verification, direct two-asset publication, public/latest postconditions, and published asset digests. README and release documentation point to the public latest-release URL. The immutable `v0.1.0` release remains available for its original source, while the current build was published as `v0.1.1` from `main` commit `745ed972088f5ed0877db44a48a9c53a823ff95c` after CI run `32694081209` passed and release run `32694613064` attempt 2 passed. The public release is non-draft, non-prerelease, latest, and identifies the ad-hoc/unnotarized signing status: <https://github.com/peteallen/onyx/releases/tag/v0.1.1>. Its universal DMG and checksum were downloaded from the public URLs, verified with `shasum -a 256 -c`, and matched the published asset digest (`2788ae8bf135a5d3b704b6421b6ada8a7186ce865a6545351c60d0e49dad4eb6`). The mounted app reports bundle `app.onyx.agent`, version `0.1.1`, and both `x86_64` and `arm64` architectures. The `/releases/latest` endpoint and both direct asset URLs returned HTTP 200.
 
 - **Discoverability follow-up:** Complete. The README presents the latest-release page, direct DMG, and checksum as a top-level download callout; the public `v0.1.1` release now satisfies the download and provenance acceptance criteria.
+
+- **Current release refresh:** In progress. CI run `32946321394` attempt 2 passed all 865 tests plus the universal DMG gates on commit `6899fda0e9d0154befa4575a608b1ed7b2fa253a`. Two `v0.1.2` publication attempts built valid artifacts but encountered a late tag at a different source commit; the workflow correctly refused to move it. The fixed build is advancing to `v0.1.3` with new immutable provenance.
 
 ### RELEASE-002 — Installing a release must replace stale local Onyx copies
 

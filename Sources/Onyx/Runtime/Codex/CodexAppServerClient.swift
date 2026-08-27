@@ -70,7 +70,7 @@ enum CodexAppServerHandshake {
         "clientInfo": .object([
             "name": .string("onyx"),
             "title": .string("Onyx"),
-            "version": .string("0.1.2"),
+            "version": .string("0.1.3"),
         ]),
         "capabilities": .object([
             // `item/tool/requestUserInput` and the richer approval fields that
