@@ -172,18 +172,27 @@ enum ProjectTaskSidebarProjection {
         // history that work ran during navigation and could beachball the UI.
         let resolver = ProjectTaskProjectResolver(projects: orderedProjects)
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let filtered = tasks.filter { task in
-            guard !query.isEmpty else { return true }
-            return task.thread.title.localizedCaseInsensitiveContains(query)
-                || task.thread.preview.localizedCaseInsensitiveContains(query)
-                || (task.thread.cwd?.localizedCaseInsensitiveContains(query) ?? false)
-                || task.providerDisplayName.localizedCaseInsensitiveContains(query)
-                || (resolver.project(forFolderPath: task.thread.cwd)?
-                    .displayName.localizedCaseInsensitiveContains(query) ?? false)
+        // The common (empty-search) path should not copy thousands of row
+        // values just to iterate them once. Keep filtering lazy for that path;
+        // search still materializes only the matching rows below.
+        let filtered: [ProjectTaskReference]
+        if query.isEmpty {
+            filtered = tasks
+        } else {
+            filtered = tasks.filter { task in
+                task.thread.title.localizedCaseInsensitiveContains(query)
+                    || task.thread.preview.localizedCaseInsensitiveContains(query)
+                    || (task.thread.cwd?.localizedCaseInsensitiveContains(query) ?? false)
+                    || task.providerDisplayName.localizedCaseInsensitiveContains(query)
+                    || (resolver.project(forFolderPath: task.thread.cwd)?
+                        .displayName.localizedCaseInsensitiveContains(query) ?? false)
+            }
         }
 
         var tasksByProject: [ProjectID: [ProjectTaskReference]] = [:]
+        tasksByProject.reserveCapacity(orderedProjects.count)
         var unassigned: [ProjectTaskReference] = []
+        unassigned.reserveCapacity(filtered.count / max(orderedProjects.count, 1))
         for task in filtered {
             if let project = resolver.project(forFolderPath: task.thread.cwd) {
                 tasksByProject[project.id, default: []].append(task)
@@ -274,37 +283,30 @@ enum ProjectTaskSidebarProjection {
 
 /// One projection-scoped, allocation-light ancestor resolver. Project paths
 /// are immutable for the duration of the sidebar calculation, so normalising
-/// and sorting them once avoids repeating Foundation path work for every task.
+/// them once and indexing their components avoids repeating Foundation path
+/// work for every task. A component trie makes lookup proportional to the
+/// working-folder depth instead of the number of imported projects.
 private final class ProjectTaskProjectResolver {
-    private struct Candidate {
-        let project: ProjectCatalogRecord
-        let components: [String]
-        let depth: Int
+    private struct Node {
+        var children: [String: Int] = [:]
+        var project: ProjectCatalogRecord?
     }
 
-    private let candidates: [Candidate]
+    private var nodes: [Node] = [Node()]
     private var matchedProjectsByPath: [String: ProjectCatalogRecord] = [:]
     private var unmatchedPaths: Set<String> = []
 
     init(projects: [ProjectCatalogRecord]) {
-        candidates = projects
-            .compactMap { project in
-                ProjectPathNormalizer.normalize(project.folderPath).map { path in
-                    let components = NSString(string: path).pathComponents
-                    return Candidate(
-                        project: project,
-                        components: components,
-                        depth: components.count
-                    )
-                }
+        // The old resolver scanned every normalized project root for each
+        // distinct task path. Insert roots into a trie once instead; lookup
+        // then walks only the path's components. Duplicate roots retain the
+        // historical order/id tie-break used by the sorted candidate list.
+        for project in projects {
+            guard let path = ProjectPathNormalizer.normalize(project.folderPath) else {
+                continue
             }
-            .sorted { lhs, rhs in
-                if lhs.depth != rhs.depth { return lhs.depth > rhs.depth }
-                if lhs.project.order != rhs.project.order {
-                    return lhs.project.order < rhs.project.order
-                }
-                return lhs.project.id.rawValue < rhs.project.id.rawValue
-            }
+            insert(project: project, components: NSString(string: path).pathComponents)
+        }
     }
 
     func project(forFolderPath rawPath: String?) -> ProjectCatalogRecord? {
@@ -316,17 +318,53 @@ private final class ProjectTaskProjectResolver {
             return nil
         }
         let components = NSString(string: path).pathComponents
-        let match = candidates.first { candidate in
-            components.count >= candidate.components.count
-                && components.prefix(candidate.components.count)
-                    .elementsEqual(candidate.components)
-        }?.project
+        var nodeIndex = 0
+        var match: ProjectCatalogRecord?
+        for component in components {
+            guard let childIndex = nodes[nodeIndex].children[component] else { break }
+            nodeIndex = childIndex
+            if let project = nodes[nodeIndex].project {
+                // Walking from the root means each later match is a more
+                // specific ancestor, exactly like the prior depth sort.
+                match = project
+            }
+        }
         if let match {
             matchedProjectsByPath[rawPath] = match
         } else {
             unmatchedPaths.insert(rawPath)
         }
         return match
+    }
+
+    private func insert(project: ProjectCatalogRecord, components: [String]) {
+        var nodeIndex = 0
+        for component in components {
+            if let childIndex = nodes[nodeIndex].children[component] {
+                nodeIndex = childIndex
+            } else {
+                let childIndex = nodes.count
+                nodes.append(Node())
+                nodes[nodeIndex].children[component] = childIndex
+                nodeIndex = childIndex
+            }
+        }
+
+        guard let existing = nodes[nodeIndex].project else {
+            nodes[nodeIndex].project = project
+            return
+        }
+        if isPreferred(project, over: existing) {
+            nodes[nodeIndex].project = project
+        }
+    }
+
+    private func isPreferred(
+        _ lhs: ProjectCatalogRecord,
+        over rhs: ProjectCatalogRecord
+    ) -> Bool {
+        if lhs.order != rhs.order { return lhs.order < rhs.order }
+        return lhs.id.rawValue < rhs.id.rawValue
     }
 }
 

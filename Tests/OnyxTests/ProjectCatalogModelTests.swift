@@ -237,6 +237,90 @@ final class ProjectCatalogModelTests: XCTestCase {
         XCTAssertEqual(byProvider.groups[0].tasks.map(\.thread.id), ["local"])
     }
 
+    func testProjectionUsesMostSpecificAncestorWithoutPrefixCollisions() {
+        let projects = [
+            project(id: "app", path: "/work/app", name: "App", order: 0),
+            project(
+                id: "client",
+                path: "/work/app/packages/client",
+                name: "Client package",
+                order: 1
+            ),
+            project(
+                id: "application",
+                path: "/work/application",
+                name: "Application",
+                order: 2
+            ),
+        ]
+        let tasks = [
+            reference(thread(id: "root-file", title: "Root", cwd: "/work/app/Sources")),
+            reference(thread(
+                id: "nested-file",
+                title: "Nested",
+                cwd: "/work/app/packages/client/Sources"
+            )),
+            reference(thread(
+                id: "prefix-file",
+                title: "Prefix",
+                cwd: "/work/application/Sources"
+            )),
+            reference(thread(id: "collision", title: "Collision", cwd: "/work/appx/Sources")),
+        ]
+
+        let grouping = ProjectTaskSidebarProjection.group(tasks, by: projects)
+
+        XCTAssertEqual(grouping.groups.map(\.project.id), [
+            ProjectID("app"),
+            ProjectID("client"),
+            ProjectID("application"),
+        ])
+        XCTAssertEqual(grouping.groups[0].tasks.map(\.thread.id), ["root-file"])
+        XCTAssertEqual(grouping.groups[1].tasks.map(\.thread.id), ["nested-file"])
+        XCTAssertEqual(grouping.groups[2].tasks.map(\.thread.id), ["prefix-file"])
+        XCTAssertEqual(grouping.unassigned.map(\.thread.id), ["collision"])
+    }
+
+    func testProjectionMatchesExactRootAndLeavesInvalidPathsUnassigned() {
+        let root = project(id: "app", path: "/work/app", name: "App", order: 0)
+        let tasks = [
+            reference(thread(id: "exact", title: "Exact", cwd: "/work/app")),
+            reference(thread(id: "relative", title: "Relative", cwd: "work/app")),
+            reference(thread(id: "blank", title: "Blank", cwd: "   ")),
+            reference(thread(id: "nul", title: "Nul", cwd: "/work/app\0/file")),
+            reference(thread(id: "missing", title: "Missing", cwd: nil)),
+        ]
+
+        let grouping = ProjectTaskSidebarProjection.group(tasks, by: [root])
+
+        XCTAssertEqual(grouping.groups[0].tasks.map(\.thread.id), ["exact"])
+        XCTAssertEqual(
+            Set(grouping.unassigned.map(\.thread.id)),
+            Set(["relative", "blank", "nul", "missing"])
+        )
+    }
+
+    func testProjectionDuplicateRootsKeepOrderAndIDTieBreak() {
+        let projects = [
+            project(id: "z-root", path: "/work/shared", name: "Z root", order: 0),
+            project(id: "a-root", path: "/work/shared", name: "A root", order: 0),
+        ]
+        let task = reference(thread(
+            id: "shared-file",
+            title: "Shared",
+            cwd: "/work/shared/file"
+        ))
+
+        let grouping = ProjectTaskSidebarProjection.group([task], by: projects)
+
+        XCTAssertEqual(
+            grouping.groups.map(\.project.id),
+            [ProjectID("a-root"), ProjectID("z-root")]
+        )
+        XCTAssertEqual(grouping.groups[0].tasks.map(\.thread.id), ["shared-file"])
+        XCTAssertTrue(grouping.groups[1].tasks.isEmpty)
+    }
+
     func testLargeProjectionRemainsComfortablyInteractive() {
         // This mirrors a long-lived Codex installation: hundreds of imported
         // project roots and thousands of tasks. Projection runs away from the

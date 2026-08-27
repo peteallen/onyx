@@ -219,7 +219,7 @@ New hands-on feedback is added to this ledger as it arrives. It changes this seq
 - **Problem:** Clicking New Task with a large history can block the window instead of immediately presenting a fresh composer.
 - **Decision:** Publish the welcome/composer state synchronously from bounded cached state, keep draft persistence off the interaction path, and reuse rather than restart an in-flight task refresh.
 - **Acceptance:** The first click visibly switches to a usable blank task within one frame where practical; repeated clicks are harmless; the previous draft is preserved; large catalogs do not get synchronously reprojected.
-- **Verification:** Model coverage stays below 50 ms and a hosted 4,824-task click-to-paint check stays below 100 ms. The hosted benchmark waits only when SwiftUI genuinely defers mounting the welcome prompt or composer, so unrelated executor scheduling on a busy CI host is not charged to an already-complete paint. A canonical-preview check with Pete’s real task history is still pending.
+- **Verification:** Model coverage stays below 50 ms and a hosted 4,824-task click-to-paint check stays below 100 ms. Sidebar grouping now indexes imported project paths once and resolves each distinct working folder by its path depth rather than scanning every project; focused coverage protects exact and deepest-ancestor matches, prefix collisions, duplicate-root ordering, and invalid paths. The hosted benchmark waits only when SwiftUI genuinely defers mounting the welcome prompt or composer, so unrelated executor scheduling on a busy CI host is not charged to an already-complete paint. A canonical-preview check with Pete’s real task history is still pending.
 
 ### RUNTIME-002 — Repeated use still crashes
 
