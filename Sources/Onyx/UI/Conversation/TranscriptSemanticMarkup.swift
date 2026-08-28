@@ -39,6 +39,7 @@ enum TranscriptSemanticMarkup {
     static let maximumStyledRegions = 3
     static let maximumStyledRegionUTF8Bytes = 512
     static let maximumSourceUTF8Bytes = 128 * 1_024
+    static let maximumSourceLines = 2_048
 
     private static let openingPrefix = "[onyx:"
     private static let closingTag = "[/onyx]"
@@ -62,7 +63,8 @@ enum TranscriptSemanticMarkup {
 
     static func project(_ source: String) -> TranscriptSemanticMarkupProjection {
         guard !source.isEmpty,
-              source.utf8.count <= maximumSourceUTF8Bytes else {
+              source.utf8.count <= maximumSourceUTF8Bytes,
+              hasBoundedLineCount(source) else {
             return literalProjection(source)
         }
 
@@ -136,6 +138,15 @@ enum TranscriptSemanticMarkup {
 
     private static func literalProjection(_ source: String) -> TranscriptSemanticMarkupProjection {
         TranscriptSemanticMarkupProjection(rawText: source, cleanText: source, regions: [])
+    }
+
+    private static func hasBoundedLineCount(_ source: String) -> Bool {
+        var lineBreakCount = 0
+        for scalar in source.unicodeScalars where CharacterSet.newlines.contains(scalar) {
+            lineBreakCount += 1
+            if lineBreakCount >= maximumSourceLines { return false }
+        }
+        return true
     }
 
     /// Groups semantic tokens as balanced wrappers. A group is valid only
