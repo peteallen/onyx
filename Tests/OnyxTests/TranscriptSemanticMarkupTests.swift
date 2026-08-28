@@ -147,6 +147,20 @@ final class TranscriptSemanticMarkupTests: XCTestCase {
         )
     }
 
+    func testSemanticRegionInsideOuterMarkdownEmphasisKeepsTheEmphasis() throws {
+        let item = assistantItem(body: "**[onyx:success]Built[/onyx] today**")
+        let rendered = TranscriptCellView.bodyAttributedText(for: item)
+        XCTAssertEqual(rendered.string, "Built today")
+        let builtRange = (rendered.string as NSString).range(of: "Built")
+        let builtFont = try XCTUnwrap(
+            rendered.attribute(.font, at: builtRange.location, effectiveRange: nil) as? NSFont
+        )
+        XCTAssertTrue(
+            NSFontManager.shared.traits(of: builtFont).contains(.boldFontMask),
+            "Outer Markdown emphasis should survive semantic marker removal"
+        )
+    }
+
     func testUnicodeAndMarkdownBlockPrefixesKeepSemanticRangeAligned() throws {
         let source = "# 😀 [onyx:success]café 🚀[/onyx]"
         let item = assistantItem(body: source)

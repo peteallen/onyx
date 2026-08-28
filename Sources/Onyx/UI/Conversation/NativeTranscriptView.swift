@@ -2847,6 +2847,12 @@ enum TranscriptMarkdownRenderer {
         let range: NSRange
     }
 
+    private struct SemanticSentinelPair {
+        let role: TranscriptSemanticRole
+        let start: String
+        let end: String
+    }
+
     static func attributedString(
         markdown source: String,
         baseFont: NSFont,
@@ -3220,6 +3226,87 @@ enum TranscriptMarkdownRenderer {
             return parsedInlineMarkdown(source, font: font, textColor: textColor)
         }
 
+        // Parse the complete clean line with private-use sentinels around each
+        // semantic slice. This keeps Markdown delimiters outside a wrapper
+        // (for example, `**[onyx:success]Built[/onyx]**`) intact, while the
+        // sentinels give us a stable output range after Markdown removes its
+        // own syntax. They are deleted before the attributed string is shown.
+        let pairs = semanticSlices.enumerated().map { index, slice in
+            SemanticSentinelPair(
+                role: slice.role,
+                start: String(UnicodeScalar(0xE000 + (index * 2))!),
+                end: String(UnicodeScalar(0xE001 + (index * 2))!)
+            )
+        }
+        let annotatedSource = NSMutableString(string: source)
+        for (slice, pair) in zip(semanticSlices.reversed(), pairs.reversed()) {
+            guard slice.range.location >= 0,
+                  NSMaxRange(slice.range) <= annotatedSource.length else { continue }
+            annotatedSource.insert(pair.end, at: NSMaxRange(slice.range))
+            annotatedSource.insert(pair.start, at: slice.range.location)
+        }
+
+        let rendered = NSMutableAttributedString(
+            attributedString: parsedInlineMarkdown(
+                annotatedSource as String,
+                font: font,
+                textColor: textColor
+            )
+        )
+        let renderedString = rendered.string as NSString
+        var sentinelRanges: [NSRange] = []
+        sentinelRanges.reserveCapacity(pairs.count * 2)
+
+        for pair in pairs {
+            let startRange = renderedString.range(of: pair.start)
+            let endRange = renderedString.range(of: pair.end)
+            guard startRange.location != NSNotFound,
+                  endRange.location != NSNotFound,
+                  NSMaxRange(startRange) <= endRange.location else {
+                // A future Markdown parser could discard private-use scalars.
+                // Keep the older segmented behavior as a safe presentation
+                // fallback rather than silently losing semantic color.
+                return segmentedInlineMarkdown(
+                    source,
+                    font: font,
+                    textColor: textColor,
+                    semanticSlices: semanticSlices,
+                    appearance: appearance
+                )
+            }
+            let contentRange = NSRange(
+                location: NSMaxRange(startRange),
+                length: endRange.location - NSMaxRange(startRange)
+            )
+            if contentRange.length > 0 {
+                rendered.addAttributes(
+                    [
+                        .foregroundColor: semanticColor(
+                            for: pair.role,
+                            appearance: appearance
+                        ),
+                        .onyxSemanticRole: pair.role.rawValue,
+                    ],
+                    range: contentRange
+                )
+            }
+            sentinelRanges.append(startRange)
+            sentinelRanges.append(endRange)
+        }
+
+        for range in sentinelRanges.sorted(by: { $0.location > $1.location }) {
+            rendered.deleteCharacters(in: range)
+        }
+        return rendered
+    }
+
+    private static func segmentedInlineMarkdown(
+        _ source: String,
+        font: NSFont,
+        textColor: NSColor,
+        semanticSlices: [SemanticSlice],
+        appearance: NSAppearance?
+    ) -> NSAttributedString {
         let sourceNSString = source as NSString
         let result = NSMutableAttributedString()
         var cursor = 0
