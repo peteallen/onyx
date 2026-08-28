@@ -668,7 +668,7 @@ struct ProjectSidebarHeader: View {
                         .foregroundStyle(isExpanded ? Color.secondary : Color.secondary.opacity(0.78))
                     Text(project.displayName)
                         .font(.system(size: OnyxTypography.navigation, weight: .medium))
-                        .foregroundStyle(isExpanded ? Color.primary : Color.secondary)
+                        .foregroundStyle(isExpanded ? OnyxTheme.strongText : OnyxTheme.quietText)
                         .lineLimit(1)
                     Spacer(minLength: 4)
                     Text("\(taskCount)")
@@ -779,7 +779,7 @@ private struct TaskSidebarRow: View {
                 HStack(spacing: 6) {
                     Text(thread.title)
                         .font(.system(size: OnyxTypography.navigation, weight: isSelected ? .medium : .regular))
-                        .foregroundStyle(.primary)
+                        .foregroundStyle(isSelected ? OnyxTheme.strongText : OnyxTheme.readingText)
                         .lineLimit(1)
                     Spacer(minLength: 4)
                     if !isArchived, attention.showsSidebarAttentionLabel {

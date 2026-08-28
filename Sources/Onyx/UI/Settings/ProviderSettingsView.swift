@@ -534,7 +534,7 @@ private struct ProviderSettingsBanner: View {
                 .foregroundStyle(tint)
             Text(text)
                 .font(.system(size: OnyxTypography.navigation))
-                .foregroundStyle(.primary)
+                .foregroundStyle(OnyxTheme.readingText)
                 .textSelection(.enabled)
             Spacer(minLength: 0)
         }

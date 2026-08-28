@@ -83,7 +83,12 @@ struct ConversationWorkspaceView: View {
                         }
                     }
 
-                    VStack(spacing: 8) {
+                    // Keep every short-state surface on the conversation's
+                    // leading axis. Without an explicit alignment SwiftUI
+                    // centers a capped approval card inside this wide stack.
+                    // Twelve points also keeps the card/composer handoff
+                    // readable without turning the bottom rail into a gap.
+                    VStack(alignment: .leading, spacing: 12) {
                         if let interaction = model.activeUserInteraction {
                             UserInteractionView(model: model, interaction: interaction)
                                 .id(interaction)
@@ -193,7 +198,11 @@ private struct PendingSteeringStrip: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(PendingSteeringPresentation.title(for: messages.count))
                         .font(.system(size: OnyxTypography.navigation, weight: .semibold))
-                        .foregroundStyle(.primary)
+                        // This strip represents active motion, so keep its
+                        // headline in the same electric semantic lane as the
+                        // arrow and count instead of falling back to glare-
+                        // level primary white.
+                        .foregroundStyle(OnyxTheme.electric)
                     if let latestMessage {
                         Text("\(PendingSteeringPresentation.stateLabel(for: latestMessage.state)) · \(PendingSteeringPresentation.messagePreview(for: latestMessage))")
                             .font(.system(size: OnyxTypography.secondary))
