@@ -147,6 +147,37 @@ final class TranscriptSemanticMarkupTests: XCTestCase {
         )
     }
 
+    func testUnicodeAndMarkdownBlockPrefixesKeepSemanticRangeAligned() throws {
+        let source = "# 😀 [onyx:success]café 🚀[/onyx]"
+        let item = assistantItem(body: source)
+        let rendered = TranscriptCellView.bodyAttributedText(for: item)
+        let text = rendered.string as NSString
+        let semanticRange = text.range(of: "café 🚀")
+
+        XCTAssertEqual(rendered.string, "😀 café 🚀")
+        XCTAssertEqual(semanticRange.location, 3, "UTF-16 range should follow the heading's rendered text")
+        XCTAssertEqual(
+            rendered.attribute(.onyxSemanticRole, at: semanticRange.location, effectiveRange: nil) as? String,
+            TranscriptSemanticRole.success.rawValue
+        )
+        let color = try XCTUnwrap(
+            rendered.attribute(.foregroundColor, at: semanticRange.location, effectiveRange: nil) as? NSColor
+        )
+        XCTAssertEqual(color, OnyxTheme.successNSColor(for: nil))
+    }
+
+    func testLineBoundFallbackLeavesMarkersLiteral() {
+        let source = (0...TranscriptSemanticMarkup.maximumSourceLines)
+            .map { index in
+                index == 0 ? "[onyx:success]first[/onyx]" : "line \(index)"
+            }
+            .joined(separator: "\n")
+        let projection = TranscriptSemanticMarkup.project(source)
+
+        XCTAssertEqual(projection.cleanText, source)
+        XCTAssertTrue(projection.regions.isEmpty)
+    }
+
     func testOnlyAssistantMessagesInterpretSemanticMarkup() {
         let source = "[onyx:success]Do not style user text[/onyx]"
         let userItem = TimelineItem(
