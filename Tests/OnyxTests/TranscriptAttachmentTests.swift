@@ -122,6 +122,16 @@ final class TranscriptAttachmentTests: XCTestCase {
         XCTAssertLessThan(cell.messageBubbleFrame.width, 180)
         XCTAssertGreaterThan(cell.messageBubbleFrame.minX, 500)
         XCTAssertEqual(cell.layer?.backgroundColor, NSColor.clear.cgColor)
+
+        for appearanceName in [NSAppearance.Name.darkAqua, .aqua] {
+            cell.appearance = NSAppearance(named: appearanceName)
+            cell.viewDidChangeEffectiveAppearance()
+            XCTAssertEqual(
+                cell.layer?.backgroundColor,
+                NSColor.clear.cgColor,
+                "Appearance refreshes must tint only the user bubble, not the full transcript row"
+            )
+        }
     }
 
     @MainActor

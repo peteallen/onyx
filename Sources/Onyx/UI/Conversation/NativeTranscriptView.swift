@@ -3818,7 +3818,15 @@ final class TranscriptCellView: NSView {
                 tint: disclosureTintColor(for: item.status)
             )
         }
-        layer?.backgroundColor = backgroundColor(for: item.kind).cgColor
+        let isProminentActivity = item.isProminentActivity
+        let isExpandedRoutineActivity = item.kind.isRoutineActivity && isExpanded
+        layer?.backgroundColor = if isProminentActivity {
+            backgroundColor(for: item.kind).cgColor
+        } else if isExpandedRoutineActivity {
+            NSColor.controlBackgroundColor.withAlphaComponent(0.18).cgColor
+        } else {
+            NSColor.clear.cgColor
+        }
         if item.kind == .userMessage {
             bubbleBackground.layer?.backgroundColor = backgroundColor(for: item.kind).cgColor
         }
