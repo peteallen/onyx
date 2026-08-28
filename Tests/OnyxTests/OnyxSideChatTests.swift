@@ -8,9 +8,15 @@ import XCTest
 final class OnyxSideChatTests: XCTestCase {
     func testSideChatPanelLayoutOverlaysWithoutShrinkingMainConversation() {
         XCTAssertEqual(SideChatPanelLayout.resolve(availableWidth: 860).panelWidth, 380)
-        XCTAssertEqual(SideChatPanelLayout.resolve(availableWidth: 420).panelWidth, 380)
-        XCTAssertEqual(SideChatPanelLayout.resolve(availableWidth: 340).panelWidth, 320)
-        XCTAssertEqual(SideChatPanelLayout.resolve(availableWidth: 250).panelWidth, 300)
+        XCTAssertEqual(SideChatPanelLayout.resolve(availableWidth: 640).panelWidth, 320)
+        XCTAssertEqual(SideChatPanelLayout.resolve(availableWidth: 420).panelWidth, 420)
+        XCTAssertEqual(SideChatPanelLayout.resolve(availableWidth: 340).panelWidth, 340)
+        XCTAssertEqual(SideChatPanelLayout.resolve(availableWidth: 250).panelWidth, 250)
+        XCTAssertEqual(
+            SideChatPanelLayout.resolve(availableWidth: 640).panelWidth,
+            640 - SideChatPanelLayout.minimumConversationWidth,
+            accuracy: 0.001
+        )
     }
 
     func testSideChatForkAndStreamingStayIsolatedFromDurableTask() async {

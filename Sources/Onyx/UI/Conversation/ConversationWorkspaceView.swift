@@ -357,14 +357,37 @@ struct SideChatPanelLayout: Equatable {
     static let minimumWidth: CGFloat = 300
     static let preferredWidth: CGFloat = 380
     static let maximumWidth: CGFloat = 460
+    /// Preserve a meaningful slice of the parent conversation whenever the
+    /// panel shares its width. Below this threshold the panel becomes a full
+    /// overlay instead of leaving a narrow, unusable strip of the main task.
+    static let minimumConversationWidth: CGFloat = 320
+    static let splitLayoutMinimumWidth: CGFloat = 640
     static let compactHorizontalInset: CGFloat = 20
 
     let panelWidth: CGFloat
 
     static func resolve(availableWidth: CGFloat) -> Self {
-        let boundedAvailable = max(0, availableWidth - compactHorizontalInset)
+        guard availableWidth.isFinite, availableWidth > 0 else {
+            return Self(panelWidth: 0)
+        }
+
+        // At compact widths Side Chat owns the whole conversation surface.
+        // This keeps its editor and transcript useful and avoids a 40–100 pt
+        // sliver of parent content that reads like a broken split view.
+        if availableWidth < splitLayoutMinimumWidth {
+            return Self(panelWidth: availableWidth)
+        }
+
+        let boundedAvailable = max(
+            minimumWidth,
+            availableWidth - compactHorizontalInset
+        )
+        let maximumForSplit = max(
+            minimumWidth,
+            availableWidth - minimumConversationWidth
+        )
         let width = min(maximumWidth, max(minimumWidth, min(preferredWidth, boundedAvailable)))
-        return Self(panelWidth: width)
+        return Self(panelWidth: min(width, maximumForSplit))
     }
 }
 
@@ -977,9 +1000,10 @@ private struct ComposerView: View {
             Button(action: model.interrupt) {
                 Label("Stop", systemImage: "stop.fill")
                     .font(.system(size: OnyxTypography.navigation, weight: .semibold))
+                    .foregroundStyle(OnyxTheme.warning)
                     .padding(.horizontal, 9)
                     .frame(height: 26)
-                    .background(Color.primary.opacity(0.065))
+                    .background(OnyxTheme.warning.opacity(0.10))
                     .clipShape(Capsule())
                 .frame(height: OnyxHitTarget.compact)
                 .contentShape(Rectangle())

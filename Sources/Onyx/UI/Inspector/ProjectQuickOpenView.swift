@@ -222,7 +222,7 @@ struct ProjectQuickOpenView: View {
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(file.name)
-                        .foregroundStyle(Color.primary)
+                        .foregroundStyle(OnyxTheme.strongText)
                         .lineLimit(1)
                     if file.relativePath != file.name {
                         Text(file.relativePath)

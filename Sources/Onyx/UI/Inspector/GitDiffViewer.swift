@@ -807,7 +807,7 @@ struct GitDiffViewerView: View {
                 .padding(.trailing, 8)
         }
         .font(.system(size: 10, design: .monospaced))
-        .foregroundStyle(line.kind == .noNewline ? .secondary : .primary)
+        .foregroundStyle(line.kind == .noNewline ? .secondary : OnyxTheme.readingText)
         .frame(minWidth: 300, minHeight: 20, alignment: .leading)
         .background(line.kind.backgroundColor)
         .accessibilityElement(children: .ignore)

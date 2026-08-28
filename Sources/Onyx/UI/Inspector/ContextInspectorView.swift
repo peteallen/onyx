@@ -116,7 +116,11 @@ struct ContextInspectorView: View {
         .frame(height: summaryViewportHeight, alignment: .top)
         .background(OnyxTheme.inspector)
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .padding(.horizontal, 10)
+        // The content already owns the pane's 12 pt horizontal axis.  A
+        // second 10 pt wrapper made the inspector feel squeezed and left its
+        // card/header edges on different columns; keep only vertical breathing
+        // room around the compact summary surface.
+        .padding(.horizontal, 0)
         .padding(.top, 10)
         .padding(.bottom, 10)
         .onPreferenceChange(InspectorContentHeightPreferenceKey.self) { height in
@@ -143,7 +147,8 @@ struct ContextInspectorView: View {
         }
         .background(OnyxTheme.inspector)
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .padding(10)
+        .padding(.horizontal, 0)
+        .padding(.vertical, 10)
     }
 }
 
@@ -256,7 +261,7 @@ private struct SummaryInspector: View {
                             .accessibilityHidden(true)
                         Text(step.text)
                             .font(.system(size: OnyxTypography.secondary))
-                            .foregroundStyle(step.status == .completed ? OnyxTheme.quietText : Color.primary)
+                            .foregroundStyle(step.status == .completed ? OnyxTheme.quietText : OnyxTheme.readingText)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     .accessibilityElement(children: .ignore)
@@ -294,7 +299,7 @@ private struct SummaryInspector: View {
                             .accessibilityHidden(true)
                         VStack(alignment: .leading, spacing: 1) {
                             Text(agent.displayName)
-                                .foregroundStyle(Color.primary)
+                                .foregroundStyle(OnyxTheme.strongText)
                                 .lineLimit(1)
                             if let message = agent.message?.trimmingCharacters(in: .whitespacesAndNewlines),
                                !message.isEmpty {
@@ -706,7 +711,7 @@ private struct FilesInspector: View {
                                     .foregroundStyle(.secondary)
                                 VStack(alignment: .leading, spacing: 1) {
                                     Text(file.name)
-                                        .foregroundStyle(Color.primary)
+                                        .foregroundStyle(OnyxTheme.strongText)
                                         .lineLimit(1)
                                     if file.relativePath != file.name {
                                         Text(file.relativePath)
@@ -1047,6 +1052,7 @@ struct ProjectFileRow: View {
                                 .foregroundStyle(.secondary)
                                 .accessibilityHidden(true)
                             Text(entry.name)
+                                .foregroundStyle(OnyxTheme.strongText)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
                         }
@@ -1062,6 +1068,7 @@ struct ProjectFileRow: View {
                         .foregroundStyle(.secondary)
                         .accessibilityHidden(true)
                     Text(entry.name)
+                        .foregroundStyle(OnyxTheme.strongText)
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
@@ -1119,7 +1126,7 @@ private struct SourcePreviewLineView: View {
                 .fill(OnyxTheme.border)
                 .frame(width: OnyxTheme.hairline)
             Text(line.text.isEmpty ? " " : line.text)
-                .foregroundStyle(Color.primary)
+                .foregroundStyle(OnyxTheme.readingText)
                 .padding(.horizontal, 7)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: true, vertical: false)
@@ -1145,7 +1152,7 @@ private struct InspectorValueRow: View {
                 .foregroundStyle(OnyxTheme.quietText)
                 .frame(width: 68, alignment: .leading)
             Text(value)
-                .foregroundStyle(Color.primary)
+                .foregroundStyle(OnyxTheme.readingText)
                 .multilineTextAlignment(.leading)
                 .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
@@ -1168,7 +1175,7 @@ private struct InspectorPathRow: View {
                 .foregroundStyle(OnyxTheme.quietText)
             Text(path)
                 .font(.system(size: OnyxTypography.secondary, design: .monospaced))
-                .foregroundStyle(Color.primary)
+                .foregroundStyle(OnyxTheme.readingText)
                 .textSelection(.enabled)
                 .lineLimit(2)
                 .truncationMode(.middle)
@@ -1213,7 +1220,7 @@ struct InspectorDisclosureSection<Content: View>: View {
                 HStack(spacing: 7) {
                     Label(title, systemImage: icon)
                         .font(.system(size: OnyxTypography.navigation, weight: .medium))
-                        .foregroundStyle(Color.primary)
+                        .foregroundStyle(OnyxTheme.strongText)
                     Spacer(minLength: 8)
                     if !summary.isEmpty {
                         Text(summary)
@@ -1258,7 +1265,9 @@ private struct FileTreeRow: View {
                 .frame(width: 13)
                 .foregroundStyle(.secondary)
                 .accessibilityHidden(true)
-            Text(name).lineLimit(1)
+            Text(name)
+                .foregroundStyle(OnyxTheme.strongText)
+                .lineLimit(1)
         }
         .font(.system(size: OnyxTypography.secondary))
         .padding(.leading, CGFloat(depth) * 13)

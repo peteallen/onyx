@@ -4,6 +4,185 @@ import XCTest
 @testable import Onyx
 
 final class TranscriptLayoutPerformanceTests: XCTestCase {
+    func testShortTranscriptReceivesOnlyTheFlexibleLowerThirdOffset() {
+        XCTAssertEqual(
+            TranscriptVerticalAlignment.extraTopOffset(
+                viewportHeight: 620,
+                contentHeight: 150
+            ),
+            470,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            TranscriptVerticalAlignment.extraTopOffset(
+                viewportHeight: 150,
+                contentHeight: 150
+            ),
+            0,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            TranscriptVerticalAlignment.extraTopOffset(
+                viewportHeight: 120,
+                contentHeight: 240
+            ),
+            0,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            TranscriptVerticalAlignment.extraTopOffset(
+                viewportHeight: .infinity,
+                contentHeight: 150
+            ),
+            0,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            TranscriptVerticalAlignment.extraTopOffset(
+                viewportHeight: 620,
+                contentHeight: .nan
+            ),
+            0,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            TranscriptVerticalAlignment.extraTopOffset(
+                viewportHeight: 620,
+                contentHeight: 150,
+                hasContent: false
+            ),
+            0,
+            accuracy: 0.001
+        )
+    }
+
+    @MainActor
+    func testHostedShortTranscriptRestsAboveComposer() throws {
+        let fixture = TranscriptLayoutMutationFixture()
+        fixture.snapshot = TranscriptPresentationSnapshot(
+            items: [
+                TimelineItem(
+                    id: "short-lower-third",
+                    kind: .assistantMessage,
+                    title: nil,
+                    body: "A short answer.",
+                    status: .completed,
+                    timestamp: .now,
+                    detail: nil
+                ),
+            ],
+            revision: 1
+        )
+        let hosted = TranscriptHostedFixture(fixture: fixture)
+        defer { hosted.close() }
+        hosted.layout()
+        let collectionView = try hosted.collectionView()
+        let controller = try hosted.controller()
+        let path = IndexPath(item: 0, section: 0)
+        let attributes = try XCTUnwrap(collectionView.layoutAttributesForItem(at: path))
+        let clipHeight = collectionView.enclosingScrollView?.contentView.bounds.height ?? 0
+
+        XCTAssertGreaterThan(
+            attributes.frame.minY,
+            18,
+            "A short transcript should settle below the top inset instead of floating at y=18"
+        )
+        XCTAssertEqual(
+            attributes.frame.maxY,
+            clipHeight - 24,
+            accuracy: 1,
+            "The final short row should keep the ordinary bottom breathing room"
+        )
+        XCTAssertGreaterThan(controller.layoutExtraTopOffsetForTesting, 0)
+    }
+
+    @MainActor
+    func testHostedShortTranscriptTracksResizeAndReturnsToNormalFlowWhenLong() throws {
+        let shortItem = TimelineItem(
+            id: "short-resize-anchor",
+            kind: .assistantMessage,
+            title: nil,
+            body: "A short answer that should stay close to the composer.",
+            status: .completed,
+            timestamp: .now,
+            detail: nil
+        )
+        let fixture = TranscriptLayoutMutationFixture()
+        fixture.snapshot = TranscriptPresentationSnapshot(items: [shortItem], revision: 1)
+        let hosted = TranscriptHostedFixture(fixture: fixture)
+        defer { hosted.close() }
+        hosted.layout()
+
+        let collectionView = try hosted.collectionView()
+        let controller = try hosted.controller()
+        let path = IndexPath(item: 0, section: 0)
+        let initialOffset = controller.layoutExtraTopOffsetForTesting
+
+        hosted.window.setContentSize(NSSize(width: 720, height: 520))
+        hosted.layout()
+
+        let resizedAttributes = try XCTUnwrap(
+            collectionView.layoutAttributesForItem(at: path)
+        )
+        let resizedClipHeight = collectionView.enclosingScrollView?.contentView.bounds.height ?? 0
+        XCTAssertGreaterThan(controller.layoutExtraTopOffsetForTesting, initialOffset)
+        XCTAssertEqual(resizedAttributes.frame.maxY, resizedClipHeight - 24, accuracy: 1)
+
+        let longItems = [shortItem] + (0..<18).map { index in
+            TimelineItem(
+                id: "long-after-short-\(index)",
+                kind: .assistantMessage,
+                title: nil,
+                body: String(
+                    repeating: "This response is long enough to return the transcript to ordinary scrolling. ",
+                    count: 5
+                ),
+                status: .completed,
+                timestamp: Date(timeIntervalSince1970: Double(index + 1)),
+                detail: nil
+            )
+        }
+        fixture.snapshot = TranscriptPresentationSnapshot(items: longItems, revision: 2)
+        hosted.layout()
+
+        let firstLongAttributes = try XCTUnwrap(
+            collectionView.layoutAttributesForItem(at: path)
+        )
+        XCTAssertEqual(controller.layoutExtraTopOffsetForTesting, 0, accuracy: 0.001)
+        XCTAssertEqual(firstLongAttributes.frame.minY, 18, accuracy: 1)
+        XCTAssertGreaterThan(collectionView.collectionViewLayout?.collectionViewContentSize.height ?? 0, resizedClipHeight)
+    }
+
+    @MainActor
+    func testHostedShortPrependGrowsUpwardWithoutMovingMountedTail() throws {
+        let fixture = TranscriptLayoutMutationFixture()
+        let hosted = TranscriptHostedFixture(fixture: fixture)
+        defer { hosted.close() }
+        hosted.layout()
+
+        let collectionView = try hosted.collectionView()
+        let originalPath = IndexPath(item: 0, section: 0)
+        let originalFrame = try XCTUnwrap(
+            collectionView.layoutAttributesForItem(at: originalPath)?.frame
+        )
+
+        fixture.prependEarlierMessages(count: 1)
+        hosted.layout()
+
+        let shiftedPath = IndexPath(item: 1, section: 0)
+        let shiftedFrame = try XCTUnwrap(
+            collectionView.layoutAttributesForItem(at: shiftedPath)?.frame
+        )
+        XCTAssertEqual(
+            shiftedFrame.minY,
+            originalFrame.minY,
+            accuracy: 1,
+            "Prepending a short history page should grow upward and keep the mounted tail still"
+        )
+        let clipHeight = collectionView.enclosingScrollView?.contentView.bounds.height ?? 0
+        XCTAssertEqual(shiftedFrame.maxY, clipHeight - 24, accuracy: 1)
+    }
+
     func testPrependHintKeepsLargeHistoryPlanningBounded() {
         let tail = (0..<20_000).map { index in
             makeItem(id: "tail-\(index)", body: "Stable tail \(index)")

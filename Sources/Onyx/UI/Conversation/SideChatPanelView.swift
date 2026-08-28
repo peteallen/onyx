@@ -89,7 +89,10 @@ struct SideChatPanelView: View {
 
             composer
         }
-        .frame(minWidth: 300, idealWidth: 380, maxWidth: 460)
+        // The parent supplies an explicit width.  Keep the panel's intrinsic
+        // preference for ordinary windows, but allow the compact full-overlay
+        // mode to shrink all the way to the available conversation width.
+        .frame(minWidth: 0, idealWidth: 380, maxWidth: 460)
         .background(OnyxTheme.chrome)
         .overlay(alignment: .leading) {
             Rectangle()

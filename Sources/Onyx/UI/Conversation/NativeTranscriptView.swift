@@ -798,12 +798,87 @@ struct TranscriptFlowMetrics: Equatable {
     }
 }
 
+/// Computes the flexible top space needed to keep a short transcript in the
+/// same lower-third gravity as the composer.  A collection view normally
+/// clamps a short document to y=0, which leaves a one- or two-message task
+/// stranded at the top of a very large black canvas.  The offset belongs to
+/// the layout (rather than a synthetic data-source row) so row identities,
+/// pagination, and viewport anchoring stay unchanged.
+enum TranscriptVerticalAlignment {
+    static func extraTopOffset(
+        viewportHeight: CGFloat,
+        contentHeight: CGFloat,
+        hasContent: Bool = true
+    ) -> CGFloat {
+        guard hasContent,
+              viewportHeight.isFinite,
+              contentHeight.isFinite,
+              viewportHeight > 0,
+              contentHeight > 0 else { return 0 }
+        return max(0, viewportHeight - contentHeight)
+    }
+}
+
 private final class TranscriptCollectionFlowLayout: NSCollectionViewFlowLayout {
+    private(set) var extraTopOffset: CGFloat = 0
+
+    override func prepare() {
+        super.prepare()
+
+        // `super.collectionViewContentSize` is the intrinsic document height,
+        // including the ordinary 18/24 pt section insets.  Add flexible space
+        // only while that intrinsic document is shorter than the visible clip
+        // view; long transcripts retain their existing scroll geometry.
+        let viewportHeight = collectionView?.enclosingScrollView?.contentView.bounds.height ?? 0
+        let intrinsicHeight = super.collectionViewContentSize.height
+        extraTopOffset = TranscriptVerticalAlignment.extraTopOffset(
+            viewportHeight: viewportHeight,
+            contentHeight: intrinsicHeight,
+            hasContent: (collectionView?.numberOfItems(inSection: 0) ?? 0) > 0
+        )
+    }
+
+    override var collectionViewContentSize: NSSize {
+        var size = super.collectionViewContentSize
+        size.height += extraTopOffset
+        return size
+    }
+
+    override func layoutAttributesForElements(in rect: NSRect) -> [NSCollectionViewLayoutAttributes] {
+        guard extraTopOffset > 0 else {
+            return super.layoutAttributesForElements(in: rect)
+        }
+        let translatedRect = rect.offsetBy(dx: 0, dy: -extraTopOffset)
+        return super.layoutAttributesForElements(in: translatedRect).map { attributes in
+            let copy = attributes.copy() as! NSCollectionViewLayoutAttributes
+            copy.frame.origin.y += extraTopOffset
+            return copy
+        }
+    }
+
+    override func layoutAttributesForItem(
+        at indexPath: IndexPath
+    ) -> NSCollectionViewLayoutAttributes? {
+        guard let attributes = super.layoutAttributesForItem(at: indexPath) else {
+            return nil
+        }
+        guard extraTopOffset > 0 else { return attributes }
+        let copy = attributes.copy() as! NSCollectionViewLayoutAttributes
+        copy.frame.origin.y += extraTopOffset
+        return copy
+    }
+
     override func shouldInvalidateLayout(forBoundsChange newBounds: NSRect) -> Bool {
         guard let collectionView else {
             return super.shouldInvalidateLayout(forBoundsChange: newBounds)
         }
+        // The lower-third offset depends on the visible clip height as well
+        // as the transcript width.  AppKit's flow layout generally only
+        // invalidates for width changes; explicitly treating a height change
+        // as a metric change keeps the offset correct during live window
+        // resizes (and does not fire for ordinary vertical scrolling).
         return collectionView.bounds.width != newBounds.width
+            || collectionView.bounds.height != newBounds.height
             || super.shouldInvalidateLayout(forBoundsChange: newBounds)
     }
 
@@ -1049,6 +1124,7 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
     /// row's identity.
     private var expandedItemIDs = Set<String>()
     private var hasScheduledFollowScroll = false
+    private var observedViewportHeight: CGFloat?
     private var editableUserMessageID: String?
     private var retryableFailedResponseItemID: String?
     private var onEditUserMessage: (String) -> Void = { _ in }
@@ -1057,6 +1133,7 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
     var projectionStorageMaterializationCount: Int {
         displayRows.fullMaterializationCount + activityGroups.fullMaterializationCount
     }
+    var layoutExtraTopOffsetForTesting: CGFloat { layout.extraTopOffset }
 
     override func loadView() {
         view = NSView()
@@ -1577,6 +1654,16 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
     override func viewDidLayout() {
         super.viewDidLayout()
         if layoutState.readableWidthDidChange(to: readableWidth) {
+            layout.invalidateLayout()
+        }
+        // The transcript's flexible lower-third gravity depends on the clip
+        // view height, not the collection document height.  AppKit does not
+        // always invalidate a document layout when the hosting window changes
+        // height, so explicitly invalidate once per distinct viewport size.
+        let viewportHeight = scrollView.contentView.bounds.height
+        if viewportHeight.isFinite,
+           observedViewportHeight != viewportHeight {
+            observedViewportHeight = viewportHeight
             layout.invalidateLayout()
         }
     }
@@ -2475,7 +2562,8 @@ final class TranscriptActivityGroupView: NSView {
         super.init(frame: frameRect)
 
         titleLabel.font = .systemFont(ofSize: OnyxTypography.reading, weight: .regular)
-        titleLabel.textColor = NSColor.secondaryLabelColor.withAlphaComponent(0.86)
+        titleLabel.textColor = OnyxTheme.readingNSColor(for: effectiveAppearance)
+            .withAlphaComponent(0.86)
         titleLabel.lineBreakMode = .byTruncatingTail
         titleLabel.maximumNumberOfLines = 1
         titleLabel.usesSingleLineMode = true
@@ -2496,6 +2584,16 @@ final class TranscriptActivityGroupView: NSView {
         addSubview(expansionControl)
         setAccessibilityElement(true)
         setAccessibilityRole(.group)
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        // Keep the compact group title on the explicit low-glare ramp. As
+        // with cell headers, alpha-applied dynamic label colors can resolve
+        // to pure white when copied into an attributed string.
+        titleLabel.textColor = OnyxTheme.readingNSColor(for: effectiveAppearance)
+            .withAlphaComponent(0.86)
+        needsLayout = true
     }
 
     @available(*, unavailable)
@@ -2905,7 +3003,10 @@ enum TranscriptMarkdownRenderer {
             color = textColor
         case .quote:
             font = NSFontManager.shared.convert(baseFont, toHaveTrait: .italicFontMask)
-            color = .secondaryLabelColor
+            // Keep quoted prose on the same warm, appearance-aware reading
+            // ramp as the surrounding message. Applying alpha to AppKit's
+            // dynamic label colors can otherwise resolve back to white.
+            color = textColor.withAlphaComponent(0.78)
         case .code:
             font = .monospacedSystemFont(
                 ofSize: max(OnyxTypography.reading, baseFont.pointSize - 1),
@@ -4164,6 +4265,11 @@ final class TranscriptCellView: NSView {
         appearance: NSAppearance?
     ) -> NSAttributedString {
         let title = displayTitle(for: item)
+        // Resolve a concrete reading color before applying alpha. AppKit's
+        // `secondaryLabelColor.withAlphaComponent(...)` can lose its dynamic
+        // role and render as glare-level label white in an attributed field.
+        let softenedReadingColor = OnyxTheme.readingNSColor(for: appearance)
+            .withAlphaComponent(0.86)
         guard item.kind.isRoutineActivity else {
             return NSAttributedString(
                 string: title,
@@ -4192,7 +4298,7 @@ final class TranscriptCellView: NSView {
                 string: title.isEmpty ? summary : title,
                 attributes: [
                     .font: NSFont.systemFont(ofSize: OnyxTypography.reading, weight: .regular),
-                    .foregroundColor: NSColor.secondaryLabelColor.withAlphaComponent(0.86),
+                    .foregroundColor: softenedReadingColor,
                 ]
             )
         }
@@ -4201,7 +4307,7 @@ final class TranscriptCellView: NSView {
             string: title,
             attributes: [
                 .font: NSFont.systemFont(ofSize: OnyxTypography.reading, weight: .regular),
-                .foregroundColor: NSColor.secondaryLabelColor.withAlphaComponent(0.86),
+                .foregroundColor: softenedReadingColor,
             ]
         )
         headline.append(

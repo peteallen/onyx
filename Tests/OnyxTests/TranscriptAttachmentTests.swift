@@ -923,6 +923,39 @@ final class TranscriptAttachmentTests: XCTestCase {
     }
 
     @MainActor
+    func testCollapsedRoutineHeaderUsesWarmReadingColorInsteadOfDynamicWhite() throws {
+        let dark = try XCTUnwrap(NSAppearance(named: .darkAqua))
+        let item = TimelineItem(
+            id: "appearance-aware-activity",
+            kind: .tool,
+            title: "Inspect changes",
+            body: "Read output",
+            status: .running,
+            timestamp: .now,
+            detail: nil
+        )
+        let cell = TranscriptCellView(frame: NSRect(x: 0, y: 0, width: 640, height: 48))
+        cell.appearance = dark
+        cell.configure(with: item, isExpanded: false)
+
+        let titleLabel = try XCTUnwrap(
+            cell.subviews
+                .compactMap { $0 as? NSTextField }
+                .first { $0.stringValue.hasPrefix("Inspect changes") }
+        )
+        let foreground = try XCTUnwrap(
+            titleLabel.attributedStringValue
+                .attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor
+        )
+        let resolved = try XCTUnwrap(foreground.usingColorSpace(.sRGB))
+
+        XCTAssertEqual(resolved.redComponent, 0.84, accuracy: 0.01)
+        XCTAssertEqual(resolved.greenComponent, 0.82, accuracy: 0.01)
+        XCTAssertEqual(resolved.blueComponent, 0.78, accuracy: 0.01)
+        XCTAssertEqual(foreground.alphaComponent, 0.86, accuracy: 0.01)
+    }
+
+    @MainActor
     func testCommandAndFileChangeBodiesRemainExactLiteralEvidence() {
         let body = "# not a heading\n---\n- removed\n+ added\n**literal markers**"
         for kind in [TimelineItemKind.command, .fileChange, .tool] {
