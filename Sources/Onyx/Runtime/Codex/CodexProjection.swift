@@ -3,6 +3,8 @@ import Foundation
 enum CodexProjection {
     private static let maximumProjectedDataURLCharacters = 24 * 1_024 * 1_024 * 4 / 3 + 512
     private static let maximumTurnFailureCharacters = 2_000
+    private static let outputLimitFailureMessage =
+        "The provider reached its output limit before completing this response."
 
     static func thread(from value: JSONValue) -> RuntimeThread? {
         guard let id = value["id"]?.stringValue else { return nil }
@@ -180,7 +182,25 @@ enum CodexProjection {
 
     private static func boundedTurnFailureMessage(_ raw: String?) -> String? {
         guard let raw, let safe = safeTextCandidate(raw) else { return nil }
-        return boundedText(safe, maximumCharacters: maximumTurnFailureCharacters)
+        guard let bounded = boundedText(safe, maximumCharacters: maximumTurnFailureCharacters) else {
+            return nil
+        }
+        // codex-app-server 0.149.0 turns a valid Responses
+        // `response.incomplete(max_output_tokens)` terminal event into this
+        // misleading transport-looking diagnostic. Preserve unrelated
+        // disconnects verbatim, but give this known output-limit condition a
+        // provider-facing explanation in both live and persisted projections.
+        if isOutputLimitDisconnectDiagnostic(bounded) {
+            return outputLimitFailureMessage
+        }
+        return bounded
+    }
+
+    private static func isOutputLimitDisconnectDiagnostic(_ message: String) -> Bool {
+        let normalized = message.lowercased()
+        return normalized.contains("stream disconnected before completion")
+            && normalized.contains("incomplete response returned")
+            && normalized.contains("max_output_tokens")
     }
 
     private static func turnItemDetail(from rawValue: String?) -> RuntimeTurnItemDetail {

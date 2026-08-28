@@ -200,6 +200,40 @@ final class CodexProjectionTests: XCTestCase {
         XCTAssertTrue(failure.body.hasSuffix("…"))
     }
 
+    func testNormalizesAppServerOutputLimitDisconnectInLiveAndPersistedProjection() throws {
+        let diagnostic =
+            "stream disconnected before completion: Incomplete response returned, reason: max_output_tokens"
+        let failedTurn = JSONValue.object([
+            "id": .string("output-limit-turn"),
+            "status": .string("failed"),
+            "error": .object(["message": .string(diagnostic)]),
+            "items": .array([]),
+        ])
+
+        XCTAssertEqual(
+            CodexProjection.turnFailureMessage(from: failedTurn),
+            "The provider reached its output limit before completing this response."
+        )
+
+        let turn = try XCTUnwrap(CodexProjection.conversationTurn(from: failedTurn))
+        let failure = try XCTUnwrap(turn.items.first)
+        XCTAssertEqual(
+            failure.body,
+            "The provider reached its output limit before completing this response."
+        )
+    }
+
+    func testLeavesUnrelatedStreamDisconnectDiagnosticUntouched() {
+        let diagnostic = JSONValue.object([
+            "message": .string("stream disconnected before completion: upstream reset")
+        ])
+
+        XCTAssertEqual(
+            CodexProjection.turnFailureMessage(from: diagnostic),
+            "stream disconnected before completion: upstream reset"
+        )
+    }
+
     func testFailedTurnWithoutServerErrorStillProjectsOneStableFailure() throws {
         let turn = try XCTUnwrap(CodexProjection.conversationTurn(from: .object([
             "id": .string("missing-error"),

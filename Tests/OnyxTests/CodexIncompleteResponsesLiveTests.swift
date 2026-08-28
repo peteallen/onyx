@@ -131,11 +131,11 @@ final class CodexIncompleteResponsesLiveTests: XCTestCase {
             XCTAssertEqual(observed.streamedPartialDeltaCount, 1)
             XCTAssertEqual(observed.completedPartialItemCount, 1)
             XCTAssertEqual(observed.liveFailureBodies.count, 1)
-            XCTAssertTrue(observed.liveFailureBodies.contains { body in
-                body.localizedCaseInsensitiveContains("max output")
-                    || body.localizedCaseInsensitiveContains("token")
-                    || body.localizedCaseInsensitiveContains("incomplete")
-            })
+            XCTAssertEqual(
+                observed.liveFailureBodies,
+                ["The provider reached its output limit before completing this response."],
+                "The app-server's transport-looking output-limit diagnostic should be normalized in the transcript."
+            )
             XCTAssertEqual(observed.durablePartialItemCount, 1)
             XCTAssertEqual(observed.durableFailureItemCount, 1)
             XCTAssertEqual(conversation.thread.status, .failed)
