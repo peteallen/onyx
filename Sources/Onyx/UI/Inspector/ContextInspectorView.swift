@@ -44,14 +44,14 @@ struct ContextInspectorView: View {
                     ZStack {
                         if model.inspectorTab == tab {
                             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .fill(Color.primary.opacity(0.065))
+                                .fill(OnyxTheme.iris.opacity(0.10))
                                 .frame(height: 31)
                         }
                         Label(tab.label, systemImage: tab.icon)
                             .font(.system(size: OnyxTypography.navigation, weight: model.inspectorTab == tab ? .medium : .regular))
                             .foregroundStyle(
                                 model.inspectorTab == tab
-                                    ? Color.primary
+                                    ? OnyxTheme.iris
                                     : OnyxTheme.inactiveControlText
                             )
                     }
@@ -511,7 +511,7 @@ private struct SummaryInspector: View {
         switch status {
         case .pending: .secondary
         case .inProgress: OnyxTheme.electric
-        case .completed: OnyxTheme.iris
+        case .completed: OnyxTheme.success
         case .unknown: .secondary
         }
     }
@@ -528,7 +528,7 @@ private struct SummaryInspector: View {
     private func agentColor(for status: RuntimeCollaborationAgentStatus) -> Color {
         switch status {
         case .starting, .working: OnyxTheme.electric
-        case .completed: OnyxTheme.iris
+        case .completed: OnyxTheme.success
         case .failed: OnyxTheme.destructive
         case .interrupted: OnyxTheme.warning
         case .stopped, .unavailable, .unknown: .secondary
@@ -549,7 +549,7 @@ private struct FilesInspector: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 7) {
-                Image(systemName: "folder.fill").foregroundStyle(OnyxTheme.iris)
+                Image(systemName: "folder.fill").foregroundStyle(OnyxTheme.electric)
                 Text(projectPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "Choose project")
                     .fontWeight(.semibold)
                 Spacer(minLength: 6)
@@ -1023,7 +1023,7 @@ struct ProjectFileRow: View {
                             .frame(width: 12, height: 20)
                         Image(systemName: icon)
                             .frame(width: 13)
-                            .foregroundStyle(OnyxTheme.iris)
+                            .foregroundStyle(OnyxTheme.electric)
                             .accessibilityHidden(true)
                         Text(entry.name)
                             .lineLimit(1)

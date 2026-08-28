@@ -810,7 +810,7 @@ final class TranscriptAttachmentTests: XCTestCase {
         )
         XCTAssertEqual(
             cell.expansionControl.contentTintColor,
-            NSColor.systemBlue.withAlphaComponent(0.84),
+            OnyxTheme.electricNSColor(for: cell.effectiveAppearance).withAlphaComponent(0.90),
             "The disclosure still carries Plan's running state after removing the text column"
         )
 
@@ -890,6 +890,36 @@ final class TranscriptAttachmentTests: XCTestCase {
             rendered.attribute(.link, at: text.range(of: "preview").location, effectiveRange: nil) as? URL,
             URL(string: "https://example.test")
         )
+    }
+
+    @MainActor
+    func testTranscriptReadingForegroundFollowsTheHostedAppearance() throws {
+        let item = TimelineItem(
+            id: "appearance-aware-prose",
+            kind: .assistantMessage,
+            title: nil,
+            body: "Long-form response",
+            status: .completed,
+            timestamp: .now,
+            detail: nil
+        )
+        let dark = try XCTUnwrap(NSAppearance(named: .darkAqua))
+        let light = try XCTUnwrap(NSAppearance(named: .aqua))
+
+        for appearance in [dark, light] {
+            let rendered = TranscriptCellView.bodyAttributedText(
+                for: item,
+                appearance: appearance
+            )
+            let foreground = try XCTUnwrap(
+                rendered.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor
+            )
+            XCTAssertEqual(
+                foreground,
+                OnyxTheme.readingNSColor(for: appearance),
+                "Transcript prose must resolve from its hosting appearance, not the process default"
+            )
+        }
     }
 
     @MainActor

@@ -16,9 +16,10 @@ final class ThinkingIndicatorTests: XCTestCase {
         let colors = TranscriptPendingResponsePresentation.colors(for: NSAppearance(named: .darkAqua))
 
         XCTAssertEqual(label.textColor, colors.text)
-        XCTAssertGreaterThan(colors.text.redComponent, 0.85)
-        XCTAssertGreaterThan(colors.text.greenComponent, 0.85)
-        XCTAssertGreaterThan(colors.text.blueComponent, 0.85)
+        XCTAssertEqual(colors.tint, OnyxTheme.electricNSColor(for: NSAppearance(named: .darkAqua)))
+        XCTAssertLessThan(colors.text.redComponent, 0.90)
+        XCTAssertLessThan(colors.text.greenComponent, 0.90)
+        XCTAssertLessThan(colors.text.blueComponent, 0.90)
         XCTAssertEqual(
             view.layer?.backgroundColor,
             colors.tint.withAlphaComponent(0.14).cgColor,
@@ -40,6 +41,7 @@ final class ThinkingIndicatorTests: XCTestCase {
         let colors = TranscriptPendingResponsePresentation.colors(for: NSAppearance(named: .aqua))
 
         XCTAssertEqual(label.textColor, colors.text)
+        XCTAssertEqual(colors.tint, OnyxTheme.electricNSColor(for: NSAppearance(named: .aqua)))
         XCTAssertLessThan(colors.text.redComponent, 0.25)
         XCTAssertLessThan(colors.text.greenComponent, 0.25)
         XCTAssertLessThan(colors.text.blueComponent, 0.25)

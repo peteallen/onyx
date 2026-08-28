@@ -393,7 +393,7 @@ private struct ConversationHeaderView: View {
             HStack(spacing: 8) {
                 Image(systemName: "folder")
                     .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(OnyxTheme.electric.opacity(0.84))
                     .accessibilityHidden(true)
 
                 Text(headerTitle)
@@ -598,6 +598,7 @@ private struct ArchivedThreadStrip: View {
                 Button("Restore Task") { model.restore(id) }
                     .buttonStyle(.borderedProminent)
                     .tint(OnyxTheme.iris)
+                    .foregroundStyle(OnyxTheme.canvas)
                     .controlSize(.small)
             }
         }
@@ -696,6 +697,7 @@ private struct AccountAccessStrip: View {
                 Button("Open Sign In", action: model.reopenLoginPage)
                     .buttonStyle(.borderedProminent)
                     .tint(OnyxTheme.iris)
+                    .foregroundStyle(OnyxTheme.canvas)
                     .controlSize(.small)
                 Button("Cancel", action: model.cancelLogin)
                     .buttonStyle(.borderless)
@@ -709,6 +711,7 @@ private struct AccountAccessStrip: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(OnyxTheme.iris)
+                    .foregroundStyle(OnyxTheme.canvas)
                     .controlSize(.small)
                     .accessibilityLabel("Open provider settings")
                     .accessibilityHint("Choose Providers to add or update this connection's API key")
@@ -727,6 +730,7 @@ private struct AccountAccessStrip: View {
                     Button(method.displayName) { model.startLogin(method) }
                         .buttonStyle(.borderedProminent)
                         .tint(OnyxTheme.iris)
+                        .foregroundStyle(OnyxTheme.canvas)
                         .controlSize(.small)
                 }
             }
@@ -1371,7 +1375,7 @@ private struct ComposerView: View {
                                 .frame(width: 29, height: 29)
                             Image(systemName: "arrow.up")
                                 .font(.system(size: 12, weight: .bold))
-                                .foregroundStyle(Color.white)
+                                .foregroundStyle(OnyxTheme.canvas)
                         }
                         .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
                         .contentShape(Rectangle())
@@ -1385,7 +1389,7 @@ private struct ComposerView: View {
                 Button(action: model.interrupt) {
                     ZStack {
                         Circle()
-                            .fill(Color.primary)
+                            .fill(OnyxTheme.warning)
                             .frame(width: 28, height: 28)
 
                         Image(systemName: "stop.fill")
@@ -1408,7 +1412,7 @@ private struct ComposerView: View {
 
                     Image(systemName: "arrow.up")
                         .font(.system(size: 12, weight: .bold))
-                        .foregroundStyle(canSend ? Color.white : Color.secondary.opacity(0.58))
+                        .foregroundStyle(canSend ? OnyxTheme.canvas : Color.secondary.opacity(0.58))
                 }
                 .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
                 .contentShape(Rectangle())

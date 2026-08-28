@@ -26,14 +26,15 @@ struct UserInteractionView: View {
 private struct InteractionHeader: View {
     let interaction: RuntimeUserInteraction
     let icon: String
+    let tint: Color
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             ZStack {
-                Circle().fill(OnyxTheme.warning.opacity(0.15))
+                Circle().fill(tint.opacity(0.15))
                 Image(systemName: icon)
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(OnyxTheme.warning)
+                    .foregroundStyle(tint)
             }
             .frame(width: 30, height: 30)
 
@@ -62,7 +63,8 @@ private struct ApprovalInteractionView: View {
             VStack(alignment: .leading, spacing: 5) {
                 InteractionHeader(
                     interaction: interaction,
-                    icon: prompt.subject == .network ? "network.badge.shield.half.filled" : "checkmark.shield"
+                    icon: prompt.subject == .network ? "network.badge.shield.half.filled" : "checkmark.shield",
+                    tint: OnyxTheme.warning
                 )
                 if let command = prompt.command, !command.isEmpty {
                     Text(command)
@@ -106,7 +108,8 @@ private struct ApprovalInteractionView: View {
                 } else if prompt.allows(.accept) {
                     Button("Allow") { model.respondToApproval(.accept, for: interaction) }
                         .buttonStyle(.borderedProminent)
-                        .tint(OnyxTheme.iris)
+                        .tint(OnyxTheme.warning)
+                        .foregroundStyle(OnyxTheme.canvas)
                         .controlSize(.small)
                         .keyboardShortcut(.defaultAction)
                         .focused($focusedAction, equals: .accept)
@@ -115,7 +118,8 @@ private struct ApprovalInteractionView: View {
                         model.respondToApproval(.acceptForSession, for: interaction)
                     }
                     .buttonStyle(.borderedProminent)
-                    .tint(OnyxTheme.iris)
+                    .tint(OnyxTheme.warning)
+                    .foregroundStyle(OnyxTheme.canvas)
                     .controlSize(.small)
                     .keyboardShortcut(.defaultAction)
                     .focused($focusedAction, equals: .acceptForSession)
@@ -167,7 +171,11 @@ private struct QuestionInteractionView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            InteractionHeader(interaction: interaction, icon: "questionmark.bubble")
+            InteractionHeader(
+                interaction: interaction,
+                icon: "questionmark.bubble",
+                tint: OnyxTheme.iris
+            )
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
@@ -198,13 +206,14 @@ private struct QuestionInteractionView: View {
                 Button("Submit") { model.respond(to: interaction, with: .answers(answers)) }
                     .buttonStyle(.borderedProminent)
                     .tint(OnyxTheme.iris)
+                    .foregroundStyle(OnyxTheme.canvas)
                     .disabled(!canSubmit)
                     .promptKeyboardShortcut(.defaultAction, enabled: prompt.isBlocking)
                     .focused($focusedControl, equals: .submit)
             }
         }
         .padding(12)
-        .background(OnyxTheme.warning.opacity(0.045))
+        .background(OnyxTheme.iris.opacity(0.045))
         .onyxPanel(radius: 12)
         .onAppear {
             guard prompt.isBlocking else { return }
@@ -346,7 +355,11 @@ private struct FormInteractionView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            InteractionHeader(interaction: interaction, icon: "list.bullet.clipboard")
+            InteractionHeader(
+                interaction: interaction,
+                icon: "list.bullet.clipboard",
+                tint: OnyxTheme.iris
+            )
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 11) {
@@ -374,13 +387,14 @@ private struct FormInteractionView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(OnyxTheme.iris)
+                .foregroundStyle(OnyxTheme.canvas)
                 .disabled(!canSubmit)
                 .keyboardShortcut(.defaultAction)
                 .focused($focusedControl, equals: .submit)
             }
         }
         .padding(12)
-        .background(OnyxTheme.warning.opacity(0.045))
+        .background(OnyxTheme.iris.opacity(0.045))
         .onyxPanel(radius: 12)
         .onAppear { moveFocus(to: initialFocusTarget) }
         .onChange(of: draft) { _, value in
@@ -546,7 +560,11 @@ private struct ExternalLinkInteractionView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            InteractionHeader(interaction: interaction, icon: "link")
+            InteractionHeader(
+                interaction: interaction,
+                icon: "link",
+                tint: OnyxTheme.electric
+            )
             HStack {
                 Button("Cancel") {
                     model.respond(to: interaction, with: .externalLink(.cancel))
@@ -563,12 +581,13 @@ private struct ExternalLinkInteractionView: View {
                     model.respond(to: interaction, with: .externalLink(.accept))
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(OnyxTheme.iris)
+                .tint(OnyxTheme.electric)
+                .foregroundStyle(OnyxTheme.canvas)
                 .focused($focusedAction, equals: .finish)
             }
         }
         .padding(12)
-        .background(OnyxTheme.warning.opacity(0.045))
+        .background(OnyxTheme.electric.opacity(0.045))
         .onyxPanel(radius: 12)
         .onAppear {
             Task { @MainActor in
@@ -587,14 +606,18 @@ private struct UnsupportedInteractionView: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            InteractionHeader(interaction: interaction, icon: "exclamationmark.triangle")
+            InteractionHeader(
+                interaction: interaction,
+                icon: "exclamationmark.triangle",
+                tint: OnyxTheme.destructive
+            )
             Button("Stop task", role: .destructive) { model.interruptInteraction(interaction) }
                 .controlSize(.small)
                 .keyboardShortcut(.cancelAction)
                 .focused($isStopFocused)
         }
         .padding(12)
-        .background(OnyxTheme.warning.opacity(0.055))
+        .background(OnyxTheme.destructive.opacity(0.055))
         .onyxPanel(radius: 12)
         .onAppear {
             Task { @MainActor in

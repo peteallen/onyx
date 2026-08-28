@@ -455,6 +455,7 @@ struct GitDiffViewerView: View {
                 .controlSize(.small)
                 .buttonStyle(.borderedProminent)
                 .tint(OnyxTheme.iris)
+                .foregroundStyle(OnyxTheme.canvas)
                 .accessibilityLabel("Inspect changes in \(URL(fileURLWithPath: path).lastPathComponent)")
             }
         case .loading:
@@ -903,6 +904,7 @@ struct GitDiffViewerView: View {
                 .controlSize(.small)
                 .buttonStyle(.borderedProminent)
                 .tint(OnyxTheme.iris)
+                .foregroundStyle(OnyxTheme.canvas)
                 .disabled(!model.canStartReview)
                 .onyxHelp("Review staged, unstaged, and untracked project changes")
         }

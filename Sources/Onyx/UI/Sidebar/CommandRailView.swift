@@ -58,7 +58,7 @@ private struct UtilityButton: View {
         Button(action: action) {
             ZStack {
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(isSelected ? Color.primary.opacity(0.065) : Color.clear)
+                    .fill(isSelected ? OnyxTheme.iris.opacity(0.09) : Color.clear)
                     .frame(width: 27, height: 27)
                 Image(systemName: icon)
                     .font(.system(size: 12.5, weight: .medium))
@@ -83,7 +83,7 @@ private struct ConnectionStatus: View {
     var color: Color {
         switch state {
         case .connected: OnyxTheme.success
-        case .connecting: OnyxTheme.warning
+        case .connecting: OnyxTheme.electric
         case .failed: OnyxTheme.destructive
         case .disconnected: Color.secondary.opacity(0.45)
         }

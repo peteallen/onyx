@@ -225,13 +225,17 @@ private struct OnyxSettingsView: View {
                     Label("Providers", systemImage: "point.3.connected.trianglepath.dotted")
                 }
         }
+        .tint(OnyxTheme.iris)
     }
 
     private var codexSettings: some View {
         Form {
             Section("Runtime") {
                 LabeledContent("Provider", value: model.session?.displayName ?? "Codex")
-                LabeledContent("Status", value: connectionLabel)
+                LabeledContent("Status") {
+                    Label(connectionLabel, systemImage: model.connectionState.onyxAccessibilitySymbol)
+                        .foregroundStyle(connectionColor)
+                }
             }
             Section("Account") {
                 LabeledContent("Account", value: model.authState.displayLabel)
@@ -252,6 +256,7 @@ private struct OnyxSettingsView: View {
                         Button("Open Sign In", action: model.reopenLoginPage)
                             .buttonStyle(.borderedProminent)
                             .tint(OnyxTheme.iris)
+                            .foregroundStyle(OnyxTheme.canvas)
                         Button("Cancel", action: model.cancelLogin)
                             .disabled(model.isAuthenticating)
                     }
@@ -270,6 +275,7 @@ private struct OnyxSettingsView: View {
                             Button(method.displayName) { model.startLogin(method) }
                                 .buttonStyle(.borderedProminent)
                                 .tint(OnyxTheme.iris)
+                                .foregroundStyle(OnyxTheme.canvas)
                         }
                         if let method = model.deviceCodeLoginMethod {
                             Button(method.displayName) { model.startLogin(method) }
@@ -282,7 +288,7 @@ private struct OnyxSettingsView: View {
                     .foregroundStyle(.secondary)
             }
             Section("Appearance") {
-                Text("Onyx uses a restrained near-black appearance and reserves its mineral accent for focus, selection, and live activity.")
+                Text("Onyx keeps its near-black canvas, softens long-form reading text, and uses color to distinguish intent, active work, success, attention, and failure.")
                     .foregroundStyle(.secondary)
             }
         }
@@ -296,6 +302,15 @@ private struct OnyxSettingsView: View {
         case .connecting: "Connecting"
         case .disconnected: "Disconnected"
         case .failed: "Unavailable"
+        }
+    }
+
+    private var connectionColor: Color {
+        switch model.connectionState {
+        case .connected: OnyxTheme.success
+        case .connecting: OnyxTheme.electric
+        case .disconnected: .secondary
+        case .failed: OnyxTheme.destructive
         }
     }
 }

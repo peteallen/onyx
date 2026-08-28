@@ -217,7 +217,7 @@ struct ProjectQuickOpenView: View {
             HStack(spacing: 10) {
                 Image(systemName: "doc.text")
                     .frame(width: 15)
-                    .foregroundStyle(index == selectedIndex ? OnyxTheme.electric : Color.secondary)
+                    .foregroundStyle(index == selectedIndex ? OnyxTheme.iris : Color.secondary)
                     .accessibilityHidden(true)
 
                 VStack(alignment: .leading, spacing: 2) {
@@ -247,7 +247,7 @@ struct ProjectQuickOpenView: View {
             .background {
                 if index == selectedIndex {
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(Color.primary.opacity(0.07))
+                        .fill(OnyxTheme.iris.opacity(0.10))
                 }
             }
         }

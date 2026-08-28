@@ -18,6 +18,13 @@ struct NativeTranscriptView: NSViewControllerRepresentable {
     }
 
     func updateNSViewController(_ controller: TranscriptViewController, context: Context) {
+        // The native transcript owns attributed foregrounds instead of
+        // inheriting SwiftUI's label color. Give it the hosting appearance
+        // explicitly so newly recycled rows never resolve through the
+        // process-wide default while the window is using the other scheme.
+        controller.view.appearance = NSAppearance(
+            named: context.environment.colorScheme == .dark ? .darkAqua : .aqua
+        )
         controller.update(
             items: items,
             isAwaitingResponse: isAwaitingResponse,
@@ -2334,14 +2341,11 @@ final class TranscriptViewController: NSViewController, NSCollectionViewDataSour
 /// and lets hosted tests verify both appearances without relying on whatever
 /// appearance happens to be active for the test process.
 enum TranscriptPendingResponsePresentation {
-    static let darkTint = NSColor(srgbRed: 0.43, green: 0.72, blue: 1.0, alpha: 1)
-    static let lightTint = NSColor(srgbRed: 0.08, green: 0.31, blue: 0.68, alpha: 1)
-    static let darkText = NSColor(srgbRed: 0.93, green: 0.95, blue: 1.0, alpha: 1)
-    static let lightText = NSColor(srgbRed: 0.12, green: 0.14, blue: 0.18, alpha: 1)
-
     static func colors(for appearance: NSAppearance?) -> (tint: NSColor, text: NSColor) {
-        let isDark = appearance?.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        return isDark ? (darkTint, darkText) : (lightTint, lightText)
+        (
+            OnyxTheme.electricNSColor(for: appearance),
+            OnyxTheme.readingNSColor(for: appearance)
+        )
     }
 }
 
@@ -2736,8 +2740,9 @@ enum TranscriptMarkdownRenderer {
     static func attributedString(
         markdown source: String,
         baseFont: NSFont,
-        textColor: NSColor = .labelColor
+        textColor: NSColor? = nil
     ) -> NSAttributedString {
+        let textColor = textColor ?? OnyxTheme.readingNSColor(for: nil)
         let paragraphStyle = NSMutableParagraphStyle()
         paragraphStyle.lineBreakMode = .byWordWrapping
         paragraphStyle.lineSpacing = readingLineSpacing
@@ -3127,7 +3132,7 @@ final class TranscriptCellView: NSView {
         summaryLabel.maximumNumberOfLines = 1
         summaryLabel.usesSingleLineMode = true
         bodyLabel.font = .systemFont(ofSize: Self.messageFontSize, weight: .regular)
-        bodyLabel.textColor = .labelColor
+        bodyLabel.textColor = OnyxTheme.readingNSColor(for: effectiveAppearance)
         bodyLabel.isSelectable = true
         bodyLabel.allowsEditingTextAttributes = true
         bodyLabel.maximumNumberOfLines = 0
@@ -3203,6 +3208,15 @@ final class TranscriptCellView: NSView {
         fatalError("init(coder:) has not been implemented")
     }
 
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        // `NSTextField` stores the concrete colors inside its attributed value.
+        // Re-render the mounted item when the hosting appearance changes so
+        // light-mode text cannot linger after a dark-mode transition (or vice
+        // versa) in a recycled transcript row.
+        applyItemAppearance()
+    }
+
     /// Compatibility entry point for callers/tests that do not provide a
     /// persisted expansion value. This preserves the original standalone-cell
     /// behavior; the live collection controller supplies the persisted value
@@ -3228,7 +3242,11 @@ final class TranscriptCellView: NSView {
         self.onEdit = onEdit
         self.onRetry = onRetry
 
-        fullTitleAttributedText = Self.headerAttributedText(for: item, isExpanded: self.isExpanded)
+        fullTitleAttributedText = Self.headerAttributedText(
+            for: item,
+            isExpanded: self.isExpanded,
+            appearance: effectiveAppearance
+        )
         titleLabel.attributedStringValue = fullTitleAttributedText
         summaryLabel.stringValue = Self.compactSummary(for: item)
         bodyLabel.font = Self.bodyFont(for: item)
@@ -3236,12 +3254,12 @@ final class TranscriptCellView: NSView {
         // duplicate and parse that payload into an attributed string until the
         // user actually opens the row.
         bodyLabel.attributedStringValue = self.isExpanded
-            ? Self.bodyAttributedText(for: item)
+            ? Self.bodyAttributedText(for: item, appearance: effectiveAppearance)
             : NSAttributedString()
         detailLabel.stringValue = detailText(for: item, collapsed: self.isExpandable && !self.isExpanded)
         statusLabel.stringValue = statusText(for: item.status)
         avatar.stringValue = avatarGlyph(for: item.kind)
-        avatar.textColor = activityIconColor(for: item.kind)
+        avatar.textColor = activityIconColor(for: item.kind, status: item.status)
         detailLabel.textColor = item.kind.isRoutineActivity
             ? .tertiaryLabelColor
             : .secondaryLabelColor
@@ -3393,7 +3411,10 @@ final class TranscriptCellView: NSView {
         isExpanded.toggle()
         if isExpanded {
             if let item {
-                bodyLabel.attributedStringValue = Self.bodyAttributedText(for: item)
+                bodyLabel.attributedStringValue = Self.bodyAttributedText(
+                    for: item,
+                    appearance: effectiveAppearance
+                )
             }
             rebuildMediaViews()
         } else {
@@ -3443,7 +3464,11 @@ final class TranscriptCellView: NSView {
         } else {
             NSColor.clear.cgColor
         }
-        fullTitleAttributedText = Self.headerAttributedText(for: item, isExpanded: isExpanded)
+        fullTitleAttributedText = Self.headerAttributedText(
+            for: item,
+            isExpanded: isExpanded,
+            appearance: effectiveAppearance
+        )
         titleLabel.attributedStringValue = fullTitleAttributedText
         summaryLabel.isHidden = !collapsed || item.body.isEmpty
         bodyLabel.isHidden = collapsed || item.body.isEmpty
@@ -3666,6 +3691,37 @@ final class TranscriptCellView: NSView {
             values.append(isExpanded ? "Expanded" : "Collapsed")
         }
         setAccessibilityValue(values.joined(separator: ", "))
+    }
+
+    private func applyItemAppearance() {
+        bodyLabel.textColor = OnyxTheme.readingNSColor(for: effectiveAppearance)
+        guard let item else { return }
+        fullTitleAttributedText = Self.headerAttributedText(
+            for: item,
+            isExpanded: isExpanded,
+            appearance: effectiveAppearance
+        )
+        titleLabel.attributedStringValue = fullTitleAttributedText
+        if isExpanded {
+            bodyLabel.attributedStringValue = Self.bodyAttributedText(
+                for: item,
+                appearance: effectiveAppearance
+            )
+        }
+        avatar.textColor = activityIconColor(for: item.kind, status: item.status)
+        statusLabel.textColor = statusTextColor(for: item.status)
+        if isExpandable {
+            TranscriptDisclosurePresentation.apply(
+                to: expansionControl,
+                isExpanded: isExpanded,
+                tint: disclosureTintColor(for: item.status)
+            )
+        }
+        layer?.backgroundColor = backgroundColor(for: item.kind).cgColor
+        if item.kind == .userMessage {
+            bubbleBackground.layer?.backgroundColor = backgroundColor(for: item.kind).cgColor
+        }
+        needsDisplay = true
     }
 
     /// Legacy bounded measurement retained for callers that only need a
@@ -4029,8 +4085,12 @@ final class TranscriptCellView: NSView {
         return "\(progress)  ·  \(current.text)"
     }
 
-    static func bodyAttributedText(for item: TimelineItem) -> NSAttributedString {
+    static func bodyAttributedText(
+        for item: TimelineItem,
+        appearance: NSAppearance? = nil
+    ) -> NSAttributedString {
         let font = bodyFont(for: item)
+        let textColor = OnyxTheme.readingNSColor(for: appearance)
         guard item.kind.rendersMarkdown else {
             // Commands, diffs, and tool payloads are evidence. Rendering their
             // leading `+`, `-`, `#`, or `---` as Markdown would change what the
@@ -4039,13 +4099,14 @@ final class TranscriptCellView: NSView {
                 string: item.body,
                 attributes: [
                     .font: font,
-                    .foregroundColor: NSColor.labelColor,
+                    .foregroundColor: textColor,
                 ]
             )
         }
         return TranscriptMarkdownRenderer.attributedString(
             markdown: item.body,
-            baseFont: font
+            baseFont: font,
+            textColor: textColor
         )
     }
 
@@ -4099,7 +4160,8 @@ final class TranscriptCellView: NSView {
 
     private static func headerAttributedText(
         for item: TimelineItem,
-        isExpanded: Bool
+        isExpanded: Bool,
+        appearance: NSAppearance?
     ) -> NSAttributedString {
         let title = displayTitle(for: item)
         guard item.kind.isRoutineActivity else {
@@ -4107,7 +4169,7 @@ final class TranscriptCellView: NSView {
                 string: title,
                 attributes: [
                     .font: NSFont.systemFont(ofSize: OnyxTypography.reading, weight: .semibold),
-                    .foregroundColor: NSColor.labelColor,
+                    .foregroundColor: OnyxTheme.strongNSColor(for: appearance),
                 ]
             )
         }
@@ -4214,20 +4276,19 @@ final class TranscriptCellView: NSView {
 
     private func disclosureTintColor(for status: TimelineItemStatus) -> NSColor {
         switch status {
-        case .pending: NSColor.systemIndigo.withAlphaComponent(0.78)
-        case .running: NSColor.systemBlue.withAlphaComponent(0.84)
+        case .pending: OnyxTheme.electricNSColor(for: effectiveAppearance).withAlphaComponent(0.78)
+        case .running: OnyxTheme.electricNSColor(for: effectiveAppearance).withAlphaComponent(0.90)
         case .completed: .tertiaryLabelColor
-        case .failed: .systemRed
-        case .declined: .systemOrange
+        case .failed: OnyxTheme.destructiveNSColor(for: effectiveAppearance)
+        case .declined: OnyxTheme.warningNSColor(for: effectiveAppearance)
         }
     }
 
     private func statusTextColor(for status: TimelineItemStatus) -> NSColor {
         switch status {
-        case .failed: .systemRed
-        case .declined: .systemOrange
-        case .running: .systemBlue
-        case .pending: .systemIndigo
+        case .failed: OnyxTheme.destructiveNSColor(for: effectiveAppearance)
+        case .declined: OnyxTheme.warningNSColor(for: effectiveAppearance)
+        case .running, .pending: OnyxTheme.electricNSColor(for: effectiveAppearance)
         case .completed: .secondaryLabelColor
         }
     }
@@ -4247,24 +4308,45 @@ final class TranscriptCellView: NSView {
         }
     }
 
-    private func activityIconColor(for kind: TimelineItemKind) -> NSColor {
+    private func activityIconColor(
+        for kind: TimelineItemKind,
+        status: TimelineItemStatus
+    ) -> NSColor {
+        switch status {
+        case .failed:
+            return OnyxTheme.destructiveNSColor(for: effectiveAppearance)
+        case .declined:
+            return OnyxTheme.warningNSColor(for: effectiveAppearance)
+        case .pending, .running:
+            return OnyxTheme.electricNSColor(for: effectiveAppearance)
+        case .completed:
+            break
+        }
         switch kind {
-        case .error: .systemRed
-        case .approval: .systemOrange
-        case .plan: .systemIndigo
-        case .reasoning, .command, .fileChange, .tool, .system: .tertiaryLabelColor
-        case .assistantMessage, .userMessage: .clear
+        case .error:
+            return OnyxTheme.destructiveNSColor(for: effectiveAppearance)
+        case .approval:
+            return OnyxTheme.warningNSColor(for: effectiveAppearance)
+        case .plan, .reasoning:
+            return OnyxTheme.irisNSColor(for: effectiveAppearance)
+        case .command, .fileChange, .tool, .system:
+            return .tertiaryLabelColor
+        case .assistantMessage, .userMessage:
+            return .clear
         }
     }
 
     private func backgroundColor(for kind: TimelineItemKind) -> NSColor {
         switch kind {
         case .userMessage:
-            NSColor.controlBackgroundColor.withAlphaComponent(0.72)
+            // User intent gets the same restrained violet wash as selection.
+            // The bubble stays dark; it simply reads as authored/decisive at a
+            // glance instead of becoming another neutral card.
+            OnyxTheme.irisNSColor(for: effectiveAppearance).withAlphaComponent(0.11)
         case .error:
-            NSColor.systemRed.withAlphaComponent(0.09)
+            OnyxTheme.destructiveNSColor(for: effectiveAppearance).withAlphaComponent(0.09)
         case .approval:
-            NSColor.systemOrange.withAlphaComponent(0.10)
+            OnyxTheme.warningNSColor(for: effectiveAppearance).withAlphaComponent(0.10)
         case _ where kind.isActivity:
             NSColor.controlBackgroundColor.withAlphaComponent(0.38)
         default:

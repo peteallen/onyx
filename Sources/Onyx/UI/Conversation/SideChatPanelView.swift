@@ -196,7 +196,7 @@ struct SideChatPanelView: View {
                     Button(action: model.interruptSideChat) {
                         ZStack {
                             Circle()
-                                .fill(Color.primary)
+                                .fill(OnyxTheme.warning)
                                 .frame(width: 26, height: 26)
                             Image(systemName: "stop.fill")
                                 .font(.system(size: 9, weight: .bold))
@@ -220,7 +220,7 @@ struct SideChatPanelView: View {
                                 .frame(width: 27, height: 27)
                             Image(systemName: "arrow.up")
                                 .font(.system(size: 11, weight: .bold))
-                                .foregroundStyle(canSend ? Color.white : Color.secondary.opacity(0.58))
+                                .foregroundStyle(canSend ? OnyxTheme.canvas : Color.secondary.opacity(0.58))
                         }
                         .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
                         .contentShape(Rectangle())

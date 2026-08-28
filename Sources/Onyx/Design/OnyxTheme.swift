@@ -2,10 +2,11 @@ import AppKit
 import SwiftUI
 
 enum OnyxTheme {
-    // A calm, native-feeling dark hierarchy: the canvas is nearly black, each
-    // adjacent surface is only just lighter, and color is saved for a focused
-    // action or a small state indicator.  Keep the public names stable; most
-    // of the app composes its visual language from these tokens.
+    // Keep the canvas unapologetically black, then take the glare out of the
+    // things people stare at. Color describes a vibe/state rather than a pane:
+    // violet = intent, cyan = motion, mint = reassurance, amber = attention,
+    // coral = failure. Keep the public names stable; most of the app composes
+    // its visual language from these tokens.
     static let rail = adaptiveColor(
         dark: NSColor(srgbRed: 0.035, green: 0.036, blue: 0.039, alpha: 1),
         light: NSColor(srgbRed: 0.930, green: 0.931, blue: 0.934, alpha: 1)
@@ -14,28 +15,28 @@ enum OnyxTheme {
         dark: NSColor(srgbRed: 0.105, green: 0.108, blue: 0.115, alpha: 1),
         light: NSColor(srgbRed: 0.855, green: 0.858, blue: 0.865, alpha: 1)
     )
-    // Color is an interaction signal, not a structural color.  These tokens
-    // also carry small status labels, so each appearance has its own restrained
-    // palette with at least 4.5:1 contrast on the sidebar and inspector.
+    // These tokens also carry small status labels, so each appearance has its
+    // own vivid-but-readable palette with at least 4.5:1 contrast on the
+    // sidebar and inspector.
     static let iris = adaptiveColor(
-        dark: NSColor(srgbRed: 0.34, green: 0.57, blue: 0.90, alpha: 1),
-        light: NSColor(srgbRed: 0.20, green: 0.36, blue: 0.62, alpha: 1)
+        dark: NSColor(srgbRed: 0.72, green: 0.58, blue: 1.00, alpha: 1),
+        light: NSColor(srgbRed: 0.34, green: 0.20, blue: 0.62, alpha: 1)
     )
     static let electric = adaptiveColor(
-        dark: NSColor(srgbRed: 0.41, green: 0.64, blue: 0.94, alpha: 1),
-        light: NSColor(srgbRed: 0.14, green: 0.39, blue: 0.54, alpha: 1)
+        dark: NSColor(srgbRed: 0.31, green: 0.82, blue: 0.96, alpha: 1),
+        light: NSColor(srgbRed: 0.02, green: 0.39, blue: 0.52, alpha: 1)
     )
     static let success = adaptiveColor(
-        dark: NSColor(srgbRed: 0.37, green: 0.66, blue: 0.56, alpha: 1),
-        light: NSColor(srgbRed: 0.17, green: 0.40, blue: 0.31, alpha: 1)
+        dark: NSColor(srgbRed: 0.43, green: 0.86, blue: 0.67, alpha: 1),
+        light: NSColor(srgbRed: 0.09, green: 0.43, blue: 0.29, alpha: 1)
     )
     static let warning = adaptiveColor(
-        dark: NSColor(srgbRed: 0.82, green: 0.61, blue: 0.31, alpha: 1),
-        light: NSColor(srgbRed: 0.44, green: 0.32, blue: 0.08, alpha: 1)
+        dark: NSColor(srgbRed: 0.96, green: 0.72, blue: 0.34, alpha: 1),
+        light: NSColor(srgbRed: 0.48, green: 0.31, blue: 0.03, alpha: 1)
     )
     static let destructive = adaptiveColor(
-        dark: NSColor(srgbRed: 0.84, green: 0.39, blue: 0.41, alpha: 1),
-        light: NSColor(srgbRed: 0.62, green: 0.20, blue: 0.24, alpha: 1)
+        dark: NSColor(srgbRed: 1.00, green: 0.48, blue: 0.50, alpha: 1),
+        light: NSColor(srgbRed: 0.65, green: 0.16, blue: 0.20, alpha: 1)
     )
 
     static let canvas = adaptiveColor(
@@ -75,7 +76,26 @@ enum OnyxTheme {
     )
     static let border = Color.primary.opacity(0.065)
     static let divider = Color.primary.opacity(0.055)
+    /// Softer than AppKit/SwiftUI's pure label white, but still comfortably
+    /// above AA contrast on the reading canvas. This is the color for prose,
+    /// composer input, and other content someone reads for more than a glance.
+    static let readingText = adaptiveColor(
+        dark: NSColor(srgbRed: 0.84, green: 0.82, blue: 0.78, alpha: 1),
+        light: NSColor(srgbRed: 0.16, green: 0.15, blue: 0.18, alpha: 1)
+    )
+    static let strongText = adaptiveColor(
+        dark: NSColor(srgbRed: 0.93, green: 0.92, blue: 0.95, alpha: 1),
+        light: NSColor(srgbRed: 0.10, green: 0.09, blue: 0.12, alpha: 1)
+    )
     static let quietText = Color.secondary.opacity(0.90)
+    static let terminalText = adaptiveColor(
+        dark: NSColor(srgbRed: 0.72, green: 0.76, blue: 0.80, alpha: 1),
+        light: NSColor(srgbRed: 0.18, green: 0.22, blue: 0.26, alpha: 1)
+    )
+    static let terminalMutedText = adaptiveColor(
+        dark: NSColor(srgbRed: 0.48, green: 0.52, blue: 0.57, alpha: 1),
+        light: NSColor(srgbRed: 0.37, green: 0.41, blue: 0.45, alpha: 1)
+    )
     static let inactiveControlText = adaptiveColor(
         dark: NSColor(srgbRed: 0.640, green: 0.640, blue: 0.660, alpha: 1),
         light: NSColor(srgbRed: 0.380, green: 0.380, blue: 0.400, alpha: 1)
@@ -93,6 +113,78 @@ enum OnyxTheme {
                 appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
             }
         )
+    }
+
+    /// AppKit counterparts for native transcript/composer surfaces. Keeping
+    /// these sourced from the same values prevents SwiftUI and recycled native
+    /// rows from drifting into different visual languages.
+    static func readingNSColor(for appearance: NSAppearance?) -> NSColor {
+        adaptiveNSColor(
+            dark: NSColor(srgbRed: 0.84, green: 0.82, blue: 0.78, alpha: 1),
+            light: NSColor(srgbRed: 0.16, green: 0.15, blue: 0.18, alpha: 1),
+            appearance: appearance
+        )
+    }
+
+    static func strongNSColor(for appearance: NSAppearance?) -> NSColor {
+        adaptiveNSColor(
+            dark: NSColor(srgbRed: 0.93, green: 0.92, blue: 0.95, alpha: 1),
+            light: NSColor(srgbRed: 0.10, green: 0.09, blue: 0.12, alpha: 1),
+            appearance: appearance
+        )
+    }
+
+    static func irisNSColor(for appearance: NSAppearance?) -> NSColor {
+        adaptiveNSColor(
+            dark: NSColor(srgbRed: 0.72, green: 0.58, blue: 1.00, alpha: 1),
+            light: NSColor(srgbRed: 0.34, green: 0.20, blue: 0.62, alpha: 1),
+            appearance: appearance
+        )
+    }
+
+    static func electricNSColor(for appearance: NSAppearance?) -> NSColor {
+        adaptiveNSColor(
+            dark: NSColor(srgbRed: 0.31, green: 0.82, blue: 0.96, alpha: 1),
+            light: NSColor(srgbRed: 0.02, green: 0.39, blue: 0.52, alpha: 1),
+            appearance: appearance
+        )
+    }
+
+    static func successNSColor(for appearance: NSAppearance?) -> NSColor {
+        adaptiveNSColor(
+            dark: NSColor(srgbRed: 0.43, green: 0.86, blue: 0.67, alpha: 1),
+            light: NSColor(srgbRed: 0.09, green: 0.43, blue: 0.29, alpha: 1),
+            appearance: appearance
+        )
+    }
+
+    static func warningNSColor(for appearance: NSAppearance?) -> NSColor {
+        adaptiveNSColor(
+            dark: NSColor(srgbRed: 0.96, green: 0.72, blue: 0.34, alpha: 1),
+            light: NSColor(srgbRed: 0.48, green: 0.31, blue: 0.03, alpha: 1),
+            appearance: appearance
+        )
+    }
+
+    static func destructiveNSColor(for appearance: NSAppearance?) -> NSColor {
+        adaptiveNSColor(
+            dark: NSColor(srgbRed: 1.00, green: 0.48, blue: 0.50, alpha: 1),
+            light: NSColor(srgbRed: 0.65, green: 0.16, blue: 0.20, alpha: 1),
+            appearance: appearance
+        )
+    }
+
+    private static func adaptiveNSColor(
+        dark: NSColor,
+        light: NSColor,
+        appearance: NSAppearance?
+    ) -> NSColor {
+        // Swift imports AppKit's `currentDrawingAppearance` property under
+        // the API-renamed `currentDrawing()` spelling in this SDK.
+        let resolvedAppearance: NSAppearance = appearance ?? NSAppearance.currentDrawing()
+        return resolvedAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? dark
+            : light
     }
 }
 

@@ -56,8 +56,8 @@ struct NativeComposerTextView: NSViewRepresentable {
         textView.drawsBackground = false
         textView.textContainerInset = NSSize(width: 2, height: 7)
         textView.font = .systemFont(ofSize: OnyxTypography.reading)
-        textView.textColor = .labelColor
-        textView.insertionPointColor = .controlAccentColor
+        textView.textColor = OnyxTheme.readingNSColor(for: textView.effectiveAppearance)
+        textView.insertionPointColor = OnyxTheme.irisNSColor(for: textView.effectiveAppearance)
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
@@ -78,6 +78,8 @@ struct NativeComposerTextView: NSViewRepresentable {
         textView.onPasteImages = onPasteImages
         textView.onCancel = onCancel
         textView.placeholder = Self.placeholder
+        textView.textColor = OnyxTheme.readingNSColor(for: textView.effectiveAppearance)
+        textView.insertionPointColor = OnyxTheme.irisNSColor(for: textView.effectiveAppearance)
         textView.maximumTextContainerWidth = OnyxWorkspaceMetrics.maximumConversationTextWidth
         textView.isEditable = isEnabled
         context.coordinator.consumeFocusRequest(focusRequest)
@@ -280,10 +282,22 @@ final class ComposerTextView: NSTextView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        applyOnyxAppearance()
         guard window != nil, hasPendingExplicitFocusRequest else { return }
         DispatchQueue.main.async { [weak self] in
             self?.onExplicitFocusBecameAvailable?()
         }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyOnyxAppearance()
+        needsDisplay = true
+    }
+
+    private func applyOnyxAppearance() {
+        textColor = OnyxTheme.readingNSColor(for: effectiveAppearance)
+        insertionPointColor = OnyxTheme.irisNSColor(for: effectiveAppearance)
     }
 
     override func setFrameSize(_ newSize: NSSize) {

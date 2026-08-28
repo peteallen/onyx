@@ -133,7 +133,7 @@ struct TaskSidebarView: View {
                         }
                     Image(systemName: "square.and.pencil")
                         .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(.primary)
+                        .foregroundStyle(OnyxTheme.iris)
                 }
                 .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
                 .contentShape(Rectangle())
@@ -832,7 +832,7 @@ private struct TaskSidebarRow: View {
         .background {
             if isSelected {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(Color.primary.opacity(0.055))
+                    .fill(OnyxTheme.iris.opacity(0.09))
                     .overlay(alignment: .leading) {
                         Capsule()
                             .fill(OnyxTheme.iris)

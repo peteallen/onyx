@@ -16,6 +16,7 @@ struct ProviderSettingsView: View {
             editor
         }
         .navigationSplitViewStyle(.balanced)
+        .tint(OnyxTheme.iris)
         .task {
             await model.start()
         }
@@ -91,6 +92,7 @@ struct ProviderSettingsView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .buttonStyle(.borderless)
+            .foregroundStyle(OnyxTheme.iris)
             .padding(.horizontal, 14)
             .padding(.vertical, 11)
             .accessibilityLabel("Add OpenAI-compatible connection")
@@ -446,6 +448,7 @@ struct ProviderSettingsView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(OnyxTheme.iris)
+            .foregroundStyle(OnyxTheme.canvas)
             .disabled(
                 model.isSaving
                     || model.isDiscovering

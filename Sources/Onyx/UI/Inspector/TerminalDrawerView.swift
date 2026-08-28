@@ -56,12 +56,12 @@ struct TerminalDrawerView: View {
             VStack(spacing: 0) {
                 resizeHandle
                 header
-                Divider().overlay(Color.white.opacity(0.07))
+                Divider().overlay(OnyxTheme.divider)
 
                 outputView
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-                Divider().overlay(Color.white.opacity(0.07))
+                Divider().overlay(OnyxTheme.divider)
                 inputBar
             }
             .onAppear {
@@ -75,8 +75,8 @@ struct TerminalDrawerView: View {
                 resizeTerminal(to: newSize)
             }
         }
-        .foregroundStyle(Color.white.opacity(0.72))
-        .background(Color(red: 0.035, green: 0.037, blue: 0.045))
+        .foregroundStyle(OnyxTheme.terminalText)
+        .background(OnyxTheme.rail)
     }
 
     private var resizeHandle: some View {
@@ -85,7 +85,7 @@ struct TerminalDrawerView: View {
             .frame(height: OnyxHitTarget.splitter)
             .overlay {
                 Capsule()
-                    .fill(Color.white.opacity(0.14))
+                    .fill(OnyxTheme.electric.opacity(0.30))
                     .frame(width: 34, height: 2)
             }
             .contentShape(Rectangle())
@@ -120,7 +120,7 @@ struct TerminalDrawerView: View {
         HStack(spacing: 8) {
             Image(systemName: session.isRunning ? "circle.fill" : "circle")
                 .font(.system(size: 6, weight: .bold))
-                .foregroundStyle(session.isRunning ? Color.green.opacity(0.85) : Color.white.opacity(0.45))
+                .foregroundStyle(session.isRunning ? OnyxTheme.success : OnyxTheme.terminalMutedText)
                 .accessibilityLabel(session.isRunning ? "Shell running" : "Shell stopped")
             Image(systemName: "terminal")
                 .accessibilityHidden(true)
@@ -156,7 +156,7 @@ struct TerminalDrawerView: View {
                 }
                 .padding(.horizontal, 7)
                 .frame(height: 22)
-                .background(Color.white.opacity(0.055))
+                .background(OnyxTheme.electric.opacity(0.07))
                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
             }
 
@@ -237,14 +237,14 @@ struct TerminalDrawerView: View {
                     if displayedOutput.isEmpty {
                         if session.isRunning {
                             Text("Shell ready. Type a command below.")
-                                .foregroundStyle(Color.white.opacity(0.34))
+                                .foregroundStyle(OnyxTheme.terminalMutedText)
                         } else {
                             Text("Shell is not running.")
-                                .foregroundStyle(Color.white.opacity(0.34))
+                                .foregroundStyle(OnyxTheme.terminalMutedText)
                         }
                     } else {
                         Text(displayedOutput)
-                            .foregroundStyle(Color.white.opacity(0.72))
+                            .foregroundStyle(OnyxTheme.terminalText)
                     }
                     Color.clear.frame(height: 1).id("terminal-bottom")
                 }
@@ -308,7 +308,7 @@ struct TerminalDrawerView: View {
         }
         .padding(.horizontal, 12)
         .frame(height: 34)
-        .background(Color.white.opacity(0.018))
+        .background(OnyxTheme.electric.opacity(0.025))
     }
 
     private func resizeTerminal(to size: CGSize) {

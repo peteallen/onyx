@@ -5,6 +5,24 @@ import XCTest
 
 @MainActor
 final class NativeComposerCaretTests: XCTestCase {
+    func testComposerReadingForegroundFollowsEffectiveAppearance() throws {
+        let textView = ComposerTextView(frame: NSRect(x: 0, y: 0, width: 360, height: 60))
+        let window = host(textView)
+        defer { release(window) }
+        let dark = try XCTUnwrap(NSAppearance(named: .darkAqua))
+        let light = try XCTUnwrap(NSAppearance(named: .aqua))
+
+        window.appearance = dark
+        textView.viewDidChangeEffectiveAppearance()
+        XCTAssertEqual(textView.textColor, OnyxTheme.readingNSColor(for: dark))
+        XCTAssertEqual(textView.insertionPointColor, OnyxTheme.irisNSColor(for: dark))
+
+        window.appearance = light
+        textView.viewDidChangeEffectiveAppearance()
+        XCTAssertEqual(textView.textColor, OnyxTheme.readingNSColor(for: light))
+        XCTAssertEqual(textView.insertionPointColor, OnyxTheme.irisNSColor(for: light))
+    }
+
     func testPlaceholderOriginMatchesHostedInsertionPoint() throws {
         let textView = makeTextView()
         let window = host(textView)

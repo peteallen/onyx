@@ -5,6 +5,91 @@ import XCTest
 
 @MainActor
 final class OnyxThemeContrastTests: XCTestCase {
+    func testRoutineReadingTextIsReadableWithoutMaximumWhiteOnBlackGlare() throws {
+        let appearances: [(name: String, value: NSAppearance)] = try [
+            ("light", XCTUnwrap(NSAppearance(named: .aqua))),
+            ("dark", XCTUnwrap(NSAppearance(named: .darkAqua))),
+        ]
+        let readingSurfaces: [(name: String, color: Color)] = [
+            ("canvas", OnyxTheme.canvas),
+            ("composer", OnyxTheme.composerSurface),
+            ("surface", OnyxTheme.surface),
+        ]
+
+        for appearance in appearances {
+            let foreground = try resolvedRGB(
+                OnyxTheme.readingText,
+                appearance: appearance.value
+            )
+            for surface in readingSurfaces {
+                let background = try resolvedRGB(surface.color, appearance: appearance.value)
+                let ratio = contrastRatio(foreground, background)
+                let formattedRatio = String(format: "%.2f", ratio)
+                XCTAssertGreaterThanOrEqual(
+                    ratio,
+                    4.5,
+                    "Reading text has only \(formattedRatio):1 contrast on \(surface.name) in \(appearance.name) mode"
+                )
+                if appearance.name == "dark" {
+                    XCTAssertLessThan(
+                        ratio,
+                        15,
+                        "Routine reading text should not return to maximum white-on-black glare"
+                    )
+                }
+            }
+        }
+    }
+
+    func testSwiftUIAndAppKitSemanticColorsResolveIdentically() throws {
+        let appearances = try [
+            XCTUnwrap(NSAppearance(named: .aqua)),
+            XCTUnwrap(NSAppearance(named: .darkAqua)),
+        ]
+        let colors: [(Color, (NSAppearance?) -> NSColor)] = [
+            (OnyxTheme.readingText, OnyxTheme.readingNSColor),
+            (OnyxTheme.iris, OnyxTheme.irisNSColor),
+            (OnyxTheme.electric, OnyxTheme.electricNSColor),
+            (OnyxTheme.success, OnyxTheme.successNSColor),
+            (OnyxTheme.warning, OnyxTheme.warningNSColor),
+            (OnyxTheme.destructive, OnyxTheme.destructiveNSColor),
+        ]
+
+        for appearance in appearances {
+            for color in colors {
+                let swiftUI = try resolvedRGB(color.0, appearance: appearance)
+                let appKitColor = try XCTUnwrap(color.1(appearance).usingColorSpace(.sRGB))
+                XCTAssertEqual(swiftUI.red, appKitColor.redComponent, accuracy: 0.001)
+                XCTAssertEqual(swiftUI.green, appKitColor.greenComponent, accuracy: 0.001)
+                XCTAssertEqual(swiftUI.blue, appKitColor.blueComponent, accuracy: 0.001)
+            }
+        }
+    }
+
+    func testTerminalTextRolesRemainReadableOnTheBlackRail() throws {
+        let appearances: [(name: String, value: NSAppearance)] = try [
+            ("light", XCTUnwrap(NSAppearance(named: .aqua))),
+            ("dark", XCTUnwrap(NSAppearance(named: .darkAqua))),
+        ]
+        let roles: [(name: String, color: Color)] = [
+            ("terminal text", OnyxTheme.terminalText),
+            ("terminal muted text", OnyxTheme.terminalMutedText),
+        ]
+
+        for appearance in appearances {
+            let background = try resolvedRGB(OnyxTheme.rail, appearance: appearance.value)
+            for role in roles {
+                let foreground = try resolvedRGB(role.color, appearance: appearance.value)
+                let ratio = contrastRatio(foreground, background)
+                XCTAssertGreaterThanOrEqual(
+                    ratio,
+                    4.5,
+                    "\(role.name) has only \(String(format: "%.2f", ratio)):1 contrast in \(appearance.name) mode"
+                )
+            }
+        }
+    }
+
     func testSemanticStatusColorsMeetSmallTextContrastInBothAppearances() throws {
         let statusColors: [(name: String, color: Color)] = [
             ("iris", OnyxTheme.iris),
