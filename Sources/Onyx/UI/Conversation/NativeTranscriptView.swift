@@ -2833,12 +2833,26 @@ enum TranscriptMarkdownRenderer {
         let prefix: String
         let content: String
         let style: BlockStyle
+        /// UTF-16 offset of `content` in the original clean Markdown line.
+        let contentUTF16Offset: Int
+    }
+
+    private struct SourceLine {
+        let text: String
+        let range: NSRange
+    }
+
+    private struct SemanticSlice {
+        let role: TranscriptSemanticRole
+        let range: NSRange
     }
 
     static func attributedString(
         markdown source: String,
         baseFont: NSFont,
-        textColor: NSColor? = nil
+        textColor: NSColor? = nil,
+        semanticProjection: TranscriptSemanticMarkupProjection? = nil,
+        appearance: NSAppearance? = nil
     ) -> NSAttributedString {
         let textColor = textColor ?? OnyxTheme.readingNSColor(for: nil)
         let paragraphStyle = NSMutableParagraphStyle()
@@ -2860,17 +2874,40 @@ enum TranscriptMarkdownRenderer {
             return NSAttributedString(string: source, attributes: plainAttributes)
         }
 
+        // A projection is valid only for the exact raw body passed by the
+        // caller. This prevents stale streaming projections from coloring a
+        // newer cumulative body. The durable source itself remains untouched.
+        let semanticProjection = semanticProjection?.rawText == source
+            ? semanticProjection
+            : nil
+        let renderSource = semanticProjection?.cleanText ?? source
+
         var renderedLines: [NSAttributedString] = []
         renderedLines.reserveCapacity(min(256, max(1, byteCount / 48)))
         var fence: String?
 
-        for line in source.components(separatedBy: .newlines) {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
+        for line in sourceLines(renderSource) {
+            let trimmed = line.text.trimmingCharacters(in: .whitespaces)
             if let delimiter = fence {
                 if trimmed.hasPrefix(delimiter) {
                     fence = nil
                 } else {
-                    renderedLines.append(styledLine(BlockLine(prefix: "", content: line, style: .code), baseFont: baseFont, textColor: textColor))
+                    // Parser-protected fenced code never produces semantic
+                    // regions, so code remains exact evidence-like prose.
+                    renderedLines.append(
+                        styledLine(
+                            BlockLine(
+                                prefix: "",
+                                content: line.text,
+                                style: .code,
+                                contentUTF16Offset: 0
+                            ),
+                            baseFont: baseFont,
+                            textColor: textColor,
+                            semanticSlices: [],
+                            appearance: appearance
+                        )
+                    )
                 }
                 continue
             }
@@ -2878,7 +2915,20 @@ enum TranscriptMarkdownRenderer {
                 fence = String(trimmed.prefix(3))
                 continue
             }
-            renderedLines.append(styledLine(parseBlock(line), baseFont: baseFont, textColor: textColor))
+            let block = parseBlock(line.text)
+            renderedLines.append(
+                styledLine(
+                    block,
+                    baseFont: baseFont,
+                    textColor: textColor,
+                    semanticSlices: semanticSlices(
+                        for: block,
+                        lineRange: line.range,
+                        regions: semanticProjection?.regions ?? []
+                    ),
+                    appearance: appearance
+                )
+            )
         }
 
         let result = NSMutableAttributedString()
@@ -2911,10 +2961,49 @@ enum TranscriptMarkdownRenderer {
         return true
     }
 
+    private static func sourceLines(_ source: String) -> [SourceLine] {
+        let sourceNSString = source as NSString
+        guard sourceNSString.length > 0 else {
+            return [SourceLine(text: "", range: NSRange(location: 0, length: 0))]
+        }
+
+        var lines: [SourceLine] = []
+        var location = 0
+        while location < sourceNSString.length {
+            var lineStart = 0
+            var lineEnd = 0
+            var contentsEnd = 0
+            sourceNSString.getLineStart(
+                &lineStart,
+                end: &lineEnd,
+                contentsEnd: &contentsEnd,
+                for: NSRange(location: location, length: 0)
+            )
+            let range = NSRange(location: lineStart, length: contentsEnd - lineStart)
+            lines.append(SourceLine(text: sourceNSString.substring(with: range), range: range))
+            location = max(lineEnd, location + 1)
+        }
+
+        // `components(separatedBy: .newlines)`, used by the original renderer,
+        // retains the final empty paragraph. Preserve that selection/copy
+        // behavior when the clean Markdown ends in a newline.
+        if let finalScalar = source.unicodeScalars.last,
+           CharacterSet.newlines.contains(finalScalar) {
+            lines.append(
+                SourceLine(
+                    text: "",
+                    range: NSRange(location: sourceNSString.length, length: 0)
+                )
+            )
+        }
+        return lines
+    }
+
     /// Produces a marker-free preview without scanning or parsing the complete
     /// activity payload. Invalid Markdown simply remains readable plain text.
     static func compactPlainText(from source: Substring) -> String {
-        let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanSource = TranscriptSemanticMarkup.cleanText(from: String(source))
+        let trimmed = cleanSource.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               !trimmed.hasPrefix("```"),
               !trimmed.hasPrefix("~~~") else { return "" }
@@ -2936,29 +3025,50 @@ enum TranscriptMarkdownRenderer {
         let leadingCount = line.prefix(while: { $0 == " " || $0 == "\t" }).count
         let leading = String(line.prefix(leadingCount))
         var content = String(line.dropFirst(leadingCount))
+        var contentUTF16Offset = leading.utf16.count
 
         let hashes = content.prefix(while: { $0 == "#" }).count
         if (1...6).contains(hashes), content.dropFirst(hashes).first?.isWhitespace == true {
+            let contentAfterHashes = String(content.dropFirst(hashes))
+            let whitespaceCount = contentAfterHashes
+                .prefix(while: { $0 == " " || $0 == "\t" })
+                .utf16.count
             return BlockLine(
                 prefix: "",
-                content: String(content.dropFirst(hashes)).trimmingCharacters(in: .whitespaces),
-                style: .heading(hashes)
+                content: contentAfterHashes.trimmingCharacters(in: .whitespaces),
+                style: .heading(hashes),
+                contentUTF16Offset: contentUTF16Offset + hashes + whitespaceCount
             )
         }
 
         if content.hasPrefix(">") {
             content.removeFirst()
-            if content.first == " " { content.removeFirst() }
-            return BlockLine(prefix: "│ ", content: content, style: .quote)
+            contentUTF16Offset += 1
+            if content.first == " " {
+                content.removeFirst()
+                contentUTF16Offset += 1
+            }
+            return BlockLine(
+                prefix: "│ ",
+                content: content,
+                style: .quote,
+                contentUTF16Offset: contentUTF16Offset
+            )
         }
 
         if content == "---" || content == "***" || content == "___" {
-            return BlockLine(prefix: "", content: "────────────────", style: .thematicBreak)
+            return BlockLine(
+                prefix: "",
+                content: "────────────────",
+                style: .thematicBreak,
+                contentUTF16Offset: contentUTF16Offset
+            )
         }
 
         var listPrefix: String?
         if content.hasPrefix("- ") || content.hasPrefix("* ") || content.hasPrefix("+ ") {
             content.removeFirst(2)
+            contentUTF16Offset += 2
             listPrefix = "• "
         } else {
             let digits = content.prefix(while: { $0.isNumber })
@@ -2966,6 +3076,7 @@ enum TranscriptMarkdownRenderer {
             if !digits.isEmpty,
                (remainder.hasPrefix(". ") || remainder.hasPrefix(") ")) {
                 content = String(remainder.dropFirst(2))
+                contentUTF16Offset += digits.utf16.count + 2
                 listPrefix = "\(digits). "
             }
         }
@@ -2974,22 +3085,36 @@ enum TranscriptMarkdownRenderer {
             var marker = listPrefix
             if content.hasPrefix("[ ] ") {
                 content.removeFirst(4)
+                contentUTF16Offset += 4
                 marker = "☐ "
             } else if content.lowercased().hasPrefix("[x] ") {
                 content.removeFirst(4)
+                contentUTF16Offset += 4
                 marker = "☑ "
             }
             let indentation = String(repeating: "  ", count: min(4, leadingCount / 2))
-            return BlockLine(prefix: indentation + marker, content: content, style: .list)
+            return BlockLine(
+                prefix: indentation + marker,
+                content: content,
+                style: .list,
+                contentUTF16Offset: contentUTF16Offset
+            )
         }
 
-        return BlockLine(prefix: leading, content: content, style: .body)
+        return BlockLine(
+            prefix: leading,
+            content: content,
+            style: .body,
+            contentUTF16Offset: contentUTF16Offset
+        )
     }
 
     private static func styledLine(
         _ block: BlockLine,
         baseFont: NSFont,
-        textColor: NSColor
+        textColor: NSColor,
+        semanticSlices: [SemanticSlice],
+        appearance: NSAppearance?
     ) -> NSAttributedString {
         let font: NSFont
         let color: NSColor
@@ -3022,7 +3147,15 @@ enum TranscriptMarkdownRenderer {
             string: block.prefix,
             attributes: [.font: font, .foregroundColor: color]
         )
-        line.append(inlineMarkdown(block.content, font: font, textColor: color))
+        line.append(
+            inlineMarkdown(
+                block.content,
+                font: font,
+                textColor: color,
+                semanticSlices: semanticSlices,
+                appearance: appearance
+            )
+        )
         let paragraphStyle = NSMutableParagraphStyle()
         paragraphStyle.lineBreakMode = .byWordWrapping
         paragraphStyle.lineSpacing = readingLineSpacing
@@ -3051,7 +3184,96 @@ enum TranscriptMarkdownRenderer {
         return line
     }
 
+    private static func semanticSlices(
+        for block: BlockLine,
+        lineRange: NSRange,
+        regions: [TranscriptSemanticRegion]
+    ) -> [SemanticSlice] {
+        guard !regions.isEmpty, !block.content.isEmpty else { return [] }
+        let contentRange = NSRange(
+            location: lineRange.location + block.contentUTF16Offset,
+            length: block.content.utf16.count
+        )
+        guard contentRange.length > 0 else { return [] }
+
+        return regions.compactMap { region in
+            let intersection = NSIntersectionRange(contentRange, region.range)
+            guard intersection.length > 0 else { return nil }
+            return SemanticSlice(
+                role: region.role,
+                range: NSRange(
+                    location: intersection.location - contentRange.location,
+                    length: intersection.length
+                )
+            )
+        }
+    }
+
     private static func inlineMarkdown(
+        _ source: String,
+        font: NSFont,
+        textColor: NSColor,
+        semanticSlices: [SemanticSlice] = [],
+        appearance: NSAppearance? = nil
+    ) -> NSAttributedString {
+        guard !semanticSlices.isEmpty else {
+            return parsedInlineMarkdown(source, font: font, textColor: textColor)
+        }
+
+        let sourceNSString = source as NSString
+        let result = NSMutableAttributedString()
+        var cursor = 0
+        for slice in semanticSlices {
+            guard slice.range.location >= cursor,
+                  NSMaxRange(slice.range) <= sourceNSString.length else { continue }
+            if slice.range.location > cursor {
+                let prefix = sourceNSString.substring(
+                    with: NSRange(location: cursor, length: slice.range.location - cursor)
+                )
+                result.append(parsedInlineMarkdown(prefix, font: font, textColor: textColor))
+            }
+
+            let semanticSource = sourceNSString.substring(with: slice.range)
+            let renderedSemantic = NSMutableAttributedString(
+                attributedString: parsedInlineMarkdown(
+                    semanticSource,
+                    font: font,
+                    textColor: textColor
+                )
+            )
+            if renderedSemantic.length > 0 {
+                renderedSemantic.addAttributes(
+                    [
+                        .foregroundColor: semanticColor(
+                            for: slice.role,
+                            appearance: appearance
+                        ),
+                        .onyxSemanticRole: slice.role.rawValue,
+                    ],
+                    range: NSRange(location: 0, length: renderedSemantic.length)
+                )
+            }
+            result.append(renderedSemantic)
+            cursor = NSMaxRange(slice.range)
+        }
+        if cursor < sourceNSString.length {
+            result.append(
+                parsedInlineMarkdown(
+                    sourceNSString.substring(
+                        with: NSRange(
+                            location: cursor,
+                            length: sourceNSString.length - cursor
+                        )
+                    ),
+                    font: font,
+                    textColor: textColor
+                )
+            )
+        }
+        return result
+    }
+
+    private static func parsedInlineMarkdown(
         _ source: String,
         font: NSFont,
         textColor: NSColor
@@ -3112,6 +3334,19 @@ enum TranscriptMarkdownRenderer {
             )
         }
         return result
+    }
+
+    private static func semanticColor(
+        for role: TranscriptSemanticRole,
+        appearance: NSAppearance?
+    ) -> NSColor {
+        switch role {
+        case .intent: OnyxTheme.irisNSColor(for: appearance)
+        case .working: OnyxTheme.electricNSColor(for: appearance)
+        case .success: OnyxTheme.successNSColor(for: appearance)
+        case .attention: OnyxTheme.warningNSColor(for: appearance)
+        case .failure: OnyxTheme.destructiveNSColor(for: appearance)
+        }
     }
 
     private static func validatedWebURL(from value: Any?) -> URL? {
@@ -4085,9 +4320,12 @@ final class TranscriptCellView: NSView {
         }
         let preservesLiteralEvidence = !item.kind.rendersMarkdown
         let previewSampleLength = max(256, min(maximumCharacters, 1_024) * 4)
+        let previewSample = String(item.body.prefix(previewSampleLength))
+        let projectedPreview = item.kind == .assistantMessage
+            ? TranscriptSemanticMarkup.cleanText(from: previewSample)
+            : previewSample
         if maximumCharacters == 1 {
-            let firstLine = item.body
-                .prefix(previewSampleLength)
+            let firstLine = projectedPreview
                 .split(whereSeparator: { $0.isNewline })
                 .map {
                     preservesLiteralEvidence
@@ -4100,8 +4338,7 @@ final class TranscriptCellView: NSView {
         // Do not scan a multi-megabyte tool payload just to find a preview.
         // The first few kilobytes are enough to produce a useful one-line
         // summary and keep streaming updates cheap on the main thread.
-        let sample = item.body.prefix(previewSampleLength)
-        let oneLine = sample
+        let oneLine = projectedPreview
             .split(whereSeparator: { $0.isNewline })
             .map {
                 preservesLiteralEvidence
@@ -4215,7 +4452,11 @@ final class TranscriptCellView: NSView {
         return TranscriptMarkdownRenderer.attributedString(
             markdown: item.body,
             baseFont: font,
-            textColor: textColor
+            textColor: textColor,
+            semanticProjection: item.kind == .assistantMessage
+                ? TranscriptSemanticMarkup.project(item.body)
+                : nil,
+            appearance: appearance
         )
     }
 
