@@ -232,6 +232,39 @@ final class OnyxAppModelAuthBoundaryTests: XCTestCase {
         XCTAssertNil(fixture.defaults.object(forKey: "Onyx.pinnedThreadIDs"))
     }
 
+    func testConnectionStopAfterSignOutDoesNotSurfaceASecondError() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        await startAndLoad(fixture)
+        model.signOut()
+        await fixture.runtime.waitForRefreshToFinish()
+        await waitUntil("The sign-out boundary did not finish") {
+            model.authState == .signedOut && !model.isSigningOut
+        }
+
+        // The real Codex process commonly emits its stop notification just
+        // after the shared logout boundary. That transport event is a
+        // consequence of signing out, not a second actionable failure. It
+        // must not replace the clear signed-out card with a raw connection
+        // alert/reconnect prompt.
+        await fixture.runtime.emit(.connectionChanged(.failed(
+            "Codex app-server stopped unexpectedly (exit 0)."
+        )))
+        await fixture.runtime.emit(.runtimeNotice(
+            title: "Codex runtime",
+            detail: "Codex app-server stopped unexpectedly (exit 0)."
+        ))
+        await yieldSeveralTimes()
+
+        XCTAssertEqual(model.authState, .signedOut)
+        XCTAssertEqual(model.connectionState, .disconnected)
+        XCTAssertNil(model.notice)
+        XCTAssertEqual(model.authenticationRecovery, nil)
+        XCTAssertFalse(model.timeline.contains { $0.kind == .error })
+    }
+
     func testStaleListCompletionCannotRestorePreviousAccountAfterLogout() async {
         let fixture = makeFixture(suspendedOperations: [.listThreads])
         defer { fixture.cleanUp() }

@@ -424,6 +424,13 @@ final class OnyxAppModel: ObservableObject {
     /// replaced. Clear recovery only after a login started from that recovery
     /// completes and its authoritative account read confirms the new session.
     private var loginRecoveryPendingConfirmation = false
+    /// Once an authoritative logout/account replacement has cleared the
+    /// mounted account, the provider may still deliver a final transport stop
+    /// or stderr notice from the old process. Keep those late diagnostics out
+    /// of the signed-out surface until a fresh authenticated session is
+    /// projected; otherwise the user sees a misleading second "connection
+    /// failed" error beside the clear sign-in action.
+    private var signedOutBoundaryActive = false
     /// The last authoritative, provider-reported identity that owns the
     /// account-scoped state mounted in this window. During an expired-login
     /// recovery, this is frozen before a new ceremony begins so a successful
@@ -828,6 +835,13 @@ final class OnyxAppModel: ObservableObject {
         guard authState.canRun, authenticationRecovery == nil, !isSigningOut else { return false }
         if case .connected = connectionState { return true }
         return false
+    }
+
+    /// The account strip is the sole actionable surface after an explicit
+    /// logout or account replacement. Views use this to suppress a trailing
+    /// process-stop/reconnect row that is not a separate user action.
+    var isSignedOutBoundaryActive: Bool {
+        signedOutBoundaryActive
     }
 
     /// A follow-up submitted while a response is active is a provider
@@ -1743,6 +1757,10 @@ final class OnyxAppModel: ObservableObject {
                       connectionRevision == revision,
                       !Task.isCancelled else { return }
                 isLoadingThreadList = false
+                if signedOutBoundaryActive {
+                    connectionState = .disconnected
+                    return
+                }
                 if let recovery = authenticationRecovery(for: error) {
                     // The Codex runtime can reject account/read before it has
                     // produced a session snapshot. Keep this failure attached
@@ -4039,6 +4057,21 @@ final class OnyxAppModel: ObservableObject {
             if isSideChatPresented {
                 closeSideChat()
             }
+            // A successful logout invalidates the old runtime generation, but
+            // app-server can still enqueue its final stop/disconnect event.
+            // It is bookkeeping for the account boundary, not a new failure.
+            // Keep the state quiet until a fresh signed-in session is
+            // authoritative again.
+            if signedOutBoundaryActive {
+                if case .connected = state {
+                    return
+                }
+                connectionState = .disconnected
+                isLoadingThread = false
+                isLoadingThreadList = false
+                isTurnRunning = false
+                return
+            }
             if let recovery = authenticationRecovery(for: state) {
                 // Codex commonly emits a structured recovery event and then a
                 // failed/disconnected transport event.  That transport event
@@ -4357,6 +4390,13 @@ final class OnyxAppModel: ObservableObject {
             removeInteractionDraft(for: requestID)
             reconcileThreadStatusAfterInteraction(for: threadID)
         case let .runtimeNotice(title, detail):
+            if signedOutBoundaryActive {
+                // Late stderr/runtime notices from a process that was stopped
+                // by logout must not become a second modal over the signed-out
+                // account card. The next authenticated generation can report
+                // fresh diagnostics normally.
+                return
+            }
             // A few app-server versions report an expired ChatGPT session as
             // a generic runtime notice (and may include the complete 401
             // tracing envelope).  That is the same account-recovery state as
@@ -5821,6 +5861,7 @@ final class OnyxAppModel: ObservableObject {
     /// logout. No task, transcript, draft, workspace, or async completion from
     /// the previous account may remain visible in the signed-out window.
     private func closeAccountBoundary() {
+        signedOutBoundaryActive = true
         closeSideChat()
         workspacePersistenceStore?.clearAccountOwnedState()
         invalidateLatestMessageEdit()
@@ -5907,6 +5948,12 @@ final class OnyxAppModel: ObservableObject {
         }
         session = applyingRuntimeCapabilityDowngrades(to: updatedSession)
         authState = updatedSession.auth
+        if updatedSession.auth.canRun {
+            // A fresh session (including a no-auth compatible provider) is the
+            // first authoritative generation allowed to show transport errors
+            // again after logout/account replacement.
+            signedOutBoundaryActive = false
+        }
         if authenticationRecovery == nil,
            let identity = AccountIdentity(updatedSession.auth) {
             mountedAccountIdentity = identity

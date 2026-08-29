@@ -712,7 +712,14 @@ private struct RuntimeStatusStrip: View {
         // second reconnect action) from competing with the attached Sign In
         // surface, including when the failure happened before `session` was
         // populated.
-        if model.authenticationRecovery != nil {
+        // A confirmed logout has the same ownership rule. Codex may emit a
+        // final process-stop event after the account boundary is cleared; it
+        // is not a second actionable connection failure.
+        if model.authenticationRecovery != nil
+            || model.isSignedOutBoundaryActive
+            || (model.session != nil
+                && model.authState.requiresAuthentication
+                && !model.authState.isSignedIn) {
             EmptyView()
         } else {
             switch model.connectionState {
