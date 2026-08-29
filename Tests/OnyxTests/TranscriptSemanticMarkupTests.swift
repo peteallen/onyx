@@ -63,6 +63,135 @@ final class TranscriptSemanticMarkupTests: XCTestCase {
         XCTAssertTrue(projection.regions.isEmpty)
     }
 
+    func testFencesRequireExactDelimiterIndentationAndWhitespaceOnlyClose() {
+        let sources = [
+            """
+            ```
+            ```not-a-close
+            [onyx:success]inside[/onyx]
+            ```
+            """,
+            """
+            ````
+            ```
+            [onyx:success]inside[/onyx]
+            ````
+            """,
+            """
+            > ```
+            ```
+            > [onyx:success]inside[/onyx]
+            > ```
+            """,
+        ]
+
+        for source in sources {
+            let projection = TranscriptSemanticMarkup.project(source)
+            XCTAssertEqual(projection.cleanText, source)
+            XCTAssertTrue(projection.regions.isEmpty)
+        }
+    }
+
+    func testMultilineInlineCodeNeverInterpretsContainedMarkers() {
+        let source = """
+        `code
+        [onyx:failure]literal[/onyx]
+        more`
+        [onyx:working]outside[/onyx]
+        """
+        let projection = TranscriptSemanticMarkup.project(source)
+
+        XCTAssertTrue(projection.cleanText.contains("[onyx:failure]literal[/onyx]"))
+        XCTAssertFalse(projection.cleanText.contains("[onyx:working]"))
+        XCTAssertEqual(projectedStrings(projection), ["outside"])
+    }
+
+    func testIndentedAndBlockquoteCodeProtectMarkers() {
+        let source = """
+            [onyx:failure]indented[/onyx]
+        >     [onyx:attention]quoted code[/onyx]
+        [onyx:success]outside[/onyx]
+        """
+        let projection = TranscriptSemanticMarkup.project(source)
+
+        XCTAssertTrue(projection.cleanText.contains("[onyx:failure]indented[/onyx]"))
+        XCTAssertTrue(projection.cleanText.contains("[onyx:attention]quoted code[/onyx]"))
+        XCTAssertEqual(projectedStrings(projection), ["outside"])
+    }
+
+    func testSemanticWrapperMayContainOrdinaryInlineCode() {
+        let source = "[onyx:success]Built `thing` safely[/onyx]"
+        let projection = TranscriptSemanticMarkup.project(source)
+
+        XCTAssertEqual(projection.cleanText, "Built `thing` safely")
+        XCTAssertEqual(projectedStrings(projection), ["Built `thing` safely"])
+    }
+
+    func testMarkersInsideInlineCodeLinkDestinationsAndHTMLRemainLiteral() {
+        let source = """
+        `[onyx:success]code[/onyx]`
+        [link](https://example.test/[onyx:failure]literal[/onyx])
+        <code>[onyx:attention]literal[/onyx]</code>
+        [onyx:working]outside[/onyx]
+        """
+        let projection = TranscriptSemanticMarkup.project(source)
+
+        XCTAssertTrue(projection.cleanText.contains("[onyx:success]code[/onyx]"))
+        XCTAssertTrue(projection.cleanText.contains("[onyx:failure]literal[/onyx]"))
+        XCTAssertTrue(projection.cleanText.contains("[onyx:attention]literal[/onyx]"))
+        XCTAssertEqual(projectedStrings(projection), ["outside"])
+    }
+
+    func testUnicodeBeforeMarkersKeepsUTF16RangesExact() {
+        let source = "👩🏽‍💻 café [onyx:success]✅ résumé 🚀[/onyx] end"
+        let projection = TranscriptSemanticMarkup.project(source)
+
+        XCTAssertEqual(projection.rawText, source)
+        XCTAssertEqual(projection.cleanText, "👩🏽‍💻 café ✅ résumé 🚀 end")
+        XCTAssertEqual(projectedStrings(projection), ["✅ résumé 🚀"])
+    }
+
+    func testOnlyOneBlockAndThreeTotalRegionsAreStyled() {
+        let source = """
+        [onyx:success]
+        first block
+        [/onyx]
+        [onyx:attention]
+        second block
+        [/onyx]
+        [onyx:working]inline one[/onyx]
+        [onyx:intent]inline two[/onyx]
+        """
+        let projection = TranscriptSemanticMarkup.project(source)
+
+        XCTAssertFalse(projection.cleanText.contains("[onyx:"))
+        XCTAssertEqual(
+            projectedStrings(projection),
+            ["\nfirst block\n", "inline one", "inline two"]
+        )
+    }
+
+    func testMarkerHeavySourceStaysBoundedAndLiteral() {
+        let source = String(repeating: "[onyx:success]", count: 8_000)
+        let start = CFAbsoluteTimeGetCurrent()
+        let projection = TranscriptSemanticMarkup.project(source)
+        let elapsed = CFAbsoluteTimeGetCurrent() - start
+
+        XCTAssertEqual(projection.cleanText, source)
+        XCTAssertTrue(projection.regions.isEmpty)
+        XCTAssertLessThan(elapsed, 0.5, "Marker-heavy input must remain linear-time")
+    }
+
+    func testCRLFLineBoundCountsLogicalLinesOnce() {
+        let lineCount = TranscriptSemanticMarkup.maximumSourceLines
+        let source = Array(repeating: "line", count: lineCount - 1)
+            .joined(separator: "\r\n") + "\r\n[onyx:success]last[/onyx]"
+        let projection = TranscriptSemanticMarkup.project(source)
+
+        XCTAssertFalse(projection.cleanText.contains("[onyx:success]"))
+        XCTAssertEqual(projectedStrings(projection), ["last"])
+    }
+
     func testProjectionStylesOnlyThreeShortRegionsAndCleansEveryValidWrapper() {
         let source = (0..<4)
             .map { "[onyx:success]region-\($0)[/onyx]" }
