@@ -54,7 +54,10 @@ final class OpenAICompatibleAgentTurnLivenessRuntimeTests: XCTestCase {
         let runtime = OpenAICompatibleAgentTurnLivenessRuntime(
             runtime: upstream,
             policy: OpenAICompatibleAgentTurnLivenessPolicy(
-                inactivityTimeout: .milliseconds(100)
+                // Keep the behavioral assertion comfortably above hosted
+                // runner scheduling jitter. Production remains five minutes;
+                // this test only needs enough room to prove a refresh.
+                inactivityTimeout: .seconds(1)
             )
         )
         let log = AgentTurnLivenessEventLog()
@@ -75,13 +78,16 @@ final class OpenAICompatibleAgentTurnLivenessRuntimeTests: XCTestCase {
         try await waitUntil("The progress event was not observed") {
             await log.snapshot().contains(.itemDelta(threadID: "thread-1", itemID: "answer", delta: "Still working"))
         }
-        try await Task.sleep(for: .milliseconds(65))
+        try await Task.sleep(for: .milliseconds(650))
 
         let failedWhileProgressing = await log.containsLivenessFailure()
         XCTAssertFalse(failedWhileProgressing)
 
         await upstream.emit(.turnCompleted(threadID: "thread-1", status: .idle))
-        try await Task.sleep(for: .milliseconds(130))
+        try await waitUntil("The normal terminal event was not observed") {
+            await log.snapshot().contains(.turnCompleted(threadID: "thread-1", status: .idle))
+        }
+        try await Task.sleep(for: .milliseconds(1_100))
 
         let completedEvents = await log.snapshot()
         XCTAssertFalse(completedEvents.contains { event in
