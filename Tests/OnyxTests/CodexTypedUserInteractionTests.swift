@@ -80,6 +80,28 @@ final class CodexTypedUserInteractionTests: XCTestCase {
         await runtime.disconnect()
     }
 
+    func testCommandApprovalWithoutContextShowsTheCommandOnlyOnce() throws {
+        let request = AppServerRequest(
+            id: .string("command-without-context"),
+            method: "item/commandExecution/requestApproval",
+            params: .object([
+                "threadId": .string("thread-1"),
+                "command": .string("open -a Safari /tmp/preview.html"),
+            ])
+        )
+
+        let interaction = try XCTUnwrap(CodexProjection.userInteraction(from: request))
+        XCTAssertEqual(interaction.detail, "Codex needs approval to continue.")
+        guard case let .approval(prompt) = interaction.kind else {
+            return XCTFail("Expected a typed approval prompt")
+        }
+        XCTAssertEqual(prompt.command, "open -a Safari /tmp/preview.html")
+        XCTAssertFalse(
+            interaction.detail.contains(prompt.command ?? ""),
+            "The explanatory copy must not repeat the dedicated command presentation"
+        )
+    }
+
     func testModernCommandApprovalHonorsAvailableDecisionsAndShowsAdditionalPermissions() throws {
         let request = AppServerRequest(
             id: .string("command-permissions"),

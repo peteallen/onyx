@@ -5,6 +5,96 @@ import XCTest
 
 @MainActor
 final class OnyxInteractionVisualSnapshotTests: XCTestCase {
+    func testRendersCompactCommandApprovalWhenEnabled() throws {
+        guard let outputPath = ProcessInfo.processInfo.environment["ONYX_APPROVAL_SNAPSHOT_PATH"],
+              !outputPath.isEmpty else {
+            throw XCTSkip("Set ONYX_APPROVAL_SNAPSHOT_PATH to render the command approval relationship")
+        }
+
+        let model = OnyxAppModel(runtime: nil)
+        let command = #"/bin/zsh -lc 'open -a "Google Chrome" /Users/peteallen/work/temp/turd.html'"#
+        let timelineItem = TimelineItem(
+            id: "snapshot-command-awaiting-approval",
+            kind: .command,
+            title: command,
+            body: command,
+            status: .running,
+            timestamp: .now,
+            detail: nil
+        )
+        let interaction = RuntimeUserInteraction(
+            id: .string("snapshot-command-approval"),
+            threadID: "snapshot-thread",
+            providerMethod: "item/commandExecution/requestApproval",
+            title: "Run this command?",
+            detail: "Open turd.html in Google Chrome so you can watch the lightbulb crack open.\nWorking directory: /Users/peteallen/work/temp.",
+            kind: .approval(
+                RuntimeApprovalPrompt(
+                    subject: .command,
+                    command: command,
+                    // Exercise the complete action set so the compact render
+                    // also proves that the fallback can keep every decision
+                    // reachable instead of only testing a two-button row.
+                    allowedDecisions: Set(ApprovalDecision.allCases)
+                )
+            )
+        )
+        let environment = ProcessInfo.processInfo.environment
+        let size = NSSize(
+            width: snapshotDimension(
+                environment["ONYX_APPROVAL_SNAPSHOT_WIDTH"],
+                fallback: 1_440
+            ),
+            height: snapshotDimension(
+                environment["ONYX_APPROVAL_SNAPSHOT_HEIGHT"],
+                fallback: 320
+            )
+        )
+        let hostingView = NSHostingView(
+            // Deliberately leave the fixture's parent alignment unspecified.
+            // The production workspace used to do the same, which centered a
+            // capped card on ultrawide windows. The interaction itself must
+            // retain its leading relationship regardless of that proposal.
+            rootView: VStack(spacing: 8) {
+                NativeTranscriptView(items: [timelineItem])
+                    .frame(height: 38)
+                UserInteractionView(model: model, interaction: interaction)
+            }
+            .padding(20)
+            .frame(width: size.width, height: size.height, alignment: .topLeading)
+            .background(OnyxTheme.canvas)
+            .environment(\.colorScheme, .dark)
+        )
+        hostingView.appearance = NSAppearance(named: .darkAqua)
+        hostingView.frame = NSRect(origin: .zero, size: size)
+        hostingView.layoutSubtreeIfNeeded()
+        hostingView.displayIfNeeded()
+
+        guard let bitmap = hostingView.bitmapImageRepForCachingDisplay(in: hostingView.bounds) else {
+            return XCTFail("Could not allocate the approval snapshot bitmap")
+        }
+        hostingView.cacheDisplay(in: hostingView.bounds, to: bitmap)
+        guard let data = bitmap.representation(using: .png, properties: [:]) else {
+            return XCTFail("Could not encode the approval snapshot as PNG")
+        }
+
+        let outputURL = URL(fileURLWithPath: outputPath)
+        try FileManager.default.createDirectory(
+            at: outputURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try data.write(to: outputURL, options: .atomic)
+        XCTAssertGreaterThan(data.count, 10_000)
+    }
+
+    private func snapshotDimension(_ rawValue: String?, fallback: CGFloat) -> CGFloat {
+        guard let rawValue,
+              let value = Double(rawValue),
+              value.isFinite,
+              value > 0 else { return fallback }
+        return CGFloat(value)
+    }
+
     func testRendersRequestUserInputWhenEnabled() async throws {
         guard let outputPath = ProcessInfo.processInfo.environment["ONYX_INTERACTION_SNAPSHOT_PATH"],
               !outputPath.isEmpty else {

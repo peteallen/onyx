@@ -23,6 +23,27 @@ struct UserInteractionView: View {
     }
 }
 
+/// Keeps blocking prompts on the same readable axis as the conversation.
+/// The surrounding composer stack may span a very wide window, but a question
+/// and the controls that answer it should still read as one compact thought.
+enum UserInteractionLayout {
+    static let maximumWidth = OnyxWorkspaceMetrics.maximumConversationTextWidth
+    static let cardPadding: CGFloat = 12
+    static let headerIconSize: CGFloat = 30
+    static let headerIconToTextSpacing: CGFloat = 10
+    /// The leading edge of the header's title/detail column.  Command text
+    /// uses this same axis instead of starting underneath the status icon.
+    static let headerTextLeadingInset = headerIconSize + headerIconToTextSpacing
+    static let commandTopGap: CGFloat = 8
+    static let actionTopGap: CGFloat = 12
+    static let actionSpacing: CGFloat = 8
+    /// Below this usable card width the complete approval action set becomes
+    /// a trailing vertical list. The controls may technically squeeze into a
+    /// narrower row, but doing so makes the choices read like one run-on label.
+    static let horizontalActionMinimumWidth: CGFloat = 360
+    static let actionMinimumHeight = OnyxHitTarget.compact
+}
+
 private struct InteractionHeader: View {
     let interaction: RuntimeUserInteraction
     let icon: String
@@ -36,7 +57,10 @@ private struct InteractionHeader: View {
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(tint)
             }
-            .frame(width: 30, height: 30)
+            .frame(
+                width: UserInteractionLayout.headerIconSize,
+                height: UserInteractionLayout.headerIconSize
+            )
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(interaction.title)
@@ -59,78 +83,131 @@ private struct ApprovalInteractionView: View {
     @FocusState private var focusedAction: ApprovalDecision?
 
     var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 5) {
+        // Expand the interaction view to the available row width, then keep
+        // the actual card on the same leading axis as transcript prose. This
+        // protects the relationship even when a parent stack defaults to its
+        // usual centered alignment (for example, in Side Chat).
+        HStack(alignment: .top, spacing: 0) {
+            VStack(alignment: .leading, spacing: 0) {
                 InteractionHeader(
                     interaction: interaction,
                     icon: prompt.subject == .network ? "network.badge.shield.half.filled" : "checkmark.shield",
                     tint: OnyxTheme.warning
                 )
+
                 if let command = prompt.command, !command.isEmpty {
                     Text(command)
                         .font(.system(size: OnyxTypography.secondary, design: .monospaced))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(OnyxTheme.readingText)
                         .textSelection(.enabled)
-                        .lineLimit(3)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.leading, UserInteractionLayout.headerTextLeadingInset)
+                        .padding(.trailing, 8)
+                        .padding(.top, UserInteractionLayout.commandTopGap)
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel("Command")
+                        .accessibilityValue(command)
                 }
+
+                approvalActionsLayout
+            }
+            .padding(UserInteractionLayout.cardPadding)
+            .frame(maxWidth: UserInteractionLayout.maximumWidth, alignment: .leading)
+            .background(OnyxTheme.warning.opacity(0.055))
+            .onyxPanel(radius: 12)
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .onAppear { moveFocus(to: initialFocusAction) }
+    }
+
+    /// Keep the primary action trailing on a normal card, but let the whole
+    /// action group stack at compact widths instead of clipping labels.
+    @ViewBuilder
+    private var approvalActionsLayout: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: UserInteractionLayout.actionSpacing) {
+                approvalActions
+            }
+            .frame(
+                minWidth: UserInteractionLayout.horizontalActionMinimumWidth,
+                alignment: .trailing
+            )
+            VStack(alignment: .trailing, spacing: UserInteractionLayout.actionSpacing) {
+                approvalActions
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .padding(.top, UserInteractionLayout.actionTopGap)
+    }
+
+    @ViewBuilder
+    private var approvalActions: some View {
+        if model.isResponding(to: interaction) {
+            ProgressView().controlSize(.small)
+        } else {
+            if prompt.allows(.cancel) {
+                Button("Cancel") { model.respondToApproval(.cancel, for: interaction) }
+                    .buttonStyle(.borderless)
+                    .frame(minHeight: UserInteractionLayout.actionMinimumHeight)
+                    .contentShape(Rectangle())
+                    .keyboardShortcut(.cancelAction)
+                    .focused($focusedAction, equals: .cancel)
             }
 
-            if model.isResponding(to: interaction) {
-                ProgressView().controlSize(.small)
-            } else {
-                if prompt.allows(.cancel) {
-                    Button("Cancel") { model.respondToApproval(.cancel, for: interaction) }
-                        .buttonStyle(.borderless)
-                        .keyboardShortcut(.cancelAction)
-                        .focused($focusedAction, equals: .cancel)
-                }
+            if prompt.allows(.decline) {
+                Button("Decline") { model.respondToApproval(.decline, for: interaction) }
+                    .buttonStyle(.borderless)
+                    .frame(minHeight: UserInteractionLayout.actionMinimumHeight)
+                    .contentShape(Rectangle())
+                    .promptKeyboardShortcut(.cancelAction, enabled: !prompt.allows(.cancel))
+                    .focused($focusedAction, equals: .decline)
+            }
 
-                if prompt.allows(.decline) {
-                    Button("Decline") { model.respondToApproval(.decline, for: interaction) }
-                        .buttonStyle(.borderless)
-                        .promptKeyboardShortcut(.cancelAction, enabled: !prompt.allows(.cancel))
-                        .focused($focusedAction, equals: .decline)
-                }
-
-                if prompt.allows(.accept), prompt.allows(.acceptForSession) {
-                    Menu {
-                        Button("Allow once") { model.respondToApproval(.accept, for: interaction) }
-                        Button("Allow for this session") {
-                            model.respondToApproval(.acceptForSession, for: interaction)
-                        }
-                    } label: {
-                        Label("Allow", systemImage: "chevron.down")
-                    }
-                    .menuStyle(.borderlessButton)
-                    .fixedSize()
-                    .keyboardShortcut(.defaultAction)
-                    .focused($focusedAction, equals: .accept)
-                } else if prompt.allows(.accept) {
-                    Button("Allow") { model.respondToApproval(.accept, for: interaction) }
-                        .buttonStyle(.borderedProminent)
-                        .tint(OnyxTheme.warning)
-                        .foregroundStyle(OnyxTheme.canvas)
-                        .controlSize(.small)
-                        .keyboardShortcut(.defaultAction)
-                        .focused($focusedAction, equals: .accept)
-                } else if prompt.allows(.acceptForSession) {
+            if prompt.allows(.accept), prompt.allows(.acceptForSession) {
+                Menu {
+                    Button("Allow once") { model.respondToApproval(.accept, for: interaction) }
                     Button("Allow for this session") {
                         model.respondToApproval(.acceptForSession, for: interaction)
                     }
+                } label: {
+                    Label("Allow", systemImage: "chevron.down")
+                        .font(.system(size: OnyxTypography.secondary, weight: .semibold))
+                        .foregroundStyle(OnyxTheme.canvas)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .padding(.horizontal, 10)
+                .frame(minHeight: UserInteractionLayout.actionMinimumHeight)
+                .background(OnyxTheme.warning)
+                .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                .keyboardShortcut(.defaultAction)
+                .focused($focusedAction, equals: .accept)
+            } else if prompt.allows(.accept) {
+                Button("Allow") { model.respondToApproval(.accept, for: interaction) }
                     .buttonStyle(.borderedProminent)
                     .tint(OnyxTheme.warning)
                     .foregroundStyle(OnyxTheme.canvas)
                     .controlSize(.small)
+                    .frame(minHeight: UserInteractionLayout.actionMinimumHeight)
                     .keyboardShortcut(.defaultAction)
-                    .focused($focusedAction, equals: .acceptForSession)
+                    .focused($focusedAction, equals: .accept)
+            } else if prompt.allows(.acceptForSession) {
+                Button("Allow for this session") {
+                    model.respondToApproval(.acceptForSession, for: interaction)
                 }
+                .buttonStyle(.borderedProminent)
+                .tint(OnyxTheme.warning)
+                .foregroundStyle(OnyxTheme.canvas)
+                .controlSize(.small)
+                .frame(minHeight: UserInteractionLayout.actionMinimumHeight)
+                .keyboardShortcut(.defaultAction)
+                .focused($focusedAction, equals: .acceptForSession)
             }
         }
-        .padding(.horizontal, 12)
-        .frame(minHeight: 52)
-        .background(OnyxTheme.warning.opacity(0.055))
-        .onyxPanel(radius: 12)
-        .onAppear { moveFocus(to: initialFocusAction) }
     }
 
     private var initialFocusAction: ApprovalDecision {

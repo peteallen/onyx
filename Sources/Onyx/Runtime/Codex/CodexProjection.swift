@@ -492,7 +492,14 @@ enum CodexProjection {
                 threadID: threadID,
                 providerMethod: request.method,
                 title: isNetworkRequest ? "Allow network access?" : "Run this command?",
-                detail: firstString(detail, isNetworkRequest ? nil : command, "Codex needs approval to continue."),
+                // The command has one dedicated monospaced presentation in
+                // the approval surface. Falling back to the command here made
+                // that same shell text appear twice inside one card.
+                detail: firstString(
+                    detail,
+                    isNetworkRequest ? "Codex needs network access to continue." : nil,
+                    "Codex needs approval to continue."
+                ),
                 kind: .approval(
                     RuntimeApprovalPrompt(
                         subject: isNetworkRequest ? .network : .command,
