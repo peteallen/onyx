@@ -521,7 +521,13 @@ struct OpenAICompatibleResponsesSSESanitizer: Sendable {
         // encrypted content. Copy only expected scalar shapes: allowing an
         // object or array through an otherwise-safe metadata key would give a
         // malformed provider another place to hide plaintext reasoning.
-        var scrubbed: [String: Any] = ["type": "reasoning"]
+        // `codex-app-server` decodes lifecycle snapshots as a ResponseItem.
+        // Its reasoning variant requires `summary` even when Onyx strips the
+        // provider's plaintext reasoning, so retain the safe empty container.
+        var scrubbed: [String: Any] = [
+            "type": "reasoning",
+            "summary": [Any](),
+        ]
         for key in ["id", "status", "item_id"] {
             if let value = item[key] as? String {
                 scrubbed[key] = value

@@ -150,7 +150,7 @@ final class OpenAICompatibleResponsesSSESanitizerTests: XCTestCase {
         XCTAssertEqual(reasoningItem["id"] as? String, "rs_1")
         XCTAssertEqual(reasoningItem["status"] as? String, "completed")
         XCTAssertEqual(reasoningItem["encrypted_content"] as? String, "")
-        XCTAssertNil(reasoningItem["summary"])
+        XCTAssertTrue((reasoningItem["summary"] as? [Any])?.isEmpty == true)
         XCTAssertNil(reasoningItem["content"])
         XCTAssertFalse(emitted.contains("private"))
     }
@@ -194,6 +194,37 @@ final class OpenAICompatibleResponsesSSESanitizerTests: XCTestCase {
         XCTAssertTrue(emitted.contains("response.output_item.done"))
         XCTAssertTrue(emitted.contains("function_call"))
         XCTAssertFalse(emitted.contains("private"))
+    }
+
+    func testVLLMReasoningLifecycleSnapshotsRemainValidAfterPlaintextScrub() throws {
+        // Captured from the configured vLLM Responses endpoint. app-server
+        // decodes both lifecycle snapshots as ResponseItem::Reasoning, whose
+        // wire shape requires an array-valued `summary` field.
+        let added = "event: response.output_item.added\n"
+            + "data: {\"item\":{\"id\":\"b7809c77713647e4\",\"summary\":[],"
+            + "\"type\":\"reasoning\",\"content\":null,\"encrypted_content\":null,"
+            + "\"status\":\"in_progress\"},\"output_index\":0,\"sequence_number\":2,"
+            + "\"type\":\"response.output_item.added\"}\n\n"
+        let done = "event: response.output_item.done\n"
+            + "data: {\"item\":{\"id\":\"b7809c77713647e4\",\"summary\":[],"
+            + "\"type\":\"reasoning\",\"content\":[{\"text\":\"private chain\","
+            + "\"type\":\"reasoning_text\"}],\"encrypted_content\":null,"
+            + "\"status\":\"completed\"},\"output_index\":0,\"sequence_number\":31,"
+            + "\"type\":\"response.output_item.done\"}\n\n"
+        var sanitizer = OpenAICompatibleResponsesSSESanitizer(credential: nil)
+
+        for frame in [added, done] {
+            let output = try sanitizer.append(Data(frame.utf8))
+            let object = try XCTUnwrap(try decodeFrameObject(output.frames))
+            let item = try XCTUnwrap(object["item"] as? [String: Any])
+
+            XCTAssertEqual(item["type"] as? String, "reasoning")
+            XCTAssertEqual(item["id"] as? String, "b7809c77713647e4")
+            XCTAssertTrue((item["summary"] as? [Any])?.isEmpty == true)
+            XCTAssertNil(item["content"])
+            XCTAssertEqual(item["encrypted_content"] as? String, "")
+            XCTAssertFalse(String(decoding: output.frames, as: UTF8.self).contains("private chain"))
+        }
     }
 
     func testUnknownDoneSnapshotWithStringsStillFailsClosed() throws {
