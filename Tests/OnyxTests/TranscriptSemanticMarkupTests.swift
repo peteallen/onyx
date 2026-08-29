@@ -110,12 +110,18 @@ final class TranscriptSemanticMarkupTests: XCTestCase {
         let source = """
             [onyx:failure]indented[/onyx]
         >     [onyx:attention]quoted code[/onyx]
+            > [onyx:working]indented blockquote syntax is still code[/onyx]
         [onyx:success]outside[/onyx]
         """
         let projection = TranscriptSemanticMarkup.project(source)
 
         XCTAssertTrue(projection.cleanText.contains("[onyx:failure]indented[/onyx]"))
         XCTAssertTrue(projection.cleanText.contains("[onyx:attention]quoted code[/onyx]"))
+        XCTAssertTrue(
+            projection.cleanText.contains(
+                "[onyx:working]indented blockquote syntax is still code[/onyx]"
+            )
+        )
         XCTAssertEqual(projectedStrings(projection), ["outside"])
     }
 

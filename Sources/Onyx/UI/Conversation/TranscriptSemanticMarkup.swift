@@ -485,11 +485,22 @@ enum TranscriptSemanticMarkup {
         containing location: Int,
         in ranges: [ProtectedRange]
     ) -> ProtectedRange? {
-        for candidate in ranges {
-            if candidate.range.location > location { break }
-            if location < NSMaxRange(candidate.range) { return candidate }
+        // Callers scan source text repeatedly while these ranges stay sorted.
+        // Binary search keeps a code-heavy answer linearithmic instead of
+        // rescanning every earlier code span for every UTF-16 unit.
+        var lowerBound = 0
+        var upperBound = ranges.count
+        while lowerBound < upperBound {
+            let midpoint = lowerBound + (upperBound - lowerBound) / 2
+            if ranges[midpoint].range.location <= location {
+                lowerBound = midpoint + 1
+            } else {
+                upperBound = midpoint
+            }
         }
-        return nil
+        guard lowerBound > 0 else { return nil }
+        let candidate = ranges[lowerBound - 1]
+        return location < NSMaxRange(candidate.range) ? candidate : nil
     }
 
     private static func fenceCandidate(in line: String) -> Fence? {
@@ -567,12 +578,16 @@ enum TranscriptSemanticMarkup {
                 cursor += 1
             }
             let indentLength = cursor - indentStart
+            if indentLength >= 4 ||
+               (indentLength > 0 && value.character(at: indentStart) == 0x09) {
+                return true
+            }
             if cursor < value.length, value.character(at: cursor) == 0x3E { // >
                 cursor += 1
                 if cursor < value.length, value.character(at: cursor) == 0x20 { cursor += 1 }
                 continue
             }
-            return indentLength >= 4 || (indentLength > 0 && value.character(at: indentStart) == 0x09)
+            return false
         }
         return false
     }
