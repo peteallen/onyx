@@ -19,7 +19,11 @@ struct UserInteractionView: View {
                 UnsupportedInteractionView(model: model, interaction: interaction)
             }
         }
-        .disabled(model.isResponding(to: interaction))
+        // Expired account access must not make a pending approval disappear:
+        // it remains useful context beside the sign-in recovery strip. Keep
+        // the whole request read-only until the provider freshly confirms it
+        // after reauthentication, so an old Allow action can never be reused.
+        .disabled(!model.canRespond(to: interaction))
     }
 }
 

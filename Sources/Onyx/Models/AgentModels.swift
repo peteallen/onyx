@@ -131,10 +131,10 @@ struct RuntimeAuthState: Sendable, Equatable {
 enum RuntimeAuthenticationRecovery: Sendable, Equatable {
     case signInExpired
 
-    var title: String { "Sign in again to continue" }
+    var title: String { "Sign in required" }
 
     var detail: String {
-        "Your ChatGPT sign-in is no longer valid. Sign in again to continue. Your task and draft are still here."
+        "Your ChatGPT sign-in expired. Your task and draft are still here."
     }
 }
 

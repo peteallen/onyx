@@ -6,7 +6,7 @@ enum CodexProjection {
     private static let outputLimitFailureMessage =
         "The provider reached its output limit before completing this response."
     static let authenticationRecoveryFailureMessage =
-        "Your ChatGPT sign-in is no longer valid. Sign in again to continue. Your task and draft are still here."
+        RuntimeAuthenticationRecovery.signInExpired.detail
 
     static func thread(from value: JSONValue) -> RuntimeThread? {
         guard let id = value["id"]?.stringValue else { return nil }
@@ -173,6 +173,7 @@ enum CodexProjection {
         from value: JSONValue,
         fallbackTurnID: String? = nil,
         fallbackMessage: String? = nil,
+        fallbackIsAuthenticationRecovery: Bool = false,
         fallbackTimestamp: Date? = nil
     ) -> TimelineItem? {
         let isFailedTurn = value["status"]?.stringValue?.lowercased() == "failed"
@@ -185,10 +186,13 @@ enum CodexProjection {
             ?? date(from: value["startedAt"])
             ?? fallbackTimestamp
             ?? .distantPast
+        let isAuthenticationRecovery = fallbackIsAuthenticationRecovery
+            || isAuthenticationRecoveryDiagnostic(from: value)
+            || isAuthenticationRecoveryDiagnostic(fallbackMessage ?? "")
         return TimelineItem(
             id: "codex-turn-error:\(turnID)",
             kind: .error,
-            title: "Response failed",
+            title: isAuthenticationRecovery ? "Sign in required" : "Response failed",
             body: message,
             status: .failed,
             timestamp: timestamp,
@@ -224,10 +228,24 @@ enum CodexProjection {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         let requestsNewSignIn = normalized.contains("sign in again")
+            || normalized.contains("signing in again")
             || normalized.contains("log in again")
-        return requestsNewSignIn
-            && (normalized.contains("access token could not be refreshed")
-                || normalized.contains("logged out or signed in to another account"))
+            || normalized.contains("login again")
+            || normalized.contains("reauthenticate")
+        guard requestsNewSignIn else { return false }
+
+        // JSON diagnostics from the ChatGPT plugin/account service often
+        // arrive on stderr rather than as a JSON-RPC error. In particular,
+        // `code: token_invalidated` is wrapped in a 401 payload and should
+        // enter the same in-place recovery boundary as the refresh-token
+        // wording emitted by app-server itself.
+        let tokenWasInvalidated = normalized.contains("token_invalidated")
+            || normalized.contains("token invalidated")
+            || normalized.contains("authentication token has been invalidated")
+            || normalized.contains("token_inval")
+        return tokenWasInvalidated
+            || normalized.contains("access token could not be refreshed")
+            || normalized.contains("logged out or signed in to another account")
     }
 
     private static func isOutputLimitDisconnectDiagnostic(_ message: String) -> Bool {

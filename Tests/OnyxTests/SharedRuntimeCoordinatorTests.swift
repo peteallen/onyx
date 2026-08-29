@@ -29,6 +29,202 @@ final class SharedRuntimeCoordinatorTests: XCTestCase {
         XCTAssertEqual(runtime.eventStreamAccessCount, 1)
     }
 
+    func testAuthenticationRecoveryReplaysToWindowsThatAttachLater() async throws {
+        let runtime = CoordinatorFakeRuntime()
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+        let first = CoordinatorEventRecorder()
+        await first.start(stream: coordinator.events)
+
+        runtime.emit(.authenticationRecoveryRequired(.signInExpired))
+        try await first.waitForCount(1)
+
+        let attachedLater = CoordinatorEventRecorder()
+        await attachedLater.start(stream: coordinator.events)
+        try await attachedLater.waitForCount(1)
+
+        let expected = [AgentRuntimeEvent.authenticationRecoveryRequired(.signInExpired)]
+        let firstEvents = await first.snapshot()
+        let laterEvents = await attachedLater.snapshot()
+        XCTAssertEqual(firstEvents, expected)
+        XCTAssertEqual(laterEvents, expected)
+    }
+
+    func testRoutineSignedInRefreshAndAccountEventDoNotClearRecovery() async throws {
+        let signedIn = Self.authenticatedSession(label: "Still stale")
+        let runtime = CoordinatorFakeRuntime(refreshSession: signedIn)
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+        let current = CoordinatorEventRecorder()
+        await current.start(stream: coordinator.events)
+
+        runtime.emit(.authenticationRecoveryRequired(.signInExpired))
+        try await current.waitForCount(1)
+        _ = try await coordinator.refreshAccount()
+        runtime.emit(.accountUpdated(signedIn.auth))
+        try await current.waitForCount(2)
+
+        let attachedLater = CoordinatorEventRecorder()
+        await attachedLater.start(stream: coordinator.events)
+        try await attachedLater.waitForCount(1)
+        let laterEvents = await attachedLater.snapshot()
+        XCTAssertEqual(
+            laterEvents,
+            [.authenticationRecoveryRequired(.signInExpired)],
+            "A routine signed-in projection must not masquerade as successful reauthentication."
+        )
+    }
+
+    func testUnrelatedSuccessfulLoginCannotConfirmRecovery() async throws {
+        let signedIn = Self.authenticatedSession(label: "Unrelated login")
+        let runtime = CoordinatorFakeRuntime(refreshSession: signedIn)
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+        let current = CoordinatorEventRecorder()
+        await current.start(stream: coordinator.events)
+
+        runtime.emit(.authenticationRecoveryRequired(.signInExpired))
+        try await current.waitForCount(1)
+        runtime.emit(.loginCompleted(RuntimeLoginCompletion(
+            loginID: "not-started-through-onyx",
+            success: true,
+            error: nil
+        )))
+        let marker = AgentRuntimeEvent.runtimeNotice(
+            title: "After unrelated login",
+            detail: "The stale completion was suppressed"
+        )
+        runtime.emit(marker)
+        try await current.waitForCount(2)
+        let currentEvents = await current.snapshot()
+        XCTAssertEqual(
+            currentEvents,
+            [.authenticationRecoveryRequired(.signInExpired), marker]
+        )
+
+        _ = try await coordinator.refreshAccount()
+        let attachedLater = CoordinatorEventRecorder()
+        await attachedLater.start(stream: coordinator.events)
+        try await attachedLater.waitForCount(1)
+        let laterEvents = await attachedLater.snapshot()
+        XCTAssertEqual(
+            laterEvents,
+            [.authenticationRecoveryRequired(.signInExpired)]
+        )
+    }
+
+    func testConfirmedRecoveryReplaysLoginToWindowAttachingBeforeRefreshThenClears() async throws {
+        let signedIn = Self.authenticatedSession(label: "Recovered provider")
+        let login = RuntimeLoginStart(
+            method: RuntimeLoginMethod(
+                id: "fake-login",
+                displayName: "Sign in",
+                detail: "Sign in",
+                ceremony: .browser
+            ),
+            loginID: "recovery-login",
+            authURL: URL(string: "https://example.com/login"),
+            verificationURL: nil,
+            userCode: nil
+        )
+        let runtime = CoordinatorFakeRuntime(
+            refreshSession: signedIn,
+            loginStartResult: login
+        )
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+        let current = CoordinatorEventRecorder()
+        await current.start(stream: coordinator.events)
+
+        runtime.emit(.authenticationRecoveryRequired(.signInExpired))
+        try await current.waitForCount(1)
+        _ = try await coordinator.startLogin(methodID: login.method.id)
+        runtime.emit(.loginCompleted(RuntimeLoginCompletion(
+            loginID: login.loginID,
+            success: true,
+            error: nil
+        )))
+        try await current.waitForCount(2)
+
+        // This window missed the live completion but still needs both durable
+        // pieces of recovery state so it participates in account confirmation.
+        let attachedDuringConfirmation = CoordinatorEventRecorder()
+        await attachedDuringConfirmation.start(stream: coordinator.events)
+        try await attachedDuringConfirmation.waitForCount(2)
+        let completion = RuntimeLoginCompletion(
+            loginID: login.loginID,
+            success: true,
+            error: nil
+        )
+        let confirmationEvents = await attachedDuringConfirmation.snapshot()
+        XCTAssertEqual(
+            confirmationEvents,
+            [
+                .authenticationRecoveryRequired(.signInExpired),
+                .loginCompleted(completion),
+            ]
+        )
+
+        _ = try await coordinator.refreshAccount()
+
+        let attachedAfterConfirmation = CoordinatorEventRecorder()
+        await attachedAfterConfirmation.start(stream: coordinator.events)
+        let marker = AgentRuntimeEvent.runtimeNotice(
+            title: "After confirmation",
+            detail: "No recovery should replay"
+        )
+        runtime.emit(marker)
+        try await current.waitForCount(3)
+        try await attachedAfterConfirmation.waitForCount(1)
+        let afterConfirmationEvents = await attachedAfterConfirmation.snapshot()
+        XCTAssertEqual(
+            afterConfirmationEvents,
+            [marker],
+            "Successful login plus a signed-in refresh must clear durable recovery."
+        )
+
+        // The same connected provider must still be able to expire again.
+        runtime.emit(.authenticationRecoveryRequired(.signInExpired))
+        try await current.waitForCount(4)
+        let attachedAfterSecondExpiration = CoordinatorEventRecorder()
+        await attachedAfterSecondExpiration.start(stream: coordinator.events)
+        try await attachedAfterSecondExpiration.waitForCount(1)
+        let secondExpirationEvents = await attachedAfterSecondExpiration.snapshot()
+        XCTAssertEqual(
+            secondExpirationEvents,
+            [.authenticationRecoveryRequired(.signInExpired)]
+        )
+    }
+
+    func testAuthoritativeSignedOutEventClearsRecoveryForLaterWindows() async throws {
+        let runtime = CoordinatorFakeRuntime()
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+        let current = CoordinatorEventRecorder()
+        await current.start(stream: coordinator.events)
+
+        runtime.emit(.authenticationRecoveryRequired(.signInExpired))
+        try await current.waitForCount(1)
+        runtime.emit(.accountUpdated(.signedOut))
+        try await current.waitForCount(2)
+        let currentEvents = await current.snapshot()
+        XCTAssertEqual(
+            currentEvents,
+            [
+                .authenticationRecoveryRequired(.signInExpired),
+                .accountUpdated(.signedOut),
+            ],
+            "Signed out remains an authoritative account boundary during recovery."
+        )
+
+        let attachedLater = CoordinatorEventRecorder()
+        await attachedLater.start(stream: coordinator.events)
+        let marker = AgentRuntimeEvent.runtimeNotice(
+            title: "After sign out",
+            detail: "Recovery must be gone"
+        )
+        runtime.emit(marker)
+        try await current.waitForCount(3)
+        try await attachedLater.waitForCount(1)
+        let laterEvents = await attachedLater.snapshot()
+        XCTAssertEqual(laterEvents, [marker])
+    }
+
     func testStalledSubscriberCoalescesAdjacentDeltasWhileActiveConsumerKeepsExactOrder() async throws {
         let runtime = CoordinatorFakeRuntime()
         let coordinator = SharedRuntimeCoordinator(
@@ -1257,6 +1453,25 @@ final class SharedRuntimeCoordinatorTests: XCTestCase {
             availableLoginMethods: [],
             availableModels: models,
             capabilities: capabilities
+        )
+    }
+
+    private static func authenticatedSession(label: String) -> RuntimeSession {
+        let auth = RuntimeAuthState(
+            mode: .chatgpt,
+            email: "person@example.com",
+            planLabel: "pro",
+            requiresAuthentication: true
+        )
+        return RuntimeSession(
+            runtime: .local,
+            displayName: label,
+            accountLabel: auth.email,
+            planLabel: auth.planLabel,
+            auth: auth,
+            availableLoginMethods: [],
+            availableModels: [],
+            capabilities: []
         )
     }
 

@@ -20,6 +20,11 @@ struct ConversationWorkspaceView: View {
             let composerInset = ConversationContentLayout.horizontalInset(
                 availableWidth: proxy.size.width
             )
+            let authenticationRecoveryActive = model.authenticationRecovery != nil
+            let transcriptItems = AccountAccessPresentation.transcriptItems(
+                model.transcriptSnapshot.items,
+                recoveryActive: authenticationRecoveryActive
+            )
 
             ZStack(alignment: .trailing) {
                 VStack(spacing: 0) {
@@ -36,7 +41,7 @@ struct ConversationWorkspaceView: View {
                             onLoadEarlierHistory: model.loadEarlierHistory
                         ) {
                             NativeTranscriptView(
-                                items: model.transcriptSnapshot.items,
+                                items: transcriptItems,
                                 isAwaitingResponse: (model.isTurnRunning
                                     || model.isSelectedReviewStarting
                                     || model.isPreparingFailedResponseRetryForSelectedThread)
@@ -46,10 +51,27 @@ struct ConversationWorkspaceView: View {
                                     : (model.isReviewRunning || model.isSelectedReviewStarting
                                         ? "Reviewing changes…"
                                         : "Working on a response…"),
-                                revision: model.transcriptSnapshot.revision,
-                                changeHint: model.transcriptSnapshot.changeHint,
+                                // Filtering is presentation-only and can
+                                // change while the durable transcript revision
+                                // stays fixed. Disable revision shortcuts for
+                                // that state so the native collection removes
+                                // the superseded auth row immediately.
+                                revision: authenticationRecoveryActive
+                                    ? nil
+                                    : model.transcriptSnapshot.revision,
+                                changeHint: authenticationRecoveryActive
+                                    ? nil
+                                    : model.transcriptSnapshot.changeHint,
                                 editableUserMessageID: model.latestEditableUserMessageID,
-                                retryableFailedResponseItemID: model.retryableFailedResponseItemID,
+                                // A failed turn may be retried only after the
+                                // account can safely author a new provider
+                                // operation. During reauthentication, the
+                                // recovery surface owns the next action; a
+                                // visible Retry would promise a second route
+                                // that cannot succeed yet.
+                                retryableFailedResponseItemID: model.canRunAgent
+                                    ? model.retryableFailedResponseItemID
+                                    : nil,
                                 onEditUserMessage: { messageID in
                                     model.beginEditLatestUserMessage(
                                         messageID: messageID,
@@ -57,6 +79,7 @@ struct ConversationWorkspaceView: View {
                                     )
                                 },
                                 onRetryFailedResponse: { responseItemID in
+                                    guard model.canRunAgent else { return }
                                     guard let messageID = model.retryUserMessageID(
                                         forFailedResponseItemID: responseItemID
                                     ) else { return }
@@ -94,9 +117,18 @@ struct ConversationWorkspaceView: View {
                                 .id(interaction)
                         }
 
-                        if model.session != nil,
-                           (model.loginAttempt != nil
-                            || (model.authState.requiresAuthentication && !model.authState.isSignedIn)) {
+                        // A Codex account/read can fail before the first
+                        // session snapshot is available. Recovery itself is
+                        // sufficient evidence to mount the in-place card;
+                        // otherwise the cold connecting state should stay
+                        // quiet until a provider session exists.
+                        if AccountAccessPresentation.shouldShow(
+                            sessionAvailable: model.session != nil,
+                            recoveryActive: model.authenticationRecovery != nil,
+                            loginAttemptActive: model.loginAttempt != nil,
+                            requiresAuthentication: model.authState.requiresAuthentication,
+                            signedIn: model.authState.isSignedIn
+                        ) {
                             AccountAccessStrip(model: model)
                         }
 
@@ -645,7 +677,15 @@ private struct RuntimeStatusStrip: View {
     @ObservedObject var model: OnyxAppModel
 
     var body: some View {
-        switch model.connectionState {
+        // Authentication recovery owns the connection failure copy. Hiding
+        // this generic strip prevents the raw account/read diagnostic (or a
+        // second reconnect action) from competing with the attached Sign In
+        // surface, including when the failure happened before `session` was
+        // populated.
+        if model.authenticationRecovery != nil {
+            EmptyView()
+        } else {
+            switch model.connectionState {
         case .connecting:
             HStack(spacing: 6) {
                 ProgressView()
@@ -670,6 +710,7 @@ private struct RuntimeStatusStrip: View {
             )
         case .connected:
             EmptyView()
+            }
         }
     }
 
@@ -692,91 +733,185 @@ private struct RuntimeStatusStrip: View {
     }
 }
 
+/// Copy and geometry for the account-recovery surface. Keep this separate
+/// from the SwiftUI layout so the moment a session expires has a stable,
+/// testable product contract instead of becoming another generic alert.
+enum AccountAccessPresentation {
+    static let minimumHeight: CGFloat = 72
+    static let settingsActionTitle = "Open Settings"
+    private static let legacyAuthenticationRecoveryDetail =
+        "Your ChatGPT sign-in is no longer valid. Sign in again to continue. Your task and draft are still here."
+
+    enum Action: Hashable {
+        case openSettings(prominent: Bool)
+        case moreSignInOptions
+        case signIn(runtimeName: String)
+
+        var title: String {
+            switch self {
+            case .openSettings: AccountAccessPresentation.settingsActionTitle
+            case .moreSignInOptions: "More sign-in options"
+            case .signIn: "Sign In"
+            }
+        }
+
+        var accessibilityLabel: String {
+            switch self {
+            case .openSettings: "Open account settings"
+            case .moreSignInOptions: "More sign-in options"
+            case let .signIn(runtimeName): "Sign in to \(runtimeName)"
+            }
+        }
+
+        var accessibilityHint: String {
+            switch self {
+            case .openSettings: "Review sign-in options without leaving this task"
+            case .moreSignInOptions: "Choose device-code sign in"
+            case .signIn: "Opens secure sign in; your current draft stays in Onyx"
+            }
+        }
+
+        var minimumHeight: CGFloat { OnyxHitTarget.row }
+    }
+
+    static func idleActions(
+        hasLoginMethod: Bool,
+        hasDeviceCodeMethod: Bool,
+        runtimeName: String
+    ) -> [Action] {
+        guard hasLoginMethod else { return [.openSettings(prominent: true)] }
+        var actions: [Action] = [.openSettings(prominent: false)]
+        if hasDeviceCodeMethod { actions.append(.moreSignInOptions) }
+        actions.append(.signIn(runtimeName: runtimeName))
+        return actions
+    }
+
+    /// The attached recovery card owns the actionable authentication state.
+    /// Keep provider history untouched, but do not repeat the same state as a
+    /// failure-styled transcript row while the card is present.
+    static func transcriptItems(
+        _ items: [TimelineItem],
+        recoveryActive: Bool
+    ) -> [TimelineItem] {
+        guard recoveryActive else { return items }
+        return items.filter { !isAuthenticationRecoveryItem($0) }
+    }
+
+    static func isAuthenticationRecoveryItem(_ item: TimelineItem) -> Bool {
+        guard item.kind == .error else { return false }
+        let normalizedTitle = item.title?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if normalizedTitle == "sign in required"
+            || normalizedTitle == "sign in again to continue" {
+            return true
+        }
+        if item.body == RuntimeAuthenticationRecovery.signInExpired.detail
+            || item.body == legacyAuthenticationRecoveryDetail {
+            return true
+        }
+        return CodexProjection.isAuthenticationRecoveryDiagnostic(item.body)
+    }
+
+    /// Recovery is allowed to mount before a provider session exists. A
+    /// regular signed-out card still waits for a session so the cold startup
+    /// frame does not flash an action-less account row.
+    static func shouldShow(
+        sessionAvailable: Bool,
+        recoveryActive: Bool,
+        loginAttemptActive: Bool,
+        requiresAuthentication: Bool,
+        signedIn: Bool
+    ) -> Bool {
+        recoveryActive
+            || (sessionAvailable
+                && (loginAttemptActive || (requiresAuthentication && !signedIn)))
+    }
+
+    static func signedOutTitle(isCodex: Bool, runtimeName: String) -> String {
+        isCodex ? "Codex is signed out" : "\(runtimeName) needs credentials"
+    }
+
+    static func signedOutDetail(isCodex: Bool, runtimeName: String) -> String {
+        if isCodex {
+            return "Your draft is safe here. Sign in again to send it or continue this task."
+        }
+        return "Your draft is safe here. Add or replace credentials for \(runtimeName) to continue."
+    }
+
+    static func primaryActionTitle(hasLoginMethod: Bool) -> String {
+        hasLoginMethod ? "Sign In" : "Open Settings"
+    }
+
+    static func resumeActionTitle(hasDeviceCode: Bool) -> String {
+        hasDeviceCode ? "Open Sign In" : "Open Sign In Again"
+    }
+
+}
+
 private struct AccountAccessStrip: View {
     @ObservedObject var model: OnyxAppModel
 
     var body: some View {
-        HStack(spacing: 12) {
-            ZStack {
-                Circle().fill(OnyxTheme.iris.opacity(0.13))
-                Image(systemName: model.loginAttempt == nil ? "person.crop.circle.badge.plus" : "person.badge.clock")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(OnyxTheme.iris)
-            }
-            .frame(width: 30, height: 30)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.system(size: OnyxTypography.navigation, weight: .semibold))
-                if let code = model.loginAttempt?.userCode {
-                    Text(code)
-                        .font(.system(size: OnyxTypography.reading, weight: .bold, design: .monospaced))
-                        .textSelection(.enabled)
-                } else {
-                    Text(detail)
-                        .font(.system(size: OnyxTypography.secondary))
-                        .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 12) {
+                ZStack {
+                    Circle().fill(recoveryTint.opacity(0.14))
+                    Image(systemName: iconName)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(recoveryTint)
                 }
-            }
+                .frame(width: 30, height: 30)
+                .accessibilityHidden(true)
 
-            Spacer()
-
-            if let attempt = model.loginAttempt {
-                if attempt.userCode != nil {
-                    Button("Copy Code", action: model.copyDeviceCode)
-                        .buttonStyle(.borderless)
-                }
-                Button("Open Sign In", action: model.reopenLoginPage)
-                    .buttonStyle(.borderedProminent)
-                    .tint(OnyxTheme.iris)
-                    .foregroundStyle(OnyxTheme.canvas)
-                    .controlSize(.small)
-                Button("Cancel", action: model.cancelLogin)
-                    .buttonStyle(.borderless)
-                    .disabled(model.isAuthenticating)
-            } else if model.isAuthenticating {
-                ProgressView().controlSize(.small)
-            } else {
-                if model.primaryLoginMethod == nil {
-                    SettingsLink {
-                        Text("Open Settings")
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title)
+                        .font(.system(size: OnyxTypography.navigation, weight: .semibold))
+                        .foregroundStyle(OnyxTheme.strongText)
+                    if let code = model.loginAttempt?.userCode {
+                        Text(code)
+                            .font(.system(size: OnyxTypography.reading, weight: .bold, design: .monospaced))
+                            .foregroundStyle(OnyxTheme.strongText)
+                            .textSelection(.enabled)
+                    } else {
+                        Text(detail)
+                            .font(.system(size: OnyxTypography.secondary))
+                            .foregroundStyle(OnyxTheme.readingText)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .tint(OnyxTheme.iris)
-                    .foregroundStyle(OnyxTheme.canvas)
-                    .controlSize(.small)
-                    .accessibilityLabel("Open provider settings")
-                    .accessibilityHint("Choose Providers to add or update this connection's API key")
                 }
-                if let deviceMethod = model.deviceCodeLoginMethod {
-                    Menu {
-                        Button(deviceMethod.displayName) { model.startLogin(deviceMethod) }
-                    } label: {
-                        Image(systemName: "ellipsis.circle")
-                    }
-                    .menuStyle(.borderlessButton)
-                    .fixedSize()
-                    .onyxHelp("More sign-in options")
+            }
+
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    Spacer(minLength: 0)
+                    actionButtons
                 }
-                if let method = model.primaryLoginMethod {
-                    Button(method.displayName) { model.startLogin(method) }
-                        .buttonStyle(.borderedProminent)
-                        .tint(OnyxTheme.iris)
-                        .foregroundStyle(OnyxTheme.canvas)
-                        .controlSize(.small)
+                VStack(alignment: .leading, spacing: 8) {
+                    actionButtons
                 }
             }
         }
-        .padding(.horizontal, 12)
-        .frame(minHeight: 52)
-        .background(OnyxTheme.iris.opacity(0.045))
-        .onyxPanel(radius: 12)
+        .padding(14)
+        .frame(maxWidth: .infinity, minHeight: AccountAccessPresentation.minimumHeight, alignment: .leading)
+        .background(recoveryTint.opacity(0.06))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(recoveryTint.opacity(0.30), lineWidth: OnyxTheme.hairline)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Account recovery")
     }
 
     private var title: String {
         guard let attempt = model.loginAttempt else {
-            if model.primaryLoginMethod == nil {
-                return "\(model.runtimeDisplayName) needs credentials"
+            if let recovery = model.authenticationRecovery { return recovery.title }
+            if model.authState.requiresAuthentication, !model.authState.isSignedIn {
+                return AccountAccessPresentation.signedOutTitle(
+                    isCodex: model.session?.runtime == .codex,
+                    runtimeName: model.runtimeDisplayName
+                )
             }
             return "Sign in to run \(model.runtimeDisplayName)"
         }
@@ -785,10 +920,139 @@ private struct AccountAccessStrip: View {
 
     private var detail: String {
         if let detail = model.loginAttempt?.method.detail { return detail }
-        if model.primaryLoginMethod == nil {
-            return "Open Settings, choose Providers, and add or update this connection's API key."
+        if let recovery = model.authenticationRecovery { return recovery.detail }
+        if model.authState.requiresAuthentication, !model.authState.isSignedIn {
+            return AccountAccessPresentation.signedOutDetail(
+                isCodex: model.session?.runtime == .codex,
+                runtimeName: model.runtimeDisplayName
+            )
         }
         return "Your credentials stay with \(model.runtimeDisplayName) and are never copied into Onyx."
+    }
+
+    private var iconName: String {
+        if model.loginAttempt != nil { return "person.badge.clock" }
+        return model.primaryLoginMethod == nil ? "key.slash" : "person.crop.circle.badge.exclamationmark"
+    }
+
+    private var recoveryTint: Color {
+        model.loginAttempt == nil ? OnyxTheme.warning : OnyxTheme.iris
+    }
+
+    @ViewBuilder
+    private var actionButtons: some View {
+        if let attempt = model.loginAttempt {
+            if attempt.userCode != nil {
+                Button("Copy Code", action: model.copyDeviceCode)
+                    .buttonStyle(.borderless)
+                    .frame(minHeight: OnyxHitTarget.row)
+                    .contentShape(Rectangle())
+            }
+            secondarySettingsAction
+            Button(
+                AccountAccessPresentation.resumeActionTitle(hasDeviceCode: attempt.userCode != nil),
+                action: model.reopenLoginPage
+            )
+            .buttonStyle(.borderedProminent)
+            .tint(OnyxTheme.iris)
+            .foregroundStyle(OnyxTheme.canvas)
+            .controlSize(.small)
+            .frame(minHeight: OnyxHitTarget.row)
+            .contentShape(Rectangle())
+            Button("Cancel", action: model.cancelLogin)
+                .buttonStyle(.borderless)
+                .disabled(model.isAuthenticating)
+                .frame(minHeight: OnyxHitTarget.row)
+                .contentShape(Rectangle())
+        } else if model.isAuthenticating {
+            HStack(spacing: 7) {
+                ProgressView().controlSize(.small)
+                Text("Opening secure sign in…")
+                    .font(.system(size: OnyxTypography.secondary))
+                    .foregroundStyle(OnyxTheme.readingText)
+            }
+            .frame(minHeight: OnyxHitTarget.row)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Opening secure sign in")
+        } else {
+            ForEach(idleActions, id: \.self) { action in
+                idleAction(action)
+            }
+        }
+    }
+
+    private var idleActions: [AccountAccessPresentation.Action] {
+        AccountAccessPresentation.idleActions(
+            hasLoginMethod: model.primaryLoginMethod != nil,
+            hasDeviceCodeMethod: model.deviceCodeLoginMethod != nil,
+            runtimeName: model.runtimeDisplayName
+        )
+    }
+
+    @ViewBuilder
+    private func idleAction(_ action: AccountAccessPresentation.Action) -> some View {
+        switch action {
+        case let .openSettings(prominent):
+            if prominent {
+                SettingsLink {
+                    Text(action.title)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(OnyxTheme.iris)
+                .foregroundStyle(OnyxTheme.canvas)
+                .controlSize(.small)
+                .frame(minHeight: action.minimumHeight)
+                .contentShape(Rectangle())
+                .accessibilityLabel(action.accessibilityLabel)
+                .accessibilityHint(action.accessibilityHint)
+            } else {
+                settingsAction(action)
+            }
+        case .moreSignInOptions:
+            if let deviceMethod = model.deviceCodeLoginMethod {
+                Menu {
+                    Button(deviceMethod.displayName) { model.startLogin(deviceMethod) }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .frame(width: OnyxHitTarget.compact, height: OnyxHitTarget.compact)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .frame(minHeight: action.minimumHeight)
+                .onyxHelp(action.title)
+                .accessibilityLabel(action.accessibilityLabel)
+                .accessibilityHint(action.accessibilityHint)
+            }
+        case .signIn:
+            if let method = model.primaryLoginMethod {
+                Button(action.title) {
+                    model.startLogin(method)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(OnyxTheme.iris)
+                .foregroundStyle(OnyxTheme.canvas)
+                .controlSize(.small)
+                .frame(minHeight: action.minimumHeight)
+                .contentShape(Rectangle())
+                .accessibilityLabel(action.accessibilityLabel)
+                .accessibilityHint(action.accessibilityHint)
+            }
+        }
+    }
+
+    private var secondarySettingsAction: some View {
+        settingsAction(.openSettings(prominent: false))
+    }
+
+    private func settingsAction(_ action: AccountAccessPresentation.Action) -> some View {
+        SettingsLink {
+            Text(action.title)
+        }
+        .buttonStyle(.borderless)
+        .frame(minHeight: action.minimumHeight)
+        .contentShape(Rectangle())
+        .accessibilityLabel(action.accessibilityLabel)
+        .accessibilityHint(action.accessibilityHint)
     }
 }
 

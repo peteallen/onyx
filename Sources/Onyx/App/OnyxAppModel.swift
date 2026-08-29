@@ -403,12 +403,30 @@ final class OnyxAppModel: ObservableObject {
 
     private var questionDrafts: [RuntimeRequestID: InteractionDraftEntry<RuntimeQuestionDraft>] = [:]
     private var formDrafts: [RuntimeRequestID: InteractionDraftEntry<RuntimeFormDraft>] = [:]
+    /// Provider requests that were already pending when account access expired
+    /// remain visible as context, but their old request IDs must never become
+    /// authorizing again merely because login succeeded. A fresh provider
+    /// interaction event after recovery explicitly releases one quarantine.
+    private var recoveryQuarantinedInteractionIDs: Set<RuntimeRequestID> = []
+    /// Fences response completions that began before the account-recovery
+    /// boundary. Even an unusually late success cannot clear or implicitly
+    /// reuse the old approval after credentials have changed.
+    private var recoveryInteractionGeneration: UInt64 = 0
     private var pendingRestoredSelectionID: String?
     private var cancelledLoginID: String?
     /// A stale signed-in event cannot prove that a revoked refresh token was
     /// replaced. Clear recovery only after a login started from that recovery
     /// completes and its authoritative account read confirms the new session.
     private var loginRecoveryPendingConfirmation = false
+    /// The last authoritative, provider-reported identity that owns the
+    /// account-scoped state mounted in this window. During an expired-login
+    /// recovery, this is frozen before a new ceremony begins so a successful
+    /// refresh cannot silently attach account A's task or draft to account B.
+    /// A nil value is deliberately not treated as proof that two accounts are
+    /// equal; identity-less recovery takes the destructive boundary rather
+    /// than risking old account state under replacement credentials.
+    private var mountedAccountIdentity: AccountIdentity?
+    private var authenticationRecoveryAccountIdentity: AccountIdentity?
     private var didStart = false
     private var navigationRevision = 0
     /// Distinguishes the user's first explicit New Task action from the
@@ -437,6 +455,22 @@ final class OnyxAppModel: ObservableObject {
     /// the provider-neutral reducer safe against late events from any future
     /// ephemeral-capable adapter without an arbitrary eviction boundary.
     private var discardedSideChatThreadIDs: Set<String> = []
+
+    /// ChatGPT email is the stable account identifier exposed by app-server's
+    /// authoritative `account/read` result. Authentication mode is included so
+    /// identities from unrelated credential systems can never compare equal.
+    private struct AccountIdentity: Equatable {
+        let mode: RuntimeAuthMode
+        let email: String
+
+        init?(_ auth: RuntimeAuthState) {
+            guard let mode = auth.mode,
+                  let email = auth.email?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !email.isEmpty else { return nil }
+            self.mode = mode
+            self.email = email.lowercased()
+        }
+    }
 
     /// Cursor-backed providers hydrate older turns remotely. Providers without
     /// that capability still get the same bounded presentation by retaining
@@ -547,6 +581,30 @@ final class OnyxAppModel: ObservableObject {
         model: nil,
         branch: nil
     )
+
+    /// Codex exposes its login ceremonies through the app-server session
+    /// snapshot. An expired account can fail that snapshot before a session
+    /// reaches the window model, but the already-initialized runtime still
+    /// knows how to accept the same ceremony IDs. Keep these provider-owned
+    /// descriptors as a narrow presentation fallback so the recovery card can
+    /// start sign-in immediately instead of forcing a reconnect loop.
+    private static func fallbackLoginMethods(for kind: AgentRuntimeKind?) -> [RuntimeLoginMethod] {
+        guard kind == .codex else { return [] }
+        return [
+            RuntimeLoginMethod(
+                id: "codex.chatgpt.browser",
+                displayName: "Continue with ChatGPT",
+                detail: "Sign in securely in your browser",
+                ceremony: .browser
+            ),
+            RuntimeLoginMethod(
+                id: "codex.chatgpt.device-code",
+                displayName: "Use a device code",
+                detail: "Enter a one-time code at OpenAI",
+                ceremony: .deviceCode
+            ),
+        ]
+    }
 
     init(
         runtime: (any AgentRuntime)?,
@@ -961,7 +1019,13 @@ final class OnyxAppModel: ObservableObject {
     }
 
     var activeUserInteraction: RuntimeUserInteraction? {
-        guard canRunAgent, !isShowingArchivedThreads else { return nil }
+        // A request that was on screen when sign-in expired is still useful
+        // context. Keep presenting it while the account recovery surface owns
+        // the next action; `canRespond(to:)` independently keeps every old
+        // approval, answer, or form submission non-authorizing.
+        guard !isShowingArchivedThreads,
+              !isSigningOut,
+              authenticationRecovery != nil || canRunAgent else { return nil }
         let eligible = pendingUserInteractions.filter { interaction in
             interaction.threadID == nil || interaction.threadID == selectedThreadID
         }
@@ -969,7 +1033,8 @@ final class OnyxAppModel: ObservableObject {
     }
 
     func canForkThread(_ thread: RuntimeThread) -> Bool {
-        !thread.status.isBusy
+        canRunAgent
+            && !thread.status.isBusy
             && !isPreparingLatestMessageEdit(for: thread.id)
             && !isReviewActive(for: thread.id)
             && !hasPendingInteraction(for: thread.id, blockingOnly: true)
@@ -980,16 +1045,30 @@ final class OnyxAppModel: ObservableObject {
     }
 
     func canArchiveThread(_ thread: RuntimeThread) -> Bool {
-        !thread.status.isBusy
+        canRunAgent
+            && !thread.status.isBusy
             && !isPreparingLatestMessageEdit(for: thread.id)
             && !isReviewActive(for: thread.id)
             && !hasPendingInteraction(for: thread.id, blockingOnly: false)
     }
 
     func canDeleteThread(_ thread: RuntimeThread) -> Bool {
-        thread.id != Self.welcomeThread.id
+        canRunAgent
+            && thread.id != Self.welcomeThread.id
             && !isPreparingLatestMessageEdit(for: thread.id)
             && !isReviewActive(for: thread.id)
+    }
+
+    func canRespond(to interaction: RuntimeUserInteraction) -> Bool {
+        guard canRunAgent,
+              !recoveryQuarantinedInteractionIDs.contains(interaction.id),
+              !respondingInteractionIDs.contains(interaction.id) else { return false }
+        if sideChatInteraction == interaction {
+            return interaction.threadID == sideChatThreadID
+                && !isRespondingToSideChatInteraction
+        }
+        return pendingUserInteractions.contains(interaction)
+            && (interaction.threadID == nil || interaction.threadID == selectedThreadID)
     }
 
     func isResponding(to interaction: RuntimeUserInteraction) -> Bool {
@@ -1027,12 +1106,14 @@ final class OnyxAppModel: ObservableObject {
     }
 
     var primaryLoginMethod: RuntimeLoginMethod? {
-        session?.availableLoginMethods.first(where: { $0.ceremony == .browser })
-            ?? session?.availableLoginMethods.first
+        let methods = session?.availableLoginMethods ?? Self.fallbackLoginMethods(for: runtimeKind)
+        return methods.first(where: { $0.ceremony == .browser })
+            ?? methods.first
     }
 
     var deviceCodeLoginMethod: RuntimeLoginMethod? {
-        session?.availableLoginMethods.first(where: { $0.ceremony == .deviceCode })
+        let methods = session?.availableLoginMethods ?? Self.fallbackLoginMethods(for: runtimeKind)
+        return methods.first(where: { $0.ceremony == .deviceCode })
     }
 
     var visibleThreads: [RuntimeThread] {
@@ -1418,7 +1499,10 @@ final class OnyxAppModel: ObservableObject {
     func startLogin(_ method: RuntimeLoginMethod) {
         guard let runtime, !isAuthenticating, loginAttempt == nil else { return }
         cancelledLoginID = nil
-        loginRecoveryPendingConfirmation = authenticationRecovery != nil
+        // A recovery login is not confirmed merely because its browser/device
+        // ceremony opened. Arm confirmation only from the matching successful
+        // completion event, then require an authoritative account refresh.
+        loginRecoveryPendingConfirmation = false
         isAuthenticating = true
 
         Task { [weak self] in
@@ -1466,6 +1550,7 @@ final class OnyxAppModel: ObservableObject {
                 try await runtime.cancelLogin(id: attempt.loginID)
                 if loginAttempt?.loginID == attempt.loginID { loginAttempt = nil }
                 isAuthenticating = false
+                loginRecoveryPendingConfirmation = false
             } catch {
                 cancelledLoginID = nil
                 isAuthenticating = false
@@ -1586,6 +1671,20 @@ final class OnyxAppModel: ObservableObject {
                       connectionRevision == revision,
                       !Task.isCancelled else { return }
                 isLoadingThreadList = false
+                if let recovery = authenticationRecovery(for: error) {
+                    // The Codex runtime can reject account/read before it has
+                    // produced a session snapshot. Keep this failure attached
+                    // to the workspace so the recovery card can offer its
+                    // login ceremonies; a raw connection alert would both
+                    // leak provider diagnostics and leave the user in a
+                    // reconnect loop.
+                    requireAuthenticationRecovery(recovery)
+                    connectionState = .failed("Sign in required")
+                    if notice?.title == connectionFailureNoticeTitle {
+                        notice = nil
+                    }
+                    return
+                }
                 connectionState = .failed(error.localizedDescription)
                 notice = (connectionFailureNoticeTitle, error.localizedDescription)
                 return
@@ -1820,8 +1919,12 @@ final class OnyxAppModel: ObservableObject {
                       sideChatParentThreadID == parentID,
                       !Task.isCancelled else { return }
                 isSideChatLoading = false
-                sideChatError = error.localizedDescription
                 sideChatForkTask = nil
+                if requireAuthenticationRecovery(for: error) {
+                    sideChatError = nil
+                    return
+                }
+                sideChatError = error.localizedDescription
             }
         }
     }
@@ -1849,9 +1952,10 @@ final class OnyxAppModel: ObservableObject {
                 || sideChatTurnTask != nil else { return }
 
         let threadID = sideChatThreadID
-        let shouldInterrupt = isSideChatTurnRunning
+        let shouldInterrupt = isSideChatTurnRunning && canRunAgent
         if let interactionID = sideChatInteraction?.id {
             removeInteractionDraft(for: interactionID)
+            recoveryQuarantinedInteractionIDs.remove(interactionID)
         }
         if let threadID {
             rememberDiscardedSideChatThread(threadID)
@@ -1980,7 +2084,6 @@ final class OnyxAppModel: ObservableObject {
                 let laterInputs = Set(sideChatComposerImages.map(\.input))
                 sideChatComposerImages = images.filter { !laterInputs.contains($0.input) }
                     + sideChatComposerImages
-                sideChatError = error.localizedDescription
                 // The error strip below the transcript is the one visible
                 // failure surface. Remove the optimistic sent row instead of
                 // leaving it behind beside a second red error row; otherwise
@@ -1993,12 +2096,17 @@ final class OnyxAppModel: ObservableObject {
                     reconciled.remove(at: optimisticIndex)
                     replaceSideChatTimeline(reconciled)
                 }
+                if requireAuthenticationRecovery(for: error) {
+                    sideChatError = nil
+                    return
+                }
+                sideChatError = error.localizedDescription
             }
         }
     }
 
     func interruptSideChat() {
-        guard let runtime, let threadID = sideChatThreadID else { return }
+        guard canRunAgent, let runtime, let threadID = sideChatThreadID else { return }
         let generation = sideChatGeneration
         let epoch = accountEpoch
         Task { [weak self] in
@@ -2009,6 +2117,10 @@ final class OnyxAppModel: ObservableObject {
                 guard accountEpoch == epoch,
                       sideChatGeneration == generation,
                       isSideChatPresented else { return }
+                if requireAuthenticationRecovery(for: error) {
+                    sideChatError = nil
+                    return
+                }
                 sideChatError = error.localizedDescription
             }
         }
@@ -2017,22 +2129,28 @@ final class OnyxAppModel: ObservableObject {
     func respondToSideChatInteraction(
         _ response: RuntimeUserInteractionResponse
     ) {
-        guard canRunAgent,
-              let interaction = sideChatInteraction,
-              interaction.threadID == sideChatThreadID,
+        guard let interaction = sideChatInteraction,
+              canRespond(to: interaction),
               let runtime,
               !isRespondingToSideChatInteraction else { return }
 
         let epoch = accountEpoch
         let generation = sideChatGeneration
+        let interactionGeneration = recoveryInteractionGeneration
         isRespondingToSideChatInteraction = true
         sideChatError = nil
         Task { [weak self] in
             guard let self else { return }
+            defer {
+                if sideChatGeneration == generation {
+                    isRespondingToSideChatInteraction = false
+                }
+            }
             do {
                 try await runtime.respond(to: interaction.id, with: response)
                 guard accountEpoch == epoch,
                       sideChatGeneration == generation,
+                      recoveryInteractionGeneration == interactionGeneration,
                       isSideChatPresented,
                       sideChatThreadID == interaction.threadID else { return }
                 if sideChatInteraction?.id == interaction.id {
@@ -2043,10 +2161,10 @@ final class OnyxAppModel: ObservableObject {
                 guard accountEpoch == epoch,
                       sideChatGeneration == generation,
                       isSideChatPresented else { return }
-                sideChatError = error.localizedDescription
+                if !requireAuthenticationRecovery(for: error) {
+                    sideChatError = error.localizedDescription
+                }
             }
-            guard sideChatGeneration == generation else { return }
-            isRespondingToSideChatInteraction = false
         }
     }
 
@@ -2646,6 +2764,23 @@ final class OnyxAppModel: ObservableObject {
                     restoreFailedSend(context.draftText, for: failureDraftKey)
                     restoreFailedImages(context.images, for: failureDraftKey)
                 }
+                if let authenticationRecovery = authenticationRecovery(for: error) {
+                    // The runtime also broadcasts this provider-wide, but the
+                    // typed request error lets this exact window settle without
+                    // racing a generic failure row or modal against the attached
+                    // sign-in surface.
+                    requireAuthenticationRecovery(authenticationRecovery)
+                    if !context.wasTurnRunning, let targetThreadID {
+                        mutateThread(id: targetThreadID) { $0.status = .idle }
+                    }
+                    if !context.wasTurnRunning,
+                       (selectedThreadID == targetThreadID
+                        || (targetThreadID == nil
+                            && navigationRevision == context.navigationRevision)) {
+                        isTurnRunning = false
+                    }
+                    return
+                }
                 let failure = context.wasTurnRunning
                     ? (
                         title: "Could not queue steering message",
@@ -2784,7 +2919,7 @@ final class OnyxAppModel: ObservableObject {
     }
 
     func interrupt() {
-        guard let id = selectedThreadID, let runtime else { return }
+        guard canRunAgent, let id = selectedThreadID, let runtime else { return }
         let epoch = accountEpoch
         Task { [weak self] in
             guard let self else { return }
@@ -2792,13 +2927,16 @@ final class OnyxAppModel: ObservableObject {
                 try await runtime.interrupt(threadID: id)
             } catch {
                 guard accountEpoch == epoch else { return }
-                notice = ("Could not stop the task", error.localizedDescription)
+                if !requireAuthenticationRecovery(for: error) {
+                    notice = ("Could not stop the task", error.localizedDescription)
+                }
             }
         }
     }
 
     func startReview() {
         guard let runtime, let thread = selectedThread else { return }
+        guard canRunAgent else { return }
         guard canStartReview else {
             if isTurnRunning || isStartingReview || reviewingThreadID != nil {
                 notice = (
@@ -2848,6 +2986,7 @@ final class OnyxAppModel: ObservableObject {
                 if selectedThreadID == threadID {
                     isTurnRunning = originalStatus.isBusy
                 }
+                if requireAuthenticationRecovery(for: error) { return }
                 let detail: String
                 if case let AgentRuntimeError.requestFailed(_, message) = error,
                    message.localizedCaseInsensitiveContains("active writer") {
@@ -2870,26 +3009,28 @@ final class OnyxAppModel: ObservableObject {
             respondToSideChatInteraction(response)
             return
         }
-        guard canRunAgent,
-              pendingUserInteractions.contains(interaction),
-              interaction.threadID == nil || interaction.threadID == selectedThreadID,
+        guard canRespond(to: interaction),
               let runtime,
               !respondingInteractionIDs.contains(interaction.id) else { return }
         respondingInteractionIDs.insert(interaction.id)
         let epoch = accountEpoch
+        let interactionGeneration = recoveryInteractionGeneration
         Task { [weak self] in
             guard let self else { return }
+            defer { respondingInteractionIDs.remove(interaction.id) }
             do {
                 try await runtime.respond(to: interaction.id, with: response)
-                guard accountEpoch == epoch else { return }
+                guard accountEpoch == epoch,
+                      recoveryInteractionGeneration == interactionGeneration else { return }
                 pendingUserInteractions.removeAll { $0.id == interaction.id }
                 removeInteractionDraft(for: interaction.id)
                 reconcileThreadStatusAfterInteraction(for: interaction.threadID)
             } catch {
                 guard accountEpoch == epoch else { return }
-                notice = ("Response failed", error.localizedDescription)
+                if !requireAuthenticationRecovery(for: error) {
+                    notice = ("Response failed", error.localizedDescription)
+                }
             }
-            respondingInteractionIDs.remove(interaction.id)
         }
     }
 
@@ -2914,6 +3055,7 @@ final class OnyxAppModel: ObservableObject {
         }
         guard let threadID = interaction.threadID,
               interaction.threadID == selectedThreadID,
+              canRunAgent,
               let runtime else { return }
         let epoch = accountEpoch
         Task { [weak self] in
@@ -2921,7 +3063,9 @@ final class OnyxAppModel: ObservableObject {
                 try await runtime.interrupt(threadID: threadID)
             } catch {
                 guard let self, accountEpoch == epoch else { return }
-                notice = ("Could not stop the task", error.localizedDescription)
+                if !requireAuthenticationRecovery(for: error) {
+                    notice = ("Could not stop the task", error.localizedDescription)
+                }
             }
         }
     }
@@ -3173,6 +3317,9 @@ final class OnyxAppModel: ObservableObject {
             } catch {
                 guard accountEpoch == epoch, !Task.isCancelled else { return }
                 let operationError = error
+                if requireAuthenticationRecovery(for: operationError) {
+                    return
+                }
                 let compatibilityFailure = Self.isHistoryRevertCompatibilityFailure(operationError)
                 if compatibilityFailure {
                     downgradeRuntimeCapability(.threadHistoryRevert)
@@ -3363,7 +3510,9 @@ final class OnyxAppModel: ObservableObject {
     }
 
     func beginRename(_ id: String, window: NSWindow?) {
-        guard let thread = threads.first(where: { $0.id == id }), id != Self.welcomeThread.id else { return }
+        guard canRunAgent,
+              let thread = threads.first(where: { $0.id == id }),
+              id != Self.welcomeThread.id else { return }
         let epoch = accountEpoch
         let alert = NSAlert()
         alert.messageText = "Rename task"
@@ -3387,7 +3536,10 @@ final class OnyxAppModel: ObservableObject {
     }
 
     func archive(_ id: String) {
-        guard !isShowingArchivedThreads, id != Self.welcomeThread.id, let runtime else { return }
+        guard canRunAgent,
+              !isShowingArchivedThreads,
+              id != Self.welcomeThread.id,
+              let runtime else { return }
         if let thread = threads.first(where: { $0.id == id }), !canArchiveThread(thread) {
             notice = (
                 "Task is still active",
@@ -3417,13 +3569,15 @@ final class OnyxAppModel: ObservableObject {
                 }
             } catch {
                 guard accountEpoch == epoch, !Task.isCancelled else { return }
-                notice = ("Could not archive task", error.localizedDescription)
+                if !requireAuthenticationRecovery(for: error) {
+                    notice = ("Could not archive task", error.localizedDescription)
+                }
             }
         }
     }
 
     func restore(_ id: String) {
-        guard isShowingArchivedThreads, let runtime else { return }
+        guard canRunAgent, isShowingArchivedThreads, let runtime else { return }
         threadListTask?.cancel()
         navigationRevision += 1
         let navigationAtStart = navigationRevision
@@ -3455,13 +3609,16 @@ final class OnyxAppModel: ObservableObject {
                       navigationRevision == navigationAtStart,
                       !Task.isCancelled else { return }
                 isLoadingThreadList = false
-                notice = ("Could not restore task", error.localizedDescription)
+                if !requireAuthenticationRecovery(for: error) {
+                    notice = ("Could not restore task", error.localizedDescription)
+                }
             }
         }
     }
 
     func fork(_ id: String) {
-        guard !isShowingArchivedThreads, supports(.threadForking), let runtime,
+        guard canRunAgent,
+              !isShowingArchivedThreads, supports(.threadForking), let runtime,
               let source = threads.first(where: { $0.id == id }) else { return }
         guard canForkThread(source) else {
             notice = ("Task is still running", "Stop or finish the current turn before creating a fork.")
@@ -3491,13 +3648,16 @@ final class OnyxAppModel: ObservableObject {
                 selectThread(forked.id)
             } catch {
                 guard accountEpoch == epoch, !Task.isCancelled else { return }
-                notice = ("Could not fork task", error.localizedDescription)
+                if !requireAuthenticationRecovery(for: error) {
+                    notice = ("Could not fork task", error.localizedDescription)
+                }
             }
         }
     }
 
     func compact(_ id: String) {
-        guard !isShowingArchivedThreads, supports(.threadCompaction), let runtime,
+        guard canRunAgent,
+              !isShowingArchivedThreads, supports(.threadCompaction), let runtime,
               let thread = threads.first(where: { $0.id == id }) else { return }
         guard canCompactThread(thread) else {
             notice = ("Task is still running", "Stop or finish the current turn before compacting its context.")
@@ -3514,13 +3674,16 @@ final class OnyxAppModel: ObservableObject {
                 mutateThread(id: id) { $0.status = .running }
             } catch {
                 guard accountEpoch == epoch, !Task.isCancelled else { return }
-                notice = ("Could not compact task", error.localizedDescription)
+                if !requireAuthenticationRecovery(for: error) {
+                    notice = ("Could not compact task", error.localizedDescription)
+                }
             }
         }
     }
 
     func beginDelete(_ id: String, window: NSWindow?) {
-        guard supports(.threadDeletion), id != Self.welcomeThread.id,
+        guard canRunAgent,
+              supports(.threadDeletion), id != Self.welcomeThread.id,
               let thread = threads.first(where: { $0.id == id }) else { return }
         guard canDeleteThread(thread) else {
             notice = (
@@ -3554,6 +3717,105 @@ final class OnyxAppModel: ObservableObject {
         notice = nil
     }
 
+    /// Enters the provider-wide recovery boundary without treating it as an
+    /// account change. Durable task state stays mounted, while every request
+    /// ID that existed before the new login is quarantined from future writes.
+    private func requireAuthenticationRecovery(_ recovery: RuntimeAuthenticationRecovery) {
+        if authenticationRecovery == nil {
+            authenticationRecoveryAccountIdentity = mountedAccountIdentity
+                ?? session.flatMap { AccountIdentity($0.auth) }
+        }
+        recoveryInteractionGeneration &+= 1
+        authenticationRecovery = recovery
+        recoveryQuarantinedInteractionIDs.formUnion(pendingUserInteractions.map(\.id))
+        if let sideChatInteraction {
+            recoveryQuarantinedInteractionIDs.insert(sideChatInteraction.id)
+        }
+        isTurnRunning = false
+        isSideChatTurnRunning = false
+    }
+
+    @discardableResult
+    private func requireAuthenticationRecovery(for error: any Error) -> Bool {
+        guard let recovery = authenticationRecovery(for: error) else { return false }
+        requireAuthenticationRecovery(recovery)
+        return true
+    }
+
+    /// A successful account refresh proves only that credentials work again;
+    /// it does not prove how the interrupted task settled. Resume the selected
+    /// task once so its failed/running state, transcript tail, and pending
+    /// interaction set become authoritative before Retry or another write is
+    /// offered. This deliberately paints over the existing snapshot instead of
+    /// blanking it behind a loading state.
+    private func reconcileSelectedThreadAfterAuthenticationRecovery() {
+        guard authenticationRecovery == nil,
+              let threadID = selectedThreadID,
+              threadID != Self.welcomeThread.id,
+              let runtime else { return }
+
+        // Snapshot only requests that crossed the recovery boundary. A provider
+        // may reissue one of those request IDs while the authoritative resume is
+        // still in flight; its event removes the ID from the quarantine, which
+        // must make the replacement survive the older resume completion.
+        let quarantinedInteractionIDsAtStart = recoveryQuarantinedInteractionIDs
+        loadTask?.cancel()
+        resetEarlierHistory()
+        let epoch = accountEpoch
+        let revision = navigationRevision
+        loadTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let loaded = try await loadInitialHistory(
+                    for: threadID,
+                    runtime: runtime,
+                    resumeUnpaginated: true
+                )
+                guard accountEpoch == epoch,
+                      navigationRevision == revision,
+                      selectedThreadID == threadID,
+                      authenticationRecovery == nil,
+                      !Task.isCancelled else { return }
+
+                replaceTimeline(
+                    loaded.visibleItems,
+                    authoritativeFor: loaded.conversation.thread.id
+                )
+                installEarlierHistory(from: loaded)
+                updateThread(
+                    loaded.conversation.thread,
+                    preservePositionIfPresent: true
+                )
+                let status = loaded.conversation.thread.status
+                isTurnRunning = status.isBusy || isReviewActive(for: threadID)
+                if !status.isBusy {
+                    activeTurnIDsByThreadID.removeValue(forKey: threadID)
+                    pendingUserItemByThreadID.removeValue(forKey: threadID)
+                    settlePendingSteeringMessages(for: threadID)
+                    clearReviewState(for: threadID)
+                    let stillStaleInteractionIDs = quarantinedInteractionIDsAtStart
+                        .intersection(recoveryQuarantinedInteractionIDs)
+                    removeUserInteractions(
+                        for: threadID,
+                        limitedTo: stillStaleInteractionIDs
+                    )
+                    reconcileThreadStatusAfterInteraction(for: threadID)
+                }
+                resolveLatestMessageEditAfterAuthoritativeReload(threadID: threadID)
+            } catch {
+                guard accountEpoch == epoch,
+                      navigationRevision == revision,
+                      selectedThreadID == threadID,
+                      !Task.isCancelled else { return }
+                if requireAuthenticationRecovery(for: error) { return }
+                notice = (
+                    "Task refresh needed",
+                    "You are signed in again, but Onyx could not refresh this task yet. Reopen it to confirm its latest status."
+                )
+            }
+        }
+    }
+
     private func handle(_ event: AgentRuntimeEvent) {
         if shouldDiscardClosedSideChatEvent(event) {
             return
@@ -3571,6 +3833,7 @@ final class OnyxAppModel: ObservableObject {
             if case .failed = state {
                 pendingUserInteractions.removeAll()
                 respondingInteractionIDs.removeAll()
+                recoveryQuarantinedInteractionIDs.removeAll()
                 removeAllInteractionDrafts()
                 reviewingThreadID = nil
                 startingReviewThreadID = nil
@@ -3581,6 +3844,7 @@ final class OnyxAppModel: ObservableObject {
             } else if case .disconnected = state {
                 pendingUserInteractions.removeAll()
                 respondingInteractionIDs.removeAll()
+                recoveryQuarantinedInteractionIDs.removeAll()
                 removeAllInteractionDrafts()
                 reviewingThreadID = nil
                 startingReviewThreadID = nil
@@ -3612,17 +3876,28 @@ final class OnyxAppModel: ObservableObject {
                 closeSideChat()
             }
             applyAuthProjection(updatedAuth)
-            if !updatedAuth.canRun, authenticationRecovery == nil {
+            // A provider-authored signed-out projection is the destructive
+            // account boundary even if an expired-login recovery was already
+            // visible. Recovery preserves state only while account ownership
+            // is unresolved; it must never weaken an authoritative logout.
+            if !updatedAuth.canRun {
                 closeAccountBoundary()
             }
             scheduleAccountRefresh(rejectSignedInSession: !updatedAuth.isSignedIn)
         case let .authenticationRecoveryRequired(recovery):
-            authenticationRecovery = recovery
-            isTurnRunning = false
+            requireAuthenticationRecovery(recovery)
+            if let currentNotice = notice,
+               CodexProjection.isAuthenticationRecoveryDiagnostic(currentNotice.detail) {
+                // A stderr/request race can leave the raw diagnostic in the
+                // alert binding just before the structured recovery event
+                // arrives. Remove only that matching auth alert; unrelated
+                // project or workspace notices remain available.
+                notice = nil
+            }
             // The transcript row and attached recovery surface carry this
             // state. Keep partially answered provider interactions intact and
-            // avoid a duplicate modal.
-            notice = nil
+            // avoid creating a duplicate modal. Do not clear an unrelated
+            // notice that the user may still need to read.
         case let .loginCompleted(completion):
             if cancelledLoginID != nil,
                (completion.loginID == nil || completion.loginID == cancelledLoginID),
@@ -3635,6 +3910,12 @@ final class OnyxAppModel: ObservableObject {
             let matchesCurrentAttempt = completion.loginID == nil
                 || loginAttempt?.loginID == completion.loginID
             if completion.success {
+                if authenticationRecovery != nil {
+                    // Successful login is provider-wide. Every attached window
+                    // in recovery must require one authoritative signed-in
+                    // account read, even if another window owned the ceremony.
+                    loginRecoveryPendingConfirmation = true
+                }
                 // Every window shares the provider account, even though only
                 // Settings owns the visible login ceremony. Refresh all window
                 // projections after a successful completion notification.
@@ -3642,10 +3923,7 @@ final class OnyxAppModel: ObservableObject {
                     isAuthenticating = false
                     loginAttempt = nil
                 }
-                scheduleAccountRefresh(
-                    confirmsAuthenticationRecovery: matchesCurrentAttempt
-                        && loginRecoveryPendingConfirmation
-                )
+                scheduleAccountRefresh()
             } else {
                 guard matchesCurrentAttempt else { return }
                 isAuthenticating = false
@@ -3802,6 +4080,13 @@ final class OnyxAppModel: ObservableObject {
             }
         case let .userInteractionRequested(interaction):
             guard authState.canRun, !isSigningOut else { return }
+            if authenticationRecovery == nil {
+                // Re-emission after a successful resume is the provider's
+                // explicit confirmation that this request is still pending.
+                recoveryQuarantinedInteractionIDs.remove(interaction.id)
+            } else {
+                recoveryQuarantinedInteractionIDs.insert(interaction.id)
+            }
             if interaction.isBlocking,
                let threadID = interaction.threadID,
                let index = threads.firstIndex(where: { $0.id == threadID }) {
@@ -3828,10 +4113,26 @@ final class OnyxAppModel: ObservableObject {
             let threadID = pendingUserInteractions.first(where: { $0.id == requestID })?.threadID
             pendingUserInteractions.removeAll { $0.id == requestID }
             respondingInteractionIDs.remove(requestID)
+            recoveryQuarantinedInteractionIDs.remove(requestID)
             removeInteractionDraft(for: requestID)
             reconcileThreadStatusAfterInteraction(for: threadID)
         case let .runtimeNotice(title, detail):
-            notice = (title, detail)
+            // A few app-server versions report an expired ChatGPT session as
+            // a generic runtime notice (and may include the complete 401
+            // tracing envelope).  That is the same account-recovery state as
+            // a typed request failure, not a developer diagnostic.  Route it
+            // to the attached sign-in surface and discard any matching raw
+            // alert that raced ahead of this event.
+            if runtimeKind == .codex,
+               CodexProjection.isAuthenticationRecoveryDiagnostic(detail) {
+                requireAuthenticationRecovery(.signInExpired)
+                if let currentNotice = notice,
+                   CodexProjection.isAuthenticationRecoveryDiagnostic(currentNotice.detail) {
+                    notice = nil
+                }
+            } else {
+                notice = (title, detail)
+            }
         }
     }
 
@@ -3926,6 +4227,11 @@ final class OnyxAppModel: ObservableObject {
 
         case let .userInteractionRequested(interaction)
             where interaction.threadID == sideThreadID:
+            if authenticationRecovery == nil {
+                recoveryQuarantinedInteractionIDs.remove(interaction.id)
+            } else {
+                recoveryQuarantinedInteractionIDs.insert(interaction.id)
+            }
             if let existing = sideChatInteraction, existing != interaction {
                 removeInteractionDraft(for: existing.id)
             }
@@ -3937,6 +4243,7 @@ final class OnyxAppModel: ObservableObject {
             where sideChatInteraction?.id == requestID:
             sideChatInteraction = nil
             isRespondingToSideChatInteraction = false
+            recoveryQuarantinedInteractionIDs.remove(requestID)
             removeInteractionDraft(for: requestID)
             return true
 
@@ -5001,7 +5308,7 @@ final class OnyxAppModel: ObservableObject {
     }
 
     private func renameThread(_ id: String, name: String) async {
-        guard let runtime else { return }
+        guard canRunAgent, let runtime else { return }
         let epoch = accountEpoch
         do {
             try await runtime.renameThread(id: id, name: name)
@@ -5011,7 +5318,9 @@ final class OnyxAppModel: ObservableObject {
             }
         } catch {
             guard accountEpoch == epoch, !Task.isCancelled else { return }
-            notice = ("Could not rename task", error.localizedDescription)
+            if !requireAuthenticationRecovery(for: error) {
+                notice = ("Could not rename task", error.localizedDescription)
+            }
         }
     }
 
@@ -5050,13 +5359,23 @@ final class OnyxAppModel: ObservableObject {
         formDrafts.removeAll()
     }
 
-    private func removeUserInteractions(for threadID: String) {
-        let requestIDs = pendingUserInteractions.compactMap { interaction in
-            interaction.threadID == threadID ? interaction.id : nil
+    private func removeUserInteractions(
+        for threadID: String,
+        limitedTo limitedRequestIDs: Set<RuntimeRequestID>? = nil
+    ) {
+        let requestIDs = pendingUserInteractions.compactMap { interaction -> RuntimeRequestID? in
+            guard interaction.threadID == threadID,
+                  limitedRequestIDs?.contains(interaction.id) ?? true else { return nil }
+            return interaction.id
         }
-        pendingUserInteractions.removeAll { $0.threadID == threadID }
+        let removedRequestIDs = Set(requestIDs)
+        pendingUserInteractions.removeAll { interaction in
+            interaction.threadID == threadID
+                && removedRequestIDs.contains(interaction.id)
+        }
         for requestID in requestIDs {
             respondingInteractionIDs.remove(requestID)
+            recoveryQuarantinedInteractionIDs.remove(requestID)
             removeInteractionDraft(for: requestID)
         }
     }
@@ -5087,7 +5406,9 @@ final class OnyxAppModel: ObservableObject {
             persistTaskModelSelections()
         } catch {
             guard accountEpoch == epoch, !Task.isCancelled else { return }
-            notice = ("Could not delete task", error.localizedDescription)
+            if !requireAuthenticationRecovery(for: error) {
+                notice = ("Could not delete task", error.localizedDescription)
+            }
         }
     }
 
@@ -5257,12 +5578,15 @@ final class OnyxAppModel: ObservableObject {
         startingReviewThreadID = nil
         pendingUserInteractions.removeAll()
         respondingInteractionIDs.removeAll()
+        recoveryQuarantinedInteractionIDs.removeAll()
         removeAllInteractionDrafts()
         pendingRestoredSelectionID = nil
         hasExplicitNewTaskSelection = false
         downgradedRuntimeCapabilities = []
         cancelledLoginID = nil
         loginRecoveryPendingConfirmation = false
+        authenticationRecoveryAccountIdentity = nil
+        mountedAccountIdentity = nil
         loginAttempt = nil
         isAuthenticating = false
         authenticationRecovery = nil
@@ -5308,6 +5632,10 @@ final class OnyxAppModel: ObservableObject {
         }
         session = applyingRuntimeCapabilityDowngrades(to: updatedSession)
         authState = updatedSession.auth
+        if authenticationRecovery == nil,
+           let identity = AccountIdentity(updatedSession.auth) {
+            mountedAccountIdentity = identity
+        }
         if updatedSession.auth.isSignedIn { loginAttempt = nil }
 
         if selectedModelID == nil
@@ -5349,8 +5677,7 @@ final class OnyxAppModel: ObservableObject {
     }
 
     private func scheduleAccountRefresh(
-        rejectSignedInSession: Bool = false,
-        confirmsAuthenticationRecovery: Bool = false
+        rejectSignedInSession: Bool = false
     ) {
         guard let runtime else { return }
         accountRefreshTask?.cancel()
@@ -5362,19 +5689,71 @@ final class OnyxAppModel: ObservableObject {
                 let refreshedSession = try await runtime.refreshAccount()
                 guard accountEpoch == epoch, !Task.isCancelled else { return }
                 guard !rejectSignedInSession || !refreshedSession.auth.isSignedIn else { return }
-                applyRuntimeSession(refreshedSession)
-                if confirmsAuthenticationRecovery, refreshedSession.auth.isSignedIn {
-                    authenticationRecovery = nil
+                if loginRecoveryPendingConfirmation, refreshedSession.auth.isSignedIn {
+                    finishAuthenticationRecovery(with: refreshedSession)
+                } else {
+                    applyRuntimeSession(refreshedSession)
                 }
             } catch {
                 guard accountEpoch == epoch, !Task.isCancelled else { return }
                 // The notification projection is still useful. A later account event or reconnect retries.
             }
             guard accountEpoch == epoch, !Task.isCancelled else { return }
-            if confirmsAuthenticationRecovery {
-                loginRecoveryPendingConfirmation = false
-            }
             accountRefreshTask = nil
+        }
+    }
+
+    /// Commits a login-confirmed account snapshot without ever displaying old
+    /// account state under a known replacement identity. Same-account recovery
+    /// is intentionally in place; a different known identity crosses the
+    /// normal destructive account boundary before its session is projected.
+    /// If app-server cannot identify either side, use the same destructive
+    /// boundary rather than guessing that private state is safe to preserve.
+    private func finishAuthenticationRecovery(with refreshedSession: RuntimeSession) {
+        guard loginRecoveryPendingConfirmation,
+              refreshedSession.auth.isSignedIn else { return }
+
+        // `account/read` can fail before the first connection bootstrap has a
+        // session. A successful recovery refresh proves the retained transport
+        // is usable again, but it does not resume the connection task that
+        // returned early. Remember that state so recovery can re-enter the
+        // ordinary connect + complete-catalog path below.
+        let shouldResumeConnectionBootstrap = canReconnect
+
+        let priorIdentity = authenticationRecoveryAccountIdentity
+        let refreshedIdentity = AccountIdentity(refreshedSession.auth)
+
+        guard let priorIdentity, let refreshedIdentity else {
+            // Only a known same-account result is safe for in-place recovery.
+            // When either side is unknown, clear account-owned state before
+            // projecting the refreshed session rather than guessing across a
+            // possible account replacement.
+            closeAccountBoundary()
+            applyRuntimeSession(refreshedSession)
+            if shouldResumeConnectionBootstrap {
+                reconnect()
+            }
+            return
+        }
+
+        guard priorIdentity == refreshedIdentity else {
+            closeAccountBoundary()
+            applyRuntimeSession(refreshedSession)
+            if shouldResumeConnectionBootstrap {
+                reconnect()
+            }
+            return
+        }
+
+        applyRuntimeSession(refreshedSession)
+        mountedAccountIdentity = refreshedIdentity
+        authenticationRecoveryAccountIdentity = nil
+        authenticationRecovery = nil
+        loginRecoveryPendingConfirmation = false
+        if shouldResumeConnectionBootstrap {
+            reconnect()
+        } else {
+            reconcileSelectedThreadAfterAuthenticationRecovery()
         }
     }
 
@@ -5388,6 +5767,21 @@ final class OnyxAppModel: ObservableObject {
             )
         }
         return ("Could not start sign in", detail)
+    }
+
+    /// A provider should normally throw the typed recovery error. Keep the
+    /// startup boundary tolerant of an older/runtime-wrapper build that still
+    /// forwards the original diagnostic, because this catch runs before a
+    /// session snapshot (and therefore before the view has any login methods).
+    private func authenticationRecovery(for error: any Error) -> RuntimeAuthenticationRecovery? {
+        if case let AgentRuntimeError.authenticationRecoveryRequired(recovery) = error {
+            return recovery
+        }
+        guard runtimeKind == .codex,
+              CodexProjection.isAuthenticationRecoveryDiagnostic(error.localizedDescription) else {
+            return nil
+        }
+        return .signInExpired
     }
 
     private func validateSelectedReasoningEffort() {

@@ -247,15 +247,33 @@ final class CodexProjectionTests: XCTestCase {
         XCTAssertTrue(CodexProjection.isAuthenticationRecoveryDiagnostic(diagnostic))
         XCTAssertEqual(
             CodexProjection.turnFailureMessage(from: failedTurn),
-            "Your ChatGPT sign-in is no longer valid. Sign in again to continue. Your task and draft are still here."
+            "Your ChatGPT sign-in expired. Your task and draft are still here."
         )
 
         let turn = try XCTUnwrap(CodexProjection.conversationTurn(from: failedTurn))
-        XCTAssertEqual(turn.items.first?.title, "Response failed")
+        XCTAssertEqual(turn.items.first?.title, "Sign in required")
         XCTAssertEqual(
             turn.items.first?.body,
-            "Your ChatGPT sign-in is no longer valid. Sign in again to continue. Your task and draft are still here."
+            "Your ChatGPT sign-in expired. Your task and draft are still here."
         )
+    }
+
+    func testErrorlessTurnCompletionKeepsAuthenticationRecoveryTitleFromLiveFallback() throws {
+        let failure = try XCTUnwrap(
+            CodexProjection.turnFailureTimelineItem(
+                from: .object([
+                    "id": .string("errorless-auth-completion"),
+                    "status": .string("failed"),
+                    "items": .array([]),
+                ]),
+                fallbackMessage: RuntimeAuthenticationRecovery.signInExpired.detail,
+                fallbackIsAuthenticationRecovery: true
+            )
+        )
+
+        XCTAssertEqual(failure.title, "Sign in required")
+        XCTAssertEqual(failure.body, RuntimeAuthenticationRecovery.signInExpired.detail)
+        XCTAssertFalse(failure.body.localizedCaseInsensitiveContains("token"))
     }
 
     func testAuthenticationRecoveryClassifierDoesNotMisclassifyOrdinaryTokenFailures() {
@@ -284,6 +302,32 @@ final class CodexProjectionTests: XCTestCase {
                 "The refresh token was revoked while refreshing an unrelated integration."
             )
         )
+        XCTAssertTrue(
+            CodexProjection.isAuthenticationRecoveryDiagnostic(
+                """
+                {"status":401,"error":{"message":"Your authentication token has been invalidated. Please try signing in again.","type":"invalid_request_error","code":"token_invalidated"}}
+                """
+            )
+        )
+        XCTAssertFalse(
+            CodexProjection.isAuthenticationRecoveryDiagnostic(
+                "401 Unauthorized: the upstream model endpoint rejected this request"
+            )
+        )
+    }
+
+    func testNormalizedLiveFallbackRetainsSignInRequiredTitle() throws {
+        let item = try XCTUnwrap(CodexProjection.turnFailureTimelineItem(
+            from: .object([
+                "id": .string("live-auth-failure"),
+                "status": .string("failed"),
+            ]),
+            fallbackMessage: CodexProjection.authenticationRecoveryFailureMessage,
+            fallbackIsAuthenticationRecovery: true
+        ))
+
+        XCTAssertEqual(item.title, "Sign in required")
+        XCTAssertEqual(item.body, CodexProjection.authenticationRecoveryFailureMessage)
     }
 
     func testFailedTurnWithoutServerErrorStillProjectsOneStableFailure() throws {

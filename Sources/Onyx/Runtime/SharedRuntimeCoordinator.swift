@@ -160,7 +160,17 @@ final class SharedRuntimeCoordinator: AgentRuntime, @unchecked Sendable {
     }
 
     func refreshAccount() async throws -> RuntimeSession {
-        try await sessionState.refresh(using: runtime)
+        let session = try await sessionState.refresh(using: runtime)
+        if session.auth.isSignedIn {
+            let recoveryRevision = eventBroadcaster.authenticationRecoveryRevision
+            if await sessionState.consumeAuthenticationRecoveryConfirmation() {
+                // A second expiration can race the successful account read.
+                // Clear only the recovery generation that this confirmation
+                // actually observed; a newer one must remain sticky.
+                eventBroadcaster.clearAuthenticationRecovery(ifRevision: recoveryRevision)
+            }
+        }
+        return session
     }
 
     func listThreads(limit: Int, archived: Bool) async throws -> [RuntimeThread] {
@@ -434,6 +444,8 @@ private actor SharedRuntimeSessionState {
     private var isRetired = false
     private var retirementAttempt: RetirementAttempt?
     private var authEventGeneration: UInt64 = 0
+    private var authenticationRecoveryActive = false
+    private var authenticationRecoveryConfirmationPending = false
 
     func connect(using runtime: any AgentRuntime) async throws -> RuntimeSession {
         guard !isRetired else { throw SharedRuntimeCoordinator.retiredBoundaryError }
@@ -522,11 +534,17 @@ private actor SharedRuntimeSessionState {
             // observe duplicate or scheduler-dependent account events.
             guard !isLoggingOut, !signedOutBoundaryActive else { return nil }
             activeLoginIDs.removeAll()
+            if !auth.canRun {
+                authenticationRecoveryActive = false
+                authenticationRecoveryConfirmationPending = false
+            }
             // Merely connecting while signed out must not close this boundary:
             // Codex can still list local task history before login. Only a
             // successful explicit logout establishes the privilege barrier.
             return .auth(generation: authEventGeneration)
         case .authenticationRecoveryRequired:
+            authenticationRecoveryActive = true
+            authenticationRecoveryConfirmationPending = false
             return .always
         case let .loginCompleted(completion):
             invalidateSessionSnapshot()
@@ -543,6 +561,14 @@ private actor SharedRuntimeSessionState {
                 return nil
             }
 
+            // A successful completion can clear recovery in every window, so
+            // only publish one that belongs to a ceremony admitted through
+            // this shared coordinator. An unrelated or stale provider event
+            // must not arm a routine signed-in refresh as confirmation.
+            if authenticationRecoveryActive, completion.success, !matchesActiveLogin {
+                return nil
+            }
+
             if let loginID = completion.loginID {
                 activeLoginIDs.remove(loginID)
             } else if matchesActiveLogin {
@@ -550,6 +576,11 @@ private actor SharedRuntimeSessionState {
             }
             if completion.success, matchesActiveLogin {
                 signedOutBoundaryActive = false
+                if authenticationRecoveryActive {
+                    authenticationRecoveryConfirmationPending = true
+                }
+            } else if !completion.success, matchesActiveLogin, authenticationRecoveryActive {
+                authenticationRecoveryConfirmationPending = false
             }
             return .auth(generation: authEventGeneration)
         default:
@@ -569,6 +600,8 @@ private actor SharedRuntimeSessionState {
     func sourceFinished() {
         availableModelsOverride = nil
         invalidate()
+        authenticationRecoveryActive = false
+        authenticationRecoveryConfirmationPending = false
     }
 
     func invalidate() {
@@ -584,6 +617,13 @@ private actor SharedRuntimeSessionState {
         availableModelsOverride = nil
         invalidate()
         await runtime.disconnect()
+    }
+
+    func consumeAuthenticationRecoveryConfirmation() -> Bool {
+        guard authenticationRecoveryConfirmationPending else { return false }
+        authenticationRecoveryConfirmationPending = false
+        authenticationRecoveryActive = false
+        return true
     }
 
     func beginLoginOperation(allowWaitingForLogout: Bool = false) async throws -> LoginOperationToken {
@@ -812,6 +852,10 @@ private actor SharedRuntimeSessionState {
         isLoggingOut = false
         signedOutBoundaryActive = succeeded
         invalidateSessionSnapshot()
+        if succeeded {
+            authenticationRecoveryActive = false
+            authenticationRecoveryConfirmationPending = false
+        }
 
         let waiters = logoutWaiters
         logoutWaiters.removeAll()
@@ -1041,6 +1085,9 @@ private final class RuntimeEventBroadcaster: @unchecked Sendable {
     private let deltaByteLimit: Int
     private var subscriptions: [UUID: RuntimeEventSubscription] = [:]
     private var isFinished = false
+    private var stickyAuthenticationRecovery: RuntimeAuthenticationRecovery?
+    private var stickyAuthenticationRecoveryLogin: RuntimeLoginCompletion?
+    private var stickyAuthenticationRecoveryRevision: UInt64 = 0
 
     init(eventLimit: Int, deltaByteLimit: Int) {
         self.eventLimit = eventLimit
@@ -1049,12 +1096,19 @@ private final class RuntimeEventBroadcaster: @unchecked Sendable {
 
     func makeStream() -> AsyncStream<AgentRuntimeEvent> {
         let id = UUID()
+        lock.lock()
+        var initialEvents: [AgentRuntimeEvent] = []
+        if let stickyAuthenticationRecovery {
+            initialEvents.append(.authenticationRecoveryRequired(stickyAuthenticationRecovery))
+        }
+        if let stickyAuthenticationRecoveryLogin {
+            initialEvents.append(.loginCompleted(stickyAuthenticationRecoveryLogin))
+        }
         let subscription = RuntimeEventSubscription(
             eventLimit: eventLimit,
-            deltaByteLimit: deltaByteLimit
+            deltaByteLimit: deltaByteLimit,
+            initialEvents: initialEvents
         )
-
-        lock.lock()
         if isFinished {
             subscription.finish()
         } else {
@@ -1076,6 +1130,26 @@ private final class RuntimeEventBroadcaster: @unchecked Sendable {
     func yield(_ event: AgentRuntimeEvent) async {
         let currentSubscriptions: [RuntimeEventSubscription] = lock.withLock {
             guard !isFinished else { return [] }
+            switch event {
+            case let .authenticationRecoveryRequired(recovery):
+                stickyAuthenticationRecoveryRevision &+= 1
+                stickyAuthenticationRecovery = recovery
+                stickyAuthenticationRecoveryLogin = nil
+            case let .loginCompleted(completion)
+                where completion.success && stickyAuthenticationRecovery != nil:
+                // The session actor admits only a completion correlated with a
+                // login started through this coordinator while recovery is
+                // active. Replay it after recovery so a just-opened sibling
+                // also performs the authoritative account refresh.
+                stickyAuthenticationRecoveryLogin = completion
+            case let .loginCompleted(completion) where !completion.success:
+                stickyAuthenticationRecoveryLogin = nil
+            case let .accountUpdated(auth) where !auth.canRun:
+                stickyAuthenticationRecovery = nil
+                stickyAuthenticationRecoveryLogin = nil
+            default:
+                break
+            }
             return Array(subscriptions.values)
         }
 
@@ -1094,11 +1168,25 @@ private final class RuntimeEventBroadcaster: @unchecked Sendable {
             return
         }
         isFinished = true
+        stickyAuthenticationRecovery = nil
+        stickyAuthenticationRecoveryLogin = nil
         let currentSubscriptions = Array(subscriptions.values)
         lock.unlock()
 
         for subscription in currentSubscriptions {
             subscription.finish()
+        }
+    }
+
+    var authenticationRecoveryRevision: UInt64 {
+        lock.withLock { stickyAuthenticationRecoveryRevision }
+    }
+
+    func clearAuthenticationRecovery(ifRevision revision: UInt64) {
+        lock.withLock {
+            guard stickyAuthenticationRecoveryRevision == revision else { return }
+            stickyAuthenticationRecovery = nil
+            stickyAuthenticationRecoveryLogin = nil
         }
     }
 
@@ -1110,6 +1198,8 @@ private final class RuntimeEventBroadcaster: @unchecked Sendable {
         let currentSubscriptions = Array(subscriptions.values)
         subscriptions.removeAll()
         isFinished = true
+        stickyAuthenticationRecovery = nil
+        stickyAuthenticationRecoveryLogin = nil
         lock.unlock()
 
         for subscription in currentSubscriptions {
@@ -1185,9 +1275,17 @@ private final class RuntimeEventSubscription: @unchecked Sendable {
     private var isFinished = false
     private var isCancelled = false
 
-    init(eventLimit: Int, deltaByteLimit: Int) {
+    init(
+        eventLimit: Int,
+        deltaByteLimit: Int,
+        initialEvents: [AgentRuntimeEvent] = []
+    ) {
         self.eventLimit = eventLimit
         self.deltaByteLimit = deltaByteLimit
+        bufferedEvents = initialEvents
+        bufferedDeltaBytes = initialEvents.reduce(into: 0) { total, event in
+            total += Self.deltaByteCount(of: event)
+        }
     }
 
     func enqueue(_ event: AgentRuntimeEvent) async {

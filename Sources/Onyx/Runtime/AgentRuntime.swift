@@ -136,6 +136,11 @@ extension AgentRuntime {
 }
 
 enum AgentRuntimeError: LocalizedError, Sendable {
+    /// The provider rejected a request because an otherwise valid login has
+    /// expired or been revoked. Keep this typed so the app can preserve the
+    /// current task/draft and let its attached recovery surface own the next
+    /// action instead of presenting a generic request failure.
+    case authenticationRecoveryRequired(RuntimeAuthenticationRecovery)
     case executableNotFound
     case bundledRuntimeUnavailable
     case invalidCodexExecutable(String)
@@ -149,6 +154,8 @@ enum AgentRuntimeError: LocalizedError, Sendable {
 
     var errorDescription: String? {
         switch self {
+        case let .authenticationRecoveryRequired(recovery):
+            recovery.detail
         case .executableNotFound:
             "Onyx could not find a Codex runtime. Install ChatGPT/Codex or set ONYX_CODEX_PATH."
         case .bundledRuntimeUnavailable:

@@ -76,6 +76,7 @@ final class OnyxAppModelAuthBoundaryTests: XCTestCase {
         let runtime = AuthBoundaryTestRuntime(
             logoutBehavior: .immediate,
             refreshBehavior: .staleSignedIn,
+            startTurnBehavior: .succeed,
             suspendedOperations: []
         )
         let coordinator = SharedRuntimeCoordinator(runtime: runtime)
@@ -214,12 +215,15 @@ final class OnyxAppModelAuthBoundaryTests: XCTestCase {
         XCTAssertTrue(calls.startTurns.isEmpty)
     }
 
-    func testRevokedRefreshTokenPreservesTaskAndDraftButGatesWritesUntilSignIn() async throws {
+    func testRecoveryWithSameKnownAccountPreservesTaskTranscriptWorkspaceAndDraft() async throws {
         let fixture = makeFixture(refreshBehavior: .staleSignedIn)
         defer { fixture.cleanUp() }
         let model = fixture.model
 
         await startAndLoad(fixture)
+        let originalThreadID = try XCTUnwrap(model.selectedThreadID)
+        let originalTranscript = model.timeline
+        let originalWorkspace = model.selectedProjectPath
         model.composerText = "Keep this draft while I sign back in"
         await fixture.runtime.emit(.authenticationRecoveryRequired(.signInExpired))
 
@@ -261,12 +265,151 @@ final class OnyxAppModelAuthBoundaryTests: XCTestCase {
         await waitUntil("Successful sign-in did not clear account recovery") {
             model.authenticationRecovery == nil && model.canRunAgent
         }
+        XCTAssertEqual(model.authState.email, "account-a@example.com")
+        XCTAssertEqual(model.selectedThreadID, originalThreadID)
+        XCTAssertEqual(model.timeline, originalTranscript)
+        XCTAssertEqual(model.selectedProjectPath, originalWorkspace)
         XCTAssertEqual(model.composerText, "Keep this draft while I sign back in")
+    }
+
+    func testRecoveryWithDifferentKnownAccountClosesOldAccountBoundary() async throws {
+        let fixture = makeFixture(
+            refreshBehavior: .replacementSignedIn,
+            seedSensitivePersistence: true
+        )
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        await startAndLoad(fixture)
+        model.composerText = "Private draft from account A"
+        model.selectTaskModel("account-a-private-override")
+        await fixture.runtime.emit(.authenticationRecoveryRequired(.signInExpired))
+        await waitUntil("The sign-in recovery state did not reach the app model") {
+            model.authenticationRecovery == .signInExpired
+        }
+
+        model.startLogin(AuthBoundaryTestRuntime.loginMethod)
+        await waitUntil("The replacement-account login did not start") {
+            model.loginAttempt?.loginID == "recovery-login"
+        }
+        await fixture.runtime.emit(.loginCompleted(RuntimeLoginCompletion(
+            loginID: "recovery-login",
+            success: true,
+            error: nil
+        )))
+        await fixture.runtime.waitForRefreshToFinish()
+        await waitUntil("The replacement account did not close the old boundary") {
+            model.authenticationRecovery == nil
+                && model.authState.email == "account-b@example.com"
+                && model.selectedThreadID == AuthBoundaryFixture.welcomeThreadID
+        }
+
+        XCTAssertTrue(model.canRunAgent)
+        XCTAssertEqual(model.session?.auth.email, "account-b@example.com")
+        XCTAssertEqual(model.threads.map(\.id), [AuthBoundaryFixture.welcomeThreadID])
+        XCTAssertEqual(model.timeline.map(\.id), ["onyx-welcome"])
+        XCTAssertEqual(model.composerText, "")
+        XCTAssertNil(model.selectedProjectPath)
+        XCTAssertTrue(model.taskModelOverrides.isEmpty)
+        XCTAssertTrue(model.taskModelDefaults.isEmpty)
+        XCTAssertNil(fixture.defaults.object(forKey: "Onyx.selectedThreadID"))
+        XCTAssertNil(fixture.defaults.object(forKey: "Onyx.composerDrafts"))
+        XCTAssertNil(fixture.defaults.object(forKey: "Onyx.lastWorkspacePath"))
+    }
+
+    func testRevokedTokenSendFailureUsesOnlyRecoverySurfaceAndPreservesTaskAndDraft() async {
+        let fixture = makeFixture(startTurnBehavior: .authenticationRecoveryRequired)
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        await startAndLoad(fixture)
+        let taskID = try! XCTUnwrap(model.selectedThreadID)
+        let existingTimeline = model.timeline
+        let draft = "Keep this exact draft while Codex sign-in is repaired"
+        model.composerText = draft
+
+        model.sendComposer()
+
+        await waitUntil("The typed sign-in recovery did not settle the send") {
+            model.authenticationRecovery == .signInExpired && !model.isTurnRunning
+        }
+        XCTAssertEqual(model.selectedThreadID, taskID)
+        XCTAssertEqual(model.timeline, existingTimeline)
+        XCTAssertEqual(model.composerText, draft)
+        XCTAssertNil(model.notice, "The attached recovery surface must be the only auth message")
+        XCTAssertFalse(
+            model.timeline.contains { item in
+                item.title == "Could not send"
+                    || item.body.localizedCaseInsensitiveContains("refresh token")
+            },
+            "A revoked-token request must not race a raw or generic failure row against recovery."
+        )
+    }
+
+    func testRawRevokedRuntimeNoticeUsesRecoveryWithoutShowingTheRawModal() async throws {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        await startAndLoad(fixture)
+        let taskID = try XCTUnwrap(model.selectedThreadID)
+        let transcript = model.timeline
+        let workspace = model.selectedProjectPath
+        model.composerText = "Keep this draft while I sign back in"
+
+        let rawDiagnostic = #"{"timestamp":"2026-08-29T21:23:22.434005Z","level":"WARN","fields":{"message":"events failed with status 401 Unauthorized: {\n  \"error\": { \"message\": \"Your authentication token has been invalidated. Please try signing in again.\", \"type\": \"invalid_request_error\", \"code\": \"token_invalidated\" },\n  \"status\": 401\n}"},"target":"codex_analytics::client"}"#
+        await fixture.runtime.emit(.runtimeNotice(title: "Codex runtime", detail: rawDiagnostic))
+
+        await waitUntil("The raw runtime diagnostic did not enter recovery") {
+            model.authenticationRecovery == .signInExpired
+        }
+
+        XCTAssertNil(model.notice, "Authentication recovery must not open a raw JSON modal")
+        XCTAssertEqual(model.selectedThreadID, taskID)
+        XCTAssertEqual(model.timeline, transcript)
+        XCTAssertEqual(model.selectedProjectPath, workspace)
+        XCTAssertEqual(model.composerText, "Keep this draft while I sign back in")
+    }
+
+    func testRecoveryRemovesArawAuthenticationModalThatRacedBeforeTheRecoveryEvent() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        await startAndLoad(fixture)
+        let rawDiagnostic = #"{"error":{"message":"Your authentication token has been invalidated. Please try signing in again.","code":"token_invalidated"}}"#
+        model.notice = ("Codex runtime", rawDiagnostic)
+
+        await fixture.runtime.emit(.authenticationRecoveryRequired(.signInExpired))
+        await waitUntil("The recovery state did not reach the model") {
+            model.authenticationRecovery == .signInExpired
+        }
+
+        // The recovery card is the sole actionable surface. A raw alert that
+        // arrived one event earlier must not remain behind it.
+        XCTAssertNil(model.notice)
+    }
+
+    func testAuthenticationRecoveryDoesNotClearAnUnrelatedNotice() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        await startAndLoad(fixture)
+        model.notice = ("Project needs attention", "This notice is unrelated to account access.")
+        await fixture.runtime.emit(.authenticationRecoveryRequired(.signInExpired))
+
+        await waitUntil("The sign-in recovery state did not reach the app model") {
+            model.authenticationRecovery == .signInExpired
+        }
+        XCTAssertEqual(model.notice?.title, "Project needs attention")
+        XCTAssertEqual(model.notice?.detail, "This notice is unrelated to account access.")
     }
 
     private func makeFixture(
         logoutBehavior: AuthBoundaryTestRuntime.LogoutBehavior = .immediate,
         refreshBehavior: AuthBoundaryTestRuntime.RefreshBehavior = .signedOut,
+        startTurnBehavior: AuthBoundaryTestRuntime.StartTurnBehavior = .succeed,
         suspendedOperations: Set<AuthBoundaryTestRuntime.SuspendedOperation> = [],
         seedSensitivePersistence: Bool = false
     ) -> AuthBoundaryFixture {
@@ -288,6 +431,7 @@ final class OnyxAppModelAuthBoundaryTests: XCTestCase {
         let runtime = AuthBoundaryTestRuntime(
             logoutBehavior: logoutBehavior,
             refreshBehavior: refreshBehavior,
+            startTurnBehavior: startTurnBehavior,
             suspendedOperations: suspendedOperations
         )
         let model = OnyxAppModel(runtime: runtime, defaults: defaults)
@@ -412,6 +556,12 @@ private actor AuthBoundaryTestRuntime: AgentRuntime {
         case signedOut
         case failure
         case staleSignedIn
+        case replacementSignedIn
+    }
+
+    enum StartTurnBehavior: Sendable {
+        case succeed
+        case authenticationRecoveryRequired
     }
 
     struct PrivilegedCalls: Sendable {
@@ -429,6 +579,7 @@ private actor AuthBoundaryTestRuntime: AgentRuntime {
     private let eventContinuation: AsyncStream<AgentRuntimeEvent>.Continuation
     private let logoutBehavior: LogoutBehavior
     private let refreshBehavior: RefreshBehavior
+    private let startTurnBehavior: StartTurnBehavior
     private let suspendedOperations: Set<SuspendedOperation>
     private var enteredOperations: Set<SuspendedOperation> = []
     private var releasedOperations: Set<SuspendedOperation> = []
@@ -448,10 +599,12 @@ private actor AuthBoundaryTestRuntime: AgentRuntime {
     init(
         logoutBehavior: LogoutBehavior,
         refreshBehavior: RefreshBehavior,
+        startTurnBehavior: StartTurnBehavior = .succeed,
         suspendedOperations: Set<SuspendedOperation>
     ) {
         self.logoutBehavior = logoutBehavior
         self.refreshBehavior = refreshBehavior
+        self.startTurnBehavior = startTurnBehavior
         self.suspendedOperations = suspendedOperations
         let stream = AsyncStream.makeStream(of: AgentRuntimeEvent.self)
         events = stream.stream
@@ -509,6 +662,8 @@ private actor AuthBoundaryTestRuntime: AgentRuntime {
             throw TestFailure.accountRefreshFailed
         case .staleSignedIn:
             return Self.session(auth: Self.signedInAuth)
+        case .replacementSignedIn:
+            return Self.session(auth: Self.replacementSignedInAuth)
         }
     }
 
@@ -543,6 +698,9 @@ private actor AuthBoundaryTestRuntime: AgentRuntime {
 
     func startTurn(_ request: StartTurnRequest) async throws {
         startTurns.append(request)
+        if startTurnBehavior == .authenticationRecoveryRequired {
+            throw AgentRuntimeError.authenticationRecoveryRequired(.signInExpired)
+        }
     }
 
     func steer(threadID _: String, text _: String) async throws {}
@@ -629,6 +787,13 @@ private actor AuthBoundaryTestRuntime: AgentRuntime {
         mode: .chatgpt,
         email: "account-a@example.com",
         planLabel: "pro",
+        requiresAuthentication: true
+    )
+
+    private static let replacementSignedInAuth = RuntimeAuthState(
+        mode: .chatgpt,
+        email: "account-b@example.com",
+        planLabel: "plus",
         requiresAuthentication: true
     )
 

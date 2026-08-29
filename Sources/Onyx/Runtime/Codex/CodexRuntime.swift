@@ -30,6 +30,7 @@ actor CodexRuntime: AgentRuntime {
     private struct PendingTurnFailure {
         let turnID: String
         let message: String
+        let isAuthenticationRecovery: Bool
     }
 
     private var pendingTurnFailuresByThreadID: [String: PendingTurnFailure] = [:]
@@ -79,6 +80,12 @@ actor CodexRuntime: AgentRuntime {
     /// transport generation so a request error and its matching notification
     /// cannot make every attached window animate the same state twice.
     private var authenticationRecoveryGeneration: UInt64?
+    /// A signed-in account snapshot is allowed to clear the recovery latch
+    /// only after the provider has announced a successful login ceremony in
+    /// this same transport generation. Ordinary refreshes can return cached
+    /// signed-in identity while the token is still unusable and must not
+    /// re-arm the writer controls.
+    private var pendingAuthenticationRecoveryRearmGeneration: UInt64?
     /// Older user-selected binaries can reject newer protocol methods even
     /// though the adapter knows how to call them. Remember that evidence for
     /// the life of this runtime so reconnect/account refresh does not re-offer a
@@ -187,8 +194,12 @@ actor CodexRuntime: AgentRuntime {
             guard connectionGeneration == generation, !Task.isCancelled else {
                 throw CancellationError()
             }
+            let previousTransportGeneration = activeTransportGeneration
             activeTransportGeneration = connection.generation
-            authenticationRecoveryGeneration = nil
+            if previousTransportGeneration != connection.generation {
+                authenticationRecoveryGeneration = nil
+                pendingAuthenticationRecoveryRearmGeneration = nil
+            }
             let session = try await sessionSnapshot()
             guard connectionGeneration == generation, !Task.isCancelled else {
                 throw CancellationError()
@@ -200,18 +211,39 @@ actor CodexRuntime: AgentRuntime {
         } catch {
             guard connectionGeneration == generation else { throw error }
             connected = false
+            // `account/read` can be the first request to discover that the
+            // ChatGPT refresh token has expired. Keep the already-initialized
+            // app-server transport alive in that narrow case: the login
+            // ceremony itself is an app-server request, so stopping here
+            // would leave the recovery card's Sign In action with no server
+            // to talk to. Ordinary connection failures still tear everything
+            // down as before.
+            let preserveTransportForAuthenticationRecovery: Bool
+            if case .authenticationRecoveryRequired = error as? AgentRuntimeError {
+                preserveTransportForAuthenticationRecovery = activeTransportGeneration != nil
+            } else {
+                preserveTransportForAuthenticationRecovery = false
+            }
             publishAuthenticationRecoveryIfNeeded(for: error)
-            activeTransportGeneration = nil
-            cachedRequiresAuthentication = nil
+            if !preserveTransportForAuthenticationRecovery {
+                activeTransportGeneration = nil
+                cachedRequiresAuthentication = nil
+            }
             connectionAttempt = nil
             activeTurnIDs.removeAll()
             pendingTurnFailuresByThreadID.removeAll()
             pendingUserInteractions.removeAll()
             cancelDynamicToolTasks()
             resetEphemeralThreadBoundary()
-            await client.stop()
+            if !preserveTransportForAuthenticationRecovery {
+                await client.stop()
+            }
             guard connectionGeneration == generation else { throw error }
-            eventContinuation.yield(.connectionChanged(.failed(error.localizedDescription)))
+            eventContinuation.yield(.connectionChanged(.failed(
+                preserveTransportForAuthenticationRecovery
+                    ? "Sign in required"
+                    : error.localizedDescription
+            )))
             throw error
         }
     }
@@ -267,6 +299,7 @@ actor CodexRuntime: AgentRuntime {
         connectionAttempt = nil
         activeTransportGeneration = nil
         authenticationRecoveryGeneration = nil
+        pendingAuthenticationRecoveryRearmGeneration = nil
         connected = false
         cachedRequiresAuthentication = nil
         activeTurnIDs.removeAll()
@@ -280,24 +313,35 @@ actor CodexRuntime: AgentRuntime {
     }
 
     func startLogin(methodID: String) async throws -> RuntimeLoginStart {
+        // Recovery can begin before the first account snapshot succeeds. The
+        // initialized transport is deliberately retained for login/start;
+        // mark the runtime logically connected once that ceremony has begun
+        // so the authoritative post-login account refresh can restore normal
+        // task operations without launching a second app-server process.
+        let login: RuntimeLoginStart
         switch methodID {
         case Self.browserLoginMethod.id:
-            try await startBrowserLogin()
+            login = try await startBrowserLogin()
         case Self.deviceCodeLoginMethod.id:
-            try await startDeviceCodeLogin()
+            login = try await startDeviceCodeLogin()
         default:
             throw AgentRuntimeError.unsupported("login method \(methodID)")
         }
+        if activeTransportGeneration != nil {
+            connected = true
+        }
+        return login
     }
 
     private func startBrowserLogin() async throws -> RuntimeLoginStart {
-        let result = try await client.request(
+        let result = try await request(
             method: "account/login/start",
             params: .object([
                 "type": .string("chatgpt"),
                 "useHostedLoginSuccessPage": .bool(true),
                 "appBrand": .string("codex"),
-            ])
+            ]),
+            classifyAuthentication: false
         )
         guard let loginID = result["loginId"]?.stringValue,
               let rawURL = result["authUrl"]?.stringValue,
@@ -314,9 +358,10 @@ actor CodexRuntime: AgentRuntime {
     }
 
     private func startDeviceCodeLogin() async throws -> RuntimeLoginStart {
-        let result = try await client.request(
+        let result = try await request(
             method: "account/login/start",
-            params: .object(["type": .string("chatgptDeviceCode")])
+            params: .object(["type": .string("chatgptDeviceCode")]),
+            classifyAuthentication: false
         )
         guard let loginID = result["loginId"]?.stringValue,
               let rawURL = result["verificationUrl"]?.stringValue,
@@ -334,14 +379,15 @@ actor CodexRuntime: AgentRuntime {
     }
 
     func cancelLogin(id: String) async throws {
-        _ = try await client.request(
+        _ = try await request(
             method: "account/login/cancel",
-            params: .object(["loginId": .string(id)])
+            params: .object(["loginId": .string(id)]),
+            classifyAuthentication: false
         )
     }
 
     func logout() async throws {
-        _ = try await client.request(method: "account/logout", params: .null)
+        _ = try await request(method: "account/logout", params: .null, classifyAuthentication: false)
     }
 
     func refreshAccount() async throws -> RuntimeSession {
@@ -404,7 +450,7 @@ actor CodexRuntime: AgentRuntime {
         if let modelProviderID {
             params["modelProviders"] = .array([.string(modelProviderID)])
         }
-        let result = try await client.request(
+        let result = try await request(
             method: "thread/list",
             params: .object(params)
         )
@@ -421,7 +467,7 @@ actor CodexRuntime: AgentRuntime {
     }
 
     func readThread(id: String) async throws -> RuntimeConversation {
-        let result = try await client.request(
+        let result = try await request(
             method: "thread/read",
             params: .object([
                 "threadId": .string(id),
@@ -463,7 +509,7 @@ actor CodexRuntime: AgentRuntime {
     }
 
     func resumeThread(id: String) async throws -> RuntimeConversation {
-        let result = try await client.request(
+        let result = try await request(
             method: "thread/resume",
             params: .object(["threadId": .string(id)])
         )
@@ -553,7 +599,7 @@ actor CodexRuntime: AgentRuntime {
         }
         let result: JSONValue
         do {
-            result = try await client.request(
+            result = try await request(
                 method: "thread/revert",
                 params: .object([
                     "threadId": .string(id),
@@ -593,7 +639,7 @@ actor CodexRuntime: AgentRuntime {
             let definition = await dynamicToolHandler.dynamicToolDefinition()
             params["dynamicTools"] = .array([Self.dynamicToolSpecification(definition)])
         }
-        let result = try await client.request(method: "thread/start", params: .object(params))
+        let result = try await self.request(method: "thread/start", params: .object(params))
         try validateBoundProviderOwnership(in: result, operation: "thread/start")
         guard let thread = CodexProjection.thread(from: result["thread"] ?? result) else {
             throw AgentRuntimeError.missingField("thread.id")
@@ -608,7 +654,7 @@ actor CodexRuntime: AgentRuntime {
     }
 
     func forkThread(id: String) async throws -> RuntimeThread {
-        let result = try await client.request(
+        let result = try await request(
             method: "thread/fork",
             params: .object(["threadId": .string(id)])
         )
@@ -640,7 +686,7 @@ actor CodexRuntime: AgentRuntime {
 
         let result: JSONValue
         do {
-            result = try await client.request(
+            result = try await request(
                 method: "thread/fork",
                 params: .object([
                     "threadId": .string(id),
@@ -696,7 +742,7 @@ actor CodexRuntime: AgentRuntime {
         guard threadValue["ephemeral"]?.boolValue == true else {
             var cleanupFailure: (any Error)?
             do {
-                _ = try await client.request(
+                _ = try await request(
                     method: "thread/delete",
                     params: .object(["threadId": .string(threadID)])
                 )
@@ -734,14 +780,14 @@ actor CodexRuntime: AgentRuntime {
     }
 
     func compactThread(id: String) async throws {
-        _ = try await client.request(
+        _ = try await request(
             method: "thread/compact/start",
             params: .object(["threadId": .string(id)])
         )
     }
 
     func deleteThread(id: String) async throws {
-        _ = try await client.request(
+        _ = try await request(
             method: "thread/delete",
             params: .object(["threadId": .string(id)])
         )
@@ -767,7 +813,7 @@ actor CodexRuntime: AgentRuntime {
         }
         params["approvalPolicy"] = .string(codexApprovalPolicy(request.approvalPolicy))
         params["sandboxPolicy"] = codexSandboxPolicy(request.sandboxMode, cwd: request.cwd)
-        let result = try await client.request(method: "turn/start", params: .object(params))
+        let result = try await self.request(method: "turn/start", params: .object(params))
         if let turnID = result["turn"]?["id"]?.stringValue {
             activeTurnIDs[request.threadID] = turnID
         }
@@ -800,7 +846,7 @@ actor CodexRuntime: AgentRuntime {
         // `thread/read` is deliberately read-only. Acquire this app-server's
         // writer before starting the non-steerable review turn, matching the
         // preparation used for an ordinary turn on an existing task.
-        _ = try await client.request(
+        _ = try await self.request(
             method: "thread/resume",
             params: .object(["threadId": .string(request.threadID)])
         )
@@ -812,7 +858,7 @@ actor CodexRuntime: AgentRuntime {
         case .inline: "inline"
         case .detached: "detached"
         }
-        let result = try await client.request(
+        let result = try await self.request(
             method: "review/start",
             params: .object([
                 "threadId": .string(request.threadID),
@@ -846,7 +892,7 @@ actor CodexRuntime: AgentRuntime {
             throw AgentRuntimeError.protocolFailure("No active turn is available to steer")
         }
         params["expectedTurnId"] = .string(turnID)
-        _ = try await client.request(method: "turn/steer", params: .object(params))
+        _ = try await request(method: "turn/steer", params: .object(params))
     }
 
     private func codexTurnInput(_ input: RuntimeTurnInput) -> JSONValue {
@@ -873,7 +919,7 @@ actor CodexRuntime: AgentRuntime {
         // delegated child must nevertheless be cancelled when that request
         // throws; otherwise it can continue for the full provider timeout.
         defer { cancelDynamicToolTasks(threadID: threadID) }
-        _ = try await client.request(method: "turn/interrupt", params: .object(params))
+        _ = try await request(method: "turn/interrupt", params: .object(params))
     }
 
     func respond(
@@ -884,12 +930,17 @@ actor CodexRuntime: AgentRuntime {
             throw AgentRuntimeError.protocolFailure("This interaction is no longer pending")
         }
         let result = try codexInteractionResponse(response, for: request)
-        try await client.respond(id: interactionID, result: result)
+        do {
+            try await client.respond(id: interactionID, result: result)
+        } catch {
+            publishAuthenticationRecoveryIfNeeded(for: error)
+            throw error
+        }
         pendingUserInteractions.removeValue(forKey: interactionID)
     }
 
     func renameThread(id: String, name: String) async throws {
-        _ = try await client.request(
+        _ = try await request(
             method: "thread/name/set",
             params: .object([
                 "threadId": .string(id),
@@ -899,25 +950,25 @@ actor CodexRuntime: AgentRuntime {
     }
 
     func archiveThread(id: String) async throws {
-        _ = try await client.request(
+        _ = try await request(
             method: "thread/archive",
             params: .object(["threadId": .string(id)])
         )
     }
 
     func unarchiveThread(id: String) async throws {
-        _ = try await client.request(
+        _ = try await request(
             method: "thread/unarchive",
             params: .object(["threadId": .string(id)])
         )
     }
 
     private func sessionSnapshot() async throws -> RuntimeSession {
-        async let accountResult = client.request(
+        async let accountResult = request(
             method: "account/read",
             params: .object(["refreshToken": .bool(false)])
         )
-        async let modelResult = client.request(
+        async let modelResult = request(
             method: "model/list",
             params: .object(["limit": .integer(100)])
         )
@@ -928,6 +979,11 @@ actor CodexRuntime: AgentRuntime {
         let requiresAuthentication = account["requiresOpenaiAuth"]?.boolValue ?? true
         cachedRequiresAuthentication = requiresAuthentication
         let auth = authState(from: accountValue, requiresAuthentication: requiresAuthentication)
+        if auth.isSignedIn,
+           pendingAuthenticationRecoveryRearmGeneration == activeTransportGeneration {
+            authenticationRecoveryGeneration = nil
+            pendingAuthenticationRecoveryRearmGeneration = nil
+        }
         let projectedModels = (models?["data"]?.arrayValue ?? models?["models"]?.arrayValue ?? []).compactMap { value -> RuntimeModel? in
             guard let id = value["id"]?.stringValue ?? value["model"]?.stringValue else { return nil }
             let efforts = value["supportedReasoningEfforts"]?.arrayValue?.compactMap { option in
@@ -985,7 +1041,10 @@ actor CodexRuntime: AgentRuntime {
             throw AgentRuntimeError.unsupported("paginated thread history in this Codex version")
         }
         do {
-            return try await client.request(method: method, params: params)
+            // Route pagination through the shared request boundary so a
+            // revoked ChatGPT refresh token activates recovery just like a
+            // turn/start or any other app-server request.
+            return try await request(method: method, params: params)
         } catch {
             if Self.isProtocolCompatibilityFailure(error) {
                 unavailableCapabilities.insert(.threadHistoryPagination)
@@ -1038,8 +1097,15 @@ actor CodexRuntime: AgentRuntime {
             }
         case let .stderr(generation, message):
             guard generation == activeTransportGeneration else { return }
-            if message.localizedCaseInsensitiveContains("error") {
-                eventContinuation.yield(.runtimeNotice(title: "Codex runtime", detail: message))
+            if CodexProjection.isAuthenticationRecoveryDiagnostic(message) {
+                // The app-server may log a 401/token_invalidated response on
+                // stderr without also sending a JSON-RPC error notification.
+                // Treat it exactly like the typed request path and never put
+                // the credential-bearing JSON in a generic alert.
+                publishAuthenticationRecoveryIfNeeded()
+            } else if message.localizedCaseInsensitiveContains("error"),
+                      let detail = CodexRuntimeNoticeProjection.detail(from: message) {
+                eventContinuation.yield(.runtimeNotice(title: "Codex runtime", detail: detail))
             }
         case let .stopped(generation, reason):
             guard generation == activeTransportGeneration else { return }
@@ -1049,6 +1115,7 @@ actor CodexRuntime: AgentRuntime {
             connected = false
             activeTransportGeneration = nil
             authenticationRecoveryGeneration = nil
+            pendingAuthenticationRecoveryRearmGeneration = nil
             cachedRequiresAuthentication = nil
             activeTurnIDs.removeAll()
             pendingTurnFailuresByThreadID.removeAll()
@@ -1090,6 +1157,11 @@ actor CodexRuntime: AgentRuntime {
             eventContinuation.yield(.accountUpdated(auth))
             return
         case "account/login/completed":
+            if params["success"]?.boolValue == true,
+               let generation = activeTransportGeneration,
+               authenticationRecoveryGeneration == generation {
+                pendingAuthenticationRecoveryRearmGeneration = generation
+            }
             eventContinuation.yield(
                 .loginCompleted(
                     RuntimeLoginCompletion(
@@ -1177,7 +1249,8 @@ actor CodexRuntime: AgentRuntime {
                let failure = CodexProjection.turnFailureTimelineItem(
                    from: turn,
                    fallbackTurnID: turnID,
-                   fallbackMessage: fallbackMessage
+                   fallbackMessage: fallbackMessage,
+                   fallbackIsAuthenticationRecovery: pendingFailure?.isAuthenticationRecovery == true
                ) {
                 eventContinuation.yield(.itemCompleted(threadID: threadID, item: failure))
             }
@@ -1201,7 +1274,8 @@ actor CodexRuntime: AgentRuntime {
                    activeTurnIDs[threadID] == turnID {
                     pendingTurnFailuresByThreadID[threadID] = PendingTurnFailure(
                         turnID: turnID,
-                        message: detail
+                        message: detail,
+                        isAuthenticationRecovery: requiresAuthenticationRecovery
                     )
                 }
                 // Turn failures are represented by the stable transcript row
@@ -1298,7 +1372,7 @@ actor CodexRuntime: AgentRuntime {
     }
 
     private func interruptAcceptedTurn(threadID: String, turnID: String) async throws {
-        _ = try await client.request(
+        _ = try await request(
             method: "turn/interrupt",
             params: .object([
                 "threadId": .string(threadID),
@@ -1308,11 +1382,22 @@ actor CodexRuntime: AgentRuntime {
         activeTurnIDs.removeValue(forKey: threadID)
     }
 
-    private func request(method: String, params: JSONValue) async throws -> JSONValue {
+    private func request(
+        method: String,
+        params: JSONValue,
+        classifyAuthentication: Bool = true
+    ) async throws -> JSONValue {
         do {
             return try await client.request(method: method, params: params)
         } catch {
-            publishAuthenticationRecoveryIfNeeded(for: error)
+            if classifyAuthentication,
+               CodexProjection.isAuthenticationRecoveryDiagnostic(error.localizedDescription) {
+                publishAuthenticationRecoveryIfNeeded()
+                throw AgentRuntimeError.authenticationRecoveryRequired(.signInExpired)
+            }
+            if classifyAuthentication {
+                publishAuthenticationRecoveryIfNeeded(for: error)
+            }
             throw error
         }
     }
