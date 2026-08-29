@@ -64,8 +64,17 @@ final class OpenAICompatibleAgentTurnLivenessRuntimeTests: XCTestCase {
         _ = try await runtime.connect()
         try await runtime.startTurn(Self.startTurnRequest)
         await upstream.emit(.turnStarted(threadID: "thread-1", turnID: "turn-healthy"))
-        try await Task.sleep(for: .milliseconds(65))
+        // Wait until the wrapper has actually observed the lifecycle event
+        // before measuring the watchdog interval.  A busy CI runner can delay
+        // AsyncStream delivery long enough for a fixed sleep to race the
+        // intentionally tiny test timeout even though progress was emitted.
+        try await waitUntil("The turn-start event was not observed") {
+            await log.snapshot().contains(.turnStarted(threadID: "thread-1", turnID: "turn-healthy"))
+        }
         await upstream.emit(.itemDelta(threadID: "thread-1", itemID: "answer", delta: "Still working"))
+        try await waitUntil("The progress event was not observed") {
+            await log.snapshot().contains(.itemDelta(threadID: "thread-1", itemID: "answer", delta: "Still working"))
+        }
         try await Task.sleep(for: .milliseconds(65))
 
         let failedWhileProgressing = await log.containsLivenessFailure()
