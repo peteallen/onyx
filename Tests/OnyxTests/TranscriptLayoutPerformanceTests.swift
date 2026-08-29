@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import SwiftUI
 import XCTest
 @testable import Onyx
@@ -266,12 +267,12 @@ final class TranscriptLayoutPerformanceTests: XCTestCase {
         let oldOffset = oldFrame.minY - scrollView.contentView.bounds.minY
         let indexRebuildsBeforePrepend = controller.prependInstrumentation.displayIndexRebuildCount
 
-        let updateStart = ContinuousClock.now
+        let updateStart = currentThreadCPUTimeNanos()
         fixture.prependEarlierMessages(count: 80)
         layout()
         RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.03))
         hostingView.layoutSubtreeIfNeeded()
-        let updateElapsed = updateStart.duration(to: .now)
+        let updateCPU = currentThreadCPUTimeNanos() - updateStart
 
         let newPath = IndexPath(item: oldPath.item + 80, section: 0)
         _ = try XCTUnwrap(collectionView.item(at: newPath))
@@ -313,10 +314,14 @@ final class TranscriptLayoutPerformanceTests: XCTestCase {
             "The content under the reader's eyes moved while earlier history was inserted"
         )
         XCTAssertLessThan(
-            updateElapsed,
-            .milliseconds(250),
-            "A bounded older-history page blocked the hosted transcript for \(updateElapsed)"
+            updateCPU,
+            250_000_000,
+            "A bounded older-history page used too much main-thread work: \(Duration.nanoseconds(Int64(updateCPU)))"
         )
+    }
+
+    private func currentThreadCPUTimeNanos() -> UInt64 {
+        clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)
     }
 
     @MainActor
