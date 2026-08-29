@@ -234,6 +234,48 @@ final class CodexProjectionTests: XCTestCase {
         )
     }
 
+    func testNormalizesRevokedRefreshTokenIntoFriendlySignInRecovery() throws {
+        let diagnostic =
+            "Your access token could not be refreshed because your refresh token was revoked. Please log out and sign in again."
+        let failedTurn = JSONValue.object([
+            "id": .string("revoked-refresh-token"),
+            "status": .string("failed"),
+            "error": .object(["message": .string(diagnostic)]),
+            "items": .array([]),
+        ])
+
+        XCTAssertTrue(CodexProjection.isAuthenticationRecoveryDiagnostic(diagnostic))
+        XCTAssertEqual(
+            CodexProjection.turnFailureMessage(from: failedTurn),
+            "Your ChatGPT sign-in expired. Sign in again to continue. Your task and draft are still here."
+        )
+
+        let turn = try XCTUnwrap(CodexProjection.conversationTurn(from: failedTurn))
+        XCTAssertEqual(turn.items.first?.title, "Response failed")
+        XCTAssertEqual(
+            turn.items.first?.body,
+            "Your ChatGPT sign-in expired. Sign in again to continue. Your task and draft are still here."
+        )
+    }
+
+    func testAuthenticationRecoveryClassifierDoesNotMisclassifyOrdinaryTokenFailures() {
+        XCTAssertFalse(
+            CodexProjection.isAuthenticationRecoveryDiagnostic(
+                "The request exceeded the model's maximum output token limit."
+            )
+        )
+        XCTAssertFalse(
+            CodexProjection.isAuthenticationRecoveryDiagnostic(
+                "Your access token could not be refreshed because the server is temporarily unavailable."
+            )
+        )
+        XCTAssertFalse(
+            CodexProjection.isAuthenticationRecoveryDiagnostic(
+                "The refresh token was revoked while refreshing an unrelated integration."
+            )
+        )
+    }
+
     func testFailedTurnWithoutServerErrorStillProjectsOneStableFailure() throws {
         let turn = try XCTUnwrap(CodexProjection.conversationTurn(from: .object([
             "id": .string("missing-error"),

@@ -5,6 +5,8 @@ enum CodexProjection {
     private static let maximumTurnFailureCharacters = 2_000
     private static let outputLimitFailureMessage =
         "The provider reached its output limit before completing this response."
+    static let authenticationRecoveryFailureMessage =
+        "Your ChatGPT sign-in expired. Sign in again to continue. Your task and draft are still here."
 
     static func thread(from value: JSONValue) -> RuntimeThread? {
         guard let id = value["id"]?.stringValue else { return nil }
@@ -185,6 +187,13 @@ enum CodexProjection {
         guard let bounded = boundedText(safe, maximumCharacters: maximumTurnFailureCharacters) else {
             return nil
         }
+        // A revoked refresh token is an account-recovery state, not an
+        // actionable protocol diagnostic. Keep the classifier available to
+        // the runtime/app boundary so the UI can gate writes and attach its
+        // sign-in affordance without guessing from the friendly copy.
+        if isAuthenticationRecoveryDiagnostic(bounded) {
+            return authenticationRecoveryFailureMessage
+        }
         // codex-app-server 0.149.0 turns a valid Responses
         // `response.incomplete(max_output_tokens)` terminal event into this
         // misleading transport-looking diagnostic. Preserve unrelated
@@ -194,6 +203,15 @@ enum CodexProjection {
             return outputLimitFailureMessage
         }
         return bounded
+    }
+
+    static func isAuthenticationRecoveryDiagnostic(_ message: String) -> Bool {
+        let normalized = message
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return normalized.contains("access token could not be refreshed")
+            && normalized.contains("refresh token was revoked")
+            && (normalized.contains("sign in again") || normalized.contains("log in again"))
     }
 
     private static func isOutputLimitDisconnectDiagnostic(_ message: String) -> Bool {
