@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import SwiftUI
 import XCTest
@@ -244,8 +245,10 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
             y: size.height - 24
         )
         let taskListRevision = model.threadListRevision
-        let clock = ContinuousClock()
-        let start = clock.now
+        let wallClock = ContinuousClock()
+        let mountStart = wallClock.now
+        let mountDeadline = mountStart.advanced(by: .seconds(1))
+        let cpuStart = currentThreadCPUTimeNanos()
 
         try click(at: newTaskButtonPoint, in: window)
         let welcomePrompt = "What are we building? I can work in this project, inspect its history, run tools, and keep the result grounded in the current checkout."
@@ -262,30 +265,39 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
         // scheduling on busy CI hosts.
         hostingView.needsLayout = true
         hostingView.layoutSubtreeIfNeeded()
-        let deadline = start.advanced(by: .milliseconds(100))
-        while !isWelcomeComposerMounted(), clock.now < deadline {
+
+        // The product budget applies to work the main thread actively does
+        // for the click and every layout pass required to mount the welcome
+        // surface. A hosted XCTest can be descheduled by the GitHub runner
+        // between those calls, so wall-clock time would turn scheduler
+        // contention into a false product failure. Keep a separate wall-clock
+        // deadline only to prove that the surface eventually mounts and to
+        // prevent a broken host from spinning.
+        while !isWelcomeComposerMounted(), wallClock.now < mountDeadline {
             // Pump only the main run loop. This gives SwiftUI/AppKit a chance
             // to deliver a deferred mount without yielding the cooperative
             // executor to unrelated background projection work.
             pumpMainRunLoop(for: 0.001)
             hostingView.layoutSubtreeIfNeeded()
         }
-        let elapsed = start.duration(to: clock.now)
+        let mountElapsed = mountStart.duration(to: wallClock.now)
+        let interactionCPU = currentThreadCPUTimeNanos() - cpuStart
+        let welcomeComposerMounted = isWelcomeComposerMounted()
 
         XCTAssertEqual(model.selectedThreadID, DraftSafetyFixture.welcomeThreadID)
         XCTAssertEqual(model.threadListRevision, taskListRevision)
-        XCTAssertNotNil(
-            hostingView.firstDescendantTextField(withString: welcomePrompt),
-            "The hosted transcript did not publish the welcome surface after pressing New task"
+        XCTAssertTrue(
+            welcomeComposerMounted && mountElapsed < .seconds(1),
+            "The hosted transcript did not publish the welcome surface within the one-second liveness deadline (mounted: \(welcomeComposerMounted), elapsed: \(mountElapsed))"
+        )
+        XCTAssertLessThan(
+            interactionCPU,
+            100_000_000,
+            "The hosted New task interaction used too much main-thread work: \(Duration.nanoseconds(Int64(interactionCPU)))"
         )
         let composer = try XCTUnwrap(hostingView.firstDescendant(ofType: NSTextView.self))
         XCTAssertFalse(composer.isHidden)
         XCTAssertNotNil(composer.window)
-        XCTAssertLessThan(
-            elapsed,
-            .milliseconds(100),
-            "The hosted New task interaction missed the paint budget: \(elapsed)"
-        )
     }
 
     /// Foundation marks direct run-loop pumping unavailable from an async
@@ -293,6 +305,10 @@ final class OnyxAppModelDraftSafetyTests: XCTestCase {
     /// the timing loop can service AppKit without yielding the task executor.
     private func pumpMainRunLoop(for seconds: TimeInterval) {
         RunLoop.main.run(mode: .default, before: Date(timeIntervalSinceNow: seconds))
+    }
+
+    private func currentThreadCPUTimeNanos() -> UInt64 {
+        clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)
     }
 
     func testRepeatedNewTaskClicksAreIdempotent() async {
