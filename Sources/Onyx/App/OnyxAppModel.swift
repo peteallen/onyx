@@ -4152,6 +4152,13 @@ final class OnyxAppModel: ObservableObject {
             }
             scheduleAccountRefresh(rejectSignedInSession: !updatedAuth.isSignedIn)
         case let .authenticationRecoveryRequired(recovery):
+            guard !signedOutBoundaryActive else {
+                // Logout/account replacement is already authoritative. A
+                // delayed request failure from the retired transport must not
+                // replace the ordinary signed-out surface with an expired-
+                // session recovery card.
+                return
+            }
             requireAuthenticationRecovery(recovery)
             if let currentNotice = notice,
                CodexProjection.isAuthenticationRecoveryDiagnostic(currentNotice.detail) {

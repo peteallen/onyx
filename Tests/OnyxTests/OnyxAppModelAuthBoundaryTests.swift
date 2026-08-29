@@ -265,6 +265,30 @@ final class OnyxAppModelAuthBoundaryTests: XCTestCase {
         XCTAssertFalse(model.timeline.contains { $0.kind == .error })
     }
 
+    func testAuthenticationRecoveryAfterSignOutDoesNotReplaceSignedOutSurface() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        await startAndLoad(fixture)
+        model.signOut()
+        await fixture.runtime.waitForRefreshToFinish()
+        await waitUntil("The sign-out boundary did not finish") {
+            model.authState == .signedOut && !model.isSigningOut
+        }
+
+        // A model-catalog request can discover an invalid token just after
+        // logout closes the account boundary. That response belongs to the
+        // retired transport; it must not replace the ordinary signed-out card
+        // with the transient expired-session recovery surface.
+        await fixture.runtime.emit(.authenticationRecoveryRequired(.signInExpired))
+        await yieldSeveralTimes()
+
+        assertSignedOutWelcomeState(model)
+        XCTAssertNil(model.authenticationRecovery)
+        XCTAssertNil(model.notice)
+    }
+
     func testStaleListCompletionCannotRestorePreviousAccountAfterLogout() async {
         let fixture = makeFixture(suspendedOperations: [.listThreads])
         defer { fixture.cleanUp() }
