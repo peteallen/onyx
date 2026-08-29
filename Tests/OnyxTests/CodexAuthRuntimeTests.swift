@@ -202,6 +202,42 @@ final class CodexAuthRuntimeTests: XCTestCase {
         XCTAssertTrue(session.availableModels.isEmpty)
     }
 
+    func testModelCatalogAuthenticationFailurePublishesRecoveryInsteadOfHealthySession() async throws {
+        let transport = AuthCodexTransport(
+            accountResponse: Self.signedInAccountResponse
+        )
+        let runtime = CodexRuntime(client: transport)
+        _ = try await runtime.connect()
+
+        let recoveryEvent = Task { () -> AgentRuntimeEvent? in
+            for await event in runtime.events {
+                if case .authenticationRecoveryRequired = event { return event }
+            }
+            return nil
+        }
+        await transport.setRequestFailure(
+            Self.revokedRefreshTokenDiagnostic,
+            for: "model/list"
+        )
+
+        do {
+            _ = try await runtime.refreshAccount()
+            XCTFail("An authentication failure while refreshing models must not return a healthy session")
+        } catch let error as AgentRuntimeError {
+            guard case .authenticationRecoveryRequired(.signInExpired) = error else {
+                XCTFail("Expected structured authentication recovery, got (error)")
+                return
+            }
+        }
+
+        let observedRecoveryEvent = await recoveryEvent.value
+        XCTAssertEqual(
+            observedRecoveryEvent,
+            .authenticationRecoveryRequired(.signInExpired)
+        )
+        await runtime.disconnect()
+    }
+
     func testUnauthenticatedProviderCanRunWithoutLookingSignedIn() {
         let state = RuntimeAuthState(
             mode: nil,

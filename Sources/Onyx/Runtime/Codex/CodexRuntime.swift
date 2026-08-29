@@ -974,7 +974,21 @@ actor CodexRuntime: AgentRuntime {
         )
 
         let account = try await accountResult
-        let models = try? await modelResult
+        let models: JSONValue?
+        do {
+            models = try await modelResult
+        } catch {
+            // `model/list` is normally optional because an unavailable model
+            // catalog should not prevent a signed-out recovery card or a
+            // cached catalog from painting. Authentication is the exception:
+            // a revoked ChatGPT token can make account/read succeed from a
+            // stale snapshot while model/list returns the only fresh 401
+            // evidence. Do not silently project that session as healthy.
+            if case .authenticationRecoveryRequired = error as? AgentRuntimeError {
+                throw error
+            }
+            models = nil
+        }
         let accountValue = account["account"]
         let requiresAuthentication = account["requiresOpenaiAuth"]?.boolValue ?? true
         cachedRequiresAuthentication = requiresAuthentication
