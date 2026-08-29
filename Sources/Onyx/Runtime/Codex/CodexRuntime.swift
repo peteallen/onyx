@@ -75,6 +75,10 @@ actor CodexRuntime: AgentRuntime {
     /// authoritative value so a signed-in notification cannot make ChatGPT
     /// authentication look optional (or make a custom no-auth lane require it).
     private var cachedRequiresAuthentication: Bool?
+    /// A revoked refresh token is provider-wide. Latch one recovery event per
+    /// transport generation so a request error and its matching notification
+    /// cannot make every attached window animate the same state twice.
+    private var authenticationRecoveryGeneration: UInt64?
     /// Older user-selected binaries can reject newer protocol methods even
     /// though the adapter knows how to call them. Remember that evidence for
     /// the life of this runtime so reconnect/account refresh does not re-offer a
@@ -184,6 +188,7 @@ actor CodexRuntime: AgentRuntime {
                 throw CancellationError()
             }
             activeTransportGeneration = connection.generation
+            authenticationRecoveryGeneration = nil
             let session = try await sessionSnapshot()
             guard connectionGeneration == generation, !Task.isCancelled else {
                 throw CancellationError()
@@ -195,6 +200,7 @@ actor CodexRuntime: AgentRuntime {
         } catch {
             guard connectionGeneration == generation else { throw error }
             connected = false
+            publishAuthenticationRecoveryIfNeeded(for: error)
             activeTransportGeneration = nil
             cachedRequiresAuthentication = nil
             connectionAttempt = nil
@@ -260,6 +266,7 @@ actor CodexRuntime: AgentRuntime {
         connectionAttempt?.cancel()
         connectionAttempt = nil
         activeTransportGeneration = nil
+        authenticationRecoveryGeneration = nil
         connected = false
         cachedRequiresAuthentication = nil
         activeTurnIDs.removeAll()
@@ -1041,6 +1048,7 @@ actor CodexRuntime: AgentRuntime {
             connectionAttempt = nil
             connected = false
             activeTransportGeneration = nil
+            authenticationRecoveryGeneration = nil
             cachedRequiresAuthentication = nil
             activeTurnIDs.removeAll()
             pendingTurnFailuresByThreadID.removeAll()
@@ -1180,7 +1188,12 @@ actor CodexRuntime: AgentRuntime {
                 eventContinuation.yield(.userInteractionResolved(requestID))
             }
         case "error":
+            let requiresAuthenticationRecovery =
+                CodexProjection.isAuthenticationRecoveryDiagnostic(from: params)
             let detail = CodexProjection.turnFailureMessage(from: params)
+            if requiresAuthenticationRecovery {
+                publishAuthenticationRecoveryIfNeeded()
+            }
             if !threadID.isEmpty,
                let turnID = params["turnId"]?.stringValue ?? activeTurnIDs[threadID],
                let detail {
@@ -1194,6 +1207,11 @@ actor CodexRuntime: AgentRuntime {
                 // Turn failures are represented by the stable transcript row
                 // emitted with `turn/completed`; do not also interrupt the user
                 // with a modal notice for this same provider-owned failure.
+                return
+            }
+            if requiresAuthenticationRecovery {
+                // The attached sign-in surface owns provider-global recovery.
+                // Do not duplicate it with a generic modal notice.
                 return
             }
             eventContinuation.yield(
@@ -1288,6 +1306,27 @@ actor CodexRuntime: AgentRuntime {
             ])
         )
         activeTurnIDs.removeValue(forKey: threadID)
+    }
+
+    private func request(method: String, params: JSONValue) async throws -> JSONValue {
+        do {
+            return try await client.request(method: method, params: params)
+        } catch {
+            publishAuthenticationRecoveryIfNeeded(for: error)
+            throw error
+        }
+    }
+
+    private func publishAuthenticationRecoveryIfNeeded(for error: any Error) {
+        guard CodexProjection.isAuthenticationRecoveryDiagnostic(error.localizedDescription) else { return }
+        publishAuthenticationRecoveryIfNeeded()
+    }
+
+    private func publishAuthenticationRecoveryIfNeeded() {
+        let generation = activeTransportGeneration ?? connectionGeneration
+        guard authenticationRecoveryGeneration != generation else { return }
+        authenticationRecoveryGeneration = generation
+        eventContinuation.yield(.authenticationRecoveryRequired(.signInExpired))
     }
 
     private func codexInteractionResponse(

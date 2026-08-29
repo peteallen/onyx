@@ -526,6 +526,8 @@ private actor SharedRuntimeSessionState {
             // Codex can still list local task history before login. Only a
             // successful explicit logout establishes the privilege barrier.
             return .auth(generation: authEventGeneration)
+        case .authenticationRecoveryRequired:
+            return .always
         case let .loginCompleted(completion):
             invalidateSessionSnapshot()
             guard !isLoggingOut else { return nil }

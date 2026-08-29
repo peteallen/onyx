@@ -2174,7 +2174,7 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
                 break
             }
             switch projected {
-            case .connectionChanged, .accountUpdated, .loginCompleted,
+            case .connectionChanged, .accountUpdated, .authenticationRecoveryRequired, .loginCompleted,
                  .runtimeCapabilitiesDowngraded, .runtimeModelsUpdated,
                  .runtimeNotice:
                 // Provider-wide state belongs to the chat facade. The private
@@ -2515,7 +2515,7 @@ actor OpenAICompatibleAdaptiveRuntime: AgentRuntime {
             threadID
         case let .userInteractionRequested(interaction): interaction.threadID
         case .connectionChanged, .runtimeCapabilitiesDowngraded,
-             .runtimeModelsUpdated, .accountUpdated, .loginCompleted,
+             .runtimeModelsUpdated, .accountUpdated, .authenticationRecoveryRequired, .loginCompleted,
              .userInteractionResolved, .runtimeNotice:
             nil
         }

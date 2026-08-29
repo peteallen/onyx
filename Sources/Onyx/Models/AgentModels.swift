@@ -124,6 +124,20 @@ struct RuntimeAuthState: Sendable, Equatable {
     )
 }
 
+/// A provider can lose an otherwise valid session when its refresh token is
+/// revoked. This is deliberately separate from `RuntimeAuthState`: the
+/// provider has not authoritatively signed out, so task history and drafts
+/// must remain visible while writes wait for a new sign-in.
+enum RuntimeAuthenticationRecovery: Sendable, Equatable {
+    case signInExpired
+
+    var title: String { "Sign in again to continue" }
+
+    var detail: String {
+        "Your ChatGPT sign-in is no longer valid. Sign in again to continue. Your task and draft are still here."
+    }
+}
+
 enum RuntimeAuthMode: String, Sendable, Codable, Equatable {
     case apiKey = "apikey"
     case chatgpt
@@ -999,6 +1013,7 @@ enum AgentRuntimeEvent: Sendable, Equatable {
     /// durable execution lane.
     case runtimeModelsUpdated([RuntimeModel])
     case accountUpdated(RuntimeAuthState)
+    case authenticationRecoveryRequired(RuntimeAuthenticationRecovery)
     case loginCompleted(RuntimeLoginCompletion)
     case threadUpdated(RuntimeThread)
     case threadNameChanged(threadID: String, name: String?)

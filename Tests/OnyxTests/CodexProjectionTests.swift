@@ -247,14 +247,14 @@ final class CodexProjectionTests: XCTestCase {
         XCTAssertTrue(CodexProjection.isAuthenticationRecoveryDiagnostic(diagnostic))
         XCTAssertEqual(
             CodexProjection.turnFailureMessage(from: failedTurn),
-            "Your ChatGPT sign-in expired. Sign in again to continue. Your task and draft are still here."
+            "Your ChatGPT sign-in is no longer valid. Sign in again to continue. Your task and draft are still here."
         )
 
         let turn = try XCTUnwrap(CodexProjection.conversationTurn(from: failedTurn))
         XCTAssertEqual(turn.items.first?.title, "Response failed")
         XCTAssertEqual(
             turn.items.first?.body,
-            "Your ChatGPT sign-in expired. Sign in again to continue. Your task and draft are still here."
+            "Your ChatGPT sign-in is no longer valid. Sign in again to continue. Your task and draft are still here."
         )
     }
 
@@ -262,6 +262,16 @@ final class CodexProjectionTests: XCTestCase {
         XCTAssertFalse(
             CodexProjection.isAuthenticationRecoveryDiagnostic(
                 "The request exceeded the model's maximum output token limit."
+            )
+        )
+        XCTAssertTrue(
+            CodexProjection.isAuthenticationRecoveryDiagnostic(
+                "Your access token could not be refreshed. Please log out and sign in again."
+            )
+        )
+        XCTAssertTrue(
+            CodexProjection.isAuthenticationRecoveryDiagnostic(
+                "Your session changed since you logged out or signed in to another account. Please sign in again."
             )
         )
         XCTAssertFalse(

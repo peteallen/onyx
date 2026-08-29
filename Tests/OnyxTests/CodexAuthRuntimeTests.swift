@@ -340,6 +340,52 @@ final class CodexAuthRuntimeTests: XCTestCase {
             ]
         )
     }
+
+    func testRevokedRefreshTokenErrorPublishesStructuredAuthenticationRecovery() async throws {
+        let transport = AuthCodexTransport(
+            accountResponse: .object([
+                "account": .object([
+                    "type": .string("chatgpt"),
+                    "email": .string("person@example.com"),
+                ]),
+                "requiresOpenaiAuth": .bool(true),
+            ])
+        )
+        let runtime = CodexRuntime(client: transport)
+        let diagnostic =
+            "Your access token could not be refreshed because your refresh token was revoked. Please log out and sign in again."
+
+        let observedEvents = try await withThrowingTaskGroup(of: [AgentRuntimeEvent].self) { group in
+            group.addTask {
+                var events: [AgentRuntimeEvent] = []
+                for await event in runtime.events {
+                    events.append(event)
+                    if events.contains(.authenticationRecoveryRequired(.signInExpired)) {
+                        return events
+                    }
+                }
+                return events
+            }
+            group.addTask {
+                try await Task.sleep(for: .seconds(2))
+                throw AuthCodexTransport.TestFailure.timedOutWaitingForEvents
+            }
+
+            _ = try await runtime.connect()
+            await transport.emitNotification(
+                method: "error",
+                params: .object(["message": .string(diagnostic)])
+            )
+            guard let firstResult = try await group.next() else {
+                throw AuthCodexTransport.TestFailure.eventStreamEnded
+            }
+            group.cancelAll()
+            return firstResult
+        }
+        await runtime.disconnect()
+
+        XCTAssertTrue(observedEvents.contains(.authenticationRecoveryRequired(.signInExpired)))
+    }
 }
 
 private actor AuthCodexTransport: CodexAppServerTransport {

@@ -214,6 +214,56 @@ final class OnyxAppModelAuthBoundaryTests: XCTestCase {
         XCTAssertTrue(calls.startTurns.isEmpty)
     }
 
+    func testRevokedRefreshTokenPreservesTaskAndDraftButGatesWritesUntilSignIn() async throws {
+        let fixture = makeFixture(refreshBehavior: .staleSignedIn)
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        await startAndLoad(fixture)
+        model.composerText = "Keep this draft while I sign back in"
+        await fixture.runtime.emit(.authenticationRecoveryRequired(.signInExpired))
+
+        await waitUntil("The sign-in recovery state did not reach the app model") {
+            model.authenticationRecovery == .signInExpired
+        }
+
+        XCTAssertTrue(model.authState.isSignedIn, "Recovery must not pretend the account was signed out")
+        XCTAssertFalse(model.canRunAgent)
+        XCTAssertNil(model.notice, "Recovery belongs to the attached account surface, not a duplicate modal")
+        XCTAssertEqual(model.selectedThreadID, AuthBoundaryFixture.accountThread.id)
+        XCTAssertEqual(model.timeline, [AuthBoundaryFixture.sensitiveTranscriptItem])
+        XCTAssertEqual(model.composerText, "Keep this draft while I sign back in")
+
+        model.sendComposer()
+        await yieldSeveralTimes()
+        let blockedCalls = await fixture.runtime.recordedPrivilegedCalls()
+        XCTAssertTrue(blockedCalls.startTurns.isEmpty)
+        XCTAssertEqual(model.composerText, "Keep this draft while I sign back in")
+
+        await fixture.runtime.emit(.accountUpdated(AuthBoundaryTestRuntime.signedInAuthForTests))
+        await yieldSeveralTimes()
+        XCTAssertEqual(
+            model.authenticationRecovery,
+            .signInExpired,
+            "A stale signed-in event must not clear recovery without a new login ceremony"
+        )
+
+        model.startLogin(AuthBoundaryTestRuntime.loginMethod)
+        await waitUntil("The recovery login did not start") {
+            model.loginAttempt?.loginID == "recovery-login"
+        }
+        await fixture.runtime.emit(.loginCompleted(RuntimeLoginCompletion(
+            loginID: "recovery-login",
+            success: true,
+            error: nil
+        )))
+        await fixture.runtime.waitForRefreshToFinish()
+        await waitUntil("Successful sign-in did not clear account recovery") {
+            model.authenticationRecovery == nil && model.canRunAgent
+        }
+        XCTAssertEqual(model.composerText, "Keep this draft while I sign back in")
+    }
+
     private func makeFixture(
         logoutBehavior: AuthBoundaryTestRuntime.LogoutBehavior = .immediate,
         refreshBehavior: AuthBoundaryTestRuntime.RefreshBehavior = .signedOut,
@@ -341,6 +391,12 @@ private struct AuthBoundaryFixture {
 }
 
 private actor AuthBoundaryTestRuntime: AgentRuntime {
+    nonisolated static let loginMethod = RuntimeLoginMethod(
+        id: "auth-boundary.browser",
+        displayName: "Sign In",
+        detail: "Sign in securely",
+        ceremony: .browser
+    )
     enum SuspendedOperation: Hashable, Sendable {
         case listThreads
         case readThread
@@ -408,6 +464,19 @@ private actor AuthBoundaryTestRuntime: AgentRuntime {
     }
 
     func disconnect() async {}
+
+    func startLogin(methodID: String) async throws -> RuntimeLoginStart {
+        guard methodID == Self.loginMethod.id else {
+            throw AgentRuntimeError.unsupported("unknown auth-boundary login method")
+        }
+        return RuntimeLoginStart(
+            method: Self.loginMethod,
+            loginID: "recovery-login",
+            authURL: nil,
+            verificationURL: nil,
+            userCode: nil
+        )
+    }
 
     func logout() async throws {
         logoutCallCount += 1
@@ -563,6 +632,8 @@ private actor AuthBoundaryTestRuntime: AgentRuntime {
         requiresAuthentication: true
     )
 
+    static var signedInAuthForTests: RuntimeAuthState { signedInAuth }
+
     private static func session(auth: RuntimeAuthState) -> RuntimeSession {
         RuntimeSession(
             runtime: .codex,
@@ -570,7 +641,7 @@ private actor AuthBoundaryTestRuntime: AgentRuntime {
             accountLabel: auth.email,
             planLabel: auth.planLabel,
             auth: auth,
-            availableLoginMethods: [],
+            availableLoginMethods: [loginMethod],
             availableModels: [],
             capabilities: [.streaming, .approvals]
         )

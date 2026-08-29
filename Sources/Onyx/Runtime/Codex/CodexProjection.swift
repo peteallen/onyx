@@ -6,7 +6,7 @@ enum CodexProjection {
     private static let outputLimitFailureMessage =
         "The provider reached its output limit before completing this response."
     static let authenticationRecoveryFailureMessage =
-        "Your ChatGPT sign-in expired. Sign in again to continue. Your task and draft are still here."
+        "Your ChatGPT sign-in is no longer valid. Sign in again to continue. Your task and draft are still here."
 
     static func thread(from value: JSONValue) -> RuntimeThread? {
         guard let id = value["id"]?.stringValue else { return nil }
@@ -155,6 +155,20 @@ enum CodexProjection {
         return candidates.lazy.compactMap(boundedTurnFailureMessage).first
     }
 
+    /// Checks the provider's original diagnostic before `turnFailureMessage`
+    /// replaces it with user-facing copy.
+    static func isAuthenticationRecoveryDiagnostic(from value: JSONValue) -> Bool {
+        let candidates = [
+            value["error"]?["message"]?.stringValue,
+            value["error"]?.stringValue,
+            value["message"]?.stringValue,
+        ]
+        return candidates.contains { candidate in
+            guard let candidate else { return false }
+            return isAuthenticationRecoveryDiagnostic(candidate)
+        }
+    }
+
     static func turnFailureTimelineItem(
         from value: JSONValue,
         fallbackTurnID: String? = nil,
@@ -209,9 +223,11 @@ enum CodexProjection {
         let normalized = message
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
-        return normalized.contains("access token could not be refreshed")
-            && normalized.contains("refresh token was revoked")
-            && (normalized.contains("sign in again") || normalized.contains("log in again"))
+        let requestsNewSignIn = normalized.contains("sign in again")
+            || normalized.contains("log in again")
+        return requestsNewSignIn
+            && (normalized.contains("access token could not be refreshed")
+                || normalized.contains("logged out or signed in to another account"))
     }
 
     private static func isOutputLimitDisconnectDiagnostic(_ message: String) -> Bool {

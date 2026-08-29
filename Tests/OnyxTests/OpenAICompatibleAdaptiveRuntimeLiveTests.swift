@@ -351,6 +351,7 @@ private actor LiveAdaptiveEventLog {
         let kinds = values.compactMap { event -> String? in
             switch event {
             case .connectionChanged: "connection"
+            case .authenticationRecoveryRequired: "auth-recovery"
             case .threadUpdated: "thread"
             case .itemStarted: "item-started"
             case .itemDelta: "item-delta"

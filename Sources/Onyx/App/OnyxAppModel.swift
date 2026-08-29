@@ -189,6 +189,7 @@ final class OnyxAppModel: ObservableObject {
     /// re-enable the rejected action in this window.
     private var downgradedRuntimeCapabilities: RuntimeCapabilities = []
     @Published var authState = RuntimeAuthState.signedOut
+    @Published private(set) var authenticationRecovery: RuntimeAuthenticationRecovery?
     @Published var loginAttempt: RuntimeLoginStart?
     @Published var isAuthenticating = false
     @Published var isSigningOut = false
@@ -404,6 +405,10 @@ final class OnyxAppModel: ObservableObject {
     private var formDrafts: [RuntimeRequestID: InteractionDraftEntry<RuntimeFormDraft>] = [:]
     private var pendingRestoredSelectionID: String?
     private var cancelledLoginID: String?
+    /// A stale signed-in event cannot prove that a revoked refresh token was
+    /// replaced. Clear recovery only after a login started from that recovery
+    /// completes and its authoritative account read confirms the new session.
+    private var loginRecoveryPendingConfirmation = false
     private var didStart = false
     private var navigationRevision = 0
     /// Distinguishes the user's first explicit New Task action from the
@@ -734,7 +739,7 @@ final class OnyxAppModel: ObservableObject {
     }
 
     var canRunAgent: Bool {
-        guard authState.canRun, !isSigningOut else { return false }
+        guard authState.canRun, authenticationRecovery == nil, !isSigningOut else { return false }
         if case .connected = connectionState { return true }
         return false
     }
@@ -1096,6 +1101,10 @@ final class OnyxAppModel: ObservableObject {
         return "Agent runtime"
     }
 
+    /// Safe UI-facing identity for account recovery copy. The concrete
+    /// runtime remains private so views cannot couple to provider internals.
+    var isCodexRuntime: Bool { runtimeKind == .codex }
+
     private var connectionFailureNoticeTitle: String {
         "\(runtimeDisplayName) did not connect"
     }
@@ -1409,6 +1418,7 @@ final class OnyxAppModel: ObservableObject {
     func startLogin(_ method: RuntimeLoginMethod) {
         guard let runtime, !isAuthenticating, loginAttempt == nil else { return }
         cancelledLoginID = nil
+        loginRecoveryPendingConfirmation = authenticationRecovery != nil
         isAuthenticating = true
 
         Task { [weak self] in
@@ -1427,6 +1437,7 @@ final class OnyxAppModel: ObservableObject {
                 }
             } catch {
                 isAuthenticating = false
+                loginRecoveryPendingConfirmation = false
                 notice = authenticationFailure(for: error)
             }
         }
@@ -1458,6 +1469,7 @@ final class OnyxAppModel: ObservableObject {
             } catch {
                 cancelledLoginID = nil
                 isAuthenticating = false
+                loginRecoveryPendingConfirmation = false
                 notice = ("Could not cancel sign in", error.localizedDescription)
             }
         }
@@ -3600,10 +3612,17 @@ final class OnyxAppModel: ObservableObject {
                 closeSideChat()
             }
             applyAuthProjection(updatedAuth)
-            if !updatedAuth.canRun {
+            if !updatedAuth.canRun, authenticationRecovery == nil {
                 closeAccountBoundary()
             }
             scheduleAccountRefresh(rejectSignedInSession: !updatedAuth.isSignedIn)
+        case let .authenticationRecoveryRequired(recovery):
+            authenticationRecovery = recovery
+            isTurnRunning = false
+            // The transcript row and attached recovery surface carry this
+            // state. Keep partially answered provider interactions intact and
+            // avoid a duplicate modal.
+            notice = nil
         case let .loginCompleted(completion):
             if cancelledLoginID != nil,
                (completion.loginID == nil || completion.loginID == cancelledLoginID),
@@ -3623,11 +3642,15 @@ final class OnyxAppModel: ObservableObject {
                     isAuthenticating = false
                     loginAttempt = nil
                 }
-                scheduleAccountRefresh()
+                scheduleAccountRefresh(
+                    confirmsAuthenticationRecovery: matchesCurrentAttempt
+                        && loginRecoveryPendingConfirmation
+                )
             } else {
                 guard matchesCurrentAttempt else { return }
                 isAuthenticating = false
                 loginAttempt = nil
+                loginRecoveryPendingConfirmation = false
                 notice = (
                     "Sign in was not completed",
                     completion.error ?? "The ChatGPT sign-in flow ended before it completed."
@@ -3957,6 +3980,7 @@ final class OnyxAppModel: ObservableObject {
              .runtimeCapabilitiesDowngraded,
              .runtimeModelsUpdated,
              .accountUpdated,
+             .authenticationRecoveryRequired,
              .loginCompleted,
              .userInteractionResolved,
              .runtimeNotice:
@@ -5238,8 +5262,10 @@ final class OnyxAppModel: ObservableObject {
         hasExplicitNewTaskSelection = false
         downgradedRuntimeCapabilities = []
         cancelledLoginID = nil
+        loginRecoveryPendingConfirmation = false
         loginAttempt = nil
         isAuthenticating = false
+        authenticationRecovery = nil
 
         composerDrafts.removeAll()
         pendingComposerDraftMutations.removeAll(keepingCapacity: true)
@@ -5322,7 +5348,10 @@ final class OnyxAppModel: ObservableObject {
         }
     }
 
-    private func scheduleAccountRefresh(rejectSignedInSession: Bool = false) {
+    private func scheduleAccountRefresh(
+        rejectSignedInSession: Bool = false,
+        confirmsAuthenticationRecovery: Bool = false
+    ) {
         guard let runtime else { return }
         accountRefreshTask?.cancel()
         let epoch = accountEpoch
@@ -5334,11 +5363,17 @@ final class OnyxAppModel: ObservableObject {
                 guard accountEpoch == epoch, !Task.isCancelled else { return }
                 guard !rejectSignedInSession || !refreshedSession.auth.isSignedIn else { return }
                 applyRuntimeSession(refreshedSession)
+                if confirmsAuthenticationRecovery, refreshedSession.auth.isSignedIn {
+                    authenticationRecovery = nil
+                }
             } catch {
                 guard accountEpoch == epoch, !Task.isCancelled else { return }
                 // The notification projection is still useful. A later account event or reconnect retries.
             }
             guard accountEpoch == epoch, !Task.isCancelled else { return }
+            if confirmsAuthenticationRecovery {
+                loginRecoveryPendingConfirmation = false
+            }
             accountRefreshTask = nil
         }
     }
