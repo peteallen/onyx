@@ -227,6 +227,43 @@ final class OpenAICompatibleResponsesSSESanitizerTests: XCTestCase {
         }
     }
 
+    func testPreservesCapturedFunctionCallLifecycleSnapshotsWithOptionalNullMetadata() throws {
+        // vLLM emits the same function-call shape at both lifecycle edges.
+        // `caller` and `namespace` are optional in Responses and are often
+        // explicit JSON nulls; they must survive sanitization so app-server
+        // can decode the item rather than reporting a malformed ResponseItem.
+        let added = "event: response.output_item.added\n"
+            + "data: {\"item\":{\"arguments\":\"\","
+            + "\"call_id\":\"call_123\",\"name\":\"exec_command\","
+            + "\"type\":\"function_call\",\"id\":\"fc_123\","
+            + "\"caller\":null,\"namespace\":null,"
+            + "\"status\":\"in_progress\"},\"output_index\":0,"
+            + "\"type\":\"response.output_item.added\"}\n\n"
+        let done = "event: response.output_item.done\n"
+            + "data: {\"item\":{\"arguments\":\"\","
+            + "\"call_id\":\"call_123\",\"name\":\"exec_command\","
+            + "\"type\":\"function_call\",\"id\":\"fc_123\","
+            + "\"caller\":null,\"namespace\":null,"
+            + "\"status\":\"in_progress\"},\"output_index\":0,"
+            + "\"type\":\"response.output_item.done\"}\n\n"
+
+        var sanitizer = OpenAICompatibleResponsesSSESanitizer(credential: nil)
+        for frame in [added, done] {
+            let output = try sanitizer.append(Data(frame.utf8))
+            let object = try XCTUnwrap(try decodeFrameObject(output.frames))
+            let item = try XCTUnwrap(object["item"] as? [String: Any])
+
+            XCTAssertEqual(item["arguments"] as? String, "")
+            XCTAssertEqual(item["call_id"] as? String, "call_123")
+            XCTAssertEqual(item["name"] as? String, "exec_command")
+            XCTAssertEqual(item["type"] as? String, "function_call")
+            XCTAssertEqual(item["id"] as? String, "fc_123")
+            XCTAssertTrue(item["caller"] is NSNull)
+            XCTAssertTrue(item["namespace"] is NSNull)
+            XCTAssertEqual(item["status"] as? String, "in_progress")
+        }
+    }
+
     func testUnknownDoneSnapshotWithStringsStillFailsClosed() throws {
         var sanitizer = OpenAICompatibleResponsesSSESanitizer(credential: nil)
         let frame = "data: {\"type\":\"response.future_item.done\","

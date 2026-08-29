@@ -414,6 +414,12 @@ final class OnyxAppModel: ObservableObject {
     private var recoveryInteractionGeneration: UInt64 = 0
     private var pendingRestoredSelectionID: String?
     private var cancelledLoginID: String?
+    /// Fences browser/device-code/login-cancellation/logout callbacks that
+    /// outlive the account state in which they started. An authoritative
+    /// account boundary invalidates the generation before clearing UI state,
+    /// so a late RPC success or failure cannot reopen a ceremony or publish a
+    /// stale modal into the replacement account.
+    private var authenticationOperationGeneration: UInt64 = 0
     /// A stale signed-in event cannot prove that a revoked refresh token was
     /// replaced. Clear recovery only after a login started from that recovery
     /// completes and its authoritative account read confirms the new session.
@@ -483,6 +489,28 @@ final class OnyxAppModel: ObservableObject {
             visibleStartIndex: Int,
             nextProviderCursor: String?
         )
+    }
+
+    /// The last task view is kept as a single, short-lived navigation
+    /// snapshot while another task is being opened.  It is deliberately not
+    /// a per-task transcript cache: retaining every conversation here would
+    /// make a large history window slower and could keep account data alive
+    /// longer than the visible task.  If the destination read fails because
+    /// authentication expired, restoring this snapshot keeps the task the
+    /// user was actually working in on screen instead of showing an empty or
+    /// misleading transcript under the newly clicked row.
+    private struct SelectionPresentationSnapshot {
+        let threadID: String
+        let transcript: TranscriptPresentationSnapshot
+        let collaborationAgentsByID: [String: RuntimeCollaborationAgent]
+        let composerDraftKey: String
+        let composerText: String
+        let composerImages: [ComposerImageDraft]
+        let lastWorkspacePath: String?
+        let earlierHistorySource: EarlierHistorySource?
+        let canLoadEarlierHistory: Bool
+        let loadedConversationTurns: [RuntimeConversationTurn]
+        let resumedThreadID: String?
     }
 
     private var earlierHistorySource: EarlierHistorySource?
@@ -1498,6 +1526,7 @@ final class OnyxAppModel: ObservableObject {
 
     func startLogin(_ method: RuntimeLoginMethod) {
         guard let runtime, !isAuthenticating, loginAttempt == nil else { return }
+        let epoch = accountEpoch
         cancelledLoginID = nil
         // A recovery login is not confirmed merely because its browser/device
         // ceremony opened. Arm confirmation only from the matching successful
@@ -1509,6 +1538,10 @@ final class OnyxAppModel: ObservableObject {
             guard let self else { return }
             do {
                 let attempt = try await runtime.startLogin(methodID: method.id)
+                guard accountEpoch == epoch,
+                      !Task.isCancelled,
+                      isAuthenticating,
+                      loginAttempt == nil else { return }
                 loginAttempt = attempt
                 isAuthenticating = false
 
@@ -1520,8 +1553,19 @@ final class OnyxAppModel: ObservableObject {
                     )
                 }
             } catch {
+                guard accountEpoch == epoch,
+                      !Task.isCancelled,
+                      isAuthenticating,
+                      loginAttempt == nil else { return }
                 isAuthenticating = false
                 loginRecoveryPendingConfirmation = false
+                if requireAuthenticationRecovery(for: error) {
+                    // A failed login handshake can carry the same revoked
+                    // token/401 payload as a task request.  Keep that raw
+                    // provider diagnostic out of the modal and leave the
+                    // attached recovery card available for another attempt.
+                    return
+                }
                 notice = authenticationFailure(for: error)
             }
         }
@@ -1542,19 +1586,34 @@ final class OnyxAppModel: ObservableObject {
 
     func cancelLogin() {
         guard let runtime, let attempt = loginAttempt, !isAuthenticating else { return }
+        let epoch = accountEpoch
         cancelledLoginID = attempt.loginID
         isAuthenticating = true
         Task { [weak self] in
             guard let self else { return }
             do {
                 try await runtime.cancelLogin(id: attempt.loginID)
-                if loginAttempt?.loginID == attempt.loginID { loginAttempt = nil }
+                guard accountEpoch == epoch,
+                      !Task.isCancelled,
+                      loginAttempt?.loginID == attempt.loginID,
+                      cancelledLoginID == attempt.loginID else { return }
+                loginAttempt = nil
                 isAuthenticating = false
                 loginRecoveryPendingConfirmation = false
             } catch {
+                guard accountEpoch == epoch,
+                      !Task.isCancelled,
+                      loginAttempt?.loginID == attempt.loginID,
+                      cancelledLoginID == attempt.loginID else { return }
                 cancelledLoginID = nil
                 isAuthenticating = false
                 loginRecoveryPendingConfirmation = false
+                if requireAuthenticationRecovery(for: error) {
+                    // A cancellation can race token expiry. Keep the attached
+                    // recovery card as the sole authentication surface and
+                    // never expose the provider's raw credential diagnostic.
+                    return
+                }
                 notice = ("Could not cancel sign in", error.localizedDescription)
             }
         }
@@ -1562,11 +1621,15 @@ final class OnyxAppModel: ObservableObject {
 
     func signOut() {
         guard let runtime, authState.isSignedIn, !isSigningOut else { return }
+        let epoch = accountEpoch
         isSigningOut = true
         Task { [weak self] in
             guard let self else { return }
             do {
                 try await runtime.logout()
+                guard accountEpoch == epoch,
+                      !Task.isCancelled,
+                      isSigningOut else { return }
                 applyAuthProjection(.signedOut)
                 closeAccountBoundary()
                 let signedOutEpoch = accountEpoch
@@ -1582,7 +1645,16 @@ final class OnyxAppModel: ObservableObject {
                     // closed and let a later account event reconcile metadata.
                 }
             } catch {
+                guard accountEpoch == epoch,
+                      !Task.isCancelled,
+                      isSigningOut else { return }
                 isSigningOut = false
+                if requireAuthenticationRecovery(for: error) {
+                    // Logout may itself be rejected by an already-revoked
+                    // session. The attached recovery surface explains the
+                    // next step; do not stack a raw transport/token alert.
+                    return
+                }
                 notice = ("Could not sign out", error.localizedDescription)
             }
         }
@@ -1745,10 +1817,12 @@ final class OnyxAppModel: ObservableObject {
                       connectionRevision == revision,
                       !Task.isCancelled else { return }
                 isLoadingThreadList = false
-                notice = (
-                    "Connected, but tasks did not refresh",
-                    "Your existing tasks are still available. \(error.localizedDescription)"
-                )
+                if !requireAuthenticationRecovery(for: error) {
+                    notice = (
+                        "Connected, but tasks did not refresh",
+                        "Your existing tasks are still available. \(error.localizedDescription)"
+                    )
+                }
             }
 
         }
@@ -1756,6 +1830,7 @@ final class OnyxAppModel: ObservableObject {
 
     func selectThread(_ id: String) {
         guard selectedThreadID != id else { return }
+        let previousSelectionSnapshot = selectionPresentationSnapshot()
         if id != Self.welcomeThread.id {
             hasExplicitNewTaskSelection = false
             // An explicit task click supersedes any selection restored from
@@ -1775,9 +1850,9 @@ final class OnyxAppModel: ObservableObject {
         loadTask?.cancel()
         resetEarlierHistory()
         let selected = selectedThread
-        isTurnRunning = selected.map {
+        isTurnRunning = authenticationRecovery == nil && (selected.map {
             $0.status.isBusy || isReviewActive(for: $0.id)
-        } ?? false
+        } ?? false)
 
         guard id != Self.welcomeThread.id, let runtime else {
             replaceTimeline([.welcome()])
@@ -1806,13 +1881,21 @@ final class OnyxAppModel: ObservableObject {
                     loaded.conversation.thread,
                     preservePositionIfPresent: true
                 )
-                isTurnRunning = loaded.conversation.thread.status.isBusy
-                    || isReviewActive(for: loaded.conversation.thread.id)
+                isTurnRunning = authenticationRecovery == nil
+                    && (loaded.conversation.thread.status.isBusy
+                        || isReviewActive(for: loaded.conversation.thread.id))
                 isLoadingThread = false
                 resolveLatestMessageEditAfterAuthoritativeReload(threadID: id)
             } catch {
                 guard accountEpoch == epoch, !Task.isCancelled, selectedThreadID == id else { return }
                 isLoadingThread = false
+                if requireAuthenticationRecovery(for: error) {
+                    restoreSelectionPresentationSnapshot(
+                        previousSelectionSnapshot,
+                        afterFailedSelectionID: id
+                    )
+                    return
+                }
                 replaceTimeline([
                     TimelineItem(
                         id: UUID().uuidString,
@@ -1826,6 +1909,82 @@ final class OnyxAppModel: ObservableObject {
                 ])
             }
         }
+    }
+
+    private func selectionPresentationSnapshot() -> SelectionPresentationSnapshot? {
+        guard let threadID = selectedThreadID,
+              threadID != Self.welcomeThread.id else { return nil }
+        return SelectionPresentationSnapshot(
+            threadID: threadID,
+            transcript: transcriptSnapshot,
+            collaborationAgentsByID: collaborationAgentsByID,
+            composerDraftKey: composerDraftKey,
+            composerText: composerText,
+            composerImages: composerImages,
+            lastWorkspacePath: draftWorkspacePath,
+            earlierHistorySource: earlierHistorySource,
+            canLoadEarlierHistory: canLoadEarlierHistory,
+            loadedConversationTurns: loadedConversationTurns,
+            resumedThreadID: resumedThreadID
+        )
+    }
+
+    /// Restores the last fully visible task after a destination read is
+    /// rejected for authentication.  A welcome-task snapshot is intentionally
+    /// not restored: when the first task opened from New Task cannot be read,
+    /// keeping that task selected lets the recovery card remain attached to
+    /// the task the user chose while preserving its draft.
+    private func restoreSelectionPresentationSnapshot(
+        _ snapshot: SelectionPresentationSnapshot?,
+        afterFailedSelectionID failedSelectionID: String
+    ) {
+        guard let snapshot,
+              snapshot.threadID != Self.welcomeThread.id,
+              selectedThreadID == failedSelectionID else { return }
+
+        // This is a real navigation rollback. Advance the revision before
+        // publishing the old selection so any late destination callback is
+        // fenced out even if it was already queued on the main actor.
+        navigationRevision += 1
+        loadTask?.cancel()
+        loadTask = nil
+        resetEarlierHistory()
+
+        selectedThreadID = snapshot.threadID
+        preferences.set(snapshot.threadID, forKey: preferenceKey(PreferenceKey.selectedThread))
+        composerDraftKey = snapshot.composerDraftKey
+        composerText = snapshot.composerText
+        composerImages = snapshot.composerImages
+        draftWorkspacePath = snapshot.lastWorkspacePath
+        if let lastWorkspacePath = snapshot.lastWorkspacePath,
+           !lastWorkspacePath.isEmpty,
+           lastWorkspacePath != "/" {
+            preferences.set(
+                lastWorkspacePath,
+                forKey: preferenceKey("Onyx.lastWorkspacePath")
+            )
+        } else {
+            preferences.removeObject(forKey: preferenceKey("Onyx.lastWorkspacePath"))
+        }
+        // Publish a fresh revision instead of assigning the captured revision
+        // back over the newer loading snapshot. Native transcript consumers
+        // rely on revisions remaining monotonic when deciding how to update
+        // their mounted rows.
+        replaceTimeline(snapshot.transcript.items)
+        // The transcript rows rebuild the normal collaboration projection,
+        // but the live reducer can retain a child path/destination across a
+        // later sparse status row or downgrade a live child after transport
+        // loss. Preserve that exact visible presentation across the rollback.
+        collaborationAgentsByID = snapshot.collaborationAgentsByID
+        publishCollaborationAgents()
+        earlierHistorySource = snapshot.earlierHistorySource
+        canLoadEarlierHistory = snapshot.canLoadEarlierHistory
+        isLoadingEarlierHistory = false
+        loadedConversationTurns = snapshot.loadedConversationTurns
+        resumedThreadID = snapshot.resumedThreadID
+        isLoadingThread = false
+        isTurnRunning = false
+        validateSelectedReasoningEffort()
     }
 
     /// Opens a provider-native, non-durable branch of the selected task. The
@@ -2307,7 +2466,9 @@ final class OnyxAppModel: ObservableObject {
                           !Task.isCancelled,
                           threadListScope == .active else { return }
                     isLoadingThreadList = false
-                    notice = ("Connected, but tasks did not refresh", error.localizedDescription)
+                    if !requireAuthenticationRecovery(for: error) {
+                        notice = ("Connected, but tasks did not refresh", error.localizedDescription)
+                    }
                 }
             }
         } else if shouldRefreshActiveList {
@@ -2398,7 +2559,9 @@ final class OnyxAppModel: ObservableObject {
             } catch {
                 guard accountEpoch == epoch, !Task.isCancelled, threadListScope == scope else { return }
                 isLoadingThreadList = false
-                notice = ("Could not load \(scope.label.lowercased())", error.localizedDescription)
+                if !requireAuthenticationRecovery(for: error) {
+                    notice = ("Could not load \(scope.label.lowercased())", error.localizedDescription)
+                }
             }
         }
     }
@@ -2524,10 +2687,15 @@ final class OnyxAppModel: ObservableObject {
             return false
         }
         guard canRunAgent else {
-            notice = (
-                "Sign in to continue",
-                signInRequiredDetail
-            )
+            // Once recovery is attached it owns authentication feedback. Do
+            // not create a second modal when the user tries to send while
+            // their draft remains visible in the composer.
+            if authenticationRecovery == nil {
+                notice = (
+                    "Sign in to continue",
+                    signInRequiredDetail
+                )
+            }
             return false
         }
         guard images.isEmpty || canAttachImages else {
@@ -2719,7 +2887,7 @@ final class OnyxAppModel: ObservableObject {
                                 appendTimeline(optimisticUserItem)
                             }
                         }
-                        isTurnRunning = true
+                        isTurnRunning = authenticationRecovery == nil
                     }
                     updateThreadLifecycle(id: threadID, status: .running)
                     try await runtime.startTurn(
@@ -2974,7 +3142,7 @@ final class OnyxAppModel: ObservableObject {
                 startingReviewThreadID = nil
                 updateThreadLifecycle(id: threadID, status: .running)
                 if selectedThreadID == threadID, navigationRevision == revision {
-                    isTurnRunning = true
+                    isTurnRunning = authenticationRecovery == nil
                 }
             } catch {
                 guard accountEpoch == epoch, !Task.isCancelled else { return }
@@ -2984,7 +3152,7 @@ final class OnyxAppModel: ObservableObject {
                     mutateThread(id: threadID) { $0.status = originalStatus }
                 }
                 if selectedThreadID == threadID {
-                    isTurnRunning = originalStatus.isBusy
+                    isTurnRunning = authenticationRecovery == nil && originalStatus.isBusy
                 }
                 if requireAuthenticationRecovery(for: error) { return }
                 let detail: String
@@ -3348,6 +3516,9 @@ final class OnyxAppModel: ObservableObject {
                     latestMessageEditRequiresReloadThreadID = threadID
                     shouldFinishEdit = false
                 }
+                if authenticationRecovery != nil {
+                    return
+                }
                 notice = reconciled
                     ? (
                         "Could not confirm the edit",
@@ -3670,7 +3841,9 @@ final class OnyxAppModel: ObservableObject {
             do {
                 try await runtime.compactThread(id: id)
                 guard accountEpoch == epoch, !Task.isCancelled else { return }
-                if selectedThreadID == id { isTurnRunning = true }
+                if selectedThreadID == id {
+                    isTurnRunning = authenticationRecovery == nil
+                }
                 mutateThread(id: id) { $0.status = .running }
             } catch {
                 guard accountEpoch == epoch, !Task.isCancelled else { return }
@@ -3731,6 +3904,42 @@ final class OnyxAppModel: ObservableObject {
         if let sideChatInteraction {
             recoveryQuarantinedInteractionIDs.insert(sideChatInteraction.id)
         }
+        // A typed request/refresh failure can arrive after the runtime has
+        // already published its raw diagnostic as a modal notice.  Keep the
+        // attached recovery card as the sole auth surface regardless of which
+        // asynchronous path first classified the failure.
+        if let currentNotice = notice {
+            let normalizedTitle = currentNotice.title
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            let normalizedDetail = currentNotice.detail
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            let recoveryTitle = recovery.title.lowercased()
+            let recoveryDetail = recovery.detail.lowercased()
+            if normalizedTitle == recoveryTitle
+                || normalizedTitle == "sign in to continue"
+                || normalizedDetail == "sign in required"
+                || normalizedDetail == recoveryDetail
+                || normalizedDetail == signInRequiredDetail.lowercased()
+                || CodexProjection.isAuthenticationRecoveryDiagnostic(currentNotice.detail) {
+                notice = nil
+            }
+        }
+        // Side chat is an ephemeral provider fork, not durable task state. A
+        // recovery boundary retires it immediately so late fork events cannot
+        // run through the side-chat reducer after the sign-in card appears
+        // and visually resurrect a spinner or interaction. `closeSideChat`
+        // only clears this ephemeral panel; the selected task, main composer
+        // draft, transcript, and queued follow-ups remain mounted above.
+        if isSideChatPresented
+                || isSideChatLoading
+                || sideChatParentThreadID != nil
+                || sideChatThreadID != nil
+                || sideChatForkTask != nil
+                || sideChatTurnTask != nil {
+            closeSideChat()
+        }
         isTurnRunning = false
         isSideChatTurnRunning = false
     }
@@ -3787,7 +3996,8 @@ final class OnyxAppModel: ObservableObject {
                     preservePositionIfPresent: true
                 )
                 let status = loaded.conversation.thread.status
-                isTurnRunning = status.isBusy || isReviewActive(for: threadID)
+                isTurnRunning = authenticationRecovery == nil
+                    && (status.isBusy || isReviewActive(for: threadID))
                 if !status.isBusy {
                     activeTurnIDsByThreadID.removeValue(forKey: threadID)
                     pendingUserItemByThreadID.removeValue(forKey: threadID)
@@ -3828,6 +4038,30 @@ final class OnyxAppModel: ObservableObject {
         case let .connectionChanged(state):
             if isSideChatPresented {
                 closeSideChat()
+            }
+            if let recovery = authenticationRecovery(for: state) {
+                // Codex commonly emits a structured recovery event and then a
+                // failed/disconnected transport event.  That transport event
+                // must not erase the interaction, steering status, or draft
+                // that the recovery card is meant to preserve.  Older
+                // runtimes may emit only the raw failed diagnostic, so classify
+                // and normalize that ordering here as well.
+                if authenticationRecovery == nil {
+                    requireAuthenticationRecovery(recovery)
+                }
+                if case .failed = state {
+                    connectionState = .failed("Sign in required")
+                } else {
+                    connectionState = state
+                }
+                respondingInteractionIDs.removeAll()
+                reviewingThreadID = nil
+                startingReviewThreadID = nil
+                isTurnRunning = false
+                activeTurnIDsByThreadID.removeAll()
+                recoveryQuarantinedInteractionIDs.formUnion(pendingUserInteractions.map(\.id))
+                downgradeLiveCollaborationAgents()
+                return
             }
             connectionState = state
             if case .failed = state {
@@ -3929,9 +4163,14 @@ final class OnyxAppModel: ObservableObject {
                 isAuthenticating = false
                 loginAttempt = nil
                 loginRecoveryPendingConfirmation = false
+                if let error = completion.error,
+                   let recovery = authenticationRecovery(for: error) {
+                    requireAuthenticationRecovery(recovery)
+                    return
+                }
                 notice = (
                     "Sign in was not completed",
-                    completion.error ?? "The ChatGPT sign-in flow ended before it completed."
+                    sanitizedLoginFailureDetail(completion.error)
                 )
             }
         case let .threadUpdated(thread):
@@ -3953,7 +4192,8 @@ final class OnyxAppModel: ObservableObject {
                 settlePendingSteeringMessages(for: threadID)
             }
             if selectedThreadID == threadID {
-                isTurnRunning = status.isBusy || isReviewActive(for: threadID)
+                isTurnRunning = authenticationRecovery == nil
+                    && (status.isBusy || isReviewActive(for: threadID))
             }
         case let .threadArchived(threadID):
             guard authState.canRun, !isSigningOut else { return }
@@ -4070,7 +4310,7 @@ final class OnyxAppModel: ObservableObject {
             }
             if selectedThreadID == threadID {
                 flushDeltas()
-                isTurnRunning = status == .running
+                isTurnRunning = authenticationRecovery == nil && status == .running
             }
             if reviewingThreadID == threadID {
                 reviewingThreadID = nil
@@ -4106,7 +4346,7 @@ final class OnyxAppModel: ObservableObject {
             }
             if interaction.isBlocking,
                interaction.threadID == nil || interaction.threadID == selectedThreadID {
-                isTurnRunning = true
+                isTurnRunning = authenticationRecovery == nil
             }
         case let .userInteractionResolved(requestID):
             guard authState.canRun, !isSigningOut else { return }
@@ -4322,7 +4562,8 @@ final class OnyxAppModel: ObservableObject {
             upsertThreadInRecencyOrder(thread)
         }
         if selectedThreadID == thread.id {
-            isTurnRunning = thread.status.isBusy || isReviewActive(for: thread.id)
+            isTurnRunning = authenticationRecovery == nil
+                && (thread.status.isBusy || isReviewActive(for: thread.id))
             validateSelectedReasoningEffort()
         }
     }
@@ -4794,7 +5035,9 @@ final class OnyxAppModel: ObservableObject {
                       !Task.isCancelled else { return }
                 isLoadingEarlierHistory = false
                 earlierHistoryTask = nil
-                notice = ("Could not load earlier messages", error.localizedDescription)
+                if !requireAuthenticationRecovery(for: error) {
+                    notice = ("Could not load earlier messages", error.localizedDescription)
+                }
             }
         }
     }
@@ -5136,7 +5379,8 @@ final class OnyxAppModel: ObservableObject {
             threads[index].status = .running
         }
         if selectedThreadID == threadID {
-            isTurnRunning = threads[index].status.isBusy || isReviewActive(for: threadID)
+            isTurnRunning = authenticationRecovery == nil
+                && (threads[index].status.isBusy || isReviewActive(for: threadID))
         }
     }
 
@@ -5181,7 +5425,12 @@ final class OnyxAppModel: ObservableObject {
                 guard accountEpoch == epoch, threadListScope == expectedScope else { return }
                 updateThread(conversation.thread)
             } catch {
-                // A lifecycle notification can race a descendant move; the next list refresh is authoritative.
+                guard accountEpoch == epoch else { return }
+                // A lifecycle notification can race a descendant move; the
+                // next list refresh is authoritative for ordinary failures.
+                // Authentication expiry is provider-wide and must still open
+                // the attached recovery surface.
+                _ = requireAuthenticationRecovery(for: error)
             }
         }
     }
@@ -5213,7 +5462,9 @@ final class OnyxAppModel: ObservableObject {
             } catch {
                 guard accountEpoch == epoch, !Task.isCancelled, selectedThreadID == threadID else { return }
                 isLoadingThread = false
-                notice = ("Could not refresh task", error.localizedDescription)
+                if !requireAuthenticationRecovery(for: error) {
+                    notice = ("Could not refresh task", error.localizedDescription)
+                }
             }
         }
     }
@@ -5254,6 +5505,7 @@ final class OnyxAppModel: ObservableObject {
                   selectedThreadID == threadID,
                   !Task.isCancelled else { return false }
             isLoadingThread = false
+            _ = requireAuthenticationRecovery(for: error)
             return false
         }
     }
@@ -5270,6 +5522,12 @@ final class OnyxAppModel: ObservableObject {
         isLoadingThread = true
         let epoch = accountEpoch
         let revision = connectionRevision
+        // Requests that were visible before authentication recovery remain
+        // quarantined until this authoritative resume tells us whether the
+        // task is still waiting. A fresh provider re-emission removes its ID
+        // from the quarantine while this read is in flight, so capture the
+        // starting set and intersect it at cleanup time.
+        let quarantinedInteractionIDsAtStart = recoveryQuarantinedInteractionIDs
         loadTask = Task { [weak self] in
             guard let self else { return }
             do {
@@ -5282,6 +5540,7 @@ final class OnyxAppModel: ObservableObject {
                       connectionRevision == revision,
                       !Task.isCancelled,
                       selectedThreadID == threadID,
+                      authenticationRecovery == nil,
                       case .connected = connectionState else { return }
                 replaceTimeline(loaded.visibleItems, authoritativeFor: loaded.conversation.thread.id)
                 installEarlierHistory(from: loaded)
@@ -5289,9 +5548,23 @@ final class OnyxAppModel: ObservableObject {
                     loaded.conversation.thread,
                     preservePositionIfPresent: true
                 )
-                isTurnRunning = loaded.conversation.thread.status.isBusy
-                    || isReviewActive(for: loaded.conversation.thread.id)
+                isTurnRunning = authenticationRecovery == nil
+                    && (loaded.conversation.thread.status.isBusy
+                        || isReviewActive(for: loaded.conversation.thread.id))
                 isLoadingThread = false
+                if !loaded.conversation.thread.status.isBusy {
+                    activeTurnIDsByThreadID.removeValue(forKey: threadID)
+                    pendingUserItemByThreadID.removeValue(forKey: threadID)
+                    settlePendingSteeringMessages(for: threadID)
+                    clearReviewState(for: threadID)
+                    let stillStaleInteractionIDs = quarantinedInteractionIDsAtStart
+                        .intersection(recoveryQuarantinedInteractionIDs)
+                    removeUserInteractions(
+                        for: threadID,
+                        limitedTo: stillStaleInteractionIDs
+                    )
+                    reconcileThreadStatusAfterInteraction(for: threadID)
+                }
                 resolveLatestMessageEditAfterAuthoritativeReload(threadID: threadID)
             } catch {
                 guard accountEpoch == epoch,
@@ -5299,10 +5572,12 @@ final class OnyxAppModel: ObservableObject {
                       !Task.isCancelled,
                       selectedThreadID == threadID else { return }
                 isLoadingThread = false
-                notice = (
-                    "Connected, but this task did not resume",
-                    "Its cached history is still available. \(error.localizedDescription)"
-                )
+                if !requireAuthenticationRecovery(for: error) {
+                    notice = (
+                        "Connected, but this task did not resume",
+                        "Its cached history is still available. \(error.localizedDescription)"
+                    )
+                }
             }
         }
     }
@@ -5766,7 +6041,7 @@ final class OnyxAppModel: ObservableObject {
                 "The secure local callback could not be opened. Try the device-code option instead."
             )
         }
-        return ("Could not start sign in", detail)
+        return ("Could not start sign in", sanitizedLoginFailureDetail(detail))
     }
 
     /// A provider should normally throw the typed recovery error. Keep the
@@ -5777,11 +6052,61 @@ final class OnyxAppModel: ObservableObject {
         if case let AgentRuntimeError.authenticationRecoveryRequired(recovery) = error {
             return recovery
         }
+        return authenticationRecovery(for: error.localizedDescription)
+    }
+
+    private func authenticationRecovery(for message: String) -> RuntimeAuthenticationRecovery? {
         guard runtimeKind == .codex,
-              CodexProjection.isAuthenticationRecoveryDiagnostic(error.localizedDescription) else {
+              CodexProjection.isAuthenticationRecoveryDiagnostic(message) else {
             return nil
         }
         return .signInExpired
+    }
+
+    private func sanitizedLoginFailureDetail(_ rawDetail: String?) -> String {
+        guard let rawDetail,
+              !rawDetail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return "The ChatGPT sign-in flow ended before it completed."
+        }
+        let normalized = rawDetail.lowercased()
+        let containsCredentialDiagnostic = normalized.contains("token")
+            || normalized.contains("401")
+            || normalized.contains("unauthorized")
+            || normalized.contains("invalid_grant")
+            || normalized.contains("authentication")
+            || normalized.contains("refresh")
+        if containsCredentialDiagnostic {
+            return "The sign-in session could not be completed. Start sign-in again to continue."
+        }
+        return rawDetail
+    }
+
+    private func authenticationRecovery(
+        for connectionState: RuntimeConnectionState
+    ) -> RuntimeAuthenticationRecovery? {
+        switch connectionState {
+        case let .failed(detail):
+            // A structured recovery event normally precedes the transport
+            // failure.  Keep the check first so a short normalized message
+            // such as `Sign in required` is enough to retain context.
+            if authenticationRecovery != nil {
+                return authenticationRecovery
+            }
+            guard runtimeKind == .codex else { return nil }
+            if detail.trimmingCharacters(in: .whitespacesAndNewlines)
+                .localizedCaseInsensitiveCompare("Sign in required") == .orderedSame
+                || CodexProjection.isAuthenticationRecoveryDiagnostic(detail) {
+                return .signInExpired
+            }
+            return nil
+        case .disconnected:
+            // A disconnect emitted immediately after a typed auth failure is
+            // part of the same recovery transition.  Do not discard the
+            // pending interaction or draft in that ordering.
+            return authenticationRecovery
+        default:
+            return nil
+        }
     }
 
     private func validateSelectedReasoningEffort() {

@@ -68,6 +68,80 @@ final class OnyxAppModelAuthBoundaryTests: XCTestCase {
         assertSignedOutWelcomeState(model)
     }
 
+    func testStaleLoginStartCompletionCannotReopenLoginAfterAccountBoundary() async {
+        let fixture = makeFixture(suspendedOperations: [.startLogin])
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        await startAndLoad(fixture)
+        model.startLogin(AuthBoundaryTestRuntime.loginMethod)
+        await fixture.runtime.waitUntilSuspended(.startLogin)
+
+        await fixture.runtime.emit(.accountUpdated(.signedOut))
+        await waitUntil("The signed-out boundary did not close the account") {
+            model.authState == .signedOut && !model.isAuthenticating
+        }
+        await fixture.runtime.release(.startLogin)
+        await fixture.runtime.waitUntilCompleted(.startLogin)
+        await yieldSeveralTimes()
+
+        assertSignedOutWelcomeState(model)
+        XCTAssertNil(model.loginAttempt)
+        XCTAssertNil(model.authenticationRecovery)
+        XCTAssertNil(model.notice)
+    }
+
+    func testStaleCancelLoginFailureCannotShowAuthErrorAfterAccountBoundary() async {
+        let fixture = makeFixture(
+            suspendedOperations: [.cancelLogin],
+            failingOperations: [.cancelLogin]
+        )
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        await startAndLoad(fixture)
+        model.startLogin(AuthBoundaryTestRuntime.loginMethod)
+        await waitUntil("The login ceremony did not start") {
+            model.loginAttempt?.loginID == "recovery-login"
+        }
+        model.cancelLogin()
+        await fixture.runtime.waitUntilSuspended(.cancelLogin)
+
+        await fixture.runtime.emit(.accountUpdated(.signedOut))
+        await waitUntil("The signed-out boundary did not close the account") {
+            model.authState == .signedOut && !model.isAuthenticating
+        }
+        await fixture.runtime.release(.cancelLogin)
+        await fixture.runtime.waitUntilCompleted(.cancelLogin)
+        await yieldSeveralTimes()
+
+        assertSignedOutWelcomeState(model)
+        XCTAssertNil(model.loginAttempt)
+        XCTAssertNil(model.authenticationRecovery)
+        XCTAssertNil(model.notice)
+    }
+
+    func testStaleLogoutFailureCannotShowAuthErrorAfterSharedSignedOutEvent() async {
+        let fixture = makeFixture(logoutBehavior: .suspendedFailure)
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        await startAndLoad(fixture)
+        model.signOut()
+        await fixture.runtime.waitForLogoutCall()
+
+        await fixture.runtime.emit(.accountUpdated(.signedOut))
+        await waitUntil("The signed-out event did not close the account") {
+            model.authState == .signedOut
+        }
+        await fixture.runtime.finishLogout()
+        await yieldSeveralTimes()
+
+        assertSignedOutWelcomeState(model)
+        XCTAssertNil(model.authenticationRecovery)
+        XCTAssertNil(model.notice)
+    }
+
     func testSharedLogoutClosesEveryWindowAndRejectsStaleSignedInRefresh() async {
         let suiteName = "OnyxAppModelAuthBoundaryTests.shared.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -406,11 +480,176 @@ final class OnyxAppModelAuthBoundaryTests: XCTestCase {
         XCTAssertEqual(model.notice?.detail, "This notice is unrelated to account access.")
     }
 
+    func testTaskListAuthenticationFailureUsesRecoveryWithoutGenericNotice() async {
+        let fixture = makeFixture(failingOperations: [.listThreads])
+        defer { fixture.cleanUp() }
+
+        fixture.model.start()
+
+        await waitUntil("The task-list failure did not enter sign-in recovery") {
+            fixture.model.authenticationRecovery == .signInExpired
+                && !fixture.model.isLoadingThreadList
+        }
+        XCTAssertNil(fixture.model.notice)
+        XCTAssertFalse(fixture.model.timeline.contains { $0.kind == .error })
+    }
+
+    func testSelectedTaskAuthenticationFailurePreservesTaskDraftAndAvoidsErrorRow() async {
+        let fixture = makeFixture(
+            failingOperations: [.readThread],
+            seedSensitivePersistence: true
+        )
+        defer { fixture.cleanUp() }
+
+        fixture.model.start()
+
+        await waitUntil("The selected-task read failure did not enter sign-in recovery") {
+            fixture.model.authenticationRecovery == .signInExpired
+                && !fixture.model.isLoadingThread
+        }
+        XCTAssertEqual(fixture.model.selectedThreadID, AuthBoundaryFixture.accountThread.id)
+        XCTAssertEqual(fixture.model.composerText, "Private draft from account A")
+        XCTAssertFalse(fixture.model.timeline.contains { $0.kind == .error })
+        XCTAssertNil(fixture.model.notice)
+    }
+
+    func testNavigationReadAuthenticationFailureRestoresPreviouslyVisibleTaskContext() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        await startAndLoad(fixture)
+        let originalThreadID = try! XCTUnwrap(model.selectedThreadID)
+        let originalTimeline = model.timeline
+        let originalTranscriptRevision = model.transcriptSnapshot.revision
+        let originalWorkspace = model.selectedProjectPath
+        model.composerText = "Keep this draft while opening another task"
+        model.threads = [
+            AuthBoundaryFixture.accountThread,
+            AuthBoundaryFixture.secondAccountThread,
+        ]
+        await fixture.runtime.fail(.readThread)
+
+        model.selectThread(AuthBoundaryFixture.secondAccountThread.id)
+
+        await waitUntil("The navigation read failure did not enter sign-in recovery") {
+            model.authenticationRecovery == .signInExpired
+                && !model.isLoadingThread
+        }
+
+        XCTAssertEqual(model.selectedThreadID, originalThreadID)
+        XCTAssertFalse(
+            model.isTurnRunning,
+            "A restored task must not keep showing stale work while sign-in recovery owns the workspace."
+        )
+        XCTAssertEqual(model.timeline, originalTimeline)
+        XCTAssertGreaterThan(model.transcriptSnapshot.revision, originalTranscriptRevision)
+        XCTAssertEqual(model.selectedProjectPath, originalWorkspace)
+        XCTAssertEqual(
+            fixture.defaults.string(forKey: "Onyx.lastWorkspacePath"),
+            originalWorkspace
+        )
+        XCTAssertEqual(model.composerText, "Keep this draft while opening another task")
+        XCTAssertNil(model.notice)
+        XCTAssertFalse(model.timeline.contains { $0.kind == .error })
+    }
+
+    func testAuthenticationConnectionFailureKeepsPendingInteractionQuarantined() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        await startAndLoad(fixture)
+        await fixture.runtime.emit(.threadStatusChanged(
+            threadID: AuthBoundaryFixture.accountThread.id,
+            status: .running
+        ))
+        await waitUntil("The active turn did not reach the model") {
+            model.isTurnRunning
+        }
+        model.composerText = "Queue this after the current response"
+        model.sendComposer()
+        await waitUntil("The queued follow-up did not reach the model") {
+            model.pendingSteeringMessagesForSelectedThread.count == 1
+        }
+        await fixture.runtime.emit(.userInteractionRequested(AuthBoundaryFixture.interaction))
+        await waitUntil("The approval did not reach the model") {
+            model.activeUserInteraction == AuthBoundaryFixture.interaction
+        }
+
+        await fixture.runtime.emit(.authenticationRecoveryRequired(.signInExpired))
+        await fixture.runtime.emit(.connectionChanged(.failed("Sign in required")))
+        await fixture.runtime.emit(.threadStatusChanged(
+            threadID: AuthBoundaryFixture.accountThread.id,
+            status: .running
+        ))
+        await yieldSeveralTimes()
+
+        XCTAssertEqual(model.authenticationRecovery, .signInExpired)
+        XCTAssertFalse(
+            model.isTurnRunning,
+            "A late running event must not resurrect working feedback beside sign-in recovery."
+        )
+        XCTAssertEqual(model.activeUserInteraction, AuthBoundaryFixture.interaction)
+        XCTAssertFalse(model.canRespond(to: AuthBoundaryFixture.interaction))
+        XCTAssertEqual(
+            model.pendingSteeringMessagesForSelectedThread.first?.text,
+            "Queue this after the current response"
+        )
+        XCTAssertNil(model.notice)
+    }
+
+    func testRawAuthenticationConnectionFailureIsNormalizedBeforeRecoveryEvent() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        await startAndLoad(fixture)
+        let rawDiagnostic = "401 Unauthorized: token_invalidated; please sign in again"
+        await fixture.runtime.emit(.connectionChanged(.failed(rawDiagnostic)))
+        await waitUntil("The raw connection diagnostic did not enter recovery") {
+            model.authenticationRecovery == .signInExpired
+        }
+
+        if case let .failed(detail) = model.connectionState {
+            XCTAssertEqual(detail, "Sign in required")
+        } else {
+            XCTFail("Authentication transport failure should be normalized")
+        }
+        XCTAssertNil(model.notice)
+    }
+
+    func testFailedLoginCompletionDoesNotExposeCredentialDiagnostic() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        await startAndLoad(fixture)
+        model.startLogin(AuthBoundaryTestRuntime.loginMethod)
+        await waitUntil("The login ceremony did not start") {
+            model.loginAttempt?.loginID == "recovery-login"
+        }
+        let rawDiagnostic = #"{"error":{"code":"token_invalidated","message":"Your authentication token has been invalidated. Please sign in again."}}"#
+        await fixture.runtime.emit(.loginCompleted(RuntimeLoginCompletion(
+            loginID: "recovery-login",
+            success: false,
+            error: rawDiagnostic
+        )))
+        await waitUntil("The failed login completion did not settle") {
+            model.isAuthenticating == false && model.loginAttempt == nil
+        }
+
+        XCTAssertEqual(model.authenticationRecovery, .signInExpired)
+        XCTAssertNil(model.notice)
+        XCTAssertFalse(model.timeline.contains { $0.body.contains("token_invalidated") })
+    }
+
     private func makeFixture(
         logoutBehavior: AuthBoundaryTestRuntime.LogoutBehavior = .immediate,
         refreshBehavior: AuthBoundaryTestRuntime.RefreshBehavior = .signedOut,
         startTurnBehavior: AuthBoundaryTestRuntime.StartTurnBehavior = .succeed,
         suspendedOperations: Set<AuthBoundaryTestRuntime.SuspendedOperation> = [],
+        failingOperations: Set<AuthBoundaryTestRuntime.SuspendedOperation> = [],
         seedSensitivePersistence: Bool = false
     ) -> AuthBoundaryFixture {
         let suiteName = "OnyxAppModelAuthBoundaryTests.\(UUID().uuidString)"
@@ -432,7 +671,8 @@ final class OnyxAppModelAuthBoundaryTests: XCTestCase {
             logoutBehavior: logoutBehavior,
             refreshBehavior: refreshBehavior,
             startTurnBehavior: startTurnBehavior,
-            suspendedOperations: suspendedOperations
+            suspendedOperations: suspendedOperations,
+            failingOperations: failingOperations
         )
         let model = OnyxAppModel(runtime: runtime, defaults: defaults)
         return AuthBoundaryFixture(
@@ -498,6 +738,19 @@ private struct AuthBoundaryFixture {
         branch: nil
     )
 
+    static let secondAccountThread = RuntimeThread(
+        id: "account-a-second-task",
+        title: "Account A second task",
+        preview: "Another private task from account A",
+        cwd: "/tmp/onyx-auth-boundary-tests/second",
+        updatedAt: Date(timeIntervalSince1970: 3),
+        status: .idle,
+        isPinned: false,
+        runtime: .codex,
+        model: "test-model",
+        branch: nil
+    )
+
     static let sensitiveTranscriptItem = TimelineItem(
         id: "account-a-sensitive-transcript",
         kind: .assistantMessage,
@@ -542,6 +795,8 @@ private actor AuthBoundaryTestRuntime: AgentRuntime {
         ceremony: .browser
     )
     enum SuspendedOperation: Hashable, Sendable {
+        case startLogin
+        case cancelLogin
         case listThreads
         case readThread
         case resumeThread
@@ -550,6 +805,7 @@ private actor AuthBoundaryTestRuntime: AgentRuntime {
     enum LogoutBehavior: Sendable {
         case immediate
         case suspended
+        case suspendedFailure
     }
 
     enum RefreshBehavior: Sendable {
@@ -581,6 +837,7 @@ private actor AuthBoundaryTestRuntime: AgentRuntime {
     private let refreshBehavior: RefreshBehavior
     private let startTurnBehavior: StartTurnBehavior
     private let suspendedOperations: Set<SuspendedOperation>
+    private var failingOperations: Set<SuspendedOperation>
     private var enteredOperations: Set<SuspendedOperation> = []
     private var releasedOperations: Set<SuspendedOperation> = []
     private var completedOperations: Set<SuspendedOperation> = []
@@ -600,12 +857,14 @@ private actor AuthBoundaryTestRuntime: AgentRuntime {
         logoutBehavior: LogoutBehavior,
         refreshBehavior: RefreshBehavior,
         startTurnBehavior: StartTurnBehavior = .succeed,
-        suspendedOperations: Set<SuspendedOperation>
+        suspendedOperations: Set<SuspendedOperation>,
+        failingOperations: Set<SuspendedOperation> = []
     ) {
         self.logoutBehavior = logoutBehavior
         self.refreshBehavior = refreshBehavior
         self.startTurnBehavior = startTurnBehavior
         self.suspendedOperations = suspendedOperations
+        self.failingOperations = failingOperations
         let stream = AsyncStream.makeStream(of: AgentRuntimeEvent.self)
         events = stream.stream
         eventContinuation = stream.continuation
@@ -622,6 +881,10 @@ private actor AuthBoundaryTestRuntime: AgentRuntime {
         guard methodID == Self.loginMethod.id else {
             throw AgentRuntimeError.unsupported("unknown auth-boundary login method")
         }
+        await suspendIfRequested(.startLogin)
+        if failingOperations.contains(.startLogin) {
+            throw AgentRuntimeError.authenticationRecoveryRequired(.signInExpired)
+        }
         return RuntimeLoginStart(
             method: Self.loginMethod,
             loginID: "recovery-login",
@@ -631,19 +894,29 @@ private actor AuthBoundaryTestRuntime: AgentRuntime {
         )
     }
 
+    func cancelLogin(id _: String) async throws {
+        await suspendIfRequested(.cancelLogin)
+        if failingOperations.contains(.cancelLogin) {
+            throw AgentRuntimeError.authenticationRecoveryRequired(.signInExpired)
+        }
+    }
+
     func logout() async throws {
         logoutCallCount += 1
         let waiters = logoutCallWaiters
         logoutCallWaiters.removeAll()
         waiters.forEach { $0.resume() }
 
-        guard logoutBehavior == .suspended else { return }
+        guard logoutBehavior != .immediate else { return }
         await withCheckedContinuation { continuation in
             if logoutWasReleased {
                 continuation.resume()
             } else {
                 logoutContinuation = continuation
             }
+        }
+        if logoutBehavior == .suspendedFailure {
+            throw AgentRuntimeError.authenticationRecoveryRequired(.signInExpired)
         }
     }
 
@@ -669,16 +942,25 @@ private actor AuthBoundaryTestRuntime: AgentRuntime {
 
     func listThreads(limit _: Int, archived: Bool) async throws -> [RuntimeThread] {
         await suspendIfRequested(.listThreads)
+        if failingOperations.contains(.listThreads) {
+            throw AgentRuntimeError.authenticationRecoveryRequired(.signInExpired)
+        }
         return archived ? [] : [AuthBoundaryFixture.accountThread]
     }
 
     func readThread(id: String) async throws -> RuntimeConversation {
         await suspendIfRequested(.readThread)
+        if failingOperations.contains(.readThread) {
+            throw AgentRuntimeError.authenticationRecoveryRequired(.signInExpired)
+        }
         return try conversation(id: id)
     }
 
     func resumeThread(id: String) async throws -> RuntimeConversation {
         await suspendIfRequested(.resumeThread)
+        if failingOperations.contains(.resumeThread) {
+            throw AgentRuntimeError.authenticationRecoveryRequired(.signInExpired)
+        }
         return try conversation(id: id)
     }
 
@@ -719,6 +1001,10 @@ private actor AuthBoundaryTestRuntime: AgentRuntime {
 
     func emit(_ event: AgentRuntimeEvent) {
         eventContinuation.yield(event)
+    }
+
+    func fail(_ operation: SuspendedOperation) {
+        failingOperations.insert(operation)
     }
 
     func waitForLogoutCall() async {
@@ -808,7 +1094,7 @@ private actor AuthBoundaryTestRuntime: AgentRuntime {
             auth: auth,
             availableLoginMethods: [loginMethod],
             availableModels: [],
-            capabilities: [.streaming, .approvals]
+            capabilities: [.streaming, .steering, .approvals]
         )
     }
 }

@@ -248,6 +248,19 @@ enum CodexProjection {
             || normalized.contains("logged out or signed in to another account")
     }
 
+    /// Some app-server builds repeatedly log this short message while their
+    /// optional remote-control worker waits for a ChatGPT session. The same
+    /// line appears in app-server instances backing credential-free generic
+    /// providers, so it is neither an account-boundary signal nor a useful
+    /// runtime error.
+    static func isIgnorableAuthenticationDiagnostic(_ message: String) -> Bool {
+        let normalized = message
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return normalized.contains("requires chatgpt authentication")
+            || normalized.contains("requires authentication to use remote control")
+    }
+
     private static func isOutputLimitDisconnectDiagnostic(_ message: String) -> Bool {
         let normalized = message.lowercased()
         return normalized.contains("stream disconnected before completion")

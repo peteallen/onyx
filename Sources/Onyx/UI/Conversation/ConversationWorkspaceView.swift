@@ -286,7 +286,11 @@ struct ProviderExecutionScopeStrip: View {
     @ObservedObject var model: OnyxAppModel
 
     var body: some View {
-        if !model.supports(.tools) {
+        if ProviderExecutionScopePresentation.isChatOnly(
+            session: model.session,
+            selectedModel: model.selectedRuntimeModel,
+            taskCapabilities: model.selectedThread?.taskCapabilities
+        ) {
             Label(
                 "Chat only — this model is currently on the reply-only path and cannot inspect or edit project files or run commands.",
                 systemImage: "text.bubble"
@@ -301,7 +305,33 @@ struct ProviderExecutionScopeStrip: View {
 }
 
 enum ProviderExecutionScopePresentation {
-    static func isChatOnly(session: RuntimeSession?) -> Bool {
+    /// Generic adaptive sessions intentionally keep `.tools` off the
+    /// provider-wide capability set: tools belong to the selected model/task
+    /// lane. Use the durable task projection first, then the selected model's
+    /// execution mode, before falling back to the native session capability.
+    /// This prevents a capable generic model from being labelled "Chat only"
+    /// while its adaptive agent attempt is being prepared.
+    static func isChatOnly(
+        session: RuntimeSession?,
+        selectedModel: RuntimeModel? = nil,
+        taskCapabilities: RuntimeCapabilities? = nil
+    ) -> Bool {
+        if let taskCapabilities {
+            return !taskCapabilities.contains(.tools)
+        }
+        if let selectedModel {
+            if let capabilities = selectedModel.taskCapabilities {
+                return !capabilities.contains(.tools)
+            }
+            switch selectedModel.executionMode {
+            case .agent:
+                return false
+            case .chat, .checkingAgent:
+                return true
+            case .inherited:
+                break
+            }
+        }
         guard let session else { return false }
         return !session.capabilities.contains(.tools)
     }
@@ -1128,7 +1158,11 @@ private struct ComposerView: View {
     }
 
     private var isChatOnlyProvider: Bool {
-        !model.supports(.tools)
+        ProviderExecutionScopePresentation.isChatOnly(
+            session: model.session,
+            selectedModel: model.selectedRuntimeModel,
+            taskCapabilities: model.selectedThread?.taskCapabilities
+        )
     }
 
     private var taskOptionsHelp: String {

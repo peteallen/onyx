@@ -118,6 +118,63 @@ final class OnyxSideChatTests: XCTestCase {
         XCTAssertFalse(model.threads.contains(where: { $0.id == SideChatFixture.fork.id }))
     }
 
+    func testAuthenticationRecoveryRetiresSideChatAndDropsLateEphemeralEvents() async {
+        let fixture = makeFixture(
+            capabilities: [.streaming, .interruption, .ephemeralThreadForking]
+        )
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        model.start()
+        await waitUntil("Parent task did not load") {
+            model.selectedThreadID == SideChatFixture.parent.id
+                && model.timeline == [SideChatFixture.parentItem]
+        }
+
+        // The durable composer belongs to the selected task and must survive
+        // an account-recovery boundary even though the ephemeral panel does
+        // not.
+        model.composerText = "Keep this main-task draft"
+        model.openSideChat()
+        await waitUntil("Ephemeral fork did not open") {
+            model.sideChatThreadID == SideChatFixture.fork.id
+        }
+        let sideThreadID = SideChatFixture.fork.id
+        await fixture.runtime.emit(
+            .turnStarted(threadID: sideThreadID, turnID: "side-turn-before-expiry")
+        )
+        await waitUntil("Side-chat turn did not become active") {
+            model.isSideChatTurnRunning
+        }
+
+        await fixture.runtime.emit(
+            .authenticationRecoveryRequired(.signInExpired)
+        )
+        await waitUntil("Recovery did not retire the side-chat panel") {
+            model.authenticationRecovery == .signInExpired
+                && !model.isSideChatPresented
+                && model.sideChatThreadID == nil
+                && !model.isSideChatTurnRunning
+        }
+        XCTAssertEqual(model.composerText, "Keep this main-task draft")
+        XCTAssertEqual(model.timeline, [SideChatFixture.parentItem])
+
+        // Events already queued by the provider for the retired fork must not
+        // fall through to the durable reducer or resurrect side-chat work.
+        await fixture.runtime.emit(
+            .turnStarted(threadID: sideThreadID, turnID: "late-side-turn")
+        )
+        await fixture.runtime.emit(
+            .itemDelta(threadID: sideThreadID, itemID: "late-side-item", delta: "late")
+        )
+        try? await Task.sleep(for: .milliseconds(40))
+        XCTAssertFalse(model.isSideChatPresented)
+        XCTAssertFalse(model.isSideChatTurnRunning)
+        XCTAssertFalse(model.isTurnRunning)
+        XCTAssertEqual(model.timeline, [SideChatFixture.parentItem])
+        XCTAssertFalse(model.threads.contains(where: { $0.id == sideThreadID }))
+    }
+
     func testPastedImageInSideChatBecomesVisibleAttachmentAndTurnInput() async throws {
         let fixture = makeFixture(
             capabilities: [.streaming, .interruption, .images, .ephemeralThreadForking]

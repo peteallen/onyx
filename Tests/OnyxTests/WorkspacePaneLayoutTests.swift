@@ -38,6 +38,64 @@ final class WorkspacePaneLayoutTests: XCTestCase {
         XCTAssertFalse(ProviderExecutionScopePresentation.isChatOnly(session: codingSession))
     }
 
+    func testAdaptiveAgentModelIsNotLabelledChatOnlyWhenSessionOmitsTools() {
+        let session = RuntimeSession(
+            runtime: .local,
+            displayName: "Fixture vLLM",
+            accountLabel: nil,
+            planLabel: nil,
+            auth: RuntimeAuthState(
+                mode: nil,
+                email: nil,
+                planLabel: nil,
+                requiresAuthentication: false
+            ),
+            availableLoginMethods: [],
+            availableModels: [],
+            // Adaptive providers keep tools model/task-scoped rather than
+            // claiming them on the provider-wide session.
+            capabilities: [.streaming]
+        )
+        let agentModel = RuntimeModel(
+            id: "any-capable-model",
+            displayName: "Any capable model",
+            description: nil,
+            isDefault: true,
+            defaultReasoningEffort: nil,
+            reasoningEfforts: [],
+            executionMode: .agent,
+            taskCapabilities: [.streaming, .tools, .terminal]
+        )
+
+        XCTAssertFalse(
+            ProviderExecutionScopePresentation.isChatOnly(
+                session: session,
+                selectedModel: agentModel
+            )
+        )
+    }
+
+    func testDurableChatTaskStillShowsChatOnlyWhenCatalogModelIsAgentProjected() {
+        let agentModel = RuntimeModel(
+            id: "same-model",
+            displayName: "Same model",
+            description: nil,
+            isDefault: true,
+            defaultReasoningEffort: nil,
+            reasoningEfforts: [],
+            executionMode: .agent,
+            taskCapabilities: [.streaming, .tools, .terminal]
+        )
+
+        XCTAssertTrue(
+            ProviderExecutionScopePresentation.isChatOnly(
+                session: nil,
+                selectedModel: agentModel,
+                taskCapabilities: [.streaming]
+            )
+        )
+    }
+
     func testConversationControlsStayReadableWithoutCrampingCompactWindows() {
         XCTAssertEqual(ConversationContentLayout.maximumComposerWidth, .infinity)
         XCTAssertEqual(OnyxWorkspaceMetrics.maximumConversationTextWidth, 880)

@@ -1103,6 +1103,10 @@ actor CodexRuntime: AgentRuntime {
                 // Treat it exactly like the typed request path and never put
                 // the credential-bearing JSON in a generic alert.
                 publishAuthenticationRecoveryIfNeeded()
+            } else if CodexProjection.isIgnorableAuthenticationDiagnostic(message) {
+                // The optional remote-control worker repeats this every
+                // second while ChatGPT auth is unavailable, including in
+                // generic-provider runtimes. It is not actionable in Onyx.
             } else if message.localizedCaseInsensitiveContains("error"),
                       let detail = CodexRuntimeNoticeProjection.detail(from: message) {
                 eventContinuation.yield(.runtimeNotice(title: "Codex runtime", detail: detail))

@@ -485,12 +485,14 @@ struct OpenAICompatibleAgentRuntimeFactory: Sendable {
 
     private let credentialStore: any CredentialStore
     private let dynamicToolHandler: (any CodexDynamicToolHandler)?
+    private let turnLivenessPolicy: OpenAICompatibleAgentTurnLivenessPolicy
     private let proxyFactory: ProxyFactory
     private let runtimeFactory: RuntimeFactory
 
     init(
         credentialStore: any CredentialStore = KeychainCredentialStore(),
         dynamicToolHandler: (any CodexDynamicToolHandler)? = nil,
+        turnLivenessPolicy: OpenAICompatibleAgentTurnLivenessPolicy = .production,
         proxyFactory: @escaping ProxyFactory = OpenAICompatibleAgentRuntimeFactory.productionProxy,
         runtimeFactory: @escaping RuntimeFactory = { binding, handler in
             try CodexRuntime.makeDefault(
@@ -501,6 +503,7 @@ struct OpenAICompatibleAgentRuntimeFactory: Sendable {
     ) {
         self.credentialStore = credentialStore
         self.dynamicToolHandler = dynamicToolHandler
+        self.turnLivenessPolicy = turnLivenessPolicy
         self.proxyFactory = proxyFactory
         self.runtimeFactory = runtimeFactory
     }
@@ -511,12 +514,14 @@ struct OpenAICompatibleAgentRuntimeFactory: Sendable {
     /// above so the scoped broker reaches app-server.
     init(
         credentialStore: any CredentialStore = KeychainCredentialStore(),
+        turnLivenessPolicy: OpenAICompatibleAgentTurnLivenessPolicy = .production,
         proxyFactory: @escaping ProxyFactory = OpenAICompatibleAgentRuntimeFactory.productionProxy,
         runtimeFactory: @escaping LegacyRuntimeFactory
     ) {
         self.init(
             credentialStore: credentialStore,
             dynamicToolHandler: nil,
+            turnLivenessPolicy: turnLivenessPolicy,
             proxyFactory: proxyFactory,
             runtimeFactory: { binding, _ in try runtimeFactory(binding) }
         )
@@ -548,8 +553,12 @@ struct OpenAICompatibleAgentRuntimeFactory: Sendable {
                 stateIdentifier: identity.stateIdentifier
             )
             let runtime = try runtimeFactory(binding, dynamicToolHandler)
-            return OpenAICompatiblePreparedAgentRuntime(
+            let boundedRuntime = OpenAICompatibleAgentTurnLivenessRuntime(
                 runtime: runtime,
+                policy: turnLivenessPolicy
+            )
+            return OpenAICompatiblePreparedAgentRuntime(
+                runtime: boundedRuntime,
                 identity: identity,
                 proxy: proxy
             )

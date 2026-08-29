@@ -57,6 +57,166 @@ final class OpenAICompatibleAdaptiveRuntimeTests: XCTestCase {
         await harness.runtime.disconnect()
     }
 
+    func testStalledAgentTurnFailsInPlaceAndNextAttemptUsesCleanPrivateLane() async throws {
+        let rawID = "stalled-agent-turn"
+        let publicID = publicAgentThreadID(rawID)
+        let chat = AdaptiveRuntimeFake(kind: .local)
+        let stalledAgent = AdaptiveRuntimeFake(
+            kind: .codex,
+            threads: [makeAdaptiveThread(id: rawID, model: "agent-model")]
+        )
+        let replacementAgent = AdaptiveRuntimeFake(
+            kind: .codex,
+            threads: [makeAdaptiveThread(id: rawID, model: "agent-model")]
+        )
+        let harness = try await makeAdaptiveHarness(
+            chat: chat,
+            agents: [stalledAgent, replacementAgent],
+            ownerships: [(publicID, .agent, "agent-model")],
+            turnLivenessPolicy: OpenAICompatibleAgentTurnLivenessPolicy(
+                inactivityTimeout: .milliseconds(60)
+            )
+        )
+        defer { harness.removeTemporaryState() }
+        let eventLog = AdaptiveEventLog()
+        let collector = collectEvents(from: harness.runtime.events, into: eventLog)
+        defer { collector.cancel() }
+
+        _ = try await harness.runtime.connect()
+        try await harness.runtime.startTurn(.init(
+            threadID: publicID,
+            inputs: [.text("Do not leave this task working forever")],
+            model: "agent-model"
+        ))
+        await stalledAgent.emit(.turnStarted(threadID: rawID, turnID: "stalled-turn"))
+
+        try await eventually("friendly stalled-turn failure") {
+            await eventLog.events().contains { event in
+                guard case let .itemCompleted(threadID, item) = event else { return false }
+                return threadID == publicID
+                    && item.id.hasPrefix("onyx-provider-liveness:")
+                    && item.title == "Model stopped responding"
+                    && item.body.contains("choose another model")
+            }
+        }
+        let failedEvents = await eventLog.events()
+        XCTAssertTrue(failedEvents.contains(
+            .threadStatusChanged(threadID: publicID, status: .failed)
+        ))
+        XCTAssertTrue(failedEvents.contains(
+            .turnCompleted(threadID: publicID, status: .failed)
+        ))
+        XCTAssertFalse(failedEvents.contains { event in
+            if case .connectionChanged(.failed) = event { return true }
+            return false
+        }, "A dead private lane must not disconnect the visible provider")
+        try await eventually("stalled private proxy retirement") {
+            harness.factory.proxyStopCount == 1
+        }
+
+        try await harness.runtime.startTurn(.init(
+            threadID: publicID,
+            inputs: [.text("Retry with a clean lane")],
+            model: "agent-model"
+        ))
+        await replacementAgent.emit(.turnStarted(threadID: rawID, turnID: "retry-turn"))
+        await replacementAgent.emit(.turnCompleted(threadID: rawID, status: .idle))
+
+        XCTAssertEqual(harness.factory.preparationCount, 2)
+        let replacementStartTurnIDs = await replacementAgent.threadIDs(for: .startTurn)
+        XCTAssertEqual(replacementStartTurnIDs, [rawID])
+        await harness.runtime.disconnect()
+    }
+
+    @MainActor
+    func testStalledAgentTurnEndsWorkingAndOffersAttachedRetryInAppModel() async throws {
+        let rawID = "stalled-agent-app-model"
+        let publicID = publicAgentThreadID(rawID)
+        let thread = makeAdaptiveThread(id: rawID, model: "agent-model")
+        let previousUser = TimelineItem(
+            id: "previous-user",
+            kind: .userMessage,
+            title: nil,
+            body: "Earlier prompt",
+            status: .completed,
+            timestamp: .now,
+            detail: nil
+        )
+        let previousAnswer = makeAdaptiveItem(id: "previous-answer", body: "Earlier answer")
+        let conversation = RuntimeConversation(
+            thread: thread,
+            items: [previousUser, previousAnswer],
+            turns: [
+                RuntimeConversationTurn(
+                    id: "previous-turn",
+                    items: [previousUser, previousAnswer],
+                    status: .completed,
+                    itemDetail: .full,
+                    startedAt: .now,
+                    completedAt: .now,
+                    durationMilliseconds: 1
+                ),
+            ]
+        )
+        let chat = AdaptiveRuntimeFake(kind: .local)
+        let stalledAgent = AdaptiveRuntimeFake(
+            kind: .codex,
+            threads: [thread],
+            conversations: [rawID: conversation]
+        )
+        let replacementAgent = AdaptiveRuntimeFake(
+            kind: .codex,
+            threads: [thread],
+            conversations: [rawID: conversation]
+        )
+        let harness = try await makeAdaptiveHarness(
+            chat: chat,
+            agents: [stalledAgent, replacementAgent],
+            ownerships: [(publicID, .agent, "agent-model")],
+            turnLivenessPolicy: OpenAICompatibleAgentTurnLivenessPolicy(
+                inactivityTimeout: .milliseconds(60)
+            )
+        )
+        defer { harness.removeTemporaryState() }
+        let suiteName = "OpenAICompatibleAdaptiveRuntimeTests.liveness.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let model = OnyxAppModel(runtime: harness.runtime, defaults: defaults)
+
+        model.start()
+        for _ in 0..<400 {
+            if model.selectedThreadID == publicID && !model.isLoadingThread { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(model.selectedThreadID, publicID)
+        XCTAssertFalse(model.isLoadingThread)
+
+        model.composerText = "Please retry this exact work"
+        model.sendComposer()
+        // Reproduce compatible endpoints that accept the request but never
+        // publish an upstream turn-start notification before stalling. The
+        // liveness boundary must still create a failed loaded turn so Retry is
+        // attached to this optimistic user message.
+        for _ in 0..<400 {
+            if model.retryableFailedResponseItemID != nil { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+
+        XCTAssertFalse(model.isTurnRunning)
+        XCTAssertEqual(model.selectedThread?.status, .failed)
+        let failureID = try XCTUnwrap(model.retryableFailedResponseItemID)
+        let failure = try XCTUnwrap(model.timeline.first(where: { $0.id == failureID }))
+        XCTAssertEqual(failure.title, "Model stopped responding")
+        XCTAssertTrue(failure.body.contains("Retry this response"))
+        XCTAssertTrue(failure.body.contains("choose another model"))
+        XCTAssertNotNil(model.retryUserMessageID(forFailedResponseItemID: failureID))
+        XCTAssertNil(model.notice)
+        XCTAssertTrue(model.canRunAgent)
+
+        await harness.runtime.disconnect()
+    }
+
     func testTaskOperationsAlwaysRouteToTheDurableOwner() async throws {
         let chatRawID = "chat-owned"
         let agentRawID = "agent-owned"
@@ -1385,7 +1545,8 @@ private func makeAdaptiveHarness(
     ownerships: [(String, OpenAICompatibleTaskLane, String)] = [],
     probe: AdaptiveRuntimeProbe? = nil,
     now: Date = Date(),
-    proxyStopGate: AdaptiveAsyncGate? = nil
+    proxyStopGate: AdaptiveAsyncGate? = nil,
+    turnLivenessPolicy: OpenAICompatibleAgentTurnLivenessPolicy = .production
 ) async throws -> AdaptiveHarness {
     let connection = try ProviderConnectionRecord(
         id: ProviderConnectionID("adaptive-runtime-test"),
@@ -1423,7 +1584,8 @@ private func makeAdaptiveHarness(
     )
     let factoryQueue = AdaptiveAgentFactoryQueue(
         runtimes: agents,
-        proxyStopGate: proxyStopGate
+        proxyStopGate: proxyStopGate,
+        turnLivenessPolicy: turnLivenessPolicy
     )
     let runtime = OpenAICompatibleAdaptiveRuntime(
         connectionID: connection.id,
@@ -1773,10 +1935,16 @@ private final class AdaptiveAgentFactoryQueue: @unchecked Sendable {
     private var storedPreparationCount = 0
     private var storedProxyStopCount = 0
     private let proxyStopGate: AdaptiveAsyncGate?
+    private let turnLivenessPolicy: OpenAICompatibleAgentTurnLivenessPolicy
 
-    init(runtimes: [AdaptiveRuntimeFake], proxyStopGate: AdaptiveAsyncGate? = nil) {
+    init(
+        runtimes: [AdaptiveRuntimeFake],
+        proxyStopGate: AdaptiveAsyncGate? = nil,
+        turnLivenessPolicy: OpenAICompatibleAgentTurnLivenessPolicy = .production
+    ) {
         self.runtimes = runtimes
         self.proxyStopGate = proxyStopGate
+        self.turnLivenessPolicy = turnLivenessPolicy
     }
 
     var preparationCount: Int { lock.withLock { storedPreparationCount } }
@@ -1785,6 +1953,7 @@ private final class AdaptiveAgentFactoryQueue: @unchecked Sendable {
     func makeFactory() -> OpenAICompatibleAgentRuntimeFactory {
         OpenAICompatibleAgentRuntimeFactory(
             credentialStore: InMemoryCredentialStore(),
+            turnLivenessPolicy: turnLivenessPolicy,
             proxyFactory: { [self] _, _ in
                 lock.withLock { storedPreparationCount += 1 }
                 return OpenAICompatibleAgentProxyLease(

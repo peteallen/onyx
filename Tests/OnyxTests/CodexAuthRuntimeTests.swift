@@ -556,6 +556,27 @@ final class CodexAuthRuntimeTests: XCTestCase {
         await runtime.disconnect()
     }
 
+    func testRemoteControlAuthenticationWaitIsIgnoredWithoutRecoveryOrNoticeFlood() async throws {
+        let transport = AuthCodexTransport(accountResponse: Self.signedInAccountResponse)
+        let runtime = CodexRuntime(client: transport)
+        let marker = "remote-control-auth-wait-marker"
+        let recordedEvents = Task {
+            try await collectAuthEventsThroughAccountMarker(from: runtime.events, marker: marker)
+        }
+
+        _ = try await runtime.connect()
+        let repeatedDiagnostic =
+            "waiting to resolve remote control preference until authentication is available error=remote control requires ChatGPT authentication"
+        await transport.emitStderr(repeatedDiagnostic)
+        await transport.emitStderr(repeatedDiagnostic)
+        await transport.emitAccountMarker(marker)
+
+        let events = try await recordedEvents.value
+        XCTAssertFalse(events.contains(.authenticationRecoveryRequired(.signInExpired)))
+        XCTAssertFalse(events.contains(where: \.isRuntimeNotice))
+        await runtime.disconnect()
+    }
+
     func testConversationAndTurnRequestAuthenticationFailuresShareOneStructuredBoundary() async throws {
         for operation in AuthenticationFailingOperation.allCases {
             let transport = AuthCodexTransport(accountResponse: Self.signedInAccountResponse)

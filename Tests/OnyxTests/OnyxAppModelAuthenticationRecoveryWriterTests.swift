@@ -81,6 +81,15 @@ final class OnyxAppModelAuthenticationRecoveryWriterTests: XCTestCase {
             fixture.model.authenticationRecovery == .signInExpired
         }
 
+        fixture.model.composerText = "Keep this draft visible"
+        fixture.model.sendComposer()
+        await yieldSeveralTimes()
+        XCTAssertNil(
+            fixture.model.notice,
+            "The attached recovery card must not be duplicated by a send alert."
+        )
+        XCTAssertEqual(fixture.model.composerText, "Keep this draft visible")
+
         XCTAssertFalse(fixture.model.canRunAgent)
         XCTAssertFalse(fixture.model.canStartReview)
         XCTAssertFalse(fixture.model.canForkThread(WriterRecoveryFixture.thread))
@@ -157,6 +166,79 @@ final class OnyxAppModelAuthenticationRecoveryWriterTests: XCTestCase {
             ),
             WriterRecoveryFixture.failedUser.id
         )
+    }
+
+    func testRecoveryReconnectRemovesStaleApprovalWhenResumedTaskIsIdle() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        await startAndLoad(fixture)
+
+        await fixture.runtime.emit(.userInteractionRequested(WriterRecoveryFixture.approval))
+        await waitUntil("The approval did not reach the model") {
+            fixture.model.activeUserInteraction == WriterRecoveryFixture.approval
+        }
+        await fixture.runtime.emit(.authenticationRecoveryRequired(.signInExpired))
+        await fixture.runtime.emit(.connectionChanged(.failed("Sign in required")))
+        await waitUntil("Recovery did not enter the reconnect state") {
+            fixture.model.authenticationRecovery == .signInExpired
+                && fixture.model.canReconnect
+        }
+
+        await fixture.runtime.emit(.loginCompleted(RuntimeLoginCompletion(
+            loginID: nil,
+            success: true,
+            error: nil
+        )))
+        await waitUntil("Recovered reconnect did not remove the stale approval") {
+            fixture.model.authenticationRecovery == nil
+                && fixture.model.canRunAgent
+                && fixture.model.activeUserInteraction == nil
+                && !fixture.model.isTurnRunning
+        }
+
+        XCTAssertFalse(fixture.model.canRespond(to: WriterRecoveryFixture.approval))
+        XCTAssertNil(fixture.model.notice)
+    }
+
+    func testRecoveryReconnectKeepsApprovalReissuedDuringAuthoritativeResume() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        await startAndLoad(fixture)
+
+        await fixture.runtime.emit(.userInteractionRequested(WriterRecoveryFixture.approval))
+        await waitUntil("The approval did not reach the model") {
+            fixture.model.activeUserInteraction == WriterRecoveryFixture.approval
+        }
+        await fixture.runtime.emit(.authenticationRecoveryRequired(.signInExpired))
+        await fixture.runtime.emit(.connectionChanged(.failed("Sign in required")))
+        await waitUntil("Recovery did not enter the reconnect state") {
+            fixture.model.authenticationRecovery == .signInExpired
+                && fixture.model.canReconnect
+        }
+        await fixture.runtime.suspendNextResume()
+
+        await fixture.runtime.emit(.loginCompleted(RuntimeLoginCompletion(
+            loginID: nil,
+            success: true,
+            error: nil
+        )))
+        await fixture.runtime.waitUntilResumeIsSuspended()
+        await fixture.runtime.emit(.userInteractionRequested(WriterRecoveryFixture.approval))
+        await waitUntil("The reissued approval did not become actionable") {
+            fixture.model.authenticationRecovery == nil
+                && fixture.model.canRespond(to: WriterRecoveryFixture.approval)
+        }
+        await fixture.runtime.releaseSuspendedResume()
+        await waitUntil("Authoritative reconnect erased the reissued approval") {
+            !fixture.model.isLoadingThread
+                && fixture.model.canRespond(to: WriterRecoveryFixture.approval)
+        }
+
+        fixture.model.respondToApproval(.accept, for: WriterRecoveryFixture.approval)
+        await waitUntil("The reissued approval was not sent") {
+            await fixture.runtime.recordedResponses().count == 1
+        }
+        XCTAssertNil(fixture.model.notice)
     }
 
     private func makeFixture() -> WriterRecoveryFixture {

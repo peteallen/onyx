@@ -316,6 +316,19 @@ final class CodexProjectionTests: XCTestCase {
         )
     }
 
+    func testClassifiesRepeatedRemoteControlAuthenticationWaitAsIgnorableNoise() {
+        XCTAssertTrue(
+            CodexProjection.isIgnorableAuthenticationDiagnostic(
+                "waiting to resolve remote control preference until authentication is available error=remote control requires ChatGPT authentication"
+            )
+        )
+        XCTAssertFalse(
+            CodexProjection.isIgnorableAuthenticationDiagnostic(
+                "error: the upstream model endpoint requires API authentication"
+            )
+        )
+    }
+
     func testNormalizedLiveFallbackRetainsSignInRequiredTitle() throws {
         let item = try XCTUnwrap(CodexProjection.turnFailureTimelineItem(
             from: .object([
