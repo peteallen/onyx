@@ -21,6 +21,9 @@ noncanonical Onyx executable is active, rebuilds only
 dist-preview/Onyx Preview.app, and launches that bundle without creating a
 second instance. The auth-recovery fixture is debug-only and contains no real
 credentials; it exists for safely checking the expired-session recovery UI.
+If the local LaunchServices daemon is unavailable (as in a headless test
+session), the same canonical bundle is started through its embedded executable
+so the preview can still be verified; no alternate app path is used.
 EOF
 }
 
@@ -144,6 +147,69 @@ guard_against_other_onyx_processes() {
   die "quit the other Onyx process yourself; no noncanonical process was stopped"
 }
 
+launch_canonical_preview() {
+  local -a direct_arguments
+  local open_output=""
+  local open_status=0
+
+  if (( ${#launch_arguments[@]} > 0 )); then
+    # launch_arguments starts with `--args`, which belongs to /usr/bin/open,
+    # not to the app executable used by the bounded fallback below.
+    direct_arguments=("${(@)launch_arguments[2,-1]}")
+  else
+    direct_arguments=()
+  fi
+
+  if open_output="$(/usr/bin/open "$preview_app" "${launch_arguments[@]}" 2>&1)"; then
+    [[ -z "$open_output" ]] || print -- "$open_output"
+    return 0
+  else
+    open_status=$?
+  fi
+
+  # A failed `open` can still have handed the bundle to LaunchServices. Check
+  # the exact executable before starting anything ourselves, preserving the
+  # one-process invariant. Only the known LaunchServices-unavailable errors
+  # may use the fallback; all other errors remain actionable failures.
+  local existing_pids
+  existing_pids="$(lsof_fields_or_die -a -d txt -t -- "$preview_executable")"
+  if [[ -n "$existing_pids" ]]; then
+    print -u2 -- "run-preview: LaunchServices returned $open_status after starting the canonical preview; continuing (PID $existing_pids)"
+    return 0
+  fi
+  if [[ "$open_output" != *"kLSNoExecutableErr"* &&
+        "$open_output" != *"kLSServerCommunicationErr"* &&
+        "$open_output" != *"-10822"* &&
+        "$open_output" != *"-10827"* &&
+        "$open_output" != *"kLSApplicationNotFoundErr"* ]]; then
+    print -u2 -- "$open_output"
+    die "could not launch the canonical preview (open exited $open_status)"
+  fi
+
+  local launch_log
+  launch_log="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/onyx-preview-launch.XXXXXX")" ||
+    die "could not create a private canonical preview launch log"
+  # `nohup` plus zsh's `&!` keeps the GUI process alive after this short-lived
+  # launcher exits while retaining the exact canonical executable identity.
+  nohup "$preview_executable" "${direct_arguments[@]}" >| "$launch_log" 2>&1 &!
+  local launch_pid=$!
+
+  local running_pids=""
+  for _ in {1..50}; do
+    running_pids="$(lsof_fields_or_die -a -d txt -t -- "$preview_executable")"
+    [[ -n "$running_pids" ]] && break
+    /bin/sleep 0.1
+  done
+  if [[ -z "$running_pids" ]]; then
+    print -u2 -- "run-preview: canonical executable did not stay running (launcher PID $launch_pid)"
+    [[ ! -s "$launch_log" ]] || print -u2 -- "$(<"$launch_log")"
+    /bin/rm -f -- "$launch_log"
+    die "could not launch the canonical preview"
+  fi
+  /bin/rm -f -- "$launch_log"
+  print -u2 -- "run-preview: LaunchServices unavailable; launched canonical preview executable (PID $running_pids)"
+}
+
 main() {
   local -a launch_arguments
   launch_arguments=()
@@ -189,7 +255,7 @@ main() {
   # Launch by the one stable bundle path. package-preview has already stopped
   # the exact previous executable; parallel instances would duplicate its
   # app-server.
-  /usr/bin/open "$preview_app" "${launch_arguments[@]}"
+  launch_canonical_preview
 }
 
 # Keep the parser sourceable by the shell contract test without packaging or

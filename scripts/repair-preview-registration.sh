@@ -91,8 +91,23 @@ for old_app in "${old_apps[@]}"; do
 done
 
 if (( stable_exists == 1 )); then
-  "$lsregister" -f "$stable_app"
-  print -- "Registered stable preview: $stable_app"
+  # LaunchServices is not available in some headless/macOS automation
+  # sessions (lsregister reports kLSServerCommunicationErr/-10822). That is
+  # a registration problem, not a malformed bundle; run-preview has a
+  # canonical direct-launch fallback for this narrow condition. Keep failing
+  # closed for every other registration error so a real bundle problem is not
+  # hidden.
+  register_output=""
+  if register_output="$("$lsregister" -f "$stable_app" 2>&1)"; then
+    [[ -z "$register_output" ]] || print -- "$register_output"
+    print -- "Registered stable preview: $stable_app"
+  elif [[ "$register_output" == *"-10822"* ||
+          "$register_output" == *"kLSServerCommunicationErr"* ]]; then
+    print -u2 -- "LaunchServices is unavailable; the canonical preview will be launched directly: $stable_app"
+  else
+    print -u2 -- "$register_output"
+    die "could not register the stable preview: $stable_app"
+  fi
 else
   print -- "Stable preview is not packaged yet: $stable_app"
 fi
