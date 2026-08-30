@@ -570,6 +570,35 @@ final class OnyxAppModelAuthBoundaryTests: XCTestCase {
         XCTAssertNil(fixture.model.notice)
     }
 
+    func testAccountRefreshAuthenticationFailureUsesRecoveryWithoutGenericNotice() async {
+        let fixture = makeFixture(
+            refreshBehavior: .authenticationRecoveryRequired
+        )
+        defer { fixture.cleanUp() }
+
+        await startAndLoad(fixture)
+        let originalThreadID = fixture.model.selectedThreadID
+        let originalTimeline = fixture.model.timeline
+        fixture.model.composerText = "Keep this draft while account access is repaired"
+
+        // A signed-in account projection can be followed by a refresh request
+        // that is the first place an older runtime reports the revoked token.
+        await fixture.runtime.emit(.accountUpdated(AuthBoundaryTestRuntime.signedInAuthForTests))
+
+        await waitUntil("The account-refresh auth failure did not enter recovery") {
+            fixture.model.authenticationRecovery == .signInExpired
+        }
+
+        XCTAssertNil(fixture.model.notice)
+        XCTAssertEqual(fixture.model.selectedThreadID, originalThreadID)
+        XCTAssertEqual(fixture.model.timeline, originalTimeline)
+        XCTAssertEqual(
+            fixture.model.composerText,
+            "Keep this draft while account access is repaired"
+        )
+        XCTAssertFalse(fixture.model.canRunAgent)
+    }
+
     func testNavigationReadAuthenticationFailureRestoresPreviouslyVisibleTaskContext() async {
         let fixture = makeFixture()
         defer { fixture.cleanUp() }
@@ -868,6 +897,7 @@ private actor AuthBoundaryTestRuntime: AgentRuntime {
     enum RefreshBehavior: Sendable {
         case signedOut
         case failure
+        case authenticationRecoveryRequired
         case staleSignedIn
         case replacementSignedIn
     }
@@ -990,6 +1020,8 @@ private actor AuthBoundaryTestRuntime: AgentRuntime {
             return Self.session(auth: .signedOut)
         case .failure:
             throw TestFailure.accountRefreshFailed
+        case .authenticationRecoveryRequired:
+            throw AgentRuntimeError.authenticationRecoveryRequired(.signInExpired)
         case .staleSignedIn:
             return Self.session(auth: Self.signedInAuth)
         case .replacementSignedIn:

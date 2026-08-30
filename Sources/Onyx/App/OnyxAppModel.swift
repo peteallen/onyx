@@ -6025,7 +6025,17 @@ final class OnyxAppModel: ObservableObject {
                 }
             } catch {
                 guard accountEpoch == epoch, !Task.isCancelled else { return }
-                // The notification projection is still useful. A later account event or reconnect retries.
+                // Account refresh is the last boundary after both an account
+                // notification and a completed login ceremony. Older Codex
+                // runtimes can still surface an expired/revoked token only
+                // from this request, so do not leave the window looking signed
+                // in (or expose the raw diagnostic) when that happens. The
+                // attached recovery surface remains the sole auth action.
+                if !signedOutBoundaryActive {
+                    _ = requireAuthenticationRecovery(for: error)
+                }
+                // The notification projection is still useful for ordinary
+                // refresh failures. A later account event or reconnect retries.
             }
             guard accountEpoch == epoch, !Task.isCancelled else { return }
             accountRefreshTask = nil
