@@ -60,5 +60,18 @@ final class PreviewAuthRecoveryRuntimeTests: XCTestCase {
             PreviewAuthRecoveryRuntime.fixtureQueuedFollowUp
         )
     }
+
+    func testFixturePublishesRecoveryToTheMountedModel() async {
+        let host = PreviewAuthRecoveryComposition.makeHost()
+        let model = host.makeWindowModel(for: WorkspaceWindowID())
+
+        model.start()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(20))
+        while model.authenticationRecovery == nil, ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+
+        XCTAssertEqual(model.authenticationRecovery, .signInExpired)
+    }
 }
 #endif
