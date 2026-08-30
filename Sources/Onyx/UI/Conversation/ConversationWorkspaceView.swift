@@ -999,6 +999,14 @@ enum AccountAccessPresentation {
                 && (loginAttemptActive || (requiresAuthentication && !signedIn)))
     }
 
+    /// The attached recovery card is the sole authentication surface. Gate
+    /// the workspace alert at presentation time as well as clearing the model
+    /// notice, because those publications can reach SwiftUI in adjacent
+    /// transactions during a stderr/request race.
+    static func shouldShowNotice(noticePresent: Bool, recoveryActive: Bool) -> Bool {
+        noticePresent && !recoveryActive
+    }
+
     static func signedOutTitle(isCodex: Bool, runtimeName: String) -> String {
         isCodex ? "Codex is signed out" : "\(runtimeName) needs credentials"
     }

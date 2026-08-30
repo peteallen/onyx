@@ -134,6 +134,28 @@ final class AccountAccessPresentationTests: XCTestCase {
         )
     }
 
+    func testRecoveryCardSuppressesAStaleWorkspaceAlertAtPresentationTime() {
+        XCTAssertFalse(
+            AccountAccessPresentation.shouldShowNotice(
+                noticePresent: true,
+                recoveryActive: true
+            ),
+            "A raw runtime alert must never cover the attached Sign In actions"
+        )
+        XCTAssertTrue(
+            AccountAccessPresentation.shouldShowNotice(
+                noticePresent: true,
+                recoveryActive: false
+            )
+        )
+        XCTAssertFalse(
+            AccountAccessPresentation.shouldShowNotice(
+                noticePresent: false,
+                recoveryActive: false
+            )
+        )
+    }
+
     func testCodexSessionWithEmptyLoginMethodsStillOffersSignIn() {
         // Some app-server versions return a signed-out session with no
         // availableLoginMethods. The recovery card must remain actionable;
