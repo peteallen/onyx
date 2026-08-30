@@ -28,6 +28,12 @@ die() {
   exit 1
 }
 
+is_launchservices_unavailable() {
+  local diagnostic="$1"
+  [[ "$diagnostic" == *"-10822"* ||
+     "$diagnostic" == *"kLSServerCommunicationErr"* ]]
+}
+
 while (( $# > 0 )); do
   case "$1" in
     --gc)
@@ -74,6 +80,7 @@ for candidate in "$repo_root"/dist*/**/*.app(N); do
   esac
 done
 
+registration_unavailable=0
 for old_app in "${old_apps[@]}"; do
   print -- "Unregistering legacy Onyx app: $old_app"
   unregister_output=""
@@ -83,6 +90,16 @@ for old_app in "${old_apps[@]}"; do
     # That is the desired end state, so keep repairing the remaining records.
     if [[ "$unregister_output" == *"-10814"* ]]; then
       print -- "Legacy app was already unregistered: $old_app"
+    elif is_launchservices_unavailable "$unregister_output"; then
+      # Registration and unregistration share the same LaunchServices server.
+      # If it is unavailable, do not fail before the canonical direct-launch
+      # fallback gets a chance to start the already-verified bundle. Leaving
+      # stale records in place is recoverable; treating a malformed bundle as
+      # recoverable would hide a real packaging error, so every other error
+      # remains fatal.
+      print -u2 -- "LaunchServices is unavailable; skipping legacy registration cleanup"
+      registration_unavailable=1
+      break
     else
       print -u2 -- "$unregister_output"
       die "could not unregister legacy Onyx app: $old_app"
@@ -98,11 +115,12 @@ if (( stable_exists == 1 )); then
   # closed for every other registration error so a real bundle problem is not
   # hidden.
   register_output=""
-  if register_output="$("$lsregister" -f "$stable_app" 2>&1)"; then
+  if (( registration_unavailable == 1 )); then
+    print -u2 -- "LaunchServices is unavailable; the canonical preview will be launched directly: $stable_app"
+  elif register_output="$("$lsregister" -f "$stable_app" 2>&1)"; then
     [[ -z "$register_output" ]] || print -- "$register_output"
     print -- "Registered stable preview: $stable_app"
-  elif [[ "$register_output" == *"-10822"* ||
-          "$register_output" == *"kLSServerCommunicationErr"* ]]; then
+  elif is_launchservices_unavailable "$register_output"; then
     print -u2 -- "LaunchServices is unavailable; the canonical preview will be launched directly: $stable_app"
   else
     print -u2 -- "$register_output"
@@ -112,7 +130,17 @@ else
   print -- "Stable preview is not packaged yet: $stable_app"
 fi
 
-if (( run_gc == 1 )); then
-  "$lsregister" -gc
-  print -- "LaunchServices stale-record garbage collection requested"
+if (( run_gc == 1 && registration_unavailable == 0 )); then
+  gc_output=""
+  if gc_output="$("$lsregister" -gc 2>&1)"; then
+    [[ -z "$gc_output" ]] || print -- "$gc_output"
+    print -- "LaunchServices stale-record garbage collection requested"
+  elif is_launchservices_unavailable "$gc_output"; then
+    print -u2 -- "LaunchServices is unavailable; skipped stale-record garbage collection"
+  else
+    print -u2 -- "$gc_output"
+    die "could not garbage-collect stale LaunchServices records"
+  fi
+elif (( run_gc == 1 )); then
+  print -u2 -- "LaunchServices is unavailable; skipped stale-record garbage collection"
 fi

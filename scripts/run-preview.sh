@@ -191,7 +191,10 @@ launch_canonical_preview() {
     die "could not create a private canonical preview launch log"
   # `nohup` plus zsh's `&!` keeps the GUI process alive after this short-lived
   # launcher exits while retaining the exact canonical executable identity.
-  nohup "$preview_executable" "${direct_arguments[@]}" >| "$launch_log" 2>&1 &!
+  # Restricted runners can reject zsh's default background priority bump
+  # (`nice(5)`), which otherwise makes a healthy direct launch disappear.
+  unsetopt BG_NICE
+  /usr/bin/nohup "$preview_executable" "${direct_arguments[@]}" >| "$launch_log" 2>&1 &!
   local launch_pid=$!
 
   local running_pids=""
