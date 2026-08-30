@@ -1779,6 +1779,11 @@ final class OnyxAppModel: ObservableObject {
             }
             do {
                 let connectedSession = try await runtime.connect()
+                // The provider can publish a terminal lifecycle event just
+                // before resolving the handshake. Give the shared event
+                // consumer one turn to apply that event before promoting the
+                // late session and starting the catalog refresh.
+                await Task.yield()
                 guard accountEpoch == epoch,
                       connectionRevision == revision,
                       !Task.isCancelled else { return }
