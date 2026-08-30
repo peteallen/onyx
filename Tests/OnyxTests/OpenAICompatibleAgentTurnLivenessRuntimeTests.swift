@@ -729,7 +729,13 @@ final class OpenAICompatibleAgentTurnLivenessRuntimeTests: XCTestCase {
         let runtime = OpenAICompatibleAgentTurnLivenessRuntime(
             runtime: upstream,
             policy: OpenAICompatibleAgentTurnLivenessPolicy(
-                inactivityTimeout: .milliseconds(80)
+                // This test exercises interaction pausing, not a sub-100ms
+                // timeout.  On a busy hosted runner the wrapper's
+                // AsyncStream pump can be descheduled long enough for an
+                // 80ms watchdog to retire the lane before both request
+                // events are observed.  Keep a generous test-only margin;
+                // production remains five minutes.
+                inactivityTimeout: .seconds(1)
             )
         )
         let log = AgentTurnLivenessEventLog()
@@ -761,12 +767,14 @@ final class OpenAICompatibleAgentTurnLivenessRuntimeTests: XCTestCase {
         // explicit resolutions arrive.
         await upstream.emit(.threadStatusChanged(threadID: "thread-1", status: .running))
         try await runtime.respond(to: first.id, with: .approval(.accept))
-        try await Task.sleep(for: .milliseconds(140))
+        try await Task.sleep(for: .milliseconds(1_100))
         let failuresWhilePaused = await log.livenessFailureCount(threadID: "thread-1")
         XCTAssertEqual(failuresWhilePaused, 0)
 
         await upstream.emit(.userInteractionResolved(first.id))
-        try await Task.sleep(for: .milliseconds(140))
+        // One interaction remains unresolved, so the watchdog must stay
+        // paused beyond a full inactivity interval.
+        try await Task.sleep(for: .milliseconds(1_100))
         let failuresWhileSecondPaused = await log.livenessFailureCount(threadID: "thread-1")
         XCTAssertEqual(failuresWhileSecondPaused, 0)
 
