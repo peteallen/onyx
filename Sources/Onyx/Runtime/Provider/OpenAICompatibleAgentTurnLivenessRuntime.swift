@@ -1,5 +1,26 @@
 import Foundation
 
+/// A caller can request shutdown while this actor is busy settling a provider
+/// admission.  Keep that intent outside the actor so a watchdog or queued
+/// connection event cannot turn an ordinary app shutdown into a task failure
+/// before the actor gets a chance to run `disconnect`.
+private final class OpenAICompatibleDisconnectGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var requested = false
+
+    func request() {
+        lock.lock()
+        requested = true
+        lock.unlock()
+    }
+
+    var isRequested: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return requested
+    }
+}
+
 /// Bounds a private OpenAI-compatible app-server turn after the provider has
 /// accepted it but stops producing lifecycle events. The ordinary Codex
 /// runtime remains authoritative while it is making progress; this wrapper
@@ -66,6 +87,10 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
     private let runtime: any AgentRuntime
     private let policy: OpenAICompatibleAgentTurnLivenessPolicy
     private let eventContinuation: AsyncStream<AgentRuntimeEvent>.Continuation
+    /// This is intentionally nonisolated: `disconnect()` marks it before
+    /// hopping back to the actor, giving explicit shutdown precedence over a
+    /// watchdog callback that is already queued on the actor executor.
+    private nonisolated let disconnectGate = OpenAICompatibleDisconnectGate()
     private var eventPump: Task<Void, Never>?
     private var activeTurns: [String: ActiveTurn] = [:]
     /// Admissions are keyed by their own token.  More than one request can be
@@ -122,6 +147,12 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
     }
 
     private func receive(_ event: AgentRuntimeEvent) {
+        if disconnectGate.isRequested {
+            // Every event is stale after caller-owned shutdown. The actor-side
+            // disconnect cleanup owns stream completion; do not let an
+            // upstream terminal event finish it out from under that cleanup.
+            return
+        }
         // A connection terminal is itself the retirement signal for the
         // private lane.  Do this before the normal `isRetiring` guard so the
         // first terminal is retained and delivered only after all requests
@@ -199,11 +230,10 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
     /// a provider request is still deciding whether it was accepted.
     private func receiveUnexpectedConnectionTerminal(_ state: RuntimeConnectionState) {
         guard !outputStreamFinished else { return }
-        if retirementReason == .explicitDisconnect {
+        if disconnectGate.isRequested || retirementReason == .explicitDisconnect {
             // Explicit caller shutdown is quiet and must not be converted into
             // a synthetic task failure. The owning facade emits its own
             // disconnected boundary; discard any late upstream terminal here.
-            finishOutputStreamIfNeeded()
             return
         }
         beginUnexpectedRetirement(terminalState: state)
@@ -244,7 +274,8 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
     }
 
     private func beginAdmission(threadID: String) throws -> UUID {
-        guard !isRetiring,
+        guard !disconnectGate.isRequested,
+              !isRetiring,
               retirementReason == nil,
               !hasUpstreamEventStreamEnded,
               !outputStreamFinished else {
@@ -302,6 +333,10 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
         token: UUID,
         turnID: String? = nil
     ) {
+        if disconnectGate.isRequested || retirementReason == .explicitDisconnect {
+            _ = removePendingAdmission(token: token)
+            return
+        }
         guard var admission = pendingAdmissions[token], admission.threadID == threadID else {
             // A settlement watchdog may have already retired this request.
             // Its eventual provider response is stale and must not re-arm a
@@ -347,11 +382,14 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
     private func finishRejectedAdmission(threadID: String, token: UUID) {
         guard pendingAdmissions[token]?.threadID == threadID else { return }
         _ = removePendingAdmission(token: token)
+        guard !disconnectGate.isRequested,
+              retirementReason != .explicitDisconnect else { return }
         finishRetirementIfSettled()
     }
 
     private func finishRetirementIfSettled() {
-        guard retirementReason == .unexpected,
+        guard !disconnectGate.isRequested,
+              retirementReason == .unexpected,
               isRetiring,
               pendingAdmissions.isEmpty else { return }
         guard !terminalConnectionEventEmitted else {
@@ -465,6 +503,7 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
         terminalState: RuntimeConnectionState? = nil
     ) {
         guard !outputStreamFinished,
+              !disconnectGate.isRequested,
               retirementReason != .explicitDisconnect else { return }
         if retirementReason == nil {
             retirementReason = .unexpected
@@ -503,7 +542,8 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
 
     private func expirePendingAdmission(token: UUID) {
         guard pendingAdmissions[token] != nil else { return }
-        guard retirementReason != .explicitDisconnect else {
+        guard !disconnectGate.isRequested,
+              retirementReason != .explicitDisconnect else {
             _ = removePendingAdmission(token: token)
             return
         }
@@ -536,15 +576,15 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
     }
 
     private func expireTurn(threadID: String, token: UUID) {
-        guard activeTurns[threadID]?.token == token else { return }
+        guard !disconnectGate.isRequested,
+              activeTurns[threadID]?.token == token else { return }
         beginUnexpectedRetirement()
     }
 
     private func upstreamEventStreamEnded() {
         hasUpstreamEventStreamEnded = true
         guard !outputStreamFinished else { return }
-        if retirementReason == .explicitDisconnect {
-            finishOutputStreamIfNeeded()
+        if disconnectGate.isRequested || retirementReason == .explicitDisconnect {
             return
         }
         beginUnexpectedRetirement()
@@ -557,6 +597,7 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
     /// proxy for the next attempt.
     private func failActiveTurnsAndRetireLane() {
         guard !outputStreamFinished,
+              !disconnectGate.isRequested,
               retirementReason != .explicitDisconnect else { return }
         isRetiring = true
         let failures = activeTurns
@@ -582,7 +623,9 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
     }
 
     private func emitTerminalFailure(threadID: String, turn: ActiveTurn) {
-        guard !failedTurnTokens.contains(turn.token) else { return }
+        guard !disconnectGate.isRequested,
+              retirementReason != .explicitDisconnect,
+              !failedTurnTokens.contains(turn.token) else { return }
         failedTurnTokens.insert(turn.token)
         // A few compatible app-server/provider combinations accept a turn
         // and emit progress without ever publishing `turnStarted`. The app
@@ -625,7 +668,15 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
         return try await runtime.connect()
     }
 
-    func disconnect() async {
+    nonisolated func disconnect() async {
+        // Mark caller intent before the actor hop. This tiny synchronous
+        // section is what makes explicit shutdown win a queued watchdog/EOF
+        // race on a busy hosted runner.
+        disconnectGate.request()
+        await disconnectOnActor()
+    }
+
+    private func disconnectOnActor() async {
         // Caller-initiated shutdown is a different boundary from an
         // unexpected provider failure.  Cancel every local watchdog and drop
         // pending admissions so a normal window close cannot manufacture a

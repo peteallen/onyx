@@ -675,7 +675,11 @@ final class OpenAICompatibleAgentTurnLivenessRuntimeTests: XCTestCase {
             runtime: upstream,
             policy: OpenAICompatibleAgentTurnLivenessPolicy(
                 inactivityTimeout: .milliseconds(60),
-                admissionSettlementTimeout: .milliseconds(60)
+                // This case verifies caller-owned shutdown, not timeout
+                // behavior. Keep the deadline above hosted-runner scheduling
+                // jitter; the production gate is what covers a watchdog
+                // callback already queued behind the caller's shutdown.
+                admissionSettlementTimeout: .seconds(1)
             )
         )
         let log = AgentTurnLivenessEventLog()
