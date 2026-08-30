@@ -259,13 +259,24 @@ struct OnyxWorkspaceView: View {
         .alert(
             model.notice?.title ?? "Onyx",
             isPresented: Binding(
-                get: { model.notice != nil },
+                // Authentication diagnostics are owned by the attached
+                // recovery strip.  A stderr/request race can leave the
+                // alert binding populated for one SwiftUI transaction after
+                // the model has entered recovery; keep that raw JSON from
+                // ever presenting (or remaining latched) over the Sign In
+                // action surface.
+                get: {
+                    AccountAccessPresentation.shouldShowNotice(
+                        noticePresent: model.notice != nil,
+                        recoveryActive: model.authenticationRecovery != nil
+                    )
+                },
                 set: { if !$0 { model.dismissNotice() } }
             )
         ) {
             Button("OK", role: .cancel) { model.dismissNotice() }
         } message: {
-            Text(model.notice?.detail ?? "")
+            Text(model.authenticationRecovery == nil ? (model.notice?.detail ?? "") : "")
         }
     }
 
