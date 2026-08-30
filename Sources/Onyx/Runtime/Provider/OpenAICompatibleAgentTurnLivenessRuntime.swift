@@ -48,19 +48,47 @@ struct OpenAICompatibleAgentTurnLivenessPolicy: Sendable, Equatable {
     static let production = OpenAICompatibleAgentTurnLivenessPolicy()
 }
 
+/// Returned to the caller when a provider admission completed only after the
+/// private app-server lane had already been retired.  The provider operation
+/// may eventually return successfully (some transports cannot be cancelled),
+/// but that late result must not make Onyx clear the user's draft or queued
+/// follow-up as if it were a live turn.
+enum OpenAICompatibleAgentTurnLivenessError: LocalizedError, Sendable, Equatable {
+    case laneRetired
+
+    var errorDescription: String? {
+        switch self {
+        case .laneRetired:
+            "The model stopped responding before it finished. Retry this response, or choose another model below and try again."
+        }
+    }
+}
+
 actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
     nonisolated let kind: AgentRuntimeKind
     nonisolated let events: AsyncStream<AgentRuntimeEvent>
 
     private struct ActiveTurn: Sendable {
         let token: UUID
+        let threadID: String
         /// The admission that created this turn, when its request response
         /// arrived before the lifecycle start. Keeping this link lets a
         /// terminal notification settle the right request when multiple
         /// same-thread admissions are in flight.
         var admissionToken: UUID?
         var turnID: String?
+        /// Whether this active record has observed a lifecycle/progress event
+        /// for its own admission. A no-ID terminal that arrives before that
+        /// boundary may be a delayed duplicate from an earlier same-thread
+        /// turn, so it must not consume this record.
+        var sawLifecycleStart: Bool
         var watchdog: Task<Void, Never>?
+        /// Unique generation for the currently armed inactivity watchdog.
+        /// Cancelling a Swift task is cooperative: a callback that already
+        /// woke up can still be queued on this actor after a fresh progress
+        /// event re-arms the watchdog.  Validate this generation at expiry so
+        /// an old callback cannot retire a healthy turn.
+        var watchdogToken: UUID?
         var isPausedForInteraction: Bool
     }
 
@@ -72,6 +100,11 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
         let token: UUID
         let threadID: String
         var turnID: String?
+        /// A terminal status without a turn ID is only attributable to this
+        /// admission after its lifecycle has begun.  This guard prevents a
+        /// delayed terminal from an earlier same-thread turn consuming a new
+        /// admission that has not emitted any start/progress event yet.
+        var sawLifecycleStart: Bool
         var sawTerminal: Bool
     }
 
@@ -92,7 +125,12 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
     /// watchdog callback that is already queued on the actor executor.
     private nonisolated let disconnectGate = OpenAICompatibleDisconnectGate()
     private var eventPump: Task<Void, Never>?
-    private var activeTurns: [String: ActiveTurn] = [:]
+    /// Keep one record per accepted admission.  A thread can briefly have
+    /// multiple provider requests in flight (for example a start racing a
+    /// steer); keying this table by thread ID loses the later request and can
+    /// leave its caller reporting success without a terminal boundary.
+    private var activeTurns: [UUID: ActiveTurn] = [:]
+    private var activeTurnTokensByThreadID: [String: [UUID]] = [:]
     /// Admissions are keyed by their own token.  More than one request can be
     /// suspended for a single thread (for example, a steering request racing
     /// a fresh start), so a thread-keyed dictionary would silently overwrite
@@ -100,7 +138,13 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
     private var pendingAdmissions: [UUID: PendingAdmission] = [:]
     private var pendingAdmissionTokensByThreadID: [String: [UUID]] = [:]
     private var admissionSettlementWatchdogs: [UUID: Task<Void, Never>] = [:]
+    /// Keep the complete unresolved-interaction set instead of a single
+    /// request-to-thread lookup. A provider can ask several questions before
+    /// resolving any of them, and a threadless request is a lane-wide pause
+    /// rather than an interaction we can safely ignore.
     private var interactionThreads: [RuntimeRequestID: String] = [:]
+    private var interactionIDsByThreadID: [String: Set<RuntimeRequestID>] = [:]
+    private var globalInteractionIDs: Set<RuntimeRequestID> = []
     /// The upstream stream can terminate in the small interval between an
     /// accepted start request and the request method returning. Keep this
     /// state separate from `isRetiring`: the wrapper must leave its own
@@ -111,6 +155,11 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
     private var retirementReason: RetirementReason?
     private var pendingTerminalConnectionState: RuntimeConnectionState?
     private var failedTurnTokens: Set<UUID> = []
+    /// Admission tokens that were converted into a synthetic failure after
+    /// the private lane retired.  A provider call may return after that point;
+    /// this tombstone lets its caller throw instead of treating the late
+    /// success as a valid turn.
+    private var retiredAdmissionTokens: Set<UUID> = []
     private var terminalConnectionEventEmitted = false
     private var outputStreamFinished = false
 
@@ -200,19 +249,14 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
             case .waitingForInput, .waitingForApproval:
                 pauseTurn(threadID: threadID)
             case .idle, .failed, .unknown:
-                finishTurnOrMarkAdmissionTerminal(threadID: threadID)
+                finishTurnOrMarkAdmissionTerminal(threadID: threadID, finishAll: true)
             }
         case let .turnCompleted(threadID, _):
             finishTurnOrMarkAdmissionTerminal(threadID: threadID)
         case let .userInteractionRequested(interaction):
-            if let threadID = interaction.threadID {
-                interactionThreads[interaction.id] = threadID
-                pauseTurn(threadID: threadID)
-            }
+            registerInteraction(interaction)
         case let .userInteractionResolved(requestID):
-            if let threadID = interactionThreads.removeValue(forKey: requestID) {
-                resumeTurn(threadID: threadID)
-            }
+            resolveInteraction(requestID)
         case let .threadArchived(threadID),
              let .threadDeleted(threadID):
             finishTurn(threadID: threadID)
@@ -245,31 +289,108 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
         admissionToken: UUID? = nil
     ) {
         guard !isRetiring else { return }
-        if var turn = activeTurns[threadID] {
-            if turn.admissionToken == nil {
-                turn.admissionToken = admissionToken ?? firstPendingAdmissionToken(threadID: threadID)
-            }
+        // Prefer an explicitly supplied admission token, then an existing
+        // turn ID, then the oldest accepted turn without a turn ID.  This
+        // keeps concurrent same-thread admissions distinct while preserving
+        // the provider's usual FIFO lifecycle ordering.
+        let token = admissionToken
+            ?? turnID.flatMap { activeTurnToken(threadID: threadID, turnID: $0) }
+            ?? (turnID == nil
+                ? activeTurnTokensByThreadID[threadID]?.first
+                : activeTurnTokensByThreadID[threadID]?.first(where: { token in
+                    activeTurns[token]?.turnID == nil
+                }))
+        if let token, var turn = activeTurns[token] {
             if let turnID { turn.turnID = turnID }
-            turn.isPausedForInteraction = false
-            activeTurns[threadID] = turn
-            armWatchdog(threadID: threadID, token: turn.token)
+            turn.sawLifecycleStart = true
+            turn.isPausedForInteraction = hasUnresolvedInteraction(for: threadID)
+            activeTurns[token] = turn
+            if turn.isPausedForInteraction {
+                cancelWatchdog(for: turn.token)
+            } else {
+                armWatchdog(threadID: threadID, token: turn.token)
+            }
             return
         }
-        let turn = ActiveTurn(
+
+        // A lifecycle event can arrive before the request response that
+        // admitted it. Keep the turn ID on that pending admission and wait
+        // for the response before arming its activity watchdog; the bounded
+        // admission watchdog still covers a request that never returns.
+        if admissionToken == nil,
+           let pendingToken = firstPendingAdmissionToken(
+               threadID: threadID,
+               withoutLifecycleStart: true
+           ),
+           var pending = pendingAdmissions[pendingToken] {
+            if pending.turnID == nil { pending.turnID = turnID }
+            pending.sawLifecycleStart = true
+            pendingAdmissions[pendingToken] = pending
+            return
+        }
+
+        // Events for an externally resumed turn may have no corresponding
+        // admission. Keep monitoring it with a synthetic token so EOF and
+        // inactivity still produce an attached failure.
+        let synthetic = ActiveTurn(
             token: UUID(),
-            admissionToken: admissionToken ?? firstPendingAdmissionToken(threadID: threadID),
+            threadID: threadID,
+            admissionToken: nil,
             turnID: turnID,
+            sawLifecycleStart: true,
             watchdog: nil,
-            isPausedForInteraction: false
+            watchdogToken: nil,
+            isPausedForInteraction: hasUnresolvedInteraction(for: threadID)
         )
-        activeTurns[threadID] = turn
-        armWatchdog(threadID: threadID, token: turn.token)
+        insertActiveTurn(synthetic)
+        if !synthetic.isPausedForInteraction {
+            armWatchdog(threadID: threadID, token: synthetic.token)
+        }
     }
 
-    private func firstPendingAdmissionToken(threadID: String) -> UUID? {
+    private func activeTurnToken(threadID: String, turnID: String) -> UUID? {
+        activeTurnTokensByThreadID[threadID]?.first { token in
+            activeTurns[token]?.turnID == turnID
+        }
+    }
+
+    private func activeTurnTokens(threadID: String) -> [UUID] {
+        activeTurnTokensByThreadID[threadID]?.filter { activeTurns[$0] != nil } ?? []
+    }
+
+    private func insertActiveTurn(_ turn: ActiveTurn) {
+        activeTurns[turn.token] = turn
+        activeTurnTokensByThreadID[turn.threadID, default: []].append(turn.token)
+    }
+
+    @discardableResult
+    private func removeActiveTurn(token: UUID) -> ActiveTurn? {
+        guard let turn = activeTurns.removeValue(forKey: token) else { return nil }
+        turn.watchdog?.cancel()
+        if var tokens = activeTurnTokensByThreadID[turn.threadID] {
+            tokens.removeAll { $0 == token }
+            activeTurnTokensByThreadID[turn.threadID] = tokens.isEmpty ? nil : tokens
+        }
+        return turn
+    }
+
+    private func updatePendingTurnID(threadID: String, turnID: String?) {
+        guard let turnID,
+              let pendingToken = firstPendingAdmissionToken(threadID: threadID),
+              var pending = pendingAdmissions[pendingToken],
+              pending.turnID == nil else { return }
+        pending.turnID = turnID
+        pendingAdmissions[pendingToken] = pending
+    }
+
+    private func firstPendingAdmissionToken(
+        threadID: String,
+        withoutLifecycleStart: Bool = false
+    ) -> UUID? {
         pendingAdmissionTokensByThreadID[threadID]?.first { token in
             guard let admission = pendingAdmissions[token] else { return false }
             return !admission.sawTerminal
+                && (!withoutLifecycleStart || !admission.sawLifecycleStart)
         }
     }
 
@@ -286,6 +407,7 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
             token: token,
             threadID: threadID,
             turnID: nil,
+            sawLifecycleStart: false,
             sawTerminal: false
         )
         pendingAdmissionTokensByThreadID[threadID, default: []].append(token)
@@ -302,8 +424,13 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
         // Lifecycle notifications do not carry the request token. Consume
         // them in admission order so concurrent same-thread starts/steers do
         // not overwrite one another or both claim the same terminal event.
+        // A terminal with no matching active turn is only attributable after
+        // that admission observed a lifecycle start. Otherwise it may be a
+        // delayed duplicate from an earlier same-thread turn.
         for token in tokens {
-            guard var admission = pendingAdmissions[token], !admission.sawTerminal else {
+            guard var admission = pendingAdmissions[token],
+                  !admission.sawTerminal,
+                  admission.sawLifecycleStart else {
                 continue
             }
             admission.sawTerminal = true
@@ -328,32 +455,45 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
         return admission
     }
 
+    private enum AdmissionSettlement: Sendable, Equatable {
+        case accepted
+        case alreadyTerminal
+        case laneRetired
+        case callerDisconnected
+    }
+
     private func finishAcceptedAdmission(
         threadID: String,
         token: UUID,
         turnID: String? = nil
-    ) {
+    ) -> AdmissionSettlement {
         if disconnectGate.isRequested || retirementReason == .explicitDisconnect {
             _ = removePendingAdmission(token: token)
-            return
+            return .callerDisconnected
         }
         guard var admission = pendingAdmissions[token], admission.threadID == threadID else {
             // A settlement watchdog may have already retired this request.
             // Its eventual provider response is stale and must not re-arm a
             // watchdog or publish a second failure.
-            return
+            return retiredAdmissionTokens.contains(token)
+                ? .laneRetired
+                : .alreadyTerminal
         }
         if let turnID { admission.turnID = turnID }
         pendingAdmissions[token] = admission
-        guard let settled = removePendingAdmission(token: token) else { return }
+        guard let settled = removePendingAdmission(token: token) else {
+            return retiredAdmissionTokens.contains(token)
+                ? .laneRetired
+                : .alreadyTerminal
+        }
         guard !settled.sawTerminal else {
             finishRetirementIfSettled()
-            return
+            return .alreadyTerminal
         }
         if isRetiring || hasUpstreamEventStreamEnded {
             guard !failedTurnTokens.contains(settled.token) else {
                 finishRetirementIfSettled()
-                return
+                return .laneRetired
             }
             // The request was accepted, but its private event lane ended
             // before a lifecycle event could arrive. Materialize the active
@@ -363,20 +503,44 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
                 threadID: threadID,
                 turn: ActiveTurn(
                     token: token,
+                    threadID: threadID,
                     admissionToken: settled.token,
                     turnID: settled.turnID,
+                    sawLifecycleStart: settled.sawLifecycleStart,
                     watchdog: nil,
+                    watchdogToken: nil,
                     isPausedForInteraction: false
                 )
             )
             finishRetirementIfSettled()
-            return
+            return .laneRetired
         }
-        beginOrTouchTurn(
+        let acceptedTurn = ActiveTurn(
+            token: settled.token,
             threadID: threadID,
-            turnID: turnID,
-            admissionToken: settled.token
+            admissionToken: settled.token,
+            turnID: settled.turnID ?? turnID,
+            sawLifecycleStart: settled.sawLifecycleStart,
+            watchdog: nil,
+            watchdogToken: nil,
+            isPausedForInteraction: hasUnresolvedInteraction(for: threadID)
         )
+        // A lifecycle start may have created a matching active record in a
+        // future adapter revision. Reuse it if present; otherwise retain one
+        // independent record for this admission.
+        if var existing = activeTurns[settled.token] {
+            if existing.turnID == nil { existing.turnID = acceptedTurn.turnID }
+            existing.isPausedForInteraction = hasUnresolvedInteraction(for: threadID)
+            activeTurns[settled.token] = existing
+        } else {
+            insertActiveTurn(acceptedTurn)
+        }
+        if activeTurns[settled.token]?.isPausedForInteraction == true {
+            cancelWatchdog(for: settled.token)
+        } else {
+            armWatchdog(threadID: threadID, token: settled.token)
+        }
+        return .accepted
     }
 
     private func finishRejectedAdmission(threadID: String, token: UUID) {
@@ -425,28 +589,108 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
     }
 
     private func touchTurn(threadID: String) {
-        guard let turn = activeTurns[threadID], !turn.isPausedForInteraction else { return }
-        armWatchdog(threadID: threadID, token: turn.token)
+        for token in activeTurnTokens(threadID: threadID) {
+            guard let turn = activeTurns[token], !turn.isPausedForInteraction else { continue }
+            armWatchdog(threadID: threadID, token: turn.token)
+        }
+    }
+
+    private func hasUnresolvedInteraction(for threadID: String) -> Bool {
+        !globalInteractionIDs.isEmpty
+            || !(interactionIDsByThreadID[threadID]?.isEmpty ?? true)
+    }
+
+    /// Cancels the current watchdog and invalidates any callback that may
+    /// already be queued on the actor executor.
+    private func cancelWatchdog(for token: UUID) {
+        guard var turn = activeTurns[token] else { return }
+        turn.watchdog?.cancel()
+        turn.watchdog = nil
+        turn.watchdogToken = nil
+        activeTurns[token] = turn
+    }
+
+    private func registerInteraction(_ interaction: RuntimeUserInteraction) {
+        // A raw provider request ID can be reused. Remove an older mapping
+        // before inserting the new request so one resolution cannot leave a
+        // stale count that pauses every later turn forever.
+        removeInteractionTracking(for: interaction.id)
+        if let threadID = interaction.threadID {
+            interactionThreads[interaction.id] = threadID
+            interactionIDsByThreadID[threadID, default: []].insert(interaction.id)
+            pauseTurn(threadID: threadID)
+        } else {
+            globalInteractionIDs.insert(interaction.id)
+            pauseAllTurns()
+        }
+    }
+
+    private func resolveInteraction(_ requestID: RuntimeRequestID) {
+        if let threadID = interactionThreads.removeValue(forKey: requestID) {
+            interactionIDsByThreadID[threadID]?.remove(requestID)
+            if interactionIDsByThreadID[threadID]?.isEmpty == true {
+                interactionIDsByThreadID[threadID] = nil
+            }
+            if !hasUnresolvedInteraction(for: threadID) {
+                resumeTurn(threadID: threadID)
+            }
+            return
+        }
+
+        guard globalInteractionIDs.remove(requestID) != nil else { return }
+        guard globalInteractionIDs.isEmpty else { return }
+        // A global prompt blocks every current and subsequently admitted
+        // turn. Once the last global prompt resolves, only threads without a
+        // remaining thread-specific prompt may resume.
+        let threadIDs = Set(activeTurns.values.map(\.threadID))
+        for threadID in threadIDs where !hasUnresolvedInteraction(for: threadID) {
+            resumeTurn(threadID: threadID)
+        }
+    }
+
+    @discardableResult
+    private func removeInteractionTracking(for requestID: RuntimeRequestID) -> String? {
+        if let threadID = interactionThreads.removeValue(forKey: requestID) {
+            interactionIDsByThreadID[threadID]?.remove(requestID)
+            if interactionIDsByThreadID[threadID]?.isEmpty == true {
+                interactionIDsByThreadID[threadID] = nil
+            }
+            return threadID
+        }
+        globalInteractionIDs.remove(requestID)
+        return nil
+    }
+
+    private func pauseAllTurns() {
+        let threadIDs = Set(activeTurns.values.map(\.threadID))
+        for threadID in threadIDs { pauseTurn(threadID: threadID) }
     }
 
     private func pauseTurn(threadID: String) {
-        guard var turn = activeTurns[threadID] else { return }
-        turn.watchdog?.cancel()
-        turn.watchdog = nil
-        turn.isPausedForInteraction = true
-        activeTurns[threadID] = turn
+        for token in activeTurnTokens(threadID: threadID) {
+            guard var turn = activeTurns[token] else { continue }
+            turn.isPausedForInteraction = true
+            activeTurns[token] = turn
+            cancelWatchdog(for: token)
+        }
     }
 
     private func resumeTurn(threadID: String) {
-        guard var turn = activeTurns[threadID] else { return }
-        turn.isPausedForInteraction = false
-        activeTurns[threadID] = turn
-        armWatchdog(threadID: threadID, token: turn.token)
+        guard !hasUnresolvedInteraction(for: threadID) else { return }
+        for token in activeTurnTokens(threadID: threadID) {
+            guard var turn = activeTurns[token] else { continue }
+            turn.isPausedForInteraction = false
+            activeTurns[token] = turn
+            armWatchdog(threadID: threadID, token: turn.token)
+        }
     }
 
     private func armWatchdog(threadID: String, token: UUID) {
-        guard var turn = activeTurns[threadID], turn.token == token else { return }
+        guard var turn = activeTurns[token],
+              turn.threadID == threadID,
+              turn.token == token else { return }
         turn.watchdog?.cancel()
+        let watchdogToken = UUID()
         let timeout = policy.inactivityTimeout
         turn.watchdog = Task { [weak self] in
             do {
@@ -455,36 +699,87 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
                 return
             }
             guard !Task.isCancelled, let self else { return }
-            await self.expireTurn(threadID: threadID, token: token)
+            await self.expireTurn(
+                threadID: threadID,
+                token: token,
+                watchdogToken: watchdogToken
+            )
         }
-        activeTurns[threadID] = turn
+        turn.watchdogToken = watchdogToken
+        activeTurns[token] = turn
     }
 
     private func finishTurn(threadID: String) {
-        guard let turn = activeTurns.removeValue(forKey: threadID) else { return }
-        turn.watchdog?.cancel()
-        if let admissionToken = turn.admissionToken,
-           var admission = pendingAdmissions[admissionToken] {
-            admission.sawTerminal = true
-            pendingAdmissions[admissionToken] = admission
-        } else if turn.admissionToken == nil {
-            markAdmissionTerminal(threadID: threadID)
+        let tokens = activeTurnTokens(threadID: threadID)
+        for token in tokens {
+            guard let turn = removeActiveTurn(token: token) else { continue }
+            if let admissionToken = turn.admissionToken,
+               var admission = pendingAdmissions[admissionToken] {
+                admission.sawTerminal = true
+                pendingAdmissions[admissionToken] = admission
+            }
         }
-        interactionThreads = interactionThreads.filter { $0.value != threadID }
+        guard activeTurnTokens(threadID: threadID).isEmpty else { return }
+        clearInteractions(for: threadID)
     }
 
-    private func finishTurnOrMarkAdmissionTerminal(threadID: String) {
-        guard activeTurns[threadID] != nil else {
+    private func finishTurnOrMarkAdmissionTerminal(
+        threadID: String,
+        turnID: String? = nil,
+        finishAll: Bool = false
+    ) {
+        let tokens: [UUID]
+        if finishAll {
+            // A thread-level idle/failed status is only attributable to
+            // active records that have observed this turn's lifecycle. Keep
+            // newly admitted, not-yet-started records alive for their own
+            // admission/idle watchdog instead of consuming a delayed status
+            // from the previous same-thread turn.
+            tokens = activeTurnTokens(threadID: threadID).filter {
+                activeTurns[$0]?.sawLifecycleStart == true
+            }
+        } else if let turnID,
+                  let token = activeTurnToken(threadID: threadID, turnID: turnID) {
+            tokens = [token]
+        } else if let token = activeTurnTokens(threadID: threadID).first(where: {
+            activeTurns[$0]?.sawLifecycleStart == true
+        }) {
+            tokens = [token]
+        } else {
             markAdmissionTerminal(threadID: threadID)
             return
         }
-        finishTurn(threadID: threadID)
+        for token in tokens {
+            guard let turn = removeActiveTurn(token: token) else { continue }
+            if let admissionToken = turn.admissionToken,
+               var admission = pendingAdmissions[admissionToken] {
+                admission.sawTerminal = true
+                pendingAdmissions[admissionToken] = admission
+            }
+        }
+        if activeTurnTokens(threadID: threadID).isEmpty {
+            clearInteractions(for: threadID)
+        }
     }
 
     private func cancelActiveTurns() {
         for turn in activeTurns.values { turn.watchdog?.cancel() }
         activeTurns.removeAll()
+        activeTurnTokensByThreadID.removeAll()
+        clearAllInteractionTracking()
+    }
+
+    private func clearInteractions(for threadID: String) {
+        guard let IDs = interactionIDsByThreadID.removeValue(forKey: threadID) else {
+            return
+        }
+        for ID in IDs { interactionThreads.removeValue(forKey: ID) }
+    }
+
+    private func clearAllInteractionTracking() {
         interactionThreads.removeAll()
+        interactionIDsByThreadID.removeAll()
+        globalInteractionIDs.removeAll()
     }
 
     private func cancelPendingAdmissions() {
@@ -565,9 +860,12 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
                 threadID: admission.threadID,
                 turn: ActiveTurn(
                     token: admission.token,
+                    threadID: admission.threadID,
                     admissionToken: admission.token,
                     turnID: admission.turnID,
+                    sawLifecycleStart: admission.sawLifecycleStart,
                     watchdog: nil,
+                    watchdogToken: nil,
                     isPausedForInteraction: false
                 )
             )
@@ -575,9 +873,16 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
         finishRetirementIfSettled()
     }
 
-    private func expireTurn(threadID: String, token: UUID) {
+    private func expireTurn(
+        threadID: String,
+        token: UUID,
+        watchdogToken: UUID
+    ) {
         guard !disconnectGate.isRequested,
-              activeTurns[threadID]?.token == token else { return }
+              let turn = activeTurns[token],
+              turn.threadID == threadID,
+              turn.watchdogToken == watchdogToken,
+              !turn.isPausedForInteraction else { return }
         beginUnexpectedRetirement()
     }
 
@@ -603,8 +908,8 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
         let failures = activeTurns
         cancelActiveTurns()
 
-        for threadID in failures.keys.sorted() {
-            guard let turn = failures[threadID] else { continue }
+        for turn in failures.values.sorted(by: { $0.token.uuidString < $1.token.uuidString }) {
+            let threadID = turn.threadID
             // A lifecycle start observed before the request response belongs
             // to this same pending admission. Mark it terminal before the
             // response returns so it cannot receive a duplicate synthetic
@@ -627,6 +932,9 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
               retirementReason != .explicitDisconnect,
               !failedTurnTokens.contains(turn.token) else { return }
         failedTurnTokens.insert(turn.token)
+        if let admissionToken = turn.admissionToken {
+            retiredAdmissionTokens.insert(admissionToken)
+        }
         // A few compatible app-server/provider combinations accept a turn
         // and emit progress without ever publishing `turnStarted`. The app
         // model needs a real turn boundary to attach the optimistic user
@@ -773,7 +1081,13 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
         let admission = try beginAdmission(threadID: request.threadID)
         do {
             try await runtime.startTurn(request)
-            finishAcceptedAdmission(threadID: request.threadID, token: admission)
+            let settlement = finishAcceptedAdmission(
+                threadID: request.threadID,
+                token: admission
+            )
+            if settlement == .laneRetired {
+                throw OpenAICompatibleAgentTurnLivenessError.laneRetired
+            }
         } catch {
             finishRejectedAdmission(threadID: request.threadID, token: admission)
             throw error
@@ -785,11 +1099,14 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
         let admission = try beginAdmission(threadID: request.threadID)
         do {
             let run = try await runtime.startReview(request)
-            finishAcceptedAdmission(
+            let settlement = finishAcceptedAdmission(
                 threadID: request.threadID,
                 token: admission,
                 turnID: run.turnID
             )
+            if settlement == .laneRetired {
+                throw OpenAICompatibleAgentTurnLivenessError.laneRetired
+            }
             return run
         } catch {
             finishRejectedAdmission(threadID: request.threadID, token: admission)
@@ -801,7 +1118,10 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
         let admission = try beginAdmission(threadID: threadID)
         do {
             try await runtime.steer(threadID: threadID, text: text)
-            finishAcceptedAdmission(threadID: threadID, token: admission)
+            let settlement = finishAcceptedAdmission(threadID: threadID, token: admission)
+            if settlement == .laneRetired {
+                throw OpenAICompatibleAgentTurnLivenessError.laneRetired
+            }
         } catch {
             finishRejectedAdmission(threadID: threadID, token: admission)
             throw error
@@ -812,7 +1132,10 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
         let admission = try beginAdmission(threadID: threadID)
         do {
             try await runtime.steer(threadID: threadID, inputs: inputs)
-            finishAcceptedAdmission(threadID: threadID, token: admission)
+            let settlement = finishAcceptedAdmission(threadID: threadID, token: admission)
+            if settlement == .laneRetired {
+                throw OpenAICompatibleAgentTurnLivenessError.laneRetired
+            }
         } catch {
             finishRejectedAdmission(threadID: threadID, token: admission)
             throw error
@@ -828,9 +1151,11 @@ actor OpenAICompatibleAgentTurnLivenessRuntime: AgentRuntime {
         to interactionID: RuntimeRequestID,
         with response: RuntimeUserInteractionResponse
     ) async throws {
-        let threadID = interactionThreads[interactionID]
+        // Keep the turn paused until the provider's lifecycle stream confirms
+        // `userInteractionResolved`. A successful response RPC only means the
+        // answer was accepted; the model may still be processing it, and
+        // resuming here can let a queued watchdog expire that same turn.
         try await runtime.respond(to: interactionID, with: response)
-        if let threadID { resumeTurn(threadID: threadID) }
     }
 
     func renameThread(id: String, name: String) async throws {

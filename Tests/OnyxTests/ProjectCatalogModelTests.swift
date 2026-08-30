@@ -44,6 +44,24 @@ final class ProjectCatalogModelTests: XCTestCase {
         )
     }
 
+    func testProjectPickerCancellationCallbackRunsWhenNoWindowIsAvailable() {
+        let model = ProjectCatalogModel()
+        var cancellationCount = 0
+
+        model.chooseAndImportProject(
+            window: nil,
+            initialFolderPath: nil,
+            onCancelled: { cancellationCount += 1 },
+            onImported: { _ in XCTFail("A missing window cannot import a project") }
+        )
+
+        XCTAssertEqual(
+            cancellationCount,
+            1,
+            "A canceled/unavailable folder sheet must return focus exactly once."
+        )
+    }
+
     func testHostCatalogRefreshPreservesSelectedCachedTaskUntilDirectReadCompletes() {
         let model = ProjectCatalogModel()
         let selected = thread(id: "selected", title: "Selected cached task", cwd: "/work/onyx")

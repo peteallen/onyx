@@ -8,6 +8,9 @@ struct ConversationWorkspaceView: View {
     /// what is actually visible rather than only the persisted preference.
     var sidebarDisplayed: Bool?
     var onShowSidebar: (@MainActor () -> Void)?
+    var workspaceProjectName: String? = nil
+    var workspaceProjectPath: String? = nil
+    var onOpenWorkspaceSwitcher: @MainActor () -> Void = {}
     var providerConnections: [OnyxApplicationHost.WorkspaceConnection] = []
     var selectedProviderConnectionID: ProviderConnectionID = .codexDefault
     var onSelectProviderConnection: @MainActor (ProviderConnectionID) -> Void = { _ in }
@@ -31,7 +34,10 @@ struct ConversationWorkspaceView: View {
                     ConversationHeaderView(
                         model: model,
                         sidebarDisplayed: sidebarDisplayed ?? model.isSidebarVisible,
-                        onShowSidebar: onShowSidebar ?? { model.isSidebarVisible = true }
+                        onShowSidebar: onShowSidebar ?? { model.isSidebarVisible = true },
+                        workspaceProjectName: workspaceProjectName,
+                        workspaceProjectPath: workspaceProjectPath,
+                        onOpenWorkspaceSwitcher: onOpenWorkspaceSwitcher
                     )
 
                     ZStack {
@@ -475,13 +481,118 @@ struct SideChatPanelLayout: Equatable {
     }
 }
 
+struct ConversationHeaderPresentation: Equatable {
+    static let headerHeight = OnyxWorkspaceMetrics.paneHeaderHeight
+    static let minimumSwitcherTargetHeight = OnyxHitTarget.compact
+
+    let taskTitle: String
+    let workspaceName: String
+    let workspacePath: String?
+    let branchName: String?
+
+    var contextLabel: String {
+        guard let branchName else { return workspaceName }
+        return "\(workspaceName) · \(branchName)"
+    }
+
+    var helpText: String {
+        let workspace = workspacePath ?? "Choose a project or worktree"
+        guard let branchName else { return workspace }
+        return "\(workspace) · branch \(branchName)"
+    }
+
+    var accessibilityValue: String {
+        let workspace = workspacePath ?? "not selected"
+        guard let branchName else {
+            return "Task \(taskTitle). Workspace \(workspace)."
+        }
+        return "Task \(taskTitle). Workspace \(workspace). Branch \(branchName)."
+    }
+
+    static func resolve(
+        taskTitle: String?,
+        workspacePath: String?,
+        workspaceProjectName: String? = nil,
+        workspaceProjectPath: String? = nil,
+        branch: String?,
+        isShowingArchivedThreads: Bool
+    ) -> Self {
+        let title = nonEmpty(taskTitle)
+            ?? (isShowingArchivedThreads ? "Archived tasks" : "New task")
+        let path = nonEmpty(workspacePath)
+        let workspaceName = workspaceDisplayName(
+            workspacePath: path,
+            projectName: nonEmpty(workspaceProjectName),
+            projectPath: nonEmpty(workspaceProjectPath)
+        )
+
+        return Self(
+            taskTitle: title,
+            workspaceName: workspaceName,
+            workspacePath: path,
+            branchName: nonEmpty(branch)
+        )
+    }
+
+    private static func workspaceDisplayName(
+        workspacePath: String?,
+        projectName: String?,
+        projectPath: String?
+    ) -> String {
+        guard let workspacePath else { return "Choose workspace" }
+        let normalizedWorkspace = ProjectPathNormalizer.normalize(workspacePath)
+            ?? workspacePath
+
+        if let projectName,
+           let projectPath,
+           let normalizedProject = ProjectPathNormalizer.normalize(projectPath),
+           ProjectPathNormalizer.contains(normalizedWorkspace, inside: normalizedProject) {
+            let projectComponents = NSString(string: normalizedProject).pathComponents
+            let workspaceComponents = NSString(string: normalizedWorkspace).pathComponents
+            let relative = workspaceComponents
+                .dropFirst(projectComponents.count)
+                .joined(separator: "/")
+            return relative.isEmpty ? projectName : "\(projectName) / \(relative)"
+        }
+
+        let workspaceURL = URL(fileURLWithPath: normalizedWorkspace)
+        let checkoutName = workspaceURL.lastPathComponent
+        let parentName = workspaceURL.deletingLastPathComponent().lastPathComponent
+        if parentName.hasSuffix(".worktrees") {
+            let projectName = String(parentName.dropLast(".worktrees".count))
+            if !projectName.isEmpty, !checkoutName.isEmpty {
+                return "\(projectName) / \(checkoutName)"
+            }
+        }
+        return checkoutName.isEmpty ? normalizedWorkspace : checkoutName
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else { return nil }
+        return value
+    }
+}
+
 private struct ConversationHeaderView: View {
     @ObservedObject var model: OnyxAppModel
     let sidebarDisplayed: Bool
     let onShowSidebar: @MainActor () -> Void
+    let workspaceProjectName: String?
+    let workspaceProjectPath: String?
+    let onOpenWorkspaceSwitcher: @MainActor () -> Void
     @Environment(\.onyxWindowPresentationContext) private var windowPresentation
 
     var body: some View {
+        let presentation = ConversationHeaderPresentation.resolve(
+            taskTitle: model.selectedThread?.title,
+            workspacePath: model.selectedProjectPath,
+            workspaceProjectName: workspaceProjectName,
+            workspaceProjectPath: workspaceProjectPath,
+            branch: model.selectedThread?.branch,
+            isShowingArchivedThreads: model.isShowingArchivedThreads
+        )
+
         HStack(spacing: 10) {
             if !sidebarDisplayed {
                 Button {
@@ -497,22 +608,43 @@ private struct ConversationHeaderView: View {
                 .accessibilityHint("Reveals the task list")
             }
 
-            HStack(spacing: 8) {
-                Image(systemName: "folder")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(OnyxTheme.electric.opacity(0.84))
-                    .accessibilityHidden(true)
+            Button(action: onOpenWorkspaceSwitcher) {
+                HStack(spacing: 8) {
+                    Image(systemName: "folder")
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundStyle(OnyxTheme.electric.opacity(0.78))
 
-                Text(headerTitle)
-                    .font(.system(size: OnyxTypography.paneTitle, weight: .semibold))
-                    .lineLimit(1)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(presentation.taskTitle)
+                            .font(.system(size: OnyxTypography.paneTitle, weight: .semibold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+
+                        Text(presentation.contextLabel)
+                            .font(.system(size: OnyxTypography.metadata, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.system(size: 8.5, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .frame(
+                    maxWidth: .infinity,
+                    minHeight: ConversationHeaderPresentation.minimumSwitcherTargetHeight,
+                    alignment: .leading
+                )
+                .padding(.trailing, 8)
+                .contentShape(Rectangle())
             }
-            .onyxHelp(projectContext)
-            .accessibilityElement(children: .combine)
-            .accessibilityLabel("Task")
-            .accessibilityValue("\(headerTitle), \(projectContext)")
-
-            Spacer()
+            .buttonStyle(.plain)
+            .onyxHelp("\(presentation.helpText)\nOpen workspace switcher (⌘K)")
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Switch workspace")
+            .accessibilityValue(presentation.accessibilityValue)
+            .accessibilityHint("Opens the project, worktree, and task switcher")
 
             if model.isSideChatPresented {
                 Button(action: model.closeSideChat) {
@@ -613,24 +745,13 @@ private struct ConversationHeaderView: View {
             .accessibilityLabel("Task actions")
         }
         .padding(.horizontal, OnyxWorkspaceMetrics.paneEdgeInset)
-        .frame(height: OnyxWorkspaceMetrics.paneHeaderHeight)
+        .frame(height: ConversationHeaderPresentation.headerHeight)
         .background(OnyxTheme.chrome)
         .overlay(alignment: .bottom) {
             Rectangle()
                 .fill(OnyxTheme.divider)
                 .frame(height: OnyxTheme.hairline)
         }
-    }
-
-    private var headerTitle: String {
-        model.selectedThread?.title ?? (model.isShowingArchivedThreads ? "Archived tasks" : "New task")
-    }
-
-    private var projectContext: String {
-        guard let branch = model.selectedThread?.branch, !branch.isEmpty else {
-            return model.projectName
-        }
-        return "\(model.projectName) / \(branch)"
     }
 
     private func headerAction(title: String, systemImage: String, isSelected: Bool) -> some View {

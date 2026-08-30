@@ -180,7 +180,10 @@ final class OpenAICompatibleAgentTurnLivenessRuntimeTests: XCTestCase {
         XCTAssertFalse(finishedBeforeAdmissionSettled)
 
         await upstream.succeedStart(threadID: "thread-1")
-        try await start.value
+        // The provider call returned after EOF retired the private lane.  Its
+        // late success is intentionally surfaced as a typed stale-admission
+        // error so callers cannot treat the dead turn as live work.
+        await assertLaneRetired(start)
 
         try await waitUntil("An accepted turn was lost when its event stream ended") {
             await log.isFinished()
@@ -236,7 +239,7 @@ final class OpenAICompatibleAgentTurnLivenessRuntimeTests: XCTestCase {
         XCTAssertFalse(finishedBeforeAdmissionSettled)
 
         await upstream.succeedStart(threadID: "thread-2")
-        try await pendingStart.value
+        await assertLaneRetired(pendingStart)
         try await waitUntil("The stream ended before every admission settled") {
             await log.isFinished()
         }
@@ -290,7 +293,7 @@ final class OpenAICompatibleAgentTurnLivenessRuntimeTests: XCTestCase {
         XCTAssertFalse(finishedBeforeAdmissionsSettled)
 
         await upstream.succeedStart(threadID: "thread-1")
-        try await firstStart.value
+        await assertLaneRetired(firstStart)
         try await waitUntil("The first accepted admission did not fail") {
             await log.livenessFailureCount(threadID: "thread-1") == 1
         }
@@ -302,7 +305,7 @@ final class OpenAICompatibleAgentTurnLivenessRuntimeTests: XCTestCase {
         XCTAssertFalse(finishedBeforeSecondAdmissionSettled)
 
         await upstream.succeedStart(threadID: "thread-2")
-        try await secondStart.value
+        await assertLaneRetired(secondStart)
         try await waitUntil("The stream did not finish after both admissions settled") {
             await log.isFinished()
         }
@@ -396,7 +399,7 @@ final class OpenAICompatibleAgentTurnLivenessRuntimeTests: XCTestCase {
         XCTAssertFalse(finishedBeforeAdmissionSettled)
 
         await upstream.succeedStart(threadID: "thread-1")
-        try await start.value
+        await assertLaneRetired(start)
         try await waitUntil("The delayed terminal event never arrived") {
             await log.isFinished()
         }
@@ -456,7 +459,7 @@ final class OpenAICompatibleAgentTurnLivenessRuntimeTests: XCTestCase {
         // A late provider return is stale after the timeout and must not
         // publish a second failure or terminal connection event.
         await upstream.succeedStart(threadID: "thread-1")
-        try await start.value
+        await assertLaneRetired(start)
         try await Task.sleep(for: .milliseconds(100))
         let lateEvents = await log.snapshot()
         XCTAssertEqual(livenessFailureCount(in: lateEvents, threadID: "thread-1"), 1)
@@ -497,7 +500,7 @@ final class OpenAICompatibleAgentTurnLivenessRuntimeTests: XCTestCase {
         XCTAssertEqual(terminalConnectionFailureCount(in: timedOutEvents), 1)
 
         await upstream.succeedStart(threadID: "thread-1")
-        try await start.value
+        await assertLaneRetired(start)
         try await Task.sleep(for: .milliseconds(100))
         let lateEvents = await log.snapshot()
         XCTAssertEqual(livenessFailureCount(in: lateEvents, threadID: "thread-1"), 1)
@@ -537,7 +540,7 @@ final class OpenAICompatibleAgentTurnLivenessRuntimeTests: XCTestCase {
         }
 
         await upstream.succeedStart(threadID: "thread-1")
-        try await first.value
+        await assertLaneRetired(first)
         await upstream.rejectStart(threadID: "thread-1")
         do {
             try await second.value
@@ -590,9 +593,9 @@ final class OpenAICompatibleAgentTurnLivenessRuntimeTests: XCTestCase {
         }
 
         await upstream.succeedStart(threadID: "thread-1")
-        try await first.value
+        await assertLaneRetired(first)
         await upstream.succeedStart(threadID: "thread-1")
-        try await second.value
+        await assertLaneRetired(second)
         try await waitUntil("The stream did not finish after both accepted admissions settled") {
             await log.isFinished()
         }
@@ -665,6 +668,154 @@ final class OpenAICompatibleAgentTurnLivenessRuntimeTests: XCTestCase {
         XCTAssertEqual(livenessFailureCount(in: events, threadID: "thread-1"), 0)
         XCTAssertEqual(livenessFailureCount(in: events, threadID: "thread-2"), 1)
         XCTAssertEqual(terminalConnectionFailureCount(in: events), 1)
+    }
+
+    func testLateSameThreadTerminalDoesNotDiscardLaterAdmission() async throws {
+        let upstream = AgentTurnLivenessFixtureRuntime(
+            suspendedStartThreadIDs: ["thread-1"]
+        )
+        let runtime = OpenAICompatibleAgentTurnLivenessRuntime(
+            runtime: upstream,
+            policy: OpenAICompatibleAgentTurnLivenessPolicy(
+                inactivityTimeout: .milliseconds(80),
+                admissionSettlementTimeout: .seconds(1)
+            )
+        )
+        let log = AgentTurnLivenessEventLog()
+        let collector = collect(runtime.events, into: log)
+        defer { collector.cancel() }
+
+        _ = try await runtime.connect()
+        // Complete turn A and let its active record disappear before creating
+        // admission B on the same thread.  This fixture suspends starts for
+        // this thread so B can be held while its delayed terminal arrives;
+        // release A explicitly before awaiting it.
+        let first = startTurnTask(runtime, request: Self.startTurnRequest)
+        try await waitUntil("Turn A admission did not suspend") {
+            await upstream.isStartSuspended(threadID: "thread-1")
+        }
+        await upstream.succeedStart(threadID: "thread-1")
+        try await first.value
+        await upstream.emit(.turnStarted(threadID: "thread-1", turnID: "turn-A"))
+        try await waitUntil("Turn A did not start") {
+            await log.snapshot().contains(
+                .turnStarted(threadID: "thread-1", turnID: "turn-A")
+            )
+        }
+        await upstream.emit(.turnCompleted(threadID: "thread-1", status: .idle))
+        try await waitUntil("Turn A did not complete") {
+            await log.snapshot().contains(
+                .turnCompleted(threadID: "thread-1", status: .idle)
+            )
+        }
+
+        let second = startTurnTask(runtime, request: Self.startTurnRequest)
+        try await waitUntil("Turn B admission did not suspend") {
+            await upstream.isStartSuspended(threadID: "thread-1")
+        }
+        // This terminal has no turn ID and is intentionally a delayed
+        // duplicate for A. It must not mark B terminal before B starts.
+        await upstream.emit(.turnCompleted(threadID: "thread-1", status: .idle))
+        await upstream.succeedStart(threadID: "thread-1")
+        try await second.value
+
+        try await waitUntil("Turn B was discarded after a late terminal") {
+            await log.livenessFailureCount(threadID: "thread-1") == 1
+        }
+    }
+
+    func testInteractionPauseWaitsForEveryResolutionAndRespondDoesNotResumeEarly() async throws {
+        let upstream = AgentTurnLivenessFixtureRuntime()
+        let runtime = OpenAICompatibleAgentTurnLivenessRuntime(
+            runtime: upstream,
+            policy: OpenAICompatibleAgentTurnLivenessPolicy(
+                inactivityTimeout: .milliseconds(80)
+            )
+        )
+        let log = AgentTurnLivenessEventLog()
+        let collector = collect(runtime.events, into: log)
+        defer { collector.cancel() }
+
+        _ = try await runtime.connect()
+        try await runtime.startTurn(Self.startTurnRequest)
+        await upstream.emit(.turnStarted(threadID: "thread-1", turnID: "turn-interaction"))
+        try await waitUntil("The interaction turn did not start") {
+            await log.snapshot().contains(
+                .turnStarted(threadID: "thread-1", turnID: "turn-interaction")
+            )
+        }
+
+        let first = Self.makeInteraction(id: "interaction-1", threadID: "thread-1")
+        let second = Self.makeInteraction(id: "interaction-2", threadID: "thread-1")
+        await upstream.emit(.userInteractionRequested(first))
+        await upstream.emit(.userInteractionRequested(second))
+        try await waitUntil("Both interactions did not reach the wrapper") {
+            await log.snapshot().filter {
+                if case .userInteractionRequested = $0 { return true }
+                return false
+            }.count == 2
+        }
+
+        // A generic running status and a successful response RPC are not
+        // resolution events. The watchdog must remain paused until both
+        // explicit resolutions arrive.
+        await upstream.emit(.threadStatusChanged(threadID: "thread-1", status: .running))
+        try await runtime.respond(to: first.id, with: .approval(.accept))
+        try await Task.sleep(for: .milliseconds(140))
+        let failuresWhilePaused = await log.livenessFailureCount(threadID: "thread-1")
+        XCTAssertEqual(failuresWhilePaused, 0)
+
+        await upstream.emit(.userInteractionResolved(first.id))
+        try await Task.sleep(for: .milliseconds(140))
+        let failuresWhileSecondPaused = await log.livenessFailureCount(threadID: "thread-1")
+        XCTAssertEqual(failuresWhileSecondPaused, 0)
+
+        await upstream.emit(.userInteractionResolved(second.id))
+        try await waitUntil("The turn did not resume after the final resolution") {
+            await log.livenessFailureCount(threadID: "thread-1") == 1
+        }
+    }
+
+    func testThreadlessInteractionPausesAllActiveTurns() async throws {
+        let upstream = AgentTurnLivenessFixtureRuntime()
+        let runtime = OpenAICompatibleAgentTurnLivenessRuntime(
+            runtime: upstream,
+            policy: OpenAICompatibleAgentTurnLivenessPolicy(
+                inactivityTimeout: .milliseconds(80)
+            )
+        )
+        let log = AgentTurnLivenessEventLog()
+        let collector = collect(runtime.events, into: log)
+        defer { collector.cancel() }
+
+        _ = try await runtime.connect()
+        try await runtime.startTurn(Self.makeStartTurnRequest(threadID: "thread-1"))
+        try await runtime.startTurn(Self.makeStartTurnRequest(threadID: "thread-2"))
+        await upstream.emit(.turnStarted(threadID: "thread-1", turnID: "turn-1"))
+        await upstream.emit(.turnStarted(threadID: "thread-2", turnID: "turn-2"))
+        try await waitUntil("Both turns did not start") {
+            let events = await log.snapshot()
+            return events.contains(.turnStarted(threadID: "thread-1", turnID: "turn-1"))
+                && events.contains(.turnStarted(threadID: "thread-2", turnID: "turn-2"))
+        }
+
+        let global = Self.makeInteraction(id: "global-interaction", threadID: nil)
+        await upstream.emit(.userInteractionRequested(global))
+        try await waitUntil("The threadless interaction did not reach the wrapper") {
+            await log.snapshot().contains(.userInteractionRequested(global))
+        }
+        try await Task.sleep(for: .milliseconds(140))
+        let threadOneFailuresWhilePaused = await log.livenessFailureCount(threadID: "thread-1")
+        let threadTwoFailuresWhilePaused = await log.livenessFailureCount(threadID: "thread-2")
+        XCTAssertEqual(threadOneFailuresWhilePaused, 0)
+        XCTAssertEqual(threadTwoFailuresWhilePaused, 0)
+
+        await upstream.emit(.userInteractionResolved(global.id))
+        try await waitUntil("The paused turns did not resume after global resolution") {
+            let threadOneFailures = await log.livenessFailureCount(threadID: "thread-1")
+            let threadTwoFailures = await log.livenessFailureCount(threadID: "thread-2")
+            return threadOneFailures == 1 && threadTwoFailures == 1
+        }
     }
 
     func testExplicitDisconnectDoesNotSynthesizeTaskFailureForPendingAdmission() async throws {
@@ -767,6 +918,23 @@ final class OpenAICompatibleAgentTurnLivenessRuntimeTests: XCTestCase {
         )
     }
 
+    private static func makeInteraction(
+        id: String,
+        threadID: String?
+    ) -> RuntimeUserInteraction {
+        RuntimeUserInteraction(
+            id: .string(id),
+            threadID: threadID,
+            providerMethod: "item/commandExecution/requestApproval",
+            title: "Run this command?",
+            detail: "The model needs approval to continue.",
+            kind: .approval(RuntimeApprovalPrompt(
+                subject: .command,
+                command: "echo onyx"
+            ))
+        )
+    }
+
     private func livenessFailureCount(
         in events: [AgentRuntimeEvent],
         threadID: String
@@ -802,6 +970,33 @@ final class OpenAICompatibleAgentTurnLivenessRuntimeTests: XCTestCase {
         request: StartTurnRequest
     ) -> Task<Void, any Error> {
         Task { try await runtime.startTurn(request) }
+    }
+
+    /// A provider request that returns after its private event lane has been
+    /// retired is intentionally stale.  Keep this assertion explicit so the
+    /// regression tests verify that late success cannot be mistaken for a
+    /// live turn (or silently swallowed as an arbitrary error).
+    private func assertLaneRetired(
+        _ task: Task<Void, any Error>,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        do {
+            try await task.value
+            XCTFail(
+                "A late provider admission should report laneRetired",
+                file: file,
+                line: line
+            )
+        } catch let error as OpenAICompatibleAgentTurnLivenessError {
+            XCTAssertEqual(error, .laneRetired, file: file, line: line)
+        } catch {
+            XCTFail(
+                "Unexpected late-admission error: \(error)",
+                file: file,
+                line: line
+            )
+        }
     }
 
     private func waitUntil(

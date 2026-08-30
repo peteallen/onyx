@@ -54,6 +54,7 @@ struct OnyxApp: App {
 struct OnyxWindowCommandContext {
     let newTask: () -> Void
     let openProject: () -> Void
+    let openWorkspaceSwitcher: () -> Void
     let openQuickOpen: () -> Void
     let focusTaskSearch: () -> Void
     let toggleSidebar: () -> Void
@@ -65,6 +66,7 @@ struct OnyxWindowCommandContext {
         model: OnyxAppModel,
         windowProvider: @escaping @MainActor () -> NSWindow?,
         openProject: (() -> Void)? = nil,
+        openWorkspaceSwitcher: @escaping () -> Void = {},
         openQuickOpen: @escaping () -> Void = {},
         focusTaskSearch: @escaping () -> Void,
         toggleSidebar: (() -> Void)? = nil
@@ -72,6 +74,7 @@ struct OnyxWindowCommandContext {
         Self(
             newTask: model.newTask,
             openProject: openProject ?? { model.chooseWorkspace(window: windowProvider()) },
+            openWorkspaceSwitcher: openWorkspaceSwitcher,
             openQuickOpen: openQuickOpen,
             focusTaskSearch: focusTaskSearch,
             toggleSidebar: toggleSidebar ?? { model.isSidebarVisible.toggle() },
@@ -149,6 +152,14 @@ private struct OnyxCommands: Commands {
                 windowCommands?.openQuickOpen()
             }
             .keyboardShortcut("p", modifiers: .command)
+            .disabled(windowCommands == nil)
+        }
+
+        CommandMenu("Navigate") {
+            Button("Switch Project or Task…") {
+                windowCommands?.openWorkspaceSwitcher()
+            }
+            .keyboardShortcut("k", modifiers: .command)
             .disabled(windowCommands == nil)
         }
 

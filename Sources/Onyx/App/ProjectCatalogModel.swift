@@ -475,8 +475,16 @@ final class ProjectCatalogModel: ObservableObject {
         window: NSWindow?,
         initialFolderPath: String?,
         onFailure: ProjectCatalogFailureHandler? = nil,
+        onCancelled: @escaping @MainActor () -> Void = {},
         onImported: @escaping @MainActor (ProjectCatalogRecord) -> Void
     ) {
+        guard let window else {
+            // A missing window is equivalent to a dismissed sheet from the
+            // caller's point of view. Return before constructing NSOpenPanel
+            // so headless callers do not touch AppKit's picker services.
+            onCancelled()
+            return
+        }
         let panel = NSOpenPanel()
         panel.title = "Add a project to Onyx"
         panel.prompt = "Add Project"
@@ -487,9 +495,16 @@ final class ProjectCatalogModel: ObservableObject {
         if let initialFolderPath {
             panel.directoryURL = URL(fileURLWithPath: initialFolderPath)
         }
-        guard let window else { return }
         panel.beginSheetModal(for: window) { [weak self] response in
-            guard response == .OK, let folderPath = panel.url?.path else { return }
+            guard response == .OK, let folderPath = panel.url?.path else {
+                // The sheet has relinquished its key view by this point, so
+                // let the owning window restore its next sensible target on
+                // the following main-queue turn.
+                DispatchQueue.main.async {
+                    onCancelled()
+                }
+                return
+            }
             Task { @MainActor [weak self] in
                 guard let self,
                       let imported = await self.importProject(

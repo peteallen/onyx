@@ -3,6 +3,7 @@ import SwiftUI
 struct OnyxWorkspaceView: View {
     @ObservedObject var model: OnyxAppModel
     @ObservedObject private var projectCatalog: ProjectCatalogModel
+    @StateObject private var switcherStateModel: ProjectWorkspaceSwitcherStateModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var terminalSession = TerminalSessionModel()
     @StateObject private var sourceNavigator = ProjectSourceNavigatorModel()
@@ -11,7 +12,9 @@ struct OnyxWorkspaceView: View {
     @State private var storedInspectorWidth: Double
     @State private var searchFocusRequest = 0
     @State private var quickOpenFocusRequest = 0
-    @State private var isQuickOpenPresented = false
+    @State private var workspaceSwitcherFocusRequest = 0
+    @State private var presentedPalette: WorkspaceTransientPalette?
+    @State private var paletteFocusRestoration: WorkspacePaletteFocusRestoration?
     @State private var isCompactLayout = false
     private let terminalHeightPreferenceKey: String
     private let sidebarWidthPreferenceKey: String
@@ -34,6 +37,7 @@ struct OnyxWorkspaceView: View {
         preferenceKeyPrefix: String? = nil,
         defaults: UserDefaults = .standard,
         projectCatalog: ProjectCatalogModel = ProjectCatalogModel(),
+        switcherStateModel: ProjectWorkspaceSwitcherStateModel? = nil,
         windowProvider: @escaping @MainActor () -> NSWindow? = { nil },
         providerConnections: [OnyxApplicationHost.WorkspaceConnection] = [],
         selectedProviderConnectionID: ProviderConnectionID = .codexDefault,
@@ -48,6 +52,10 @@ struct OnyxWorkspaceView: View {
     ) {
         self.model = model
         self.projectCatalog = projectCatalog
+        _switcherStateModel = StateObject(
+            wrappedValue: switcherStateModel
+                ?? ProjectWorkspaceSwitcherStateModel(defaults: defaults)
+        )
         let namespace = OnyxPreferenceNamespace(prefix: preferenceKeyPrefix)
         let key = namespace.key("Onyx.terminalHeight")
         terminalHeightPreferenceKey = key
@@ -137,6 +145,11 @@ struct OnyxWorkspaceView: View {
                             onShowSidebar: {
                                 toggleSidebar(sidebarDisplayed: showSidebar, isCompact: isCompact)
                             },
+                            workspaceProjectName: workspaceHeaderProject?.displayName,
+                            workspaceProjectPath: workspaceHeaderProject?.folderPath,
+                            onOpenWorkspaceSwitcher: {
+                                openWorkspaceSwitcher()
+                            },
                             providerConnections: providerConnections,
                             selectedProviderConnectionID: selectedProviderConnectionID,
                             onSelectProviderConnection: onSelectProviderConnection,
@@ -185,15 +198,30 @@ struct OnyxWorkspaceView: View {
                     }
                 }
             }
+            .accessibilityHidden(presentedPalette != nil)
             .overlay {
-                if isQuickOpenPresented {
+                if presentedPalette == .quickOpen {
                     ProjectQuickOpenView(
                         navigator: sourceNavigator,
                         projectPath: currentProjectPath,
                         focusRequest: quickOpenFocusRequest,
-                        chooseProject: chooseProject,
-                        dismiss: { isQuickOpenPresented = false },
+                        chooseProject: {
+                            beginProjectPicker()
+                        },
+                        dismiss: { closeTransientPalette(restoringFocus: true) },
                         open: openQuickOpenResult
+                    )
+                }
+            }
+            .overlay {
+                if presentedPalette == .workspaceSwitcher {
+                    ProjectWorkspaceSwitcherView(
+                        baseRequest: workspaceSwitcherRequest,
+                        sourceRevision: workspaceSwitcherSourceRevision,
+                        focusRequest: workspaceSwitcherFocusRequest,
+                        stateModel: switcherStateModel,
+                        dismiss: { closeTransientPalette(restoringFocus: true) },
+                        activate: activateWorkspaceSwitcherDestination
                     )
                 }
             }
@@ -359,10 +387,12 @@ struct OnyxWorkspaceView: View {
         .workspace(
             model: model,
             windowProvider: windowProvider,
-            openProject: chooseProject,
+            openProject: { beginProjectPicker() },
+            openWorkspaceSwitcher: {
+                openWorkspaceSwitcher()
+            },
             openQuickOpen: {
-                isQuickOpenPresented = true
-                quickOpenFocusRequest += 1
+                openQuickOpen()
             },
             focusTaskSearch: {
                 let sidebarDisplayed = WorkspacePaneLayout.isSidebarDisplayed(
@@ -390,19 +420,189 @@ struct OnyxWorkspaceView: View {
         model.selectedProjectPath
     }
 
-    private func chooseProject() {
+    private var workspaceSwitcherSourceRevision: ProjectWorkspaceSwitcherSourceRevision {
+        ProjectWorkspaceSwitcherSourceRevision(
+            projectRevision: projectCatalog.sidebarProjectionRevision,
+            taskRevision: model.threadListRevision,
+            scope: model.threadListScope,
+            providerConnectionID: selectedProviderConnectionID,
+            selectedThreadID: model.selectedThreadID,
+            selectedWorkspacePath: model.selectedProjectPath
+        )
+    }
+
+    private var workspaceHeaderProject: ProjectCatalogRecord? {
+        ProjectCatalogResolver.project(
+            forFolderPath: model.selectedProjectPath,
+            in: projectCatalog.projects
+        )
+    }
+
+    private var workspaceSwitcherRequest: ProjectWorkspaceSwitcherRequest {
+        let selectedTaskID: ProjectTaskReference.ID?
+        if let selectedThreadID = model.selectedThreadID,
+           selectedThreadID != "onyx:welcome" {
+            selectedTaskID = ProjectTaskReference.ID(
+                providerConnectionID: selectedProviderConnectionID,
+                threadID: selectedThreadID
+            )
+        } else {
+            selectedTaskID = nil
+        }
+
+        let selectedProjectID = model.selectedProjectPath.flatMap { path in
+            ProjectCatalogResolver.project(
+                forFolderPath: path,
+                in: projectCatalog.projects
+            )?.id
+        }
+
+        return ProjectWorkspaceSwitcherRequest(
+            projects: projectCatalog.projects,
+            // Keep the palette-open path cheap: copying the provider-list
+            // snapshot is COW/O(number-of-providers). Active/archived
+            // de-duplication and ranking happen in the switcher's detached
+            // projection worker after the surface has mounted and focused.
+            activeTasks: [],
+            archivedTasks: [],
+            selectedProjectID: selectedProjectID,
+            selectedWorkspacePath: model.selectedProjectPath,
+            selectedTaskID: selectedTaskID,
+            state: switcherStateModel.snapshot,
+            taskLists: projectCatalog.providerTaskLists,
+            taskListRevision: projectCatalog.sidebarProjectionRevision
+        )
+    }
+
+    @MainActor
+    private func openWorkspaceSwitcher() {
+        openTransientPalette(.workspaceSwitcher)
+        workspaceSwitcherFocusRequest &+= 1
+    }
+
+    @MainActor
+    private func openQuickOpen() {
+        openTransientPalette(.quickOpen)
+        quickOpenFocusRequest &+= 1
+    }
+
+    @MainActor
+    private func openTransientPalette(_ palette: WorkspaceTransientPalette) {
+        if presentedPalette == nil, let window = windowProvider() {
+            paletteFocusRestoration = WorkspacePaletteFocusRestoration(window: window)
+        }
+        // One transient palette owns the window at a time. Switching shortcuts
+        // replaces the surface in place instead of stacking two search fields
+        // that compete for focus and Escape.
+        presentedPalette = palette
+    }
+
+    @MainActor
+    private func closeTransientPalette(restoringFocus: Bool) {
+        let restoration = paletteFocusRestoration
+        presentedPalette = nil
+        paletteFocusRestoration = nil
+        guard restoringFocus else { return }
+        DispatchQueue.main.async { [windowProvider, model] in
+            guard let window = windowProvider() else { return }
+            if restoration?.restore(in: window) == true { return }
+            if restoration?.composerWasFocused == true {
+                model.requestComposerFocus()
+            }
+        }
+    }
+
+    @MainActor
+    private func activateWorkspaceSwitcherDestination(
+        _ destination: ProjectWorkspaceSwitcherRow.Destination
+    ) {
+        switch destination {
+        case .addProject:
+            beginProjectPicker()
+        case let .newTask(_, workspacePath):
+            closeTransientPalette(restoringFocus: false)
+            if let workspacePath {
+                model.newTask(inWorkspace: workspacePath)
+            } else {
+                model.newTask()
+            }
+        case let .openTask(connectionID, threadID, scopeRawValue):
+            closeTransientPalette(restoringFocus: false)
+            guard let scope = ThreadListScope(rawValue: scopeRawValue) else { return }
+            guard let onSelectProviderTask else {
+                if scope.rawValue != model.threadListScope.rawValue {
+                    model.setThreadListScope(scope)
+                } else {
+                    model.selectThread(threadID)
+                }
+                return
+            }
+            Self.routeProviderTaskSelection(
+                connectionID,
+                threadID: threadID,
+                scope: scope,
+                onSelectProviderTask: onSelectProviderTask
+            )
+        }
+    }
+
+    @MainActor
+    private func beginProjectPicker() {
+        // Keep the palette's original responder alive long enough to restore
+        // it after the folder sheet closes. Closing the palette first would
+        // otherwise discard the only reference to a composer/search editor.
+        // Sidebar and header entry points do not open a transient palette, so
+        // capture their current responder here as the equivalent fallback.
+        let restoration = paletteFocusRestoration
+            ?? windowProvider().map { WorkspacePaletteFocusRestoration(window: $0) }
+        closeTransientPalette(restoringFocus: false)
+        chooseProject(restoringFocus: restoration)
+    }
+
+    @MainActor
+    private func chooseProject(
+        restoringFocus: WorkspacePaletteFocusRestoration? = nil
+    ) {
         projectCatalog.chooseAndImportProject(
             window: windowProvider(),
             initialFolderPath: model.draftWorkspacePath,
-            onFailure: presentProjectFailure
+            onFailure: presentProjectFailure,
+            onCancelled: { [windowProvider, model] in
+                Self.restoreProjectPickerFocus(
+                    restoringFocus,
+                    model: model,
+                    windowProvider: windowProvider
+                )
+            }
         ) { imported in
             model.selectWorkspace(imported.folderPath)
         }
     }
 
+    /// A canceled folder sheet removes its temporary field editor. Restore
+    /// the responder that opened the palette when it is still mounted; if it
+    /// was a transient search field (or no window was available), route focus
+    /// back to the durable composer so the next keystroke has somewhere
+    /// useful to go.
+    @MainActor
+    private static func restoreProjectPickerFocus(
+        _ restoration: WorkspacePaletteFocusRestoration?,
+        model: OnyxAppModel,
+        windowProvider: @escaping @MainActor () -> NSWindow?
+    ) {
+        DispatchQueue.main.async {
+            guard let window = windowProvider() else {
+                if model.canEditComposer { model.requestComposerFocus() }
+                return
+            }
+            if restoration?.restore(in: window) == true { return }
+            if model.canEditComposer { model.requestComposerFocus() }
+        }
+    }
+
     @MainActor
     private func openQuickOpenResult(_ file: ProjectSourceFile) {
-        isQuickOpenPresented = false
+        closeTransientPalette(restoringFocus: false)
         ProjectQuickOpenWorkspaceRouting.open(
             file,
             model: model,
@@ -459,6 +659,37 @@ struct OnyxWorkspaceView: View {
     @MainActor
     private func presentProjectFailure(_ notice: ProjectCatalogNotice) {
         model.notice = (notice.title, notice.detail)
+    }
+}
+
+private enum WorkspaceTransientPalette: Hashable {
+    case quickOpen
+    case workspaceSwitcher
+}
+
+@MainActor
+private final class WorkspacePaletteFocusRestoration {
+    weak var responder: NSResponder?
+    let composerWasFocused: Bool
+
+    init(window: NSWindow) {
+        let firstResponder = window.firstResponder
+        composerWasFocused = firstResponder is ComposerTextView
+        if let fieldEditor = firstResponder as? NSTextView,
+           fieldEditor.isFieldEditor,
+           let fieldOwner = fieldEditor.delegate as? NSResponder {
+            responder = fieldOwner
+        } else {
+            responder = firstResponder
+        }
+    }
+
+    func restore(in window: NSWindow) -> Bool {
+        guard let responder else { return false }
+        if let view = responder as? NSView, view.window !== window {
+            return false
+        }
+        return window.makeFirstResponder(responder)
     }
 }
 

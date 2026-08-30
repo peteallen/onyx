@@ -154,6 +154,9 @@ final class OnyxApplicationHost: ObservableObject {
     let pinnedThreadStore: OnyxPinnedThreadStore
     let workspacePersistenceStore: OnyxWorkspacePersistenceStore
     let projectCatalogModel: ProjectCatalogModel
+    /// Shared presentation metadata keeps favorites and recent workspaces
+    /// consistent across windows without coupling them to task history.
+    let projectWorkspaceSwitcherStateModel: ProjectWorkspaceSwitcherStateModel
     let settingsModel: OnyxAppModel
     let providerSettingsModel: ProviderSettingsModel
     private let delegationBroker: OnyxDelegationBroker
@@ -281,6 +284,9 @@ final class OnyxApplicationHost: ObservableObject {
         pinnedThreadStores = [connectionID: pinnedThreadStore]
         self.workspacePersistenceStore = workspacePersistenceStore
         projectCatalogModel = ProjectCatalogModel(store: projectCatalogStore)
+        projectWorkspaceSwitcherStateModel = ProjectWorkspaceSwitcherStateModel(
+            defaults: defaults
+        )
         settingsModel = OnyxAppModel(
             runtime: coordinator,
             startupError: resolutionError,
@@ -1310,6 +1316,7 @@ private struct ProviderWorkspaceContent: View {
             ),
             defaults: defaults,
             projectCatalog: host.projectCatalogModel,
+            switcherStateModel: host.projectWorkspaceSwitcherStateModel,
             windowProvider: { windowReference.window },
             providerConnections: selection.availableConnections,
             selectedProviderConnectionID: selection.connectionID,
