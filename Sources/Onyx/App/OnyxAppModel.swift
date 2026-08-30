@@ -1757,6 +1757,20 @@ final class OnyxAppModel: ObservableObject {
     ) {
         guard let runtime else { return }
 
+        // A sticky provider-authored signed-out event can be replayed to a
+        // window in the small interval between `start()` attaching its event
+        // stream and calling this method. Do not let that replay get followed
+        // by a fresh connect attempt that overwrites the disconnected state
+        // (or briefly asks the retired provider for account-owned history).
+        // A successful login clears the boundary before deliberately calling
+        // `reconnect()` again.
+        guard !signedOutBoundaryActive else {
+            connectionState = .disconnected
+            isLoadingThread = false
+            isLoadingThreadList = false
+            return
+        }
+
         connectionRevision &+= 1
         let revision = connectionRevision
         let epoch = accountEpoch
