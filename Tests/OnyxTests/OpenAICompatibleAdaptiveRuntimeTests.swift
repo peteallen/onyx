@@ -128,6 +128,79 @@ final class OpenAICompatibleAdaptiveRuntimeTests: XCTestCase {
         await harness.runtime.disconnect()
     }
 
+    func testEndedAgentEventLaneFailsInPlaceAndNextAttemptUsesCleanPrivateLane() async throws {
+        let rawID = "ended-agent-lane"
+        let publicID = publicAgentThreadID(rawID)
+        let first = AdaptiveRuntimeFake(
+            kind: .codex,
+            threads: [makeAdaptiveThread(id: rawID, model: "agent-model")]
+        )
+        let replacement = AdaptiveRuntimeFake(
+            kind: .codex,
+            threads: [makeAdaptiveThread(id: rawID, model: "agent-model")]
+        )
+        let harness = try await makeAdaptiveHarness(
+            chat: AdaptiveRuntimeFake(kind: .local),
+            agents: [first, replacement],
+            ownerships: [(publicID, .agent, "agent-model")],
+            turnLivenessPolicy: OpenAICompatibleAgentTurnLivenessPolicy(
+                inactivityTimeout: .seconds(10)
+            )
+        )
+        defer { harness.removeTemporaryState() }
+        let eventLog = AdaptiveEventLog()
+        let collector = collectEvents(from: harness.runtime.events, into: eventLog)
+        defer { collector.cancel() }
+
+        _ = try await harness.runtime.connect()
+        _ = try await harness.runtime.readThread(id: publicID)
+        await first.emit(.turnStarted(threadID: rawID, turnID: "ended-turn"))
+        try await eventually("agent turn start was not observed") {
+            await eventLog.events().contains(
+                .turnStarted(threadID: publicID, turnID: "ended-turn")
+            )
+        }
+
+        // The wrapped app-server lane can terminate without a connection
+        // notification (for example, a dropped SSE stream). The liveness
+        // boundary must materialize one attached failure and retire only the
+        // private lane so a subsequent turn gets a fresh runtime.
+        await first.finishEvents()
+        try await eventually("ended agent lane did not fail the active turn") {
+            await eventLog.events().contains { event in
+                guard case let .itemCompleted(threadID, item) = event else { return false }
+                return threadID == publicID
+                    && item.id.hasPrefix("onyx-provider-liveness:")
+                    && item.title == "Model stopped responding"
+            }
+        }
+        try await eventually("ended agent lane was not retired") {
+            harness.factory.proxyStopCount == 1
+        }
+
+        try await harness.runtime.startTurn(.init(
+            threadID: publicID,
+            inputs: [.text("Retry after EOF")],
+            model: "agent-model"
+        ))
+        await replacement.emit(.turnStarted(threadID: rawID, turnID: "replacement-turn"))
+        await replacement.emit(.turnCompleted(threadID: rawID, status: .idle))
+
+        XCTAssertEqual(harness.factory.preparationCount, 2)
+        let replacementStartTurnIDs = await replacement.threadIDs(for: .startTurn)
+        XCTAssertEqual(replacementStartTurnIDs, [rawID])
+        let events = await eventLog.events()
+        XCTAssertTrue(events.contains(
+            .turnCompleted(threadID: publicID, status: .failed)
+        ))
+        XCTAssertFalse(events.contains { event in
+            if case .connectionChanged(.failed) = event { return true }
+            return false
+        }, "Private EOF must not disconnect the visible provider")
+
+        await harness.runtime.disconnect()
+    }
+
     @MainActor
     func testStalledAgentTurnEndsWorkingAndOffersAttachedRetryInAppModel() async throws {
         let rawID = "stalled-agent-app-model"
@@ -1901,6 +1974,10 @@ private actor AdaptiveRuntimeFake: AgentRuntime {
 
     func emit(_ event: AgentRuntimeEvent) {
         eventContinuation.yield(event)
+    }
+
+    func finishEvents() {
+        eventContinuation.finish()
     }
 
     func invocations() -> [AdaptiveRuntimeInvocation] {

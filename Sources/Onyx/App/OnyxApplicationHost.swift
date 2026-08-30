@@ -172,6 +172,7 @@ final class OnyxApplicationHost: ObservableObject {
     private let providerCredentialStore: any CredentialStore
     private let providerConversationStore: OpenAICompatibleConversationStore
     private let providerAdaptiveStateStore: OpenAICompatibleAdaptiveStateStore
+    private let previewAuthRecoveryFixtureEnabled: Bool
     private var runtimeCoordinators: [ProviderConnectionID: SharedRuntimeCoordinator]
     private var providerRuntimeMutationDepths: [ProviderConnectionID: Int] = [:]
     private var providerRuntimeRevisions: [ProviderConnectionID: UInt64] = [:]
@@ -230,7 +231,8 @@ final class OnyxApplicationHost: ObservableObject {
         providerCredentialStore: any CredentialStore = KeychainCredentialStore(),
         providerModelDiscovery: any ProviderModelDiscovery = URLSessionProviderModelDiscovery(),
         providerConversationStore: OpenAICompatibleConversationStore = OpenAICompatibleConversationStore(),
-        providerAdaptiveStateStore: OpenAICompatibleAdaptiveStateStore = OpenAICompatibleAdaptiveStateStore()
+        providerAdaptiveStateStore: OpenAICompatibleAdaptiveStateStore = OpenAICompatibleAdaptiveStateStore(),
+        previewAuthRecoveryFixtureEnabled: Bool = false
     ) {
         let delegationBridge = OnyxDelegationHostBridge()
         let delegationBroker = OnyxDelegationBroker(
@@ -247,6 +249,7 @@ final class OnyxApplicationHost: ObservableObject {
         self.providerCredentialStore = providerCredentialStore
         self.providerConversationStore = providerConversationStore
         self.providerAdaptiveStateStore = providerAdaptiveStateStore
+        self.previewAuthRecoveryFixtureEnabled = previewAuthRecoveryFixtureEnabled
         self.delegationBroker = delegationBroker
         let coordinator: SharedRuntimeCoordinator?
         let resolutionError: (any Error)?
@@ -324,6 +327,7 @@ final class OnyxApplicationHost: ObservableObject {
             pinnedThreadStore: pinnedThreadStore,
             workspacePersistenceStore: workspacePersistenceStore,
             startsWithNewTask: startsWithNewTask,
+            previewAuthRecoveryFixtureEnabled: previewAuthRecoveryFixtureEnabled,
             modelUsageRecorder: { [weak self] modelID in
                 self?.recordModelUsage(connectionID: requestedConnectionID, modelID: modelID)
             }

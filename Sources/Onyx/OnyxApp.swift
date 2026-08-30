@@ -11,7 +11,17 @@ struct OnyxApp: App {
         // the transcript and composer are native AppKit surfaces whose
         // dynamic colors resolve from the window appearance.
         NSApplication.shared.appearance = NSAppearance(named: .darkAqua)
+#if DEBUG
+        // The fixture is opt-in and only exists in debug previews. It lets us
+        // exercise the in-place sign-in recovery card in the real window
+        // without revoking the developer's actual ChatGPT session.
+        let applicationHost = CommandLine.arguments.contains("--onyx-auth-fixture=expired")
+            ? PreviewAuthRecoveryComposition.makeHost()
+            : OnyxApplicationHost()
+        _host = StateObject(wrappedValue: applicationHost)
+#else
         _host = StateObject(wrappedValue: OnyxApplicationHost())
+#endif
     }
 
     var body: some Scene {

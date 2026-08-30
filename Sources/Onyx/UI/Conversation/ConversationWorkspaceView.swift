@@ -133,11 +133,14 @@ struct ConversationWorkspaceView: View {
                         }
 
                         // Keep the queue projection out of the cold welcome
-                        // path. A fresh task has no steering state, and
-                        // avoiding an extra ObservableObject subscription here
-                        // keeps New Task's first paint on the same fast path as
-                        // the pre-active-turn workspace.
-                        if model.isTurnRunning {
+                        // path. A fresh task has no steering state, while a
+                        // task that just entered auth recovery can stop
+                        // reporting active work even though its accepted
+                        // follow-up still needs to remain visible.
+                        if PendingSteeringPresentation.shouldShow(
+                            isTurnRunning: model.isTurnRunning,
+                            messageCount: model.pendingSteeringMessagesForSelectedThread.count
+                        ) {
                             PendingSteeringStrip(model: model)
                         }
                         RuntimeStatusStrip(model: model)
@@ -183,6 +186,16 @@ struct ConversationWorkspaceView: View {
 /// message.
 enum PendingSteeringPresentation {
     static let rowHeight: CGFloat = 40
+
+    /// The queue strip represents an accepted app-owned follow-up, not only
+    /// an active provider turn.  Authentication recovery (and other terminal
+    /// transitions) intentionally clears `isTurnRunning`; keep the strip
+    /// mounted until the queued message is reconciled so a cleared composer
+    /// never makes work appear lost.  A zero-message idle/new-task state still
+    /// omits the strip entirely.
+    static func shouldShow(isTurnRunning: Bool, messageCount: Int) -> Bool {
+        isTurnRunning || messageCount > 0
+    }
 
     static func title(for count: Int) -> String {
         count == 1 ? "Follow-up queued" : "\(count) follow-ups queued"

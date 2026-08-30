@@ -649,6 +649,7 @@ final class OnyxAppModel: ObservableObject {
         pinnedThreadStore: OnyxPinnedThreadStore? = nil,
         workspacePersistenceStore: OnyxWorkspacePersistenceStore? = nil,
         startsWithNewTask: Bool = false,
+        previewAuthRecoveryFixtureEnabled: Bool = false,
         modelUsageRecorder: @escaping @MainActor (String) -> Void = { _ in },
         composerDraftPersistence: (any OnyxComposerDraftPersisting)? = nil
     ) {
@@ -723,6 +724,28 @@ final class OnyxAppModel: ObservableObject {
         composerDraftModel.onTextChanged = { [weak self] _ in
             self?.scheduleComposerDraftSave()
         }
+
+#if DEBUG
+        // The explicit auth-recovery preview is the only debug runtime that
+        // seeds interaction state.  Keep this entirely in-memory and scoped
+        // to the fixture's stable task ID so a visual proof can demonstrate
+        // draft/queue preservation without importing or mutating real Onyx
+        // history.
+        if previewAuthRecoveryFixtureEnabled {
+            composerDrafts[PreviewAuthRecoveryRuntime.fixtureThreadID] =
+                PreviewAuthRecoveryRuntime.fixtureComposerDraft
+            pendingSteeringMessagesByThreadID[PreviewAuthRecoveryRuntime.fixtureThreadID] = [
+                PendingSteeringMessage(
+                    id: UUID(),
+                    threadID: PreviewAuthRecoveryRuntime.fixtureThreadID,
+                    text: PreviewAuthRecoveryRuntime.fixtureQueuedFollowUp,
+                    attachmentCount: 0,
+                    state: .queued
+                ),
+            ]
+            draftWorkspacePath = PreviewAuthRecoveryRuntime.fixtureWorkspacePath
+        }
+#endif
         refreshSelectedThreadCache()
 
     }
@@ -1147,14 +1170,33 @@ final class OnyxAppModel: ObservableObject {
         formDrafts[interaction.id] = InteractionDraftEntry(interaction: interaction, value: draft)
     }
 
+    /// App-server can successfully initialize a signed-out Codex session while
+    /// omitting its login-method descriptors (older builds and some 401
+    /// recovery paths do this). Keep the recovery card actionable in that
+    /// state by using the same narrow Codex-owned fallback as the sessionless
+    /// path. Never synthesize ceremonies for generic providers.
+    private var availableLoginMethodsForPresentation: [RuntimeLoginMethod] {
+        guard let session else {
+            return Self.fallbackLoginMethods(for: runtimeKind)
+        }
+        guard !session.availableLoginMethods.isEmpty else {
+            // Once a session exists, its provider kind is authoritative. This
+            // matters while a window is being rebound: a stale Codex runtime
+            // kind must never make a generic provider look as if it supports
+            // ChatGPT OAuth.
+            return Self.fallbackLoginMethods(for: session.runtime)
+        }
+        return session.availableLoginMethods
+    }
+
     var primaryLoginMethod: RuntimeLoginMethod? {
-        let methods = session?.availableLoginMethods ?? Self.fallbackLoginMethods(for: runtimeKind)
+        let methods = availableLoginMethodsForPresentation
         return methods.first(where: { $0.ceremony == .browser })
             ?? methods.first
     }
 
     var deviceCodeLoginMethod: RuntimeLoginMethod? {
-        let methods = session?.availableLoginMethods ?? Self.fallbackLoginMethods(for: runtimeKind)
+        let methods = availableLoginMethodsForPresentation
         return methods.first(where: { $0.ceremony == .deviceCode })
     }
 
@@ -1835,6 +1877,22 @@ final class OnyxAppModel: ObservableObject {
                       connectionRevision == revision,
                       !Task.isCancelled else { return }
                 isLoadingThreadList = false
+                if Self.isAccountBoundaryFailure(error) {
+                    // A shared coordinator can reject this first list read
+                    // when another window signed out just before this window
+                    // attached. The boundary event may still be queued for
+                    // this model, so close locally here as well and keep the
+                    // coordinator's internal error out of the alert surface.
+                    if !signedOutBoundaryActive {
+                        closeAccountBoundary()
+                    }
+                    connectionState = .disconnected
+                    return
+                }
+                if signedOutBoundaryActive {
+                    connectionState = .disconnected
+                    return
+                }
                 if !requireAuthenticationRecovery(for: error) {
                     notice = (
                         "Connected, but tasks did not refresh",
@@ -4181,8 +4239,18 @@ final class OnyxAppModel: ObservableObject {
                 isAuthenticating = false
                 return
             }
-            let matchesCurrentAttempt = completion.loginID == nil
-                || loginAttempt?.loginID == completion.loginID
+            // Runtime completion notifications are provider-wide, but failed
+            // ceremonies still belong only to the window that started them.
+            // Some app-server versions omit the login ID, including when the
+            // completion races the startLogin response. In that case local
+            // in-flight state is the only ownership signal; treating a missing
+            // ID as a wildcard makes every sibling window show the same alert.
+            let matchesCurrentAttempt: Bool
+            if let loginID = completion.loginID {
+                matchesCurrentAttempt = loginAttempt?.loginID == loginID
+            } else {
+                matchesCurrentAttempt = loginAttempt != nil || isAuthenticating
+            }
             if completion.success {
                 if authenticationRecovery != nil {
                     // Successful login is provider-wide. Every attached window
@@ -4401,6 +4469,15 @@ final class OnyxAppModel: ObservableObject {
                 // Late stderr/runtime notices from a process that was stopped
                 // by logout must not become a second modal over the signed-out
                 // account card. The next authenticated generation can report
+                // fresh diagnostics normally.
+                return
+            }
+            if authenticationRecovery != nil {
+                // Once the attached recovery card owns authentication state,
+                // late generic stop/disconnect diagnostics are bookkeeping for
+                // the same expired session. Showing them as a second modal
+                // obscures the Sign In action and makes recovery look like a
+                // new failure. The next authenticated generation can surface
                 // fresh diagnostics normally.
                 return
             }
@@ -5939,6 +6016,7 @@ final class OnyxAppModel: ObservableObject {
         isLoadingThread = false
         isLoadingThreadList = false
         isTurnRunning = false
+        connectionState = .disconnected
         notice = nil
 
         preferences.removeObject(forKey: preferenceKey(PreferenceKey.selectedThread))
@@ -6069,18 +6147,14 @@ final class OnyxAppModel: ObservableObject {
             // possible account replacement.
             closeAccountBoundary()
             applyRuntimeSession(refreshedSession)
-            if shouldResumeConnectionBootstrap {
-                reconnect()
-            }
+            restartAfterAccountReplacement()
             return
         }
 
         guard priorIdentity == refreshedIdentity else {
             closeAccountBoundary()
             applyRuntimeSession(refreshedSession)
-            if shouldResumeConnectionBootstrap {
-                reconnect()
-            }
+            restartAfterAccountReplacement()
             return
         }
 
@@ -6096,6 +6170,18 @@ final class OnyxAppModel: ObservableObject {
         }
     }
 
+    /// A confirmed different (or unidentifiable) account owns a different
+    /// task catalog. Re-enter the normal connection/list bootstrap after the
+    /// old account boundary is cleared, while deliberately keeping the blank
+    /// New Task surface selected so no new-account transcript is opened
+    /// implicitly.
+    private func restartAfterAccountReplacement() {
+        beginConnection(
+            preferredSelection: Self.welcomeThread.id,
+            rehydrateVisibleThread: false
+        )
+    }
+
     private func authenticationFailure(for error: any Error) -> (title: String, detail: String) {
         let detail = error.localizedDescription
         if detail.localizedCaseInsensitiveContains("failed to start login server")
@@ -6106,6 +6192,13 @@ final class OnyxAppModel: ObservableObject {
             )
         }
         return ("Could not start sign in", sanitizedLoginFailureDetail(detail))
+    }
+
+    private static func isAccountBoundaryFailure(_ error: any Error) -> Bool {
+        guard case let AgentRuntimeError.requestFailed(code, _) = error else {
+            return false
+        }
+        return code == -32_100
     }
 
     /// A provider should normally throw the typed recovery error. Keep the

@@ -2,6 +2,33 @@ import XCTest
 @testable import Onyx
 
 final class PendingSteeringPresentationTests: XCTestCase {
+    func testAcceptedQueueRemainsVisibleAfterTheTurnStops() {
+        XCTAssertTrue(
+            PendingSteeringPresentation.shouldShow(
+                isTurnRunning: false,
+                messageCount: 1
+            )
+        )
+    }
+
+    func testEmptyIdleOrWelcomeStateDoesNotMountQueueStrip() {
+        XCTAssertFalse(
+            PendingSteeringPresentation.shouldShow(
+                isTurnRunning: false,
+                messageCount: 0
+            )
+        )
+    }
+
+    func testActiveTurnMountsQueueStripEvenBeforeFirstMessageIsPublished() {
+        XCTAssertTrue(
+            PendingSteeringPresentation.shouldShow(
+                isTurnRunning: true,
+                messageCount: 0
+            )
+        )
+    }
+
     func testQueueTitleUsesSingularAndPluralCopy() {
         XCTAssertEqual(PendingSteeringPresentation.title(for: 1), "Follow-up queued")
         XCTAssertEqual(PendingSteeringPresentation.title(for: 2), "2 follow-ups queued")

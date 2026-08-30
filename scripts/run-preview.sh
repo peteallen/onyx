@@ -14,11 +14,13 @@ Build, replace, and launch the one stable Onyx preview application.
 
 Usage:
   scripts/run-preview.sh
+  scripts/run-preview.sh --auth-recovery-fixture
 
 This command has no alternate app path or identity. It refuses to run while a
 noncanonical Onyx executable is active, rebuilds only
 dist-preview/Onyx Preview.app, and launches that bundle without creating a
-second instance.
+second instance. The auth-recovery fixture is debug-only and contains no real
+credentials; it exists for safely checking the expired-session recovery UI.
 EOF
 }
 
@@ -143,11 +145,18 @@ guard_against_other_onyx_processes() {
 }
 
 main() {
+  local -a launch_arguments
+  launch_arguments=()
+
   if (( $# > 0 )); then
     case "$1" in
       -h|--help)
         usage
         return 0
+        ;;
+      --auth-recovery-fixture)
+        (( $# == 1 )) || die "the auth-recovery fixture takes no arguments"
+        launch_arguments=(--args --onyx-auth-fixture=expired)
         ;;
       *)
         die "unknown option: $1"
@@ -180,7 +189,7 @@ main() {
   # Launch by the one stable bundle path. package-preview has already stopped
   # the exact previous executable; parallel instances would duplicate its
   # app-server.
-  /usr/bin/open "$preview_app"
+  /usr/bin/open "$preview_app" "${launch_arguments[@]}"
 }
 
 # Keep the parser sourceable by the shell contract test without packaging or

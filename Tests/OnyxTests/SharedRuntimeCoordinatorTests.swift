@@ -212,6 +212,10 @@ final class SharedRuntimeCoordinatorTests: XCTestCase {
             "Signed out remains an authoritative account boundary during recovery."
         )
 
+        // A delayed auth failure from the retired provider must be rejected
+        // after the authoritative provider account event, rather than
+        // re-arming the sticky recovery state.
+        runtime.emit(.authenticationRecoveryRequired(.signInExpired))
         let attachedLater = CoordinatorEventRecorder()
         await attachedLater.start(stream: coordinator.events)
         let marker = AgentRuntimeEvent.runtimeNotice(
@@ -220,9 +224,173 @@ final class SharedRuntimeCoordinatorTests: XCTestCase {
         )
         runtime.emit(marker)
         try await current.waitForCount(3)
-        try await attachedLater.waitForCount(1)
+        try await attachedLater.waitForCount(2)
         let laterEvents = await attachedLater.snapshot()
-        XCTAssertEqual(laterEvents, [marker])
+        XCTAssertEqual(laterEvents, [.accountUpdated(.signedOut), marker])
+
+        let currentAfterLateRecovery = await current.snapshot()
+        XCTAssertEqual(
+            currentAfterLateRecovery,
+            [
+                .authenticationRecoveryRequired(.signInExpired),
+                .accountUpdated(.signedOut),
+                marker,
+            ]
+        )
+    }
+
+    func testColdSignedOutConnectSnapshotDoesNotEstablishAccountBoundary() async throws {
+        let signedOutSession = RuntimeSession(
+            runtime: .local,
+            displayName: "Signed-out provider",
+            accountLabel: nil,
+            planLabel: nil,
+            auth: .signedOut,
+            availableLoginMethods: [],
+            availableModels: [],
+            capabilities: []
+        )
+        let runtime = CoordinatorFakeRuntime(connectSession: signedOutSession)
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+
+        let connected = try await coordinator.connect()
+        XCTAssertEqual(connected.auth, .signedOut)
+
+        // A cold signed-out snapshot is not an explicit account event. Local
+        // task history remains readable until the provider reports a boundary.
+        _ = try await coordinator.listThreads(limit: 1, archived: false)
+        let listThreadsCallCount = await runtime.listThreadsCallCount
+        XCTAssertEqual(listThreadsCallCount, 1)
+    }
+
+    func testSuccessfulLoginClearsDurableSignedOutBoundaryForLaterWindows() async throws {
+        let login = Self.loginStart(loginID: "boundary-login")
+        let runtime = CoordinatorFakeRuntime(loginStartResult: login)
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+        let current = CoordinatorEventRecorder()
+        await current.start(stream: coordinator.events)
+
+        runtime.emit(.accountUpdated(.signedOut))
+        try await current.waitForCount(1)
+        _ = try await coordinator.startLogin(methodID: login.method.id)
+        let completion = RuntimeLoginCompletion(
+            loginID: login.loginID,
+            success: true,
+            error: nil
+        )
+        runtime.emit(.loginCompleted(completion))
+        try await current.waitForCount(2)
+
+        let attachedLater = CoordinatorEventRecorder()
+        await attachedLater.start(stream: coordinator.events)
+        let marker = AgentRuntimeEvent.runtimeNotice(
+            title: "After reauthentication",
+            detail: "The signed-out boundary no longer replays"
+        )
+        runtime.emit(marker)
+        try await current.waitForCount(3)
+        try await attachedLater.waitForCount(1)
+
+        let laterEvents = await attachedLater.snapshot()
+        XCTAssertEqual(
+            laterEvents,
+            [marker],
+            "A successful admitted login must clear the durable boundary replay."
+        )
+    }
+
+    func testLateRecoveryAfterSyntheticLogoutDoesNotReplayToLaterWindows() async throws {
+        let runtime = CoordinatorFakeRuntime()
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+        let current = CoordinatorEventRecorder()
+        await current.start(stream: coordinator.events)
+
+        runtime.emit(.authenticationRecoveryRequired(.signInExpired))
+        try await current.waitForCount(1)
+
+        // The coordinator's synthetic boundary is what every window receives
+        // even when the provider emits no account notification of its own.
+        try await coordinator.logout()
+        try await current.waitForCount(2)
+
+        // A stopping app-server can report a delayed auth failure after the
+        // logout boundary. It must not become sticky again or leak into a
+        // window opened after sign-out.
+        runtime.emit(.authenticationRecoveryRequired(.signInExpired))
+        let attachedLater = CoordinatorEventRecorder()
+        await attachedLater.start(stream: coordinator.events)
+        let marker = AgentRuntimeEvent.runtimeNotice(
+            title: "After sign out",
+            detail: "Only the signed-out surface should remain"
+        )
+        runtime.emit(marker)
+        try await current.waitForCount(3)
+        try await attachedLater.waitForCount(2)
+
+        let currentEvents = await current.snapshot()
+        let laterEvents = await attachedLater.snapshot()
+        XCTAssertEqual(
+            currentEvents,
+            [
+                .authenticationRecoveryRequired(.signInExpired),
+                .accountUpdated(.signedOut),
+                marker,
+            ]
+        )
+        XCTAssertEqual(
+            laterEvents,
+            [.accountUpdated(.signedOut), marker],
+            "A late retired-transport auth event must not replay after logout."
+        )
+    }
+
+    func testRecoveryAuthorizedBeforeLogoutIsDroppedWhenDeliveryResumesAfterLogout() async throws {
+        let runtime = CoordinatorFakeRuntime()
+        let recoveryDeliveryGate = InvocationGate(isOpen: false)
+        let coordinator = SharedRuntimeCoordinator(
+            runtime: runtime,
+            eventAuthorizationBarrier: { event in
+                guard case .authenticationRecoveryRequired = event else { return }
+                await recoveryDeliveryGate.enter()
+            }
+        )
+        let current = CoordinatorEventRecorder()
+        await current.start(stream: coordinator.events)
+
+        // Pause after the recovery event has been authorized but before its
+        // authorization is revalidated at the serialized delivery boundary.
+        runtime.emit(.authenticationRecoveryRequired(.signInExpired))
+        await recoveryDeliveryGate.waitForInvocationCount(1)
+
+        // Logout advances the auth generation while the accepted recovery is
+        // suspended. Once delivery resumes, it belongs to the old generation
+        // and must not reach any window or become sticky for later windows.
+        try await coordinator.logout()
+        await recoveryDeliveryGate.open()
+        let processed = AgentRuntimeEvent.runtimeNotice(
+            title: "After delayed recovery",
+            detail: "The stale recovery was discarded"
+        )
+        runtime.emit(processed)
+        try await current.waitForCount(2)
+
+        let attachedLater = CoordinatorEventRecorder()
+        await attachedLater.start(stream: coordinator.events)
+        let laterMarker = AgentRuntimeEvent.runtimeNotice(
+            title: "Later window",
+            detail: "No stale recovery replayed"
+        )
+        runtime.emit(laterMarker)
+        try await current.waitForCount(3)
+        try await attachedLater.waitForCount(2)
+
+        let currentEvents = await current.snapshot()
+        let laterEvents = await attachedLater.snapshot()
+        XCTAssertEqual(
+            currentEvents,
+            [.accountUpdated(.signedOut), processed, laterMarker]
+        )
+        XCTAssertEqual(laterEvents, [.accountUpdated(.signedOut), laterMarker])
     }
 
     func testStalledSubscriberCoalescesAdjacentDeltasWhileActiveConsumerKeepsExactOrder() async throws {

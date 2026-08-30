@@ -1138,6 +1138,108 @@ final class OnyxMultiwindowTests: XCTestCase {
         }
     }
 
+    func testUnidentifiedFailedLoginCompletionOnlyAlertsTheWindowThatStartedIt() async {
+        let suite = makeDefaults()
+        defer { suite.cleanUp() }
+        let runtime = MultiwindowFakeRuntime(
+            threads: [],
+            connectAuth: .signedOut,
+            loginStartResult: Self.loginStart
+        )
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+        let first = OnyxAppModel(
+            runtime: coordinator,
+            defaults: suite.defaults,
+            preferenceKeyPrefix: WorkspaceWindowID().preferenceKeyPrefix
+        )
+        let second = OnyxAppModel(
+            runtime: coordinator,
+            defaults: suite.defaults,
+            preferenceKeyPrefix: WorkspaceWindowID().preferenceKeyPrefix
+        )
+        first.start()
+        second.start()
+        await waitUntil("Both windows did not reach the signed-out state") {
+            first.connectionState == .connected("Test runtime")
+                && second.connectionState == .connected("Test runtime")
+                && !first.authState.isSignedIn
+                && !second.authState.isSignedIn
+        }
+
+        first.startLogin(Self.loginMethod)
+        await waitUntil("The first window did not own the login ceremony") {
+            first.loginAttempt?.loginID == Self.loginStart.loginID
+        }
+        await runtime.emit(.loginCompleted(RuntimeLoginCompletion(
+            loginID: nil,
+            success: false,
+            error: "The browser sign-in was closed."
+        )))
+        await waitUntil("The owning window did not surface the failed sign-in") {
+            first.notice?.title == "Sign in was not completed"
+                && first.loginAttempt == nil
+        }
+
+        XCTAssertNil(second.notice, "A sibling window must not claim another window's failed sign-in")
+        XCTAssertNil(second.loginAttempt)
+        XCTAssertFalse(second.isAuthenticating)
+    }
+
+    func testUnidentifiedFailedLoginDuringStartRaceOnlyAlertsTheOwningWindow() async {
+        let suite = makeDefaults()
+        defer { suite.cleanUp() }
+        let runtime = MultiwindowFakeRuntime(
+            threads: [],
+            connectAuth: .signedOut,
+            loginStartResult: Self.loginStart,
+            suspendLoginStart: true
+        )
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+        let first = OnyxAppModel(
+            runtime: coordinator,
+            defaults: suite.defaults,
+            preferenceKeyPrefix: WorkspaceWindowID().preferenceKeyPrefix
+        )
+        let second = OnyxAppModel(
+            runtime: coordinator,
+            defaults: suite.defaults,
+            preferenceKeyPrefix: WorkspaceWindowID().preferenceKeyPrefix
+        )
+        first.start()
+        second.start()
+        await waitUntil("Both windows did not reach the signed-out state") {
+            first.connectionState == .connected("Test runtime")
+                && second.connectionState == .connected("Test runtime")
+                && !first.authState.isSignedIn
+                && !second.authState.isSignedIn
+        }
+
+        first.startLogin(Self.loginMethod)
+        await runtime.waitForStartLoginEntry()
+        XCTAssertTrue(first.isAuthenticating)
+        XCTAssertNil(first.loginAttempt)
+
+        await runtime.emit(.loginCompleted(RuntimeLoginCompletion(
+            loginID: nil,
+            success: false,
+            error: "The browser sign-in was closed."
+        )))
+        await waitUntil("The in-flight owner did not settle the failed sign-in") {
+            first.notice?.title == "Sign in was not completed"
+                && !first.isAuthenticating
+        }
+
+        XCTAssertNil(second.notice, "A sibling window must ignore an unidentified failure it did not start")
+        XCTAssertNil(second.loginAttempt)
+        XCTAssertFalse(second.isAuthenticating)
+
+        await runtime.releaseStartLogin()
+        await runtime.waitForStartLoginReturn()
+        for _ in 0..<8 { await Task.yield() }
+        XCTAssertNil(first.loginAttempt, "The late login-start response reopened a settled ceremony")
+        XCTAssertFalse(first.isAuthenticating)
+    }
+
     func testFocusedWindowCommandOnlyMutatesItsWindowModel() {
         let suite = makeDefaults()
         defer { suite.cleanUp() }
@@ -1275,6 +1377,21 @@ final class OnyxMultiwindowTests: XCTestCase {
     )
 
     private static let threads = [threadA, threadB]
+
+    private static let loginMethod = RuntimeLoginMethod(
+        id: "multiwindow.browser",
+        displayName: "Sign In",
+        detail: "Sign in securely",
+        ceremony: .browser
+    )
+
+    private static let loginStart = RuntimeLoginStart(
+        method: loginMethod,
+        loginID: "multiwindow-login",
+        authURL: nil,
+        verificationURL: nil,
+        userCode: nil
+    )
 }
 
 private final class MultiwindowFactoryProbe: @unchecked Sendable {
@@ -1306,15 +1423,25 @@ private actor MultiwindowFakeRuntime: AgentRuntime {
     private let availableModels: [RuntimeModel]
     private let connectAuth: RuntimeAuthState
     private let refreshAuth: RuntimeAuthState
+    private let loginStartResult: RuntimeLoginStart?
+    private let suspendLoginStart: Bool
     private var recordedConnectCount = 0
     private var recordedStartTurns: [StartTurnRequest] = []
+    private var startLoginEntered = false
+    private var startLoginReleased = false
+    private var startLoginReturned = false
+    private var startLoginReleaseContinuation: CheckedContinuation<Void, Never>?
+    private var startLoginEntryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var startLoginReturnWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(
         threads: [RuntimeThread],
         connectAuth: RuntimeAuthState? = nil,
         refreshAuth: RuntimeAuthState? = nil,
         availableModels: [RuntimeModel] = [],
-        listedThreads: [RuntimeThread]? = nil
+        listedThreads: [RuntimeThread]? = nil,
+        loginStartResult: RuntimeLoginStart? = nil,
+        suspendLoginStart: Bool = false
     ) {
         let fallbackAuth = RuntimeAuthState(
             mode: nil,
@@ -1327,6 +1454,8 @@ private actor MultiwindowFakeRuntime: AgentRuntime {
         self.availableModels = availableModels
         self.connectAuth = connectAuth ?? fallbackAuth
         self.refreshAuth = refreshAuth ?? connectAuth ?? fallbackAuth
+        self.loginStartResult = loginStartResult
+        self.suspendLoginStart = suspendLoginStart
         let pair = AsyncStream.makeStream(of: AgentRuntimeEvent.self)
         eventStream = pair.stream
         eventContinuation = pair.continuation
@@ -1361,6 +1490,50 @@ private actor MultiwindowFakeRuntime: AgentRuntime {
     }
 
     func disconnect() async {}
+
+    func startLogin(methodID: String) async throws -> RuntimeLoginStart {
+        guard let loginStartResult, loginStartResult.method.id == methodID else {
+            throw AgentRuntimeError.unsupported("test login")
+        }
+        startLoginEntered = true
+        let entryWaiters = startLoginEntryWaiters
+        startLoginEntryWaiters.removeAll()
+        entryWaiters.forEach { $0.resume() }
+        if suspendLoginStart, !startLoginReleased {
+            await withCheckedContinuation { continuation in
+                if startLoginReleased {
+                    continuation.resume()
+                } else {
+                    startLoginReleaseContinuation = continuation
+                }
+            }
+        }
+        startLoginReturned = true
+        let returnWaiters = startLoginReturnWaiters
+        startLoginReturnWaiters.removeAll()
+        returnWaiters.forEach { $0.resume() }
+        return loginStartResult
+    }
+
+    func waitForStartLoginEntry() async {
+        guard !startLoginEntered else { return }
+        await withCheckedContinuation { continuation in
+            startLoginEntryWaiters.append(continuation)
+        }
+    }
+
+    func releaseStartLogin() {
+        startLoginReleased = true
+        startLoginReleaseContinuation?.resume()
+        startLoginReleaseContinuation = nil
+    }
+
+    func waitForStartLoginReturn() async {
+        guard !startLoginReturned else { return }
+        await withCheckedContinuation { continuation in
+            startLoginReturnWaiters.append(continuation)
+        }
+    }
 
     func listThreads(limit _: Int, archived: Bool) async throws -> [RuntimeThread] {
         archived ? [] : listedThreads

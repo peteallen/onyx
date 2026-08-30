@@ -289,6 +289,92 @@ final class OnyxAppModelAuthBoundaryTests: XCTestCase {
         XCTAssertNil(model.notice)
     }
 
+    func testGenericRuntimeNoticeDuringAuthenticationRecoveryDoesNotStackModal() async {
+        let fixture = makeFixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.model
+
+        await startAndLoad(fixture)
+        model.composerText = "Keep this draft while I sign back in"
+        await fixture.runtime.emit(.authenticationRecoveryRequired(.signInExpired))
+        await waitUntil("The sign-in recovery state did not reach the app model") {
+            model.authenticationRecovery == .signInExpired
+        }
+
+        // App-server commonly emits a plain stop/runtime diagnostic after the
+        // typed auth failure. It belongs to the same expired-session boundary,
+        // so it must not cover the attached recovery card with a second modal.
+        await fixture.runtime.emit(.runtimeNotice(
+            title: "Codex runtime",
+            detail: "Codex app-server stopped unexpectedly (exit 0)."
+        ))
+        await yieldSeveralTimes()
+
+        XCTAssertEqual(model.authenticationRecovery, .signInExpired)
+        XCTAssertNil(model.notice)
+        XCTAssertEqual(model.composerText, "Keep this draft while I sign back in")
+        XCTAssertFalse(model.timeline.contains { $0.kind == .error })
+    }
+
+    func testWindowAttachedAfterProviderSignedOutEventStaysOnSignedOutSurface() async {
+        let suiteName = "OnyxAppModelAuthBoundaryTests.late-provider-window.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let runtime = AuthBoundaryTestRuntime(
+            logoutBehavior: .immediate,
+            refreshBehavior: .signedOut,
+            startTurnBehavior: .succeed,
+            suspendedOperations: []
+        )
+        let coordinator = SharedRuntimeCoordinator(runtime: runtime)
+        let first = OnyxAppModel(
+            runtime: coordinator,
+            defaults: defaults,
+            preferenceKeyPrefix: "Onyx.window.first"
+        )
+        first.start()
+        await waitUntil("The first window did not finish loading") {
+            first.canRunAgent
+                && first.selectedThreadID == AuthBoundaryFixture.accountThread.id
+                && first.timeline == [AuthBoundaryFixture.sensitiveTranscriptItem]
+        }
+
+        // This is a provider-authored account boundary, not a cold signed-out
+        // connect snapshot. The coordinator must retain it for later windows.
+        await runtime.emit(.accountUpdated(.signedOut))
+        await waitUntil("The provider signed-out boundary did not reach the first window") {
+            first.authState == .signedOut && first.isSignedOutBoundaryActive
+        }
+
+        let second = OnyxAppModel(
+            runtime: coordinator,
+            defaults: defaults,
+            preferenceKeyPrefix: "Onyx.window.second"
+        )
+        second.start()
+        await waitUntil("The later window did not settle into signed-out state") {
+            second.isSignedOutBoundaryActive
+                && second.connectionState == .disconnected
+                && !second.isLoadingThreadList
+        }
+
+        XCTAssertTrue(second.isSignedOutBoundaryActive)
+        XCTAssertEqual(second.connectionState, .disconnected)
+        XCTAssertNil(second.notice)
+        assertSignedOutWelcomeState(second)
+
+        // A late diagnostic from the old provider generation must remain
+        // silent in the newly attached window too.
+        await runtime.emit(.runtimeNotice(
+            title: "Codex runtime",
+            detail: "Account sign-out is in progress."
+        ))
+        await yieldSeveralTimes()
+        XCTAssertNil(second.notice)
+    }
+
     func testStaleListCompletionCannotRestorePreviousAccountAfterLogout() async {
         let fixture = makeFixture(suspendedOperations: [.listThreads])
         defer { fixture.cleanUp() }
@@ -433,11 +519,21 @@ final class OnyxAppModelAuthBoundaryTests: XCTestCase {
             model.authenticationRecovery == nil
                 && model.authState.email == "account-b@example.com"
                 && model.selectedThreadID == AuthBoundaryFixture.welcomeThreadID
+                && model.threads.contains(where: {
+                    $0.id == AuthBoundaryFixture.replacementAccountThread.id
+                })
+                && model.canRunAgent
         }
 
         XCTAssertTrue(model.canRunAgent)
         XCTAssertEqual(model.session?.auth.email, "account-b@example.com")
-        XCTAssertEqual(model.threads.map(\.id), [AuthBoundaryFixture.welcomeThreadID])
+        XCTAssertEqual(
+            model.threads.map(\.id),
+            [
+                AuthBoundaryFixture.welcomeThreadID,
+                AuthBoundaryFixture.replacementAccountThread.id,
+            ]
+        )
         XCTAssertEqual(model.timeline.map(\.id), ["onyx-welcome"])
         XCTAssertEqual(model.composerText, "")
         XCTAssertNil(model.selectedProjectPath)
@@ -837,6 +933,19 @@ private struct AuthBoundaryFixture {
         branch: nil
     )
 
+    static let replacementAccountThread = RuntimeThread(
+        id: "account-b-task",
+        title: "Account B task",
+        preview: "Work belonging only to account B",
+        cwd: "/tmp/onyx-auth-boundary-tests/account-b",
+        updatedAt: Date(timeIntervalSince1970: 4),
+        status: .idle,
+        isPinned: false,
+        runtime: .codex,
+        model: "test-model",
+        branch: nil
+    )
+
     static let sensitiveTranscriptItem = TimelineItem(
         id: "account-a-sensitive-transcript",
         kind: .assistantMessage,
@@ -939,6 +1048,7 @@ private actor AuthBoundaryTestRuntime: AgentRuntime {
     private var refreshWaiters: [CheckedContinuation<Void, Never>] = []
     private var startTurns: [StartTurnRequest] = []
     private var responses: [(RuntimeRequestID, RuntimeUserInteractionResponse)] = []
+    private var currentAuth = AuthBoundaryTestRuntime.signedInAuth
 
     init(
         logoutBehavior: LogoutBehavior,
@@ -959,7 +1069,7 @@ private actor AuthBoundaryTestRuntime: AgentRuntime {
 
     func connect() async throws -> RuntimeSession {
         eventContinuation.yield(.connectionChanged(.connected("Auth boundary runtime")))
-        return Self.session(auth: Self.signedInAuth)
+        return Self.session(auth: currentAuth)
     }
 
     func disconnect() async {}
@@ -1017,15 +1127,18 @@ private actor AuthBoundaryTestRuntime: AgentRuntime {
 
         switch refreshBehavior {
         case .signedOut:
-            return Self.session(auth: .signedOut)
+            currentAuth = .signedOut
+            return Self.session(auth: currentAuth)
         case .failure:
             throw TestFailure.accountRefreshFailed
         case .authenticationRecoveryRequired:
             throw AgentRuntimeError.authenticationRecoveryRequired(.signInExpired)
         case .staleSignedIn:
-            return Self.session(auth: Self.signedInAuth)
+            currentAuth = Self.signedInAuth
+            return Self.session(auth: currentAuth)
         case .replacementSignedIn:
-            return Self.session(auth: Self.replacementSignedInAuth)
+            currentAuth = Self.replacementSignedInAuth
+            return Self.session(auth: currentAuth)
         }
     }
 
@@ -1034,7 +1147,11 @@ private actor AuthBoundaryTestRuntime: AgentRuntime {
         if failingOperations.contains(.listThreads) {
             throw AgentRuntimeError.authenticationRecoveryRequired(.signInExpired)
         }
-        return archived ? [] : [AuthBoundaryFixture.accountThread]
+        guard !archived else { return [] }
+        if currentAuth.email == Self.replacementSignedInAuth.email {
+            return [AuthBoundaryFixture.replacementAccountThread]
+        }
+        return [AuthBoundaryFixture.accountThread]
     }
 
     func readThread(id: String) async throws -> RuntimeConversation {

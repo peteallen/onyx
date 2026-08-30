@@ -134,6 +134,70 @@ final class AccountAccessPresentationTests: XCTestCase {
         )
     }
 
+    func testCodexSessionWithEmptyLoginMethodsStillOffersSignIn() {
+        // Some app-server versions return a signed-out session with no
+        // availableLoginMethods. The recovery card must remain actionable;
+        // an empty catalog is not evidence that Codex has no login ceremony.
+        let model = OnyxAppModel(runtime: nil)
+        model.session = RuntimeSession(
+            runtime: .codex,
+            displayName: "Codex",
+            accountLabel: nil,
+            planLabel: nil,
+            auth: .signedOut,
+            availableLoginMethods: [],
+            availableModels: [],
+            capabilities: []
+        )
+        model.authState = .signedOut
+
+        XCTAssertEqual(model.primaryLoginMethod?.id, "codex.chatgpt.browser")
+        XCTAssertEqual(model.deviceCodeLoginMethod?.id, "codex.chatgpt.device-code")
+
+        let actions = AccountAccessPresentation.idleActions(
+            hasLoginMethod: model.primaryLoginMethod != nil,
+            hasDeviceCodeMethod: model.deviceCodeLoginMethod != nil,
+            runtimeName: "Codex"
+        )
+        XCTAssertEqual(actions.map(\.title), ["Open Settings", "More sign-in options", "Sign In"])
+        XCTAssertEqual(actions.last?.title, "Sign In")
+    }
+
+    func testEmptyGenericSessionDoesNotInventLoginCeremonies() {
+        let model = OnyxAppModel(runtime: nil)
+        model.session = RuntimeSession(
+            runtime: .openRouter,
+            displayName: "OpenAI-compatible",
+            accountLabel: nil,
+            planLabel: nil,
+            auth: .signedOut,
+            availableLoginMethods: [],
+            availableModels: [],
+            capabilities: []
+        )
+
+        XCTAssertNil(model.primaryLoginMethod)
+        XCTAssertNil(model.deviceCodeLoginMethod)
+
+        // A provider rebind can briefly leave the old Codex runtime kind on a
+        // window while the new session is already projected. The session kind
+        // must win so that stale Codex state cannot invent an OAuth button for
+        // this generic connection.
+        let reboundModel = OnyxAppModel(runtime: SessionlessCodexRecoveryRuntime())
+        reboundModel.session = model.session
+        XCTAssertNil(reboundModel.primaryLoginMethod)
+        XCTAssertNil(reboundModel.deviceCodeLoginMethod)
+
+        XCTAssertEqual(
+            AccountAccessPresentation.idleActions(
+                hasLoginMethod: model.primaryLoginMethod != nil,
+                hasDeviceCodeMethod: model.deviceCodeLoginMethod != nil,
+                runtimeName: model.runtimeDisplayName
+            ),
+            [.openSettings(prominent: true)]
+        )
+    }
+
     func testSessionlessCodexRecoveryExposesBothLoginCeremonies() async {
         let suite = "AccountAccessPresentationTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!

@@ -35,7 +35,8 @@ final class SharedRuntimeCoordinator: AgentRuntime, @unchecked Sendable {
     init(
         runtime: any AgentRuntime,
         subscriberEventLimit: Int = defaultSubscriberEventLimit,
-        subscriberDeltaByteLimit: Int = defaultSubscriberDeltaByteLimit
+        subscriberDeltaByteLimit: Int = defaultSubscriberDeltaByteLimit,
+        eventAuthorizationBarrier: (@Sendable (AgentRuntimeEvent) async -> Void)? = nil
     ) {
         precondition(subscriberEventLimit > 0)
         precondition(subscriberDeltaByteLimit > 0)
@@ -57,6 +58,7 @@ final class SharedRuntimeCoordinator: AgentRuntime, @unchecked Sendable {
                 // Invalidate connection snapshots before windows observe the
                 // boundary event and decide whether to reconnect.
                 if let authorization = await state.broadcastAuthorization(for: event) {
+                    await eventAuthorizationBarrier?(event)
                     await emitter.yield(event, validator: {
                         await state.isBroadcastAuthorizationValid(authorization)
                     })
@@ -535,17 +537,34 @@ private actor SharedRuntimeSessionState {
             guard !isLoggingOut, !signedOutBoundaryActive else { return nil }
             activeLoginIDs.removeAll()
             if !auth.canRun {
+                // A provider-authored non-runnable account projection is an
+                // explicit signed-out boundary (for example, an account
+                // notification after a revoked session). Keep that boundary
+                // durable in the shared coordinator so a late recovery event
+                // cannot re-arm the transient recovery surface or leak it to
+                // a window that attaches afterward. A cold `connect()`
+                // snapshot does not pass through this event path, so merely
+                // opening a signed-out provider remains non-destructive.
+                signedOutBoundaryActive = true
                 authenticationRecoveryActive = false
                 authenticationRecoveryConfirmationPending = false
             }
             // Merely connecting while signed out must not close this boundary:
-            // Codex can still list local task history before login. Only a
-            // successful explicit logout establishes the privilege barrier.
+            // Codex can still list local task history before login. Only an
+            // explicit provider account event or successful logout establishes
+            // the privilege barrier.
             return .auth(generation: authEventGeneration)
         case .authenticationRecoveryRequired:
+            // Logout is the authoritative account boundary. The retired
+            // provider transport can still deliver a delayed authentication
+            // failure while it is stopping; accepting it here would make the
+            // transient recovery state sticky again and replay it to windows
+            // opened after sign-out. Keep the ordinary signed-out surface
+            // authoritative until a new login ceremony is admitted.
+            guard !isLoggingOut, !signedOutBoundaryActive else { return nil }
             authenticationRecoveryActive = true
             authenticationRecoveryConfirmationPending = false
-            return .always
+            return .auth(generation: authEventGeneration)
         case let .loginCompleted(completion):
             invalidateSessionSnapshot()
             guard !isLoggingOut else { return nil }
@@ -1085,6 +1104,11 @@ private final class RuntimeEventBroadcaster: @unchecked Sendable {
     private let deltaByteLimit: Int
     private var subscriptions: [UUID: RuntimeEventSubscription] = [:]
     private var isFinished = false
+    /// An authoritative signed-out account event is replayed to windows that
+    /// attach after the live boundary. This is intentionally separate from a
+    /// cold signed-out `RuntimeSession` returned by `connect()`: opening a
+    /// provider while signed out must not erase local task context.
+    private var stickySignedOutBoundary: RuntimeAuthState?
     private var stickyAuthenticationRecovery: RuntimeAuthenticationRecovery?
     private var stickyAuthenticationRecoveryLogin: RuntimeLoginCompletion?
     private var stickyAuthenticationRecoveryRevision: UInt64 = 0
@@ -1098,10 +1122,13 @@ private final class RuntimeEventBroadcaster: @unchecked Sendable {
         let id = UUID()
         lock.lock()
         var initialEvents: [AgentRuntimeEvent] = []
-        if let stickyAuthenticationRecovery {
+        if let stickySignedOutBoundary {
+            initialEvents.append(.accountUpdated(stickySignedOutBoundary))
+        }
+        if stickySignedOutBoundary == nil, let stickyAuthenticationRecovery {
             initialEvents.append(.authenticationRecoveryRequired(stickyAuthenticationRecovery))
         }
-        if let stickyAuthenticationRecoveryLogin {
+        if stickySignedOutBoundary == nil, let stickyAuthenticationRecoveryLogin {
             initialEvents.append(.loginCompleted(stickyAuthenticationRecoveryLogin))
         }
         let subscription = RuntimeEventSubscription(
@@ -1136,17 +1163,27 @@ private final class RuntimeEventBroadcaster: @unchecked Sendable {
                 stickyAuthenticationRecovery = recovery
                 stickyAuthenticationRecoveryLogin = nil
             case let .loginCompleted(completion)
-                where completion.success && stickyAuthenticationRecovery != nil:
-                // The session actor admits only a completion correlated with a
-                // login started through this coordinator while recovery is
-                // active. Replay it after recovery so a just-opened sibling
-                // also performs the authoritative account refresh.
-                stickyAuthenticationRecoveryLogin = completion
+                where completion.success:
+                // A successful completion admitted by the coordinator closes
+                // an explicit signed-out boundary. If recovery is active,
+                // retain the completion as a durable confirmation for windows
+                // that attach before their account refresh finishes.
+                stickySignedOutBoundary = nil
+                if stickyAuthenticationRecovery != nil {
+                    stickyAuthenticationRecoveryLogin = completion
+                }
             case let .loginCompleted(completion) where !completion.success:
                 stickyAuthenticationRecoveryLogin = nil
             case let .accountUpdated(auth) where !auth.canRun:
+                stickySignedOutBoundary = auth
                 stickyAuthenticationRecovery = nil
                 stickyAuthenticationRecoveryLogin = nil
+            case let .accountUpdated(auth) where auth.isSignedIn:
+                // A signed-in projection is only admitted after the
+                // coordinator has accepted the corresponding login boundary.
+                // Clear any old replay marker in case a window subscribes
+                // between that completion and this provider projection.
+                stickySignedOutBoundary = nil
             default:
                 break
             }
@@ -1168,6 +1205,7 @@ private final class RuntimeEventBroadcaster: @unchecked Sendable {
             return
         }
         isFinished = true
+        stickySignedOutBoundary = nil
         stickyAuthenticationRecovery = nil
         stickyAuthenticationRecoveryLogin = nil
         let currentSubscriptions = Array(subscriptions.values)
@@ -1198,6 +1236,7 @@ private final class RuntimeEventBroadcaster: @unchecked Sendable {
         let currentSubscriptions = Array(subscriptions.values)
         subscriptions.removeAll()
         isFinished = true
+        stickySignedOutBoundary = nil
         stickyAuthenticationRecovery = nil
         stickyAuthenticationRecoveryLogin = nil
         lock.unlock()
