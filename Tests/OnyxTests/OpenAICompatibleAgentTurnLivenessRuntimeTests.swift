@@ -789,7 +789,11 @@ final class OpenAICompatibleAgentTurnLivenessRuntimeTests: XCTestCase {
         let runtime = OpenAICompatibleAgentTurnLivenessRuntime(
             runtime: upstream,
             policy: OpenAICompatibleAgentTurnLivenessPolicy(
-                inactivityTimeout: .milliseconds(80)
+                // The contract under test is lane-wide interaction pausing,
+                // not an 80ms timeout.  Keep enough scheduler margin for the
+                // wrapper's AsyncStream pump on hosted runners; production
+                // continues to use the five-minute policy.
+                inactivityTimeout: .seconds(1)
             )
         )
         let log = AgentTurnLivenessEventLog()
@@ -812,7 +816,9 @@ final class OpenAICompatibleAgentTurnLivenessRuntimeTests: XCTestCase {
         try await waitUntil("The threadless interaction did not reach the wrapper") {
             await log.snapshot().contains(.userInteractionRequested(global))
         }
-        try await Task.sleep(for: .milliseconds(140))
+        // The global interaction must pause both turns beyond a full
+        // inactivity interval while it remains unresolved.
+        try await Task.sleep(for: .milliseconds(1_100))
         let threadOneFailuresWhilePaused = await log.livenessFailureCount(threadID: "thread-1")
         let threadTwoFailuresWhilePaused = await log.livenessFailureCount(threadID: "thread-2")
         XCTAssertEqual(threadOneFailuresWhilePaused, 0)
